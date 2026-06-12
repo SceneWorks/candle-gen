@@ -1,0 +1,22 @@
+[workspace]
+members = ["candle-gen", "candle-gen-sdxl"]
+resolver = "2"
+
+# Single source of truth for the deps shared across the workspace (mirrors mlx-gen's F-151). The
+# next candle bump or gen-core pin bump is then a one-line edit here rather than N synchronized
+# ones — a missed crate would otherwise resolve two distinct `sceneworks-gen-core` builds and the
+# provider crate would register into one `inventory` registry while the consumer queries another
+# ("engine not found" at RUNTIME, not a compile error — see scripts/check-gen-core-skew.sh).
+[workspace.dependencies]
+# Backend-neutral contract layer (epic 3720). lib name is `gen_core` (neutral import path). This is
+# pinned by git SHA to the SAME rev the SceneWorks worker pins — do NOT drift it, or the skew gate
+# fires. candle-gen is the Windows/CUDA sibling of mlx-gen; both satisfy this one contract.
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "8355152a79d6d328d3798c19a2b5a37bb8468622" }
+# candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
+# under the `cuda` feature). Latest crates.io release that builds cleanly on macOS (see README).
+candle-core = "0.10.2"
+candle-nn = "0.10.2"
+# Link-time model registration (the DI-container stand-in) — matches gen-core's `inventory`.
+inventory = "0.3"
+# Error bridge (CandleError -> gen_core::Error). Major matches mlx-gen (thiserror 2).
+thiserror = "2"

@@ -1,0 +1,24 @@
+[package]
+name = "candle-gen-sdxl"
+version = "0.0.0"
+edition = "2021"
+description = "Stable Diffusion XL (SDXL) provider crate for candle-gen (scaffold; pipeline lands in a later slice)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "sdxl", "inference"]
+categories = ["science"]
+
+[dependencies]
+# Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
+# build (single resolution; see scripts/check-gen-core-skew.sh).
+candle-gen = { path = "../candle-gen" }
+# Link-time self-registration into gen-core's model registry (the `inventory::submit!` below).
+inventory = { workspace = true }
+
+[features]
+# Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda`
+# on this provider crate selects the matching candle backend.
+default = []
+metal = ["candle-gen/metal"]
+cuda = ["candle-gen/cuda"]
+flash-attn = ["candle-gen/flash-attn"]

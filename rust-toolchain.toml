@@ -1,0 +1,9 @@
+# Pin the Rust toolchain so a new `stable` release can't redden CI on an untouched workspace (every
+# ~6-week stable can add default lints that turn `clippy -D warnings` red with no code change).
+# Pinned to the SAME channel as mlx-gen so the two gen-core siblings compile identically. This file
+# is the single source of truth: CI installs the channel named here (`rustup show` honors it) and
+# local `cargo` in this repo uses it too. Bump deliberately (review new lints in the same PR).
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

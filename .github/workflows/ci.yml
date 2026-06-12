@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Supersede in-flight runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The default (CPU) build works on any platform. macOS additionally exercises the `metal`
+  # feature. This lane runs fmt + clippy + check + test + the gen-core skew gate's self-test.
+  build:
+    name: fmt + clippy + check + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        # No `@stable` — that would ignore the pin. `rustup show` installs the channel named in
+        # rust-toolchain.toml (its components come with it); the explicit add is idempotent.
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+          rustc --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy (default / CPU)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check (default / CPU)
+        run: cargo check --workspace
+
+      - name: Check (Metal backend)
+        if: matrix.os == 'macos-15'
+        run: cargo check --workspace --features metal
+
+      - name: Test (default / CPU)
+        run: cargo test --workspace
+
+      - name: gen-core skew gate (self-test)
+        run: bash scripts/check-gen-core-skew.sh --self-test
+
+      - name: gen-core skew gate (real graph)
+        run: bash scripts/check-gen-core-skew.sh
+
+  # PLACEHOLDER — Windows + CUDA lane. Disabled (`if: false`) until a CUDA runner is wired.
+  #
+  # TODO (later slice, the Windows box):
+  #   * Provision the CUDA toolkit (nvcc) + a CUDA-capable runner (GitHub-hosted has none; needs a
+  #     self-hosted Windows/Linux GPU runner or a CUDA container image).
+  #   * Build with `--features cuda` (and later `--features flash-attn`, which additionally needs
+  #     the `candle-flash-attn` crate + its prebuilt/compiled fatbin kernels).
+  #   * candle compiles its CUDA kernels (fatbin) at build time — cache them; a cold build is slow.
+  #   * The default/CPU + Metal lanes above do NOT exercise any CUDA path, by design.
+  windows-cuda:
+    name: check + test (Windows / CUDA) [placeholder]
+    if: false
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        run: rustup show
+      # - name: Check (CUDA)
+      #   run: cargo check --workspace --features cuda
+      # - name: Test (CUDA)
+      #   run: cargo test --workspace --features cuda
