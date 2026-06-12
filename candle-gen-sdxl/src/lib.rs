@@ -14,8 +14,11 @@
 //! (sc-3678) rather than the candle backend silently dropping a control. The descriptor's `backend`
 //! is `"candle"` and `mac_only` is `false` (Windows/CUDA target).
 //!
-//! Carried forward as named follow-ups: flash-attn + f16-CLIP/VRAM work and component caching
-//! (sc-3674), RealVisXL + parity (sc-3677).
+//! Perf (sc-3674): CLIP loads f16 and the UNet attention runs through fused **flash-attention** when
+//! built `--features flash-attn` and the runtime toggle ([`set_flash_attn`], default on) is set.
+//!
+//! Carried forward as named follow-ups: component caching across `generate` calls + VAE-tiling for
+//! lower peak VRAM (sc-3674 cont.), RealVisXL + parity (sc-3677).
 
 mod pipeline;
 
@@ -37,6 +40,28 @@ pub const MODEL_ID: &str = "sdxl";
 
 /// SDXL works in latent space at /8: both dims must be multiples of 8.
 const SIZE_MULTIPLE: u32 = 8;
+
+/// Process-global flash-attention runtime toggle (sc-3674). The **fused CUTLASS kernels are a build
+/// opt-in** (`--features flash-attn`); this switch decides whether a flash-attn-capable build
+/// actually *uses* them, so the SceneWorks UI can expose it (defaulted on) and the worker flips it
+/// from settings — without recompiling. Mirrors `mlx-gen-sdxl::set_compile_glue`. Read at pipeline
+/// load via [`flash_attn_enabled`]; the pipeline ANDs it with `cfg!(feature = "flash-attn")`, so on a
+/// build without the feature this is inert (the unfused path always runs). Default **on**.
+static FLASH_ATTN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Enable/disable flash-attention for subsequently-loaded pipelines (sc-3674). Process-global; the
+/// worker calls this from its `backend_candle`/flash setting at startup. No effect on a build without
+/// the `flash-attn` feature (the kernels aren't compiled in).
+pub fn set_flash_attn(on: bool) {
+    FLASH_ATTN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether flash-attention is currently enabled (the runtime toggle, [`set_flash_attn`]). The
+/// pipeline still gates this behind `cfg!(feature = "flash-attn")`, so this returning `true` on a
+/// non-flash build does not enable anything.
+pub fn flash_attn_enabled() -> bool {
+    FLASH_ATTN.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// A loaded candle SDXL generator. Loading is **lazy**: this carries only the resolved snapshot
 /// `root` + the compute device/dtype (so `load` does no file I/O and registry introspection against a
@@ -216,6 +241,19 @@ mod tests {
         assert!(!d.capabilities.supports_lokr);
         // sc-3673: the wired sampler is the deterministic DDIM (not the spike's euler-ancestral).
         assert_eq!(d.capabilities.samplers, vec!["ddim"]);
+    }
+
+    /// sc-3674: the flash-attn runtime toggle defaults on and round-trips (what the worker/UI drive).
+    #[test]
+    fn flash_attn_toggle_roundtrips() {
+        assert!(
+            flash_attn_enabled(),
+            "flash-attn runtime toggle defaults on"
+        );
+        set_flash_attn(false);
+        assert!(!flash_attn_enabled());
+        set_flash_attn(true);
+        assert!(flash_attn_enabled());
     }
 
     /// A txt2img request passes validation; unsupported shapes are rejected clearly (not silently

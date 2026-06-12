@@ -3,10 +3,14 @@
 //! and into the backend-neutral [`gen_core::Generator`] contract.
 //!
 //! What changed vs the spike, and what deliberately did **not**:
-//! - **Same component numerics** (the GO-validated path): dual CLIP (CLIP-L + CLIP-bigG) loaded
-//!   **f32** and encoded, embeddings cast to **f16**; UNet **f16**; VAE **f16** with the
-//!   `madebyollin/sdxl-vae-fp16-fix` (f16 SDXL VAE NaNs without it); VAE scale **0.13025** (the
-//!   diffusers SDXL value, not candle's hardcoded SD1.5 0.18215).
+//! - **Components** (the GO-validated path): dual CLIP (CLIP-L + CLIP-bigG) loaded **f16** (sc-3674;
+//!   the spike used f32) and encoded; UNet **f16**; VAE **f16** with the `madebyollin/sdxl-vae-fp16-fix`
+//!   (f16 SDXL VAE NaNs without it); VAE scale **0.13025** (the diffusers SDXL value, not candle's
+//!   hardcoded SD1.5 0.18215).
+//! - **Perf (sc-3674)**: the UNet attention runs through fused **flash-attention** when the crate is
+//!   built `--features flash-attn` AND the runtime toggle ([`crate::set_flash_attn`], default on) is
+//!   set — on Blackwell sm_120 that cut steady-state from ~0.32 to ~0.21 s/step and peak VRAM ~21.6→18
+//!   GiB. The build feature is the opt-in; the toggle is what the SceneWorks UI exposes.
 //! - **Deterministic seeding + non-ancestral scheduler (sc-3673)**: initial noise is drawn from a
 //!   fixed-algorithm CPU RNG (`StdRng`) seeded by `seed` and moved to the device — NOT candle's CUDA
 //!   `device.set_seed`, whose seed→noise mapping was not portable across launch environments and
@@ -122,12 +126,15 @@ impl Pipeline {
                         .as_ref()
                         .ok_or_else(|| CandleError::Msg("sdxl config missing clip2".into()))?,
                 };
-                // CLIP loads f32 even though the weights file is fp16 (candle reference behavior).
+                // sc-3674: load CLIP at the compute dtype (f16), not the spike's F32. The fp16
+                // safetensors load directly, the forward runs f16 (diffusers loads CLIP fp16 too),
+                // and it halves the text-encoder VRAM (CLIP-bigG ~2.8→1.4 GiB) with no visible
+                // quality change. Embeddings are already cast to `dtype` in `encode_one`.
                 let model = stable_diffusion::build_clip_transformer(
                     clip_cfg,
                     snapshot_file(root, weights_sub)?,
                     device,
-                    DType::F32,
+                    dtype,
                 )?;
                 Ok((tokenizer, model))
             };
@@ -136,12 +143,16 @@ impl Pipeline {
         let (tokenizer_g, text_model_g) = load_clip(Clip::BigG)?;
 
         let vae = config.build_vae(hf_get(VAE_FIX_REPO, VAE_FIX_FILE)?, device, dtype)?;
+        // sc-3674: route the UNet attention through fused flash-attention when (a) this crate is
+        // built `--features flash-attn` (the CUTLASS kernels are compiled in) AND (b) the runtime
+        // toggle is on (`crate::set_flash_attn`, default on — the SceneWorks UI exposes it). The build
+        // feature is the opt-in; the toggle lets the worker turn it off without recompiling.
+        let use_flash_attn = cfg!(feature = "flash-attn") && crate::flash_attn_enabled();
         let unet = config.build_unet(
             snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?,
             device,
             4,
-            // sc-3674 wires candle-flash-attn; the spike (and this faithful port) run unfused.
-            false,
+            use_flash_attn,
             dtype,
         )?;
 

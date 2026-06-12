@@ -70,9 +70,14 @@ fn main() -> Result<()> {
     // it only through the gen_core registry below — see `candle_gen_sdxl::force_link`).
     candle_gen_sdxl::force_link();
 
+    // `--no-flash` exercises the runtime toggle (sc-3674): turn fused flash-attention off even on a
+    // flash-attn build (the worker drives this from the UI setting). No effect on a non-flash build.
+    if args.iter().any(|a| a == "--no-flash") {
+        candle_gen_sdxl::set_flash_attn(false);
+    }
+
     // Resolve through the registry — proves the inventory seam (THIS crate's `submit!` is linked).
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
-    let t_load = std::time::Instant::now();
     let gen = gen_core::registry::load("sdxl", &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={}",
@@ -96,20 +101,20 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    // Progress callback: one dot per step, newline on decode.
+    // Bench timing: stamp each Step event. The first interval (generate-start → step 1) carries the
+    // model load + CUDA cold-start, so it is NOT one of these inter-step deltas — every delta between
+    // consecutive Step marks is a warm, steady-state denoise step. Mean(deltas) is the per-step figure
+    // comparable to the spike's 0.32 s/step (and torch's 0.089 s/step).
     let t_gen = std::time::Instant::now();
-    let mut last_step = 0u32;
+    let mut marks: Vec<std::time::Instant> = Vec::new();
     let mut on_progress = |p: Progress| match p {
         Progress::Step { current, total } => {
-            last_step = current;
+            marks.push(std::time::Instant::now());
             print!("\r[smoke] step {current}/{total}   ");
             use std::io::Write;
             let _ = std::io::stdout().flush();
         }
-        Progress::Decoding => println!(
-            "\n[smoke] decoding (step {last_step} done, load+gen build was {:.1}s)",
-            t_load.elapsed().as_secs_f32()
-        ),
+        Progress::Decoding => println!("\n[smoke] decoding"),
     };
 
     let output = gen.generate(&req, &mut on_progress)?;
@@ -118,15 +123,29 @@ fn main() -> Result<()> {
         GenerationOutput::Images(imgs) => imgs,
         GenerationOutput::Video { .. } => return Err("expected images, got video".into()),
     };
-    println!("[smoke] generated {} image(s) in {gen_s:.1}s", images.len());
+
+    let deltas: Vec<f32> = marks
+        .windows(2)
+        .map(|w| (w[1] - w[0]).as_secs_f32())
+        .collect();
+    let mean_step = if deltas.is_empty() {
+        0.0
+    } else {
+        deltas.iter().sum::<f32>() / deltas.len() as f32
+    };
+    let flash = cfg!(feature = "flash-attn") && candle_gen_sdxl::flash_attn_enabled();
+    println!(
+        "[smoke] {} image(s) in {gen_s:.1}s total; steady-state {:.3}s/step (flash_attn={flash})",
+        images.len(),
+        mean_step
+    );
 
     // Sidecar with the run facts — the harness's cmd-subprocess stdout capture is lossy, so persist
-    // the timing/seed/dims to a file that can be read back to confirm the run.
-    let per_step = if steps > 0 { gen_s / steps as f32 } else { 0.0 };
+    // the bench numbers to a file that can be read back.
     let _ = std::fs::write(
         out.with_extension("meta.txt"),
         format!(
-            "engine=sdxl backend={}\n{width}x{height} steps={steps} guidance={guidance} seed={seed} count={count}\ngen_total_s={gen_s:.2} approx_per_step_s={per_step:.3}\nimages={}\n",
+            "engine=sdxl backend={} flash_attn={flash}\n{width}x{height} steps={steps} guidance={guidance} seed={seed} count={count}\ngen_total_s={gen_s:.2} steady_per_step_s={mean_step:.3}\nimages={}\n",
             gen.descriptor().backend,
             images.len()
         ),
