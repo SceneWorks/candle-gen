@@ -33,12 +33,17 @@
 //!   — the fp16-VAE-fix and the CLIP-L/bigG `tokenizer.json`s — still resolve via `hf-hub` (cached),
 //!   exactly as the spike.
 //!
-//! Component *caching across* `generate` calls (the spike's per-call reload) stays a follow-up
-//! (sc-5037) — and is in tension with the sc-4987 staged load, which deliberately frees components
-//! mid-call to bound peak VRAM; a cache must keep CLIP load-on-demand-and-free and only hold the
-//! UNet+VAE resident (a latency, not a peak-VRAM, win).
+//! - **Component caching (sc-5037)**: the seed/prompt/resolution-independent [`Components`] (UNet +
+//!   VAE) are loaded once and **cached on the generator** across `generate` calls (keyed by the
+//!   flash-attn setting), so back-to-back requests skip the ~7 GiB UNet/VAE disk re-read. This is
+//!   reconciled with the sc-4987 staged load rather than reverting it: CLIP stays
+//!   load-on-demand-and-free (only one encoder resident at a time), and the generator computes the
+//!   text embeddings *before* acquiring the cached UNet/VAE — so the cold-call ordering (CLIP freed
+//!   before UNet/VAE load) and the ~8.7 GiB peak are preserved; the cache holds only UNet+VAE
+//!   resident between calls (a latency win, not a peak-VRAM regression).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Module, Tensor, D};
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
@@ -46,6 +51,7 @@ use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
 use candle_transformers::models::stable_diffusion::schedulers::SchedulerConfig;
+use candle_transformers::models::stable_diffusion::unet_2d::UNet2DConditionModel;
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 use candle_transformers::models::stable_diffusion::{self, StableDiffusionConfig};
 use rand::{rngs::StdRng, SeedableRng};
@@ -128,6 +134,19 @@ pub(crate) struct Pipeline {
     dtype: DType,
 }
 
+/// The seed- and prompt-independent heavy components (UNet + f16 VAE), `Arc`-shared so they can be
+/// **cached on the generator across `generate` calls** (sc-5037) and cheaply cloned out from under
+/// the cache lock for a render. SDXL's UNet/VAE are resolution-agnostic (`build_unet`/`build_vae`
+/// read only the fixed `unet`/`autoencoder` sub-configs, never the latent dims), so a single cached
+/// pair serves every request size; the only construction input that varies is flash-attn, which the
+/// generator keys the cache on. CLIP is deliberately **not** here — it stays load-on-demand-and-free
+/// (the sc-4987 peak-VRAM lever), so caching the UNet/VAE does not make the dual CLIP resident.
+#[derive(Clone)]
+pub(crate) struct Components {
+    pub(crate) unet: Arc<UNet2DConditionModel>,
+    pub(crate) vae: Arc<AutoEncoderKL>,
+}
+
 impl Pipeline {
     /// Build the (light) pipeline handle for the SDXL snapshot `root` at the given device/dtype (f16)
     /// and request dims. This does **no** weight I/O — the config's only request-dependent fields are
@@ -155,9 +174,12 @@ impl Pipeline {
     /// shape `[2, tokens, 2048]`, cast to the compute dtype. Mirrors the spike's `text_embeddings`.
     ///
     /// sc-4987: each encoder is loaded, run, and dropped **inside** [`encode_one`] before the next is
-    /// loaded — so the two CLIP encoders are never co-resident, and both are gone when this returns
-    /// (before the UNet/VAE load). The embeddings it returns are the only thing that outlives them.
-    fn text_embeddings(&self, prompt: &str, uncond: &str) -> Result<Tensor> {
+    /// loaded — so the two CLIP encoders are never co-resident, and both are gone when this returns.
+    /// sc-5037: the generator calls this **before** acquiring the (possibly cached-resident) UNet/VAE,
+    /// preserving the cold-call ordering (CLIP freed before they load); on a warm call the UNet/VAE are
+    /// already resident, but only one CLIP encoder is ever resident at a time (`build_unet`+VAE ≈ 7 GiB
+    /// + one CLIP ≤ 1.4 GiB stays under the denoise-time peak, so the sc-4987 high-water is preserved).
+    pub(crate) fn text_embeddings(&self, prompt: &str, uncond: &str) -> Result<Tensor> {
         let l = self.encode_one(Clip::L, prompt, uncond)?;
         let g = self.encode_one(Clip::BigG, prompt, uncond)?;
         Ok(Tensor::cat(&[l, g], D::Minus1)?)
@@ -224,57 +246,47 @@ impl Pipeline {
         // `text_model` + `tokenizer` drop here, freeing this encoder before the caller loads the next.
     }
 
-    /// Load the UNet (f16) from the snapshot, routing attention through fused flash-attention when the
-    /// crate is built `--features flash-attn` AND the runtime toggle ([`crate::set_flash_attn`]) is on.
-    fn load_unet(&self) -> Result<stable_diffusion::unet_2d::UNet2DConditionModel> {
-        // sc-3674: the build feature compiles the CUTLASS kernels in; the runtime toggle (which the
-        // SceneWorks UI exposes) decides whether a flash-capable build actually uses them.
-        let use_flash_attn = cfg!(feature = "flash-attn") && crate::flash_attn_enabled();
-        Ok(self.config.build_unet(
+    /// Load the heavy [`Components`] (UNet + f16 VAE) for the given flash-attn setting. The UNet reads
+    /// from the snapshot (fused flash-attention when built `--features flash-attn` AND `use_flash_attn`
+    /// — sc-3674); the f16-stable VAE (`madebyollin/sdxl-vae-fp16-fix`) resolves via `hf-hub`. The
+    /// generator owns the caching of the result across calls (sc-5037); this is the cache-miss loader.
+    pub(crate) fn load_components(&self, use_flash_attn: bool) -> Result<Components> {
+        let unet = self.config.build_unet(
             snapshot_file(&self.root, "unet/diffusion_pytorch_model.fp16.safetensors")?,
             &self.device,
             4,
             use_flash_attn,
             self.dtype,
-        )?)
-    }
-
-    /// Load the f16-stable VAE (the `madebyollin/sdxl-vae-fp16-fix` weights, resolved via `hf-hub`).
-    fn load_vae(&self) -> Result<AutoEncoderKL> {
-        Ok(self.config.build_vae(
+        )?;
+        let vae = self.config.build_vae(
             hf_get(VAE_FIX_REPO, VAE_FIX_FILE)?,
             &self.device,
             self.dtype,
-        )?)
+        )?;
+        Ok(Components {
+            unet: Arc::new(unet),
+            vae: Arc::new(vae),
+        })
     }
 
-    /// Run txt2img for `req`, emitting per-step progress and honoring `req.cancel`. Returns one
-    /// `gen_core::Image` per `req.count` (each with seed `base_seed + index`).
-    ///
-    /// sc-4987 staging: the seed-independent text embeddings are computed first (which loads and frees
-    /// both CLIP encoders), *then* the UNet + VAE load — so the dual CLIP is never resident through the
-    /// denoise/decode that follow.
-    pub(crate) fn generate(
+    /// Render `req` against pre-resolved `text_embeddings` and (caller-cached, sc-5037) `unet`/`vae`,
+    /// emitting per-step progress and honoring `req.cancel`. Returns one `gen_core::Image` per
+    /// `req.count` (each with seed `base_seed + index`). The denoise+decode here is unchanged from
+    /// sc-4987 — only the component *ownership* moved out to the generator so it can cache them.
+    pub(crate) fn render(
         &self,
         req: &GenerationRequest,
+        text_embeddings: &Tensor,
+        unet: &UNet2DConditionModel,
+        vae: &AutoEncoderKL,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let guidance = req.guidance.map(|g| g as f64).unwrap_or(DEFAULT_GUIDANCE);
         let use_guide = guidance > 1.0;
-        let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let total = steps as u32;
-
-        // Seed-independent conditioning, hoisted above the count loop (the dual-CLIP forward draws no
-        // RNG); only the per-image init noise depends on the seed. Computing it first also frees both
-        // CLIP encoders (sc-4987) before the UNet/VAE below allocate.
-        let text_embeddings = self.text_embeddings(&req.prompt, negative)?;
         let (lat_h, lat_w) = (self.config.height / 8, self.config.width / 8);
-
-        // Heavy components, loaded once per call AFTER CLIP is freed and reused across the count loop.
-        let unet = self.load_unet()?;
-        let vae = self.load_vae()?;
 
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
@@ -312,7 +324,7 @@ impl Pipeline {
                     latents.clone()
                 };
                 let model_in = scheduler.scale_model_input(model_in, timestep)?;
-                let noise_pred = unet.forward(&model_in, timestep as f64, &text_embeddings)?;
+                let noise_pred = unet.forward(&model_in, timestep as f64, text_embeddings)?;
                 let noise_pred = if use_guide {
                     let chunks = noise_pred.chunk(2, 0)?;
                     let (uncond, cond) = (&chunks[0], &chunks[1]);
@@ -328,7 +340,7 @@ impl Pipeline {
             }
 
             on_progress(Progress::Decoding);
-            images.push(self.decode(&vae, &latents)?);
+            images.push(self.decode(vae, &latents)?);
         }
         Ok(images)
     }

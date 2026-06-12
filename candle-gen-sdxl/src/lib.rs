@@ -27,6 +27,7 @@
 mod pipeline;
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::registry::ModelRegistration;
@@ -35,7 +36,7 @@ use candle_gen::gen_core::{
     ModelDescriptor, Progress, WeightsSource,
 };
 
-use pipeline::Pipeline;
+use pipeline::{Components, Pipeline};
 
 /// Registry id — matches the SceneWorks worker's `payload.model` (`MODEL_TABLE["sdxl"]`). The
 /// worker maps both `sdxl` and `realvisxl` onto engine id `"sdxl"`, so — exactly like
@@ -88,15 +89,44 @@ pub fn vae_tiling_enabled() -> bool {
     VAE_TILING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A loaded candle SDXL generator. Loading is **lazy**: this carries only the resolved snapshot
-/// `root` + the compute device/dtype (so `load` does no file I/O and registry introspection against a
-/// missing path still resolves). The heavy components ([`Pipeline`]) are built at the top of
-/// [`generate`](Generator::generate); caching them across calls is sc-5037.
+/// A loaded candle SDXL generator. Loading is **lazy**: `load` does no file I/O (registry
+/// introspection against a missing path still resolves), and the heavy UNet/VAE are built on the
+/// first [`generate`](Generator::generate) call. sc-5037: those [`Components`] are then **cached** in
+/// `components` and reused across subsequent calls (keyed by the flash-attn setting), so back-to-back
+/// requests skip the ~7 GiB UNet/VAE disk re-read. CLIP is intentionally not cached — it stays
+/// load-on-demand-and-free (the sc-4987 peak-VRAM lever), so the cache is a latency win that does not
+/// raise the ~8.7 GiB high-water mark.
 pub struct SdxlGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: Device,
     dtype: DType,
+    /// Cached UNet+VAE + the flash-attn flag they were built with. `Mutex` because `Generator` is
+    /// shared and `generate` takes `&self`; the lock is held only to read/populate the cache (a
+    /// cheap `Arc` clone or a one-time load), never across the denoise.
+    components: Mutex<Option<(bool, Components)>>,
+}
+
+impl SdxlGenerator {
+    /// Get the cached UNet/VAE, loading (and caching) them on a miss. Keyed by the effective
+    /// flash-attn setting (`build_unet` bakes it in, sc-3674), so flipping [`set_flash_attn`] between
+    /// calls rebuilds rather than serving a stale UNet. The lock is held over the cache-miss load
+    /// (concurrent first-callers serialize on it) but released before the caller's denoise.
+    fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
+        let flash = cfg!(feature = "flash-attn") && flash_attn_enabled();
+        let mut guard = self
+            .components
+            .lock()
+            .expect("sdxl components cache mutex poisoned");
+        if let Some((cached_flash, comps)) = guard.as_ref() {
+            if *cached_flash == flash {
+                return Ok(comps.clone());
+            }
+        }
+        let comps = pipe.load_components(flash)?;
+        *guard = Some((flash, comps.clone()));
+        Ok(comps)
+    }
 }
 
 impl Generator for SdxlGenerator {
@@ -138,10 +168,24 @@ impl Generator for SdxlGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        // Build the pipeline (once per call) and run it. The rich-`CandleError` tail — including the
-        // typed `Canceled` — bridges into `gen_core::Error` via `?`/`map_err` (the From bridge).
+        // The rich-`CandleError` tail — including the typed `Canceled` — bridges into
+        // `gen_core::Error` via `?` (the From bridge). The light `Pipeline` handle carries this
+        // request's latent dims; the heavy UNet/VAE come from the cache.
         let pipe = Pipeline::load(&self.root, &self.device, self.dtype, req.width, req.height)?;
-        let images = pipe.generate(req, on_progress)?;
+        // Encode text FIRST (loads + frees CLIP) so the cold-call ordering — CLIP gone before the
+        // UNet/VAE are resident — is preserved (sc-4987); only then acquire the cached UNet/VAE
+        // (sc-5037). On a warm call the UNet/VAE are already resident, but CLIP loads one encoder at a
+        // time, so the footprint stays under the denoise-time peak.
+        let negative = req.negative_prompt.as_deref().unwrap_or("");
+        let text_embeddings = pipe.text_embeddings(&req.prompt, negative)?;
+        let components = self.components(&pipe)?;
+        let images = pipe.render(
+            req,
+            &text_embeddings,
+            &components.unet,
+            &components.vae,
+            on_progress,
+        )?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -218,6 +262,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         root,
         device,
         dtype: DType::F16,
+        components: Mutex::new(None),
     }))
 }
 

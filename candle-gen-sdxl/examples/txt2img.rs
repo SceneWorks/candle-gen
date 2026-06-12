@@ -58,6 +58,12 @@ fn main() -> Result<()> {
     let count: u32 = arg(&args, "--count")
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
+    // `--repeat N` calls generate() N times on the SAME generator — exercises the sc-5037 UNet/VAE
+    // cache: call 1 is cold (loads + caches), calls 2+ are warm (no UNet/VAE disk re-read). Per-call
+    // wall-clock is printed so the warm speedup is visible; the last call's images are the ones saved.
+    let repeat: u32 = arg(&args, "--repeat")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     let out = arg(&args, "--out")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("sdxl_smoke.png"));
@@ -106,28 +112,51 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    // Bench timing: stamp each Step event. The first interval (generate-start → step 1) carries the
-    // model load + CUDA cold-start, so it is NOT one of these inter-step deltas — every delta between
-    // consecutive Step marks is a warm, steady-state denoise step. Mean(deltas) is the per-step figure
-    // comparable to the spike's 0.32 s/step (and torch's 0.089 s/step).
-    let t_gen = std::time::Instant::now();
+    // Repeat generate() on the same generator; record each call's wall-clock to show the sc-5037 warm
+    // speedup (cold call 1 loads+caches UNet/VAE; warm calls skip the disk re-read). Per Step event we
+    // also stamp a mark: the first interval (call-start → step 1) carries model load + CUDA cold-start,
+    // so it is NOT one of the inter-step deltas — every delta between consecutive marks is a warm,
+    // steady-state denoise step. Marks are kept from the LAST call for the mean s/step figure.
+    let mut call_secs: Vec<f32> = Vec::with_capacity(repeat as usize);
     let mut marks: Vec<std::time::Instant> = Vec::new();
-    let mut on_progress = |p: Progress| match p {
-        Progress::Step { current, total } => {
-            marks.push(std::time::Instant::now());
-            print!("\r[smoke] step {current}/{total}   ");
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
-        }
-        Progress::Decoding => println!("\n[smoke] decoding"),
-    };
-
-    let output = gen.generate(&req, &mut on_progress)?;
-    let gen_s = t_gen.elapsed().as_secs_f32();
-    let images = match output {
-        GenerationOutput::Images(imgs) => imgs,
-        GenerationOutput::Video { .. } => return Err("expected images, got video".into()),
-    };
+    let mut images = Vec::new();
+    for call in 0..repeat {
+        marks.clear();
+        let mut on_progress = |p: Progress| match p {
+            Progress::Step { current, total } => {
+                marks.push(std::time::Instant::now());
+                print!(
+                    "\r[smoke] call {}/{repeat} step {current}/{total}   ",
+                    call + 1
+                );
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+            Progress::Decoding => println!("\n[smoke] call {}/{repeat} decoding", call + 1),
+        };
+        let t_call = std::time::Instant::now();
+        let output = gen.generate(&req, &mut on_progress)?;
+        call_secs.push(t_call.elapsed().as_secs_f32());
+        images = match output {
+            GenerationOutput::Images(imgs) => imgs,
+            GenerationOutput::Video { .. } => return Err("expected images, got video".into()),
+        };
+    }
+    let gen_s = *call_secs.last().unwrap();
+    if repeat > 1 {
+        let warm = &call_secs[1..];
+        let warm_mean = warm.iter().sum::<f32>() / warm.len() as f32;
+        println!(
+            "[smoke] per-call wall-clock: cold={:.2}s warm_mean={:.2}s (calls: {})",
+            call_secs[0],
+            warm_mean,
+            call_secs
+                .iter()
+                .map(|s| format!("{s:.2}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
 
     let deltas: Vec<f32> = marks
         .windows(2)
