@@ -21,7 +21,13 @@ calls the identical `Generator` / registry API regardless of which tensor backen
 > encoder → DiT flow-match Euler, distilled 4-step, **no CFG** → AutoencoderKL VAE), registered under
 > `"z_image_turbo"`. Same deterministic CPU-seeded-noise contract; the Qwen chat-template tokenization
 > is reused from gen-core (`TextTokenizer` / `ChatTemplate::QwenInstruct`). txt2img-only first slice
-> (img2img / LoRA / quantization are rejected, not silently dropped).
+> (img2img / LoRA / quantization are rejected, not silently dropped). **GPU-verified** on RTX PRO 6000
+> (sm_120): real 1024² renders + the conformance suite pass.
+>
+> **candle pinned to git main (post-0.10.2)** — REQUIRED for Blackwell sm_120. The crates.io 0.10.2
+> release throws `CUDA_ERROR_INVALID_PTX` at the first candle-kernels kernel whenever
+> candle-transformers is linked (SDXL + Z-Image both; plain candle-core works). The git rev clears it
+> and is source-compatible. See `[workspace.dependencies]`.
 
 ## Layout
 

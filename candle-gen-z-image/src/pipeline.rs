@@ -268,9 +268,14 @@ impl Pipeline {
                 // upcasts to f32 internally, so f32 here is correct regardless of the model dtype.
                 let t_norm = scheduler.current_timestep_normalized();
                 let t = Tensor::from_vec(vec![t_norm as f32], (1,), &self.device)?;
+                // The Z-Image DiT's predicted velocity must be NEGATED before the flow-match Euler
+                // step — a Z-Image-specific sign convention (the candle `z_image` reference's
+                // `noise_pred.neg()`). Without it the update walks the latent AWAY from the data
+                // manifold and the VAE decode is pure noise.
                 let velocity = components
                     .transformer
-                    .forward(&latents, &t, &cap_feats, &cap_mask)?;
+                    .forward(&latents, &t, &cap_feats, &cap_mask)?
+                    .neg()?;
                 latents = scheduler.step(&velocity, &latents)?;
                 on_progress(Progress::Step {
                     current: step_i as u32 + 1,
