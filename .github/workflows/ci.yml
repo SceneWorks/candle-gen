@@ -56,24 +56,50 @@ jobs:
       - name: gen-core skew gate (real graph)
         run: bash scripts/check-gen-core-skew.sh
 
-  # PLACEHOLDER — Windows + CUDA lane. Disabled (`if: false`) until a CUDA runner is wired.
+  # Windows + CUDA lane. Runs on a SELF-HOSTED runner labelled [self-hosted, windows, cuda] with the
+  # toolchain documented in the README's packaging section: CUDA 12.9 toolkit (nvcc) + VS 2022 v143
+  # (MSVC 14.4x) Build Tools. GitHub-hosted runners have no GPU and no CUDA toolkit, so this lane is
+  # skipped on forks (the runner label only exists on this repo).
   #
-  # TODO (later slice, the Windows box):
-  #   * Provision the CUDA toolkit (nvcc) + a CUDA-capable runner (GitHub-hosted has none; needs a
-  #     self-hosted Windows/Linux GPU runner or a CUDA container image).
-  #   * Build with `--features cuda` (and later `--features flash-attn`, which additionally needs
-  #     the `candle-flash-attn` crate + its prebuilt/compiled fatbin kernels).
-  #   * candle compiles its CUDA kernels (fatbin) at build time — cache them; a cold build is slow.
-  #   * The default/CPU + Metal lanes above do NOT exercise any CUDA path, by design.
+  # Packaging model (sc-3676): candle 0.10.2 compiles its kernels to **PTX**, not a SASS fatbin, and
+  # cudaforge reads CUDA_COMPUTE_CAP as a SINGLE value (a `;`-list does not parse). So portability is
+  # achieved with a **baseline virtual arch** — CUDA_COMPUTE_CAP=80 emits compute_80 PTX that the
+  # driver JIT-compiles to the runtime GPU's SASS (one binary runs on sm_80 Ampere → sm_120 Blackwell).
+  # Keep this in lockstep with README "Packaging" and scripts/package-cuda.ps1.
   windows-cuda:
-    name: check + test (Windows / CUDA) [placeholder]
-    if: false
-    runs-on: windows-latest
+    name: build + test (Windows / CUDA, baseline PTX sm_80)
+    # Skip on forks — only this repo has the labelled self-hosted GPU runner.
+    if: github.repository == 'michaeltrefry/candle-gen'
+    runs-on: [self-hosted, windows, cuda]
+    env:
+      # Baseline virtual arch: compute_80 PTX, driver-JIT'd up to the runtime GPU. NOT a hardware pin.
+      CUDA_COMPUTE_CAP: "80"
+      # Toolchain locations on the runner. Override here (not in code) if the runner layout changes —
+      # this keeps the build reproducible without a hand-set local shell.
+      CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.9"
+      VCVARS: "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat"
     steps:
       - uses: actions/checkout@v5
-      - name: Install Rust
-        run: rustup show
-      # - name: Check (CUDA)
-      #   run: cargo check --workspace --features cuda
-      # - name: Test (CUDA)
-      #   run: cargo test --workspace --features cuda
+
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        run: |
+          rustup show
+          rustc --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # nvcc emits one PTX per kernel under the candle-kernels build dir; cudaforge skips recompiling
+      # when the .ptx is newer than its .cu, so this caches across runs. cmd (not pwsh) sources vcvars
+      # in-process and runs cargo in the same environment — no MSYS `cmd /c` path mangling.
+      - name: Build (CUDA, baseline PTX)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo build --workspace --features cuda
+
+      - name: Test (CUDA)
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cargo test --workspace --features cuda
