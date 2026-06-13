@@ -39,6 +39,21 @@ calls the identical `Generator` / registry API regardless of which tensor backen
 > quantization rejected). **GPU-verified** on RTX PRO 6000 (sm_120): real 1024² schnell + dev renders
 > + both conformance suites pass.
 >
+> **FLUX.2-klein-9B txt2img** is the third model-family expansion (epic 3692, sc-3695) and the first
+> **from-scratch** port — `candle-transformers` has no FLUX.2, so the whole architecture is ported from
+> `mlx-gen-flux2` on candle-core/candle-nn: a **Qwen3** text encoder (36-layer dense LM; the hidden
+> states of layers 9/18/27 concatenate into a 12288-wide `prompt_embeds`), the **MMDiT** transformer
+> (8 joint + 24 fused-parallel single blocks, **4-axis interleaved RoPE**, global per-stream
+> modulation), and the **AutoencoderKL-Flux2** VAE (32-ch latent, a 2×2 pack into 128-ch transformer
+> space, BatchNorm-stats latent normalization). Registered under `"flux2_klein_9b"`, distilled 4-step
+> flow-match Euler with the empirical-mu sigma shift, guidance 1.0 (>1.0 runs a CFG negative pass).
+> Same deterministic CPU-seeded-noise contract; tokenization reuses gen-core's `TextTokenizer`
+> (`ChatTemplate::QwenInstructNoThink`). Runs the reference math in f32 (~59 GB resident on the 96 GB
+> Blackwell; a bf16 pass is a follow-up). txt2img-only first slice — the edit variants
+> (`flux2_klein_9b_edit` / `_kv_edit`, single/multi Reference + reference-KV cache), LoRA, and
+> quantization are deferred. **GPU-verified** on RTX PRO 6000 (sm_120): real 1024² render + conformance
+> suite pass.
+>
 > **candle pinned to git main (post-0.10.2)** — REQUIRED for Blackwell sm_120. The crates.io 0.10.2
 > release throws `CUDA_ERROR_INVALID_PTX` at the first candle-kernels kernel whenever
 > candle-transformers is linked (SDXL + Z-Image both; plain candle-core works). The git rev clears it
@@ -53,6 +68,7 @@ candle-gen/                 # workspace root
   candle-gen-sdxl/          # SDXL provider crate: Generator impl + descriptor + inventory::submit!
   candle-gen-z-image/       # Z-Image (Z-Image-Turbo) provider crate: txt2img via candle-transformers
   candle-gen-flux/          # FLUX.1 [schnell]+[dev] provider crate: txt2img via candle-transformers `flux`
+  candle-gen-flux2/         # FLUX.2-klein-9B provider crate: from-scratch MMDiT + Qwen3 + AutoencoderKL-Flux2
   scripts/
     check-gen-core-skew.sh  # version-skew gate: fails if >1 sceneworks-gen-core resolves
     check-cuda.ps1          # local cuda gate: vcvars + cargo build/test --features cuda (run pre-push)
