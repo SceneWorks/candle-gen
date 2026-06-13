@@ -1,0 +1,45 @@
+[package]
+name = "candle-gen-flux2"
+version = "0.0.0"
+edition = "2021"
+description = "FLUX.2-klein provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-flux2."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "flux", "inference"]
+categories = ["science"]
+
+[dependencies]
+# Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
+# build (single resolution; see scripts/check-gen-core-skew.sh).
+candle-gen = { path = "../candle-gen" }
+# Link-time self-registration into gen-core's model registry (the `inventory::submit!` below).
+inventory = { workspace = true }
+# FLUX.2 has NO candle-transformers reference impl (unlike FLUX.1's `flux`): the MMDiT, the 32-ch
+# 2×2-patchify VAE, and the Qwen3 prompt-embeds path are all written here on candle-core/candle-nn.
+# candle-transformers is still pulled (transitively, same build) but no FLUX.2 model is reused.
+candle-transformers = { workspace = true }
+# Qwen3 tokenizer.json loading (the FLUX.2 text encoder is a Qwen3 dense LM). The Qwen chat-template
+# wrapping is reused from gen-core's `TextTokenizer` (re-exported through `candle_gen::gen_core`).
+tokenizers = { workspace = true }
+# Deterministic CPU-seeded initial noise (sc-3673 parity) — NOT candle's CUDA `randn`.
+rand = { workspace = true }
+rand_distr = { workspace = true }
+# Parse the snapshot's transformer/text_encoder/vae config.json files where needed.
+serde_json = "1"
+
+[features]
+# Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda` on
+# this provider selects the matching candle backend everywhere.
+default = []
+metal = ["candle-gen/metal", "candle-transformers/metal"]
+cuda = ["candle-gen/cuda", "candle-transformers/cuda"]
+flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn"]
+
+[dev-dependencies]
+# `examples/flux2-txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to PNG
+# so a real GPU run can be eyeballed. Not a library dependency (the worker owns asset writes).
+image = { version = "0.25", default-features = false, features = ["png"] }
+# gen-core conformance suite (sc-4481): drives this provider through the public Generator contract.
+# Pinned to the SAME gen-core rev the workspace pins (95cd5c6). Used by tests/conformance.rs
+# (cuda-gated, #[ignore]d — it runs a real generate, so it needs weights + GPU).
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "95cd5c692b974ecaafa57c0af437f085b052e260" }
