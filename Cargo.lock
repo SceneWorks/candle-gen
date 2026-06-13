@@ -209,6 +209,10 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-nn",
+ "image",
+ "rand",
+ "rand_distr",
+ "safetensors 0.7.0",
  "sceneworks-gen-core",
  "thiserror 2.0.18",
 ]
@@ -287,7 +291,9 @@ dependencies = [
 name = "candle-gen-sdxl"
 version = "0.0.0"
 dependencies = [
+ "candle-core",
  "candle-gen",
+ "candle-nn",
  "candle-transformers",
  "hf-hub",
  "image",
@@ -296,6 +302,7 @@ dependencies = [
  "rand_distr",
  "sceneworks-gen-core-testkit",
  "tokenizers 0.22.2",
+ "tracing",
 ]
 
 [[package]]
@@ -2413,7 +2420,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core"
 version = "0.1.0"
-source = "git+https://github.com/michaeltrefry/mlx-gen?rev=95cd5c692b974ecaafa57c0af437f085b052e260#95cd5c692b974ecaafa57c0af437f085b052e260"
+source = "git+https://github.com/michaeltrefry/mlx-gen?rev=e9c569c211b77fb9061aa3968dfd03bd02804109#e9c569c211b77fb9061aa3968dfd03bd02804109"
 dependencies = [
  "inventory",
  "safetensors 0.4.5",
@@ -2424,7 +2431,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core-testkit"
 version = "0.1.0"
-source = "git+https://github.com/michaeltrefry/mlx-gen?rev=95cd5c692b974ecaafa57c0af437f085b052e260#95cd5c692b974ecaafa57c0af437f085b052e260"
+source = "git+https://github.com/michaeltrefry/mlx-gen?rev=e9c569c211b77fb9061aa3968dfd03bd02804109#e9c569c211b77fb9061aa3968dfd03bd02804109"
 dependencies = [
  "sceneworks-gen-core",
 ]

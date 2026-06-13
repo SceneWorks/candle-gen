@@ -24,6 +24,10 @@ pub use gen_core;
 pub use candle_core;
 pub use candle_nn;
 
+// The shared native training harness (epic 5164 / sc-5165) — the candle twin of `mlx_gen::train`.
+// Provider crates (sdxl/z-image/wan/lens) build their `gen_core::Trainer` on top of this.
+pub mod train;
+
 use thiserror::Error;
 
 /// The candle-backed crate error. gen-core cannot name candle types, so device/tensor failures

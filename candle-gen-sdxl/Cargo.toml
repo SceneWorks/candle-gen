@@ -17,6 +17,15 @@ inventory = { workspace = true }
 # SDXL pipeline building blocks (dual CLIP / UNet / VAE / schedulers). Backend features are passed
 # through from this crate's features below so it shares candle-gen's exact candle build.
 candle-transformers = { workspace = true }
+# Direct candle deps for the vendored, training-adapted UNet stack (`src/unet/`, sc-5165): the stock
+# candle-transformers SD UNet exposes no LoRA/checkpoint seam, so we vendor + adapt it. Same workspace
+# pin candle-gen uses, so cargo unifies to one candle build (no skew; the vendored code refers to
+# `candle_core`/`candle_nn` directly rather than through candle-gen's re-export).
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+# The vendored UNet keeps candle-transformers' `tracing` spans verbatim (kept byte-faithful to
+# upstream so the copy can be re-diffed on a candle re-pin). Already in the tree via candle-transformers.
+tracing = "0.1"
 # CLIP tokenizers + HF snapshot resolution (the spike's proven loader path).
 tokenizers = { workspace = true }
 hf-hub = { workspace = true }
@@ -40,4 +49,4 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # (cancel / progress / seed-determinism / capability honesty). Pinned to the SAME gen-core rev the
 # workspace pins (95cd5c6) so it shares one contract build. Used by tests/conformance.rs (cuda-gated,
 # #[ignore]d — it runs a real generate, so it needs weights + GPU).
-sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "95cd5c692b974ecaafa57c0af437f085b052e260" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "e9c569c211b77fb9061aa3968dfd03bd02804109" }

@@ -15,6 +15,14 @@ sceneworks-gen-core = { workspace = true }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 thiserror = { workspace = true }
+# Training harness (epic 5164 / sc-5165). `safetensors` is candle's own version (0.7) so the `View`
+# impl candle-core provides for `Tensor` applies — used to write PEFT/LoKr adapters *with metadata*
+# (candle-core's own save passes `None`). `rand`/`rand_distr` seed deterministic, launch-portable
+# adapter-factor init (the sc-3673 philosophy applied to LoRA `A`); `image` decodes the dataset.
+safetensors = "0.7"
+rand = { workspace = true }
+rand_distr = { workspace = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [features]
 # Default works on Mac with NO extra features: candle-core defaults to the CPU backend.

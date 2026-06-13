@@ -31,6 +31,12 @@
 
 mod pipeline;
 
+// Vendored, training-adapted SDXL UNet stack (sc-5165) — used by the native LoRA/LoKr trainer, which
+// lands in a later slice of this story. `allow(dead_code)` until the trainer wires it in; inference
+// continues to use the stock candle-transformers UNet via `pipeline`.
+#[allow(dead_code, unused_imports)]
+mod unet;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
 
