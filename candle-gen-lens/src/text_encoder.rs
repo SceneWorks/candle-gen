@@ -28,8 +28,8 @@
 use candle_gen::candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_gen::candle_core::{DType, Device, IndexOp, Result, Tensor, D};
 use candle_gen::candle_nn::{
-    embedding, linear, ops::sigmoid, ops::softmax_last_dim, rms_norm, Embedding, Linear, Module,
-    RmsNorm, VarBuilder,
+    embedding, linear, linear_no_bias, ops::sigmoid, ops::softmax_last_dim, rms_norm, Embedding,
+    Linear, Module, RmsNorm, VarBuilder,
 };
 
 // --- Config -----------------------------------------------------------------
@@ -174,11 +174,64 @@ impl RotaryEmbedding {
     /// (encoder-only: a single full-sequence pass).
     fn apply(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
         let (_b, _h, seq_len, _d) = q.dims4()?;
-        let cos = self.cos.narrow(0, 0, seq_len)?;
-        let sin = self.sin.narrow(0, 0, seq_len)?;
+        self.apply_at(q, k, 0, seq_len)
+    }
+
+    /// Apply rotary embeddings to `q`/`k` (`[b, heads, t, head_dim]`) at **absolute** positions
+    /// `position..position+t` (the incremental-decode variant; `apply` is `position = 0`).
+    fn apply_at(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        position: usize,
+        t: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let cos = self.cos.narrow(0, position, t)?;
+        let sin = self.sin.narrow(0, position, t)?;
         let q = candle_gen::candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
         let k = candle_gen::candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
         Ok((q, k))
+    }
+}
+
+/// A per-layer key/value cache for incremental decode (sc-5118). Stores the **post-RoPE K** and **V**
+/// at `[b, kv_heads, seq, head_dim]` (pre-`repeat_kv`); a sliding-window layer truncates to the last
+/// `window` keys each step (a faithful port of `mlx-gen-lens` `KvCache`). Keeping it simple
+/// (concat/narrow) keeps the cached decode bit-identical to a masked full recompute, which the
+/// cache-equivalence parity gate checks.
+#[derive(Debug, Default)]
+struct KvCache {
+    k: Option<Tensor>,
+    v: Option<Tensor>,
+}
+
+impl KvCache {
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
+        self.k = Some(match &self.k {
+            Some(c) => Tensor::cat(&[c, k], 2)?,
+            None => k.clone(),
+        });
+        self.v = Some(match &self.v {
+            Some(c) => Tensor::cat(&[c, v], 2)?,
+            None => v.clone(),
+        });
+        Ok(())
+    }
+
+    /// Keep only the last `window` key/value positions (sliding-window eviction).
+    fn truncate_last(&mut self, window: usize) -> Result<()> {
+        fn keep_last(slot: &mut Option<Tensor>, window: usize) -> Result<()> {
+            if let Some(c) = slot {
+                let len = c.dim(2)?;
+                if len > window {
+                    *c = c.narrow(2, len - window, window)?.contiguous()?;
+                }
+            }
+            Ok(())
+        }
+        keep_last(&mut self.k, window)?;
+        keep_last(&mut self.v, window)?;
+        Ok(())
     }
 }
 
@@ -256,6 +309,84 @@ impl Attention {
         let probs = probs.narrow(D::Minus1, 0, n_keys)?; // drop the sink column
         let out = probs.contiguous()?.matmul(&v.contiguous()?)?;
         let out = out.transpose(1, 2)?.reshape((b, seq_len, ()))?;
+        self.o_proj.forward(&out)
+    }
+
+    /// Incremental (cached) attention for autoregressive generation (sc-5118): RoPE the `t` new tokens
+    /// at their **absolute** positions `position..position+t`, append their (post-RoPE) K / V to
+    /// `cache`, attend the new queries over the whole cache, and — for a sliding-window layer — evict
+    /// the cache to the last `window` keys. `position` is passed explicitly because a sliding layer's
+    /// cache length is capped and so does not track the absolute position. `mask` is the additive
+    /// `[1, 1, t, cache_len]` causal(+sliding) mask for the prefill (`t > 1`); a single decode token
+    /// (`t == 1`) needs no mask (every cached key is valid). The sink + softmax matches [`forward`].
+    fn forward_cached(
+        &self,
+        xs: &Tensor,
+        rotary: &RotaryEmbedding,
+        position: usize,
+        cache: &mut KvCache,
+        sliding_window: Option<usize>,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (b, t, _) = xs.dims3()?;
+        let q = self
+            .q_proj
+            .forward(xs)?
+            .reshape((b, t, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = self
+            .k_proj
+            .forward(xs)?
+            .reshape((b, t, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = self
+            .v_proj
+            .forward(xs)?
+            .reshape((b, t, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        let (q, k) = rotary.apply_at(&q, &k, position, t)?;
+        cache.append(&k, &v)?;
+        // Decode (t == 1) on a sliding layer attends exactly the last `window` keys → evict the stale
+        // key BEFORE attending. A prefill (t > 1) instead carries the sliding mask, then evicts AFTER
+        // (priming the window for the next decode). This keeps cached decode == masked full recompute.
+        let prefill = t > 1;
+        if !prefill {
+            if let Some(w) = sliding_window {
+                cache.truncate_last(w)?;
+            }
+        }
+        let n_rep = self.num_heads / self.num_kv_heads;
+        let k_all = repeat_kv(cache.k.clone().unwrap(), n_rep)?;
+        let v_all = repeat_kv(cache.v.clone().unwrap(), n_rep)?;
+
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let scores = (q
+            .contiguous()?
+            .matmul(&k_all.transpose(2, 3)?.contiguous()?)?
+            * scale)?;
+        let scores = match mask {
+            Some(m) => scores.broadcast_add(m)?,
+            None => scores,
+        };
+        let n_keys = scores.dim(D::Minus1)?;
+        let sinks = self
+            .sinks
+            .reshape((1, self.num_heads, 1, 1))?
+            .broadcast_as((b, self.num_heads, t, 1))?
+            .to_dtype(scores.dtype())?
+            .contiguous()?;
+        let logits = Tensor::cat(&[&scores, &sinks], D::Minus1)?;
+        let probs = softmax_last_dim(&logits)?;
+        let probs = probs.narrow(D::Minus1, 0, n_keys)?;
+        let out = probs.contiguous()?.matmul(&v_all.contiguous()?)?;
+        let out = out.transpose(1, 2)?.reshape((b, t, ()))?;
+
+        if prefill {
+            if let Some(w) = sliding_window {
+                cache.truncate_last(w)?;
+            }
+        }
         self.o_proj.forward(&out)
     }
 }
@@ -577,6 +708,7 @@ struct DecoderLayer {
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
     is_sliding: bool,
+    sliding_window: usize,
 }
 
 impl DecoderLayer {
@@ -596,6 +728,7 @@ impl DecoderLayer {
                 vb.pp("post_attention_layernorm"),
             )?,
             is_sliding: cfg.is_sliding(layer_idx),
+            sliding_window: cfg.sliding_window,
         })
     }
 
@@ -603,6 +736,30 @@ impl DecoderLayer {
         let residual = xs;
         let h = self.input_layernorm.forward(xs)?;
         let h = self.self_attn.forward(&h, rotary, mask)?;
+        let xs = (residual + h)?;
+        let residual = &xs;
+        let h = self.post_attention_layernorm.forward(&xs)?;
+        let h = self.mlp.forward(&h)?;
+        residual + h
+    }
+
+    /// Cached (incremental-decode) layer forward (sc-5118): the new tokens at absolute `position`,
+    /// attending the per-layer `cache`. `mask` is the prefill causal(+sliding) mask (`None` for a
+    /// single decode token). A sliding layer caps its cache at the config window.
+    fn forward_cached(
+        &self,
+        xs: &Tensor,
+        rotary: &RotaryEmbedding,
+        position: usize,
+        cache: &mut KvCache,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let sliding = self.is_sliding.then_some(self.sliding_window);
+        let residual = xs;
+        let h = self.input_layernorm.forward(xs)?;
+        let h = self
+            .self_attn
+            .forward_cached(&h, rotary, position, cache, sliding, mask)?;
         let xs = (residual + h)?;
         let residual = &xs;
         let h = self.post_attention_layernorm.forward(&xs)?;
@@ -710,6 +867,126 @@ impl GptOssTextEncoder {
             .iter()
             .map(|&s| out.hidden_states[s + 1].clone())
             .collect())
+    }
+}
+
+/// The **generating** gpt-oss-20b model behind the optional PromptReasoner (sc-5118): the full decoder
+/// stack + final `norm` + `lm_head` (the encoder-only [`GptOssTextEncoder`] truncates at the last
+/// captured layer and drops the head), with an incremental KV-cache greedy decode. **Default-OFF** —
+/// the worker registry / generate path never builds this; it's only reached via [`crate::reasoner`].
+pub struct LensReasonerModel {
+    embed_tokens: Embedding,
+    layers: Vec<DecoderLayer>,
+    norm: RmsNorm,
+    lm_head: Linear, // [vocab, hidden], no bias
+    rotary: RotaryEmbedding,
+    device: Device,
+    dtype: DType,
+}
+
+impl LensReasonerModel {
+    /// Load the full generating model from the `text_encoder` weights. `quant` (Q4/Q8) transcodes the
+    /// MoE experts (sc-5111) so the reasoner stays ~12 GB, exactly like the encoder.
+    pub fn new(cfg: &Config, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
+        let vb_m = vb.pp("model");
+        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
+        let rotary = RotaryEmbedding::new(cfg, vb.device(), vb.dtype())?;
+        let vb_l = vb_m.pp("layers");
+        let layers = (0..cfg.num_hidden_layers)
+            .map(|i| DecoderLayer::new(cfg, i, vb_l.pp(i), quant))
+            .collect::<Result<Vec<_>>>()?;
+        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
+        // The LM head sits at the top level (`lm_head.weight`), not under `model.`, and has no bias.
+        let lm_head = linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?;
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            rotary,
+            device: vb.device().clone(),
+            dtype: vb.dtype(),
+        })
+    }
+
+    /// Run all layers over `hidden` `[1, T, hidden]` with the per-layer caches at absolute `position`.
+    /// `prefill` ⇒ build each layer's causal(+sliding) mask for the `T` prompt tokens; a decode step
+    /// (`T == 1`) needs no mask.
+    fn run_layers(
+        &self,
+        mut hidden: Tensor,
+        caches: &mut [KvCache],
+        position: usize,
+        prefill: bool,
+    ) -> Result<Tensor> {
+        let t = hidden.dim(1)?;
+        for (i, layer) in self.layers.iter().enumerate() {
+            let mask = if prefill {
+                let window = layer.is_sliding.then_some(layer.sliding_window);
+                Some(causal_mask(t, window, &self.device, self.dtype)?)
+            } else {
+                None
+            };
+            hidden = layer.forward_cached(
+                &hidden,
+                &self.rotary,
+                position,
+                &mut caches[i],
+                mask.as_ref(),
+            )?;
+        }
+        Ok(hidden)
+    }
+
+    /// Greedy next-token id from the **last** position of `hidden` `[1, T, hidden]`
+    /// (`argmax(lm_head(norm(h_last)))`, argmax in f32 for a stable tie-break).
+    fn argmax_token(&self, hidden: &Tensor) -> Result<u32> {
+        let t = hidden.dim(1)?;
+        let last = hidden.narrow(1, t - 1, 1)?; // [1, 1, hidden]
+        let normed = self.norm.forward(&last)?;
+        let logits = self.lm_head.forward(&normed)?.to_dtype(DType::F32)?; // [1, 1, vocab]
+        let id = logits.flatten_all()?.argmax(D::Minus1)?.to_vec0::<u32>()?;
+        Ok(id)
+    }
+
+    /// **Greedy** autoregressive generation (the parity path): prefill `input_ids`, then decode until
+    /// the harmony `<|return|>` stop or `max_new_tokens`. Returns the **new** tokens (including the
+    /// trailing stop, which [`crate::text::clean_reasoner_output`] strips) — mirroring the vendor
+    /// `out_ids[0, input_len:]`.
+    pub fn generate_greedy(&self, input_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
+        let mut caches: Vec<KvCache> = (0..self.layers.len()).map(|_| KvCache::default()).collect();
+        let l = input_ids.len();
+        let prompt = Tensor::from_vec(input_ids.to_vec(), (1, l), &self.device)?;
+        let hidden = self.embed_tokens.forward(&prompt)?;
+        let hidden = self.run_layers(hidden, &mut caches, 0, true)?;
+        let mut next = self.argmax_token(&hidden)?;
+
+        let mut position = l;
+        let mut out = vec![next];
+        while out.len() < max_new_tokens && next != crate::text::HARMONY_RETURN {
+            let tok = Tensor::from_vec(vec![next], (1, 1), &self.device)?;
+            let h = self.embed_tokens.forward(&tok)?;
+            let h = self.run_layers(h, &mut caches, position, false)?;
+            position += 1;
+            next = self.argmax_token(&h)?;
+            out.push(next);
+        }
+        Ok(out)
+    }
+
+    /// Teacher-forced per-position next-token argmax over the whole `input_ids` in **one** prefill
+    /// forward (no decode loop): `pred[i] = argmax(logits at position i)`. Used by the parity gate to
+    /// prove the incremental KV-cache decode is equivalent to a full recompute.
+    pub fn next_token_argmax(&self, input_ids: &[u32]) -> Result<Vec<u32>> {
+        let mut caches: Vec<KvCache> = (0..self.layers.len()).map(|_| KvCache::default()).collect();
+        let l = input_ids.len();
+        let prompt = Tensor::from_vec(input_ids.to_vec(), (1, l), &self.device)?;
+        let hidden = self.embed_tokens.forward(&prompt)?;
+        let hidden = self.run_layers(hidden, &mut caches, 0, true)?;
+        let normed = self.norm.forward(&hidden)?;
+        let logits = self.lm_head.forward(&normed)?.to_dtype(DType::F32)?; // [1, L, vocab]
+        let pred = logits.squeeze(0)?.argmax(D::Minus1)?; // [L]
+        pred.to_vec1::<u32>()
     }
 }
 

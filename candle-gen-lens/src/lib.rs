@@ -23,6 +23,7 @@
 
 pub mod adapters;
 pub mod quant;
+pub mod reasoner;
 pub mod resolution;
 pub mod rope;
 pub mod schedule;
@@ -33,6 +34,7 @@ pub mod vae;
 
 pub use adapters::{merge_adapters, MergeReport};
 pub use quant::QLinear;
+pub use reasoner::{LensReasoner, DEFAULT_MAX_NEW_TOKENS};
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
