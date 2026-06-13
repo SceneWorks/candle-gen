@@ -8,9 +8,13 @@
 //! **txt2img (sc-3675 + sc-3673):** [`SdxlGenerator::generate`] runs the GO-validated epic-3494
 //! prototype ([`pipeline`]) through the contract: dual CLIP → UNet (real CFG) → f16 VAE, emitting
 //! `Progress` and honoring `req.cancel`, with **deterministic CPU-seeded noise + the non-ancestral
-//! DDIM sampler** (sc-3673) so output is launch-portable per seed. The descriptor advertises **only**
-//! the wired surface (txt2img + negative prompt + guidance, `ddim`) — NOT the full mlx-gen-sdxl
-//! conditioning/LoRA/accel-sampler surface — so the worker can route the rest to the Python fallback
+//! DDIM sampler** (sc-3673) so output is launch-portable per seed.
+//!
+//! **LoRA/LoKr (sc-5165):** [`load`] accepts `spec.adapters` and merges a trained adapter's delta into
+//! the UNet weights at component load ([`adapters`] + [`pipeline`]) — the inference half of the native
+//! candle trainer, closing the train→infer loop. The descriptor advertises the wired surface
+//! (txt2img, negative prompt, guidance, `ddim`, **LoRA/LoKr**) — NOT the full mlx-gen-sdxl
+//! conditioning / accel-sampler surface — so the worker routes the rest to the Python fallback
 //! (sc-3678) rather than the candle backend silently dropping a control. The descriptor's `backend`
 //! is `"candle"` and `mac_only` is `false` (Windows/CUDA target).
 //!
@@ -31,6 +35,11 @@
 
 mod pipeline;
 
+// Inference-side LoRA/LoKr adapter merge (sc-5165) — folds a trained adapter's delta into the dense
+// UNet weights before the stock UNet is built (`pipeline` calls this on the adapter path). The candle
+// twin of `mlx-gen-sdxl::adapters`; closes the train→infer loop with the trainer below.
+mod adapters;
+
 // Vendored, training-adapted SDXL UNet + VAE-encode stack (sc-5165) — used by the native LoRA/LoKr
 // trainer below. Inference continues to use the stock candle-transformers UNet via `pipeline`; the
 // vendored copy retains some unused upstream surface (decoder blocks, the additional-residuals
@@ -50,8 +59,8 @@ use std::sync::Mutex;
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, WeightsSource,
+    self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
+    Modality, ModelDescriptor, Progress, WeightsSource,
 };
 
 use pipeline::{Components, Pipeline};
@@ -119,6 +128,10 @@ pub struct SdxlGenerator {
     root: PathBuf,
     device: Device,
     dtype: DType,
+    /// LoRA/LoKr adapters to merge into the UNet weights at first-`generate` component load (sc-5165).
+    /// Fixed for the generator's lifetime (from the `LoadSpec`), so they sit outside the component
+    /// cache key. Empty ⇒ the stock no-adapter UNet load.
+    adapters: Vec<AdapterSpec>,
     /// Cached UNet+VAE + the flash-attn flag they were built with. `Mutex` because `Generator` is
     /// shared and `generate` takes `&self`; the lock is held only to read/populate the cache (a
     /// cheap `Arc` clone or a one-time load), never across the denoise.
@@ -189,7 +202,14 @@ impl Generator for SdxlGenerator {
         // The rich-`CandleError` tail — including the typed `Canceled` — bridges into
         // `gen_core::Error` via `?` (the From bridge). The light `Pipeline` handle carries this
         // request's latent dims; the heavy UNet/VAE come from the cache.
-        let pipe = Pipeline::load(&self.root, &self.device, self.dtype, req.width, req.height)?;
+        let pipe = Pipeline::load(
+            &self.root,
+            &self.device,
+            self.dtype,
+            req.width,
+            req.height,
+            &self.adapters,
+        )?;
         // Encode text FIRST (loads + frees CLIP) so the cold-call ordering — CLIP gone before the
         // UNet/VAE are resident — is preserved (sc-4987); only then acquire the cached UNet/VAE
         // (sc-5037). On a warm call the UNet/VAE are already resident, but CLIP loads one encoder at a
@@ -208,11 +228,12 @@ impl Generator for SdxlGenerator {
     }
 }
 
-/// SDXL's identity + the surface sc-3675 actually wires: real classifier-free guidance (negative
-/// prompt + CFG scale), txt2img only, `euler_ancestral`. No conditioning / LoRA / acceleration
-/// samplers are advertised — those are the Python fallback's job (sc-3678) until candle wires them —
-/// so the descriptor never promises a path `generate` can't serve (the false-capability trap). Two
-/// backend-correct deviations from `mlx-gen-sdxl`: `backend = "candle"` and `mac_only = false`.
+/// SDXL's identity + the surface candle wires: real classifier-free guidance (negative prompt + CFG
+/// scale), txt2img, `ddim`, and **LoRA/LoKr** (sc-5165 — load-time merge of a trained adapter into the
+/// UNet weights, see [`load`] + [`pipeline`]). No conditioning / acceleration samplers are advertised —
+/// those remain the Python fallback's job (sc-3678) until candle wires them — so the descriptor never
+/// promises a path `generate` can't serve (the false-capability trap). Two backend-correct deviations
+/// from `mlx-gen-sdxl`: `backend = "candle"` and `mac_only = false`.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -229,8 +250,11 @@ pub fn descriptor() -> ModelDescriptor {
             // the shared `validate_request` rejects any conditioning, and the worker keeps those
             // shapes on the Python path (sc-3678).
             conditioning: vec![],
-            supports_lora: false,
-            supports_lokr: false,
+            // sc-5165: a trained LoRA/LoKr adapter is merged into the UNet weights at load (`load` +
+            // `pipeline::Pipeline::load_components`). Advertised so the worker routes adapter jobs here
+            // rather than to the Python fallback.
+            supports_lora: true,
+            supports_lokr: true,
             // DDIM (eta=0) — the deterministic, launch-portable sampler wired in sc-3673 (replacing
             // the spike's Euler-ancestral). The few-step accel samplers need their acceleration LoRAs
             // (not yet supported), so they are not advertised. The worker sends no `sampler` for SDXL,
@@ -253,8 +277,13 @@ pub fn descriptor() -> ModelDescriptor {
 
 /// Construct the (lazy) candle SDXL generator from a [`LoadSpec`]. `spec.weights` must be a
 /// [`WeightsSource::Dir`] pointing at a `stabilityai/stable-diffusion-xl-base-1.0`-layout snapshot
-/// (the diffusers multi-component tree: `text_encoder/`, `text_encoder_2/`, `unet/`, …). LoRA
-/// adapters are rejected — candle SDXL LoRA is not wired (it would otherwise be silently dropped).
+/// (the diffusers multi-component tree: `text_encoder/`, `text_encoder_2/`, `unet/`, …).
+///
+/// `spec.adapters` (sc-5165) are LoRA/LoKr adapters to **merge into the UNet weights** — folded in at
+/// the first `generate`'s component load (this `load` stays lazy: no file I/O here), via
+/// [`adapters::merge_adapters`](crate::pipeline). PEFT (the candle trainer's format) + kohya LoRA and
+/// PEFT/kohya LoKr are supported; an adapter that matches no UNet target errors at that first
+/// `generate` rather than rendering an unadapted image silently.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -266,12 +295,6 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(
-            "candle sdxl does not support LoRA/LoKr yet — refusing to silently drop the adapters"
-                .into(),
-        ));
-    }
     // SDXL is fp16 (the production reference dtype) regardless of the CPU-default dtype; the device
     // is the backend selected at compile time (CUDA on Windows, Metal/CPU on Mac).
     let device = candle_gen::default_device()?;
@@ -280,6 +303,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         root,
         device,
         dtype: DType::F16,
+        adapters: spec.adapters.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -323,10 +347,11 @@ mod tests {
         assert!(d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_true_cfg);
         assert!(!d.capabilities.mac_only);
-        // sc-3675 is txt2img-only: no conditioning / LoRA / accel samplers advertised.
+        // txt2img: no conditioning / accel samplers advertised. sc-5165: LoRA/LoKr ARE now wired
+        // (load-time merge), so they are advertised — the worker routes adapter jobs to candle.
         assert!(d.capabilities.conditioning.is_empty());
-        assert!(!d.capabilities.supports_lora);
-        assert!(!d.capabilities.supports_lokr);
+        assert!(d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lokr);
         // sc-3673: the wired sampler is the deterministic DDIM (not the spike's euler-ancestral).
         assert_eq!(d.capabilities.samplers, vec!["ddim"]);
     }
@@ -424,16 +449,19 @@ mod tests {
             .accepts(ConditioningKind::Reference));
     }
 
-    /// LoRA adapters are rejected at load (candle SDXL LoRA is not wired) — as a typed `Unsupported`,
-    /// so the worker can fall back to Python rather than the backend silently dropping the adapter.
+    /// sc-5165: `load` now ACCEPTS LoRA/LoKr adapters — it carries them for a load-time merge into the
+    /// UNet weights at the first `generate`. `load` stays lazy (no file I/O), so a nonexistent adapter
+    /// path still resolves here; an unresolvable / mis-formatted adapter errors only when `generate`
+    /// first builds the UNet. (The merge math + format routing are covered in `adapters`'s tests.)
     #[test]
-    fn load_rejects_lora_adapters() {
+    fn load_accepts_lora_adapters() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
         let spec = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
-        let err = load(&spec).err().expect("expected an error");
-        assert!(matches!(err, gen_core::Error::Unsupported(_)));
+        let g = load(&spec).expect("load accepts adapters (lazy; merge defers to generate)");
+        assert!(g.descriptor().capabilities.supports_lora);
+        assert!(g.descriptor().capabilities.supports_lokr);
     }
 
     #[test]

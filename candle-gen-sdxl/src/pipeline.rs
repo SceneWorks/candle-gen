@@ -57,12 +57,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Module, Tensor, D};
+use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
-use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
+use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
 use candle_transformers::models::stable_diffusion::schedulers::SchedulerConfig;
-use candle_transformers::models::stable_diffusion::unet_2d::UNet2DConditionModel;
+use candle_transformers::models::stable_diffusion::unet_2d::{
+    BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig,
+};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 use candle_transformers::models::stable_diffusion::{self, StableDiffusionConfig};
 use rand::{rngs::StdRng, SeedableRng};
@@ -152,6 +155,10 @@ pub(crate) struct Pipeline {
     root: PathBuf,
     device: Device,
     dtype: DType,
+    /// LoRA/LoKr adapters to merge into the UNet at component-load time (sc-5165). Fixed for the
+    /// generator's lifetime (they come from the `LoadSpec`), so they do not enter the component cache
+    /// key — only flash-attn does. Empty ⇒ the stock mmap `build_unet` path (zero regression).
+    adapters: Vec<AdapterSpec>,
 }
 
 /// The seed- and prompt-independent heavy components (UNet + f16 VAE), `Arc`-shared so they can be
@@ -177,6 +184,7 @@ impl Pipeline {
         dtype: DType,
         width: u32,
         height: u32,
+        adapters: &[AdapterSpec],
     ) -> Result<Self> {
         // The config's only request-dependent fields are the latent dims; the component configs
         // (clip/clip2/unet/autoencoder) are fixed for SDXL.
@@ -186,6 +194,7 @@ impl Pipeline {
             root: root.to_path_buf(),
             device: device.clone(),
             dtype,
+            adapters: adapters.to_vec(),
         })
     }
 
@@ -271,13 +280,14 @@ impl Pipeline {
     /// — sc-3674); the f16-stable VAE (`madebyollin/sdxl-vae-fp16-fix`) resolves via `hf-hub`. The
     /// generator owns the caching of the result across calls (sc-5037); this is the cache-miss loader.
     pub(crate) fn load_components(&self, use_flash_attn: bool) -> Result<Components> {
-        let unet = self.config.build_unet(
-            snapshot_file(&self.root, "unet/diffusion_pytorch_model.fp16.safetensors")?,
-            &self.device,
-            4,
-            use_flash_attn,
-            self.dtype,
-        )?;
+        let unet_file = snapshot_file(&self.root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
+        let unet = if self.adapters.is_empty() {
+            // No adapters: the stock mmap build — byte-identical to pre-sc-5165 (zero regression).
+            self.config
+                .build_unet(unet_file, &self.device, 4, use_flash_attn, self.dtype)?
+        } else {
+            self.build_unet_with_adapters(&unet_file, use_flash_attn)?
+        };
         let vae = self.config.build_vae(
             hf_get(VAE_FIX_REPO, VAE_FIX_FILE)?,
             &self.device,
@@ -287,6 +297,29 @@ impl Pipeline {
             unet: Arc::new(unet),
             vae: Arc::new(vae),
         })
+    }
+
+    /// Build the UNet with the [`AdapterSpec`]s merged into its weights (sc-5165). The base UNet
+    /// tensors are loaded onto **CPU** at their native dtype, the LoRA/LoKr deltas are folded in
+    /// ([`crate::adapters::merge_adapters`], f32 math), then the stock candle UNet is built from the
+    /// merged map — each tensor moved to the device and cast to the load dtype as the VarBuilder serves
+    /// it, so the merged weights live on the GPU exactly like the mmap path and peak GPU is unchanged.
+    ///
+    /// We merge into the dense weights rather than add a forward-time residual because SDXL's sampler
+    /// is chaos-sensitive (`(W+δ)·x` ≠ `W·x + δ·x` to ~1 ULP); see [`crate::adapters`].
+    fn build_unet_with_adapters(
+        &self,
+        unet_file: &Path,
+        use_flash_attn: bool,
+    ) -> Result<UNet2DConditionModel> {
+        let mut tensors = candle_gen::candle_core::safetensors::load(unet_file, &Device::Cpu)?;
+        crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
+        // `build_unet` reads `StableDiffusionConfig`'s private `unet` config + builds its own
+        // VarBuilder from a file path, so it cannot be fed a merged map; replicate its two lines with
+        // the canonical SDXL UNet config (pinned to candle's `StableDiffusionConfig::sdxl_`).
+        let vs = VarBuilder::from_tensors(tensors, self.dtype, &self.device);
+        let unet = UNet2DConditionModel::new(vs, 4, 4, use_flash_attn, sdxl_stock_unet_config())?;
+        Ok(unet)
     }
 
     /// Render `req` against pre-resolved `text_embeddings` and (caller-cached, sc-5037) `unet`/`vae`,
@@ -485,6 +518,40 @@ fn tile_blend_decode(
     Ok(output.broadcast_div(&weights.clamp(1e-8f32, f32::MAX)?)?)
 }
 
+/// The canonical SDXL UNet config — a verbatim copy of the `unet` block candle's
+/// `StableDiffusionConfig::sdxl_` builds (pinned to the workspace candle rev; values from
+/// `stabilityai/stable-diffusion-xl-base-1.0/unet/config.json`). `build_unet` reads that config from a
+/// **private** field and only accepts a file path, so the adapter-merge path — which must feed a
+/// merged in-memory tensor map — reconstructs it here. The no-adapter path still goes through
+/// `build_unet`, so this is exercised only when adapters are present; the conformance lane (sc-5165
+/// verify) renders an adapted image, which would NaN/garble if these drifted from the stock config.
+fn sdxl_stock_unet_config() -> UNet2DConditionModelConfig {
+    let bc = |out_channels, use_cross_attn, attention_head_dim| BlockConfig {
+        out_channels,
+        use_cross_attn,
+        attention_head_dim,
+    };
+    UNet2DConditionModelConfig {
+        blocks: vec![
+            bc(320, None, 5),
+            bc(640, Some(2), 10),
+            bc(1280, Some(10), 20),
+        ],
+        center_input_sample: false,
+        cross_attention_dim: 2048,
+        downsample_padding: 1,
+        flip_sin_to_cos: true,
+        freq_shift: 0.,
+        layers_per_block: 2,
+        mid_block_scale_factor: 1.,
+        norm_eps: 1e-5,
+        norm_num_groups: 32,
+        // The pipeline builds `StableDiffusionConfig::sdxl(None, …)`, i.e. unsliced attention.
+        sliced_attention_size: None,
+        use_linear_projection: true,
+    }
+}
+
 /// Resolve a component file inside the SDXL snapshot dir, erroring clearly if absent (e.g. a
 /// single-file RealVisXL checkpoint that lacks the diffusers multi-component tree — sc-3677).
 pub(crate) fn snapshot_file(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -513,6 +580,33 @@ mod tests {
         // float consts: compare with an epsilon (clippy's float_cmp would reject `==`).
         assert!((DEFAULT_GUIDANCE - 7.0).abs() < f64::EPSILON);
         assert!((VAE_SCALE - 0.13025).abs() < f64::EPSILON);
+    }
+
+    /// sc-5165: the adapter-merge path reconstructs the SDXL UNet config locally (since `build_unet`
+    /// reads it from a private field of `StableDiffusionConfig`). Pin its canonical values so an
+    /// accidental edit — which would silently build the adapter-path UNet differently from the
+    /// no-adapter `build_unet` path — is caught here, not only on the GPU conformance lane.
+    #[test]
+    fn sdxl_stock_unet_config_pins_canonical_values() {
+        let c = sdxl_stock_unet_config();
+        assert_eq!(c.blocks.len(), 3);
+        assert_eq!(c.blocks[0].out_channels, 320);
+        assert_eq!(c.blocks[0].use_cross_attn, None);
+        assert_eq!(c.blocks[0].attention_head_dim, 5);
+        assert_eq!(c.blocks[1].out_channels, 640);
+        assert_eq!(c.blocks[1].use_cross_attn, Some(2));
+        assert_eq!(c.blocks[1].attention_head_dim, 10);
+        assert_eq!(c.blocks[2].out_channels, 1280);
+        assert_eq!(c.blocks[2].use_cross_attn, Some(10));
+        assert_eq!(c.blocks[2].attention_head_dim, 20);
+        assert_eq!(c.cross_attention_dim, 2048);
+        assert_eq!(c.layers_per_block, 2);
+        assert_eq!(c.norm_num_groups, 32);
+        assert_eq!(c.downsample_padding, 1);
+        assert!(c.use_linear_projection);
+        assert!(!c.center_input_sample);
+        assert!(c.flip_sin_to_cos);
+        assert_eq!(c.sliced_attention_size, None);
     }
 
     /// sc-3677 parity: each image in a `count`-image batch renders at `base_seed + index` (wrapping),

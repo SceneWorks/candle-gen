@@ -483,6 +483,75 @@ pub fn build_lokr_targets(
     })
 }
 
+/// Reconstruct the LoRA weight delta `ΔW = (alpha/rank)·scale·(B·A)` as an `[out, in]` **f32** tensor
+/// — the inference-side **merge** counterpart to [`LoraLinear`]'s training **forward**, which adds the
+/// mathematically-identical residual `scale·(x·Aᵀ)·Bᵀ` with the install `scale = alpha/rank`. `down`
+/// is `A` `[rank, in]`, `up` is `B` `[out, rank]`; `scale` is the caller's per-adapter strength
+/// (`gen_core::AdapterSpec::scale`, `1.0` reconstructs the trained delta verbatim). Computed in f32 so
+/// a candle-trained adapter round-trips through inference exactly.
+///
+/// SDXL merges this into the dense UNet weight (`W += ΔW`) rather than adding it live: the ancestral
+/// sampler is chaos-sensitive and the merged forward `(W+ΔW)·x` differs from the residual form
+/// `W·x + ΔW·x` by ~1 ULP, which cascades to a visibly different image (see `candle-gen-sdxl`'s
+/// adapter merge). Holding both forms to the same f32 reconstruction keeps train and infer in lockstep.
+pub fn reconstruct_lora_delta(
+    down: &Tensor,
+    up: &Tensor,
+    alpha: f32,
+    rank: f32,
+    scale: f32,
+) -> Result<Tensor> {
+    let down = down.to_dtype(DType::F32)?;
+    let up = up.to_dtype(DType::F32)?;
+    let ba = up.matmul(&down)?; // [out, rank] · [rank, in] → [out, in]
+    let eff = (alpha as f64 / rank as f64) * scale as f64;
+    Ok((ba * eff)?)
+}
+
+/// Reconstruct the LoKr weight delta `ΔW = (alpha/rank)·scale·kron(w1, w2)` reshaped to `base_shape`
+/// (`[out, in]`), as **f32** — the inference-side merge counterpart to [`LoraLinear`]'s LoKr forward,
+/// using the *same* [`kron2d`] reconstruction. Each Kronecker leg is either a full factor (`w1`/`w2`)
+/// or a low-rank product (`w1_a·w1_b` / `w2_a·w2_b`, e.g. the trainer's zero-init `w2_a`/`w2_b` form).
+/// Errors if a leg is missing. Linear-only: pass 2-D factors (the SDXL trainer adapts Linears; Tucker /
+/// conv reconstruction is not handled here).
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_lokr_delta(
+    w1: Option<&Tensor>,
+    w1_a: Option<&Tensor>,
+    w1_b: Option<&Tensor>,
+    w2: Option<&Tensor>,
+    w2_a: Option<&Tensor>,
+    w2_b: Option<&Tensor>,
+    alpha: f32,
+    rank: f32,
+    scale: f32,
+    base_shape: (usize, usize),
+) -> Result<Tensor> {
+    let f32d = |t: &Tensor| t.to_dtype(DType::F32);
+    let factor1 = match (w1, w1_a, w1_b) {
+        (Some(w), _, _) => f32d(w)?,
+        (_, Some(a), Some(b)) => f32d(a)?.matmul(&f32d(b)?)?,
+        _ => {
+            return Err(CandleError::Msg(
+                "lokr: w1 missing (need full lokr_w1 or lokr_w1_a·lokr_w1_b)".into(),
+            ))
+        }
+    };
+    let factor2 = match (w2, w2_a, w2_b) {
+        (Some(w), _, _) => f32d(w)?,
+        (_, Some(a), Some(b)) => f32d(a)?.matmul(&f32d(b)?)?,
+        _ => {
+            return Err(CandleError::Msg(
+                "lokr: w2 missing (need full lokr_w2 or lokr_w2_a·lokr_w2_b)".into(),
+            ))
+        }
+    };
+    let (out_f, in_f) = base_shape;
+    let delta = kron2d(&factor1, &factor2)?.reshape((out_f, in_f))?;
+    let eff = (alpha as f64 / rank as f64) * scale as f64;
+    Ok((delta * eff)?)
+}
+
 /// Collect a target's factor tensors as CPU/f32 `(key, tensor)` save entries under `prefix`.
 fn factor_entries(set: &LoraSet, prefix: &str) -> Result<Vec<(String, Tensor)>> {
     let mut out = Vec::with_capacity(set.targets.len() * 3);
@@ -731,6 +800,143 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap()[0];
         assert_eq!(y, 30.0);
+    }
+
+    /// The train→infer round-trip guarantee for LoRA: the weight delta the inference loader merges
+    /// ([`reconstruct_lora_delta`]) must equal the residual the training forward adds. With base `W`,
+    /// `forward(x) - W·x` is the residual; reconstructing the delta and applying `x·ΔWᵀ` must match —
+    /// proving the merged-weight forward `(W+ΔW)·x` reproduces the trained adapter.
+    #[test]
+    fn reconstruct_lora_delta_matches_forward_residual() {
+        let w = Tensor::from_vec(
+            vec![0.5f32, -0.2, 0.1, 0.3, -0.4, 0.6],
+            (2, 3),
+            &Device::Cpu,
+        )
+        .unwrap(); // base [out=2, in=3]
+        let down = Tensor::from_vec(
+            vec![0.1f32, 0.2, -0.3, 0.4, 0.5, -0.6],
+            (2, 3),
+            &Device::Cpu,
+        )
+        .unwrap(); // A [rank=2, in=3]
+        let up = Tensor::from_vec(vec![0.7f32, -0.8, 0.9, 1.0], (2, 2), &Device::Cpu).unwrap(); // B [out=2, rank=2]
+        let (alpha, rank) = (4.0f32, 2.0f32); // train scale = alpha/rank = 2.0
+        let mut lin = LoraLinear::from_linear(Linear::new(w.clone(), None), 3, 2, "t".into());
+        lin.install_lora(down.clone(), up.clone(), (alpha / rank) as f64);
+
+        let x = Tensor::from_vec(vec![1.0f32, -2.0, 3.0], (1, 3), &Device::Cpu).unwrap();
+        let residual = (lin.forward(&x).unwrap() - x.matmul(&w.t().unwrap()).unwrap()).unwrap();
+        // scale 1.0 ⇒ ΔW = (alpha/rank)·B·A, the exact delta the forward applies.
+        let delta = reconstruct_lora_delta(&down, &up, alpha, rank, 1.0).unwrap();
+        let from_delta = x.matmul(&delta.t().unwrap()).unwrap();
+        let diff = (residual - from_delta)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff < 1e-5,
+            "reconstruct_lora_delta diverged from forward residual: {diff}"
+        );
+    }
+
+    /// The train→infer round-trip guarantee for LoKr: [`reconstruct_lokr_delta`] must equal the
+    /// residual the LoKr forward adds. 2×2 base factored `1×1 ⊗ 2×2`.
+    #[test]
+    fn reconstruct_lokr_delta_matches_forward_residual() {
+        let w = Tensor::from_vec(vec![0.1f32, 0.2, 0.3, 0.4], (2, 2), &Device::Cpu).unwrap();
+        let w1 = Tensor::from_vec(vec![2.0f32], (1, 1), &Device::Cpu).unwrap(); // [out_a=1, in_a=1]
+        let w2 = Tensor::from_vec(vec![0.5f32, -0.3, 0.2, 0.6], (2, 2), &Device::Cpu).unwrap(); // [out_b=2, in_b=2]
+        let (alpha, rank) = (3.0f32, 1.0f32); // train scale = alpha/rank = 3.0
+        let mut lin = LoraLinear::from_linear(Linear::new(w.clone(), None), 2, 2, "t".into());
+        lin.install_lokr(w1.clone(), LokrW2::Full(w2.clone()), (alpha / rank) as f64);
+
+        let x = Tensor::from_vec(vec![1.5f32, -0.5], (1, 2), &Device::Cpu).unwrap();
+        let residual = (lin.forward(&x).unwrap() - x.matmul(&w.t().unwrap()).unwrap()).unwrap();
+        let delta = reconstruct_lokr_delta(
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            alpha,
+            rank,
+            1.0,
+            (2, 2),
+        )
+        .unwrap();
+        let from_delta = x.matmul(&delta.t().unwrap()).unwrap();
+        let diff = (residual - from_delta)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff < 1e-5,
+            "reconstruct_lokr_delta diverged from forward residual: {diff}"
+        );
+    }
+
+    /// Low-rank LoKr legs reconstruct via the `a·b` product — the trainer's zero-init `w2_a`/`w2_b`
+    /// form (and a community low-rank `w1_a`/`w1_b`). A zero `w2_b` ⇒ zero delta, the init identity.
+    #[test]
+    fn reconstruct_lokr_delta_low_rank_legs() {
+        let w1 = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], (2, 2), &Device::Cpu).unwrap();
+        let w2a = Tensor::from_vec(vec![0.5f32, 0.7], (2, 1), &Device::Cpu).unwrap(); // [out_b=2, r=1]
+        let w2b_zero = Tensor::zeros((1, 2), DType::F32, &Device::Cpu).unwrap(); // [r=1, in_b=2]
+        let delta = reconstruct_lokr_delta(
+            Some(&w1),
+            None,
+            None,
+            None,
+            Some(&w2a),
+            Some(&w2b_zero),
+            2.0,
+            1.0,
+            1.0,
+            (4, 4),
+        )
+        .unwrap();
+        let max = delta
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(max, 0.0, "zero w2_b must give a zero LoKr delta");
+        // A non-zero w2_b yields the kron product scaled by alpha/rank.
+        let w2b = Tensor::from_vec(vec![1.0f32, 0.0], (1, 2), &Device::Cpu).unwrap();
+        let delta = reconstruct_lokr_delta(
+            Some(&w1),
+            None,
+            None,
+            None,
+            Some(&w2a),
+            Some(&w2b),
+            2.0,
+            1.0,
+            1.0,
+            (4, 4),
+        )
+        .unwrap();
+        assert_eq!(delta.dims(), &[4, 4]);
+        let nonzero = delta
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(nonzero > 0.0, "non-zero w2_b must give a non-zero delta");
     }
 
     #[test]

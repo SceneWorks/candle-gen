@@ -32,6 +32,10 @@ hf-hub = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673).
 rand = { workspace = true }
 rand_distr = { workspace = true }
+# Read trained adapter `.safetensors` (tensors + the `networkType`/`rank`/`alpha` metadata the LoKr
+# merge needs) at inference-side load (sc-5165 adapter merge). Candle's own version (0.7), matching
+# candle-gen, so the `View` impl candle-core provides for `Tensor` is the same one.
+safetensors = "0.7"
 
 [features]
 # Pass the backend selection through to the core crate AND candle-transformers so a downstream
