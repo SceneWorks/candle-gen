@@ -23,6 +23,10 @@ inventory = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673 pattern) — NOT candle's CUDA `randn`.
 rand = { workspace = true }
 rand_distr = { workspace = true }
+# Read trained adapter `.safetensors` (tensors + the `networkType`/`rank`/`alpha` metadata the LoKr
+# merge needs) at inference-side load (sc-5116 LoRA/LoKr merge). Candle's own version (0.7), matching
+# candle-gen, so the `View` impl candle-core provides for `Tensor` is the same one.
+safetensors = "0.7"
 
 [features]
 default = []
