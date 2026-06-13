@@ -68,6 +68,22 @@ calls the identical `Generator` / registry API regardless of which tensor backen
 > (The snapshot's `tokenizer/tokenizer.json` is built by the worker from `vocab.json`+`merges.txt`;
 > the provider requires it, matching the mlx provider.)
 >
+> **Wan2.2 TI2V-5B txt2video** is the fifth model-family expansion (epic 3692, sc-3697) — the first
+> **video** family (modality `Video`), emitting `GenerationOutput::Video`. Ported from the diffusers
+> checkpoint (`Wan-AI/Wan2.2-TI2V-5B-Diffusers`): a **UMT5-XXL** encoder (24-layer `UMT5EncoderModel`
+> — per-layer relative-position bias, gated-GELU, no attention scaling), the 30-layer
+> **`WanTransformer3DModel`** DiT (**3-axis interleaved RoPE**, AdaLN modulation, cross-attention to
+> text, classifier-free guidance), and the **`AutoencoderKLWan`** temporal VAE. Since candle ships **no
+> conv3d**, the causal Conv3d is implemented as a left-pad-in-time + summed conv2d taps
+> (`candle-gen-wan/src/conv3d.rs`); temporal upsampling reproduces the reference `time_conv` doubling +
+> `DupUp3D` residual in one pass. **UniPC** flow-match scheduler (order-2 bh2, default) with a Euler
+> fallback. UMT5 + VAE run **f32**, the 5B DiT **bf16** (~33 GB resident). The text context is
+> **zero-padded to 512 tokens** before the DiT (the model trained that way — feeding only the real
+> tokens silently collapses the latent). txt2video-only first slice — image/keyframe conditioning
+> (TI2V/I2V), VACE, LoRA, quantization, and tiling are deferred. **GPU-verified** on RTX PRO 6000
+> (sm_120): real 512² cat-walking clip + conformance suite pass; UMT5 / DiT / VAE forward passes are
+> **bit-exact** vs diffusers.
+>
 > **candle pinned to git main (post-0.10.2)** — REQUIRED for Blackwell sm_120. The crates.io 0.10.2
 > release throws `CUDA_ERROR_INVALID_PTX` at the first candle-kernels kernel whenever
 > candle-transformers is linked (SDXL + Z-Image both; plain candle-core works). The git rev clears it
@@ -84,6 +100,7 @@ candle-gen/                 # workspace root
   candle-gen-flux/          # FLUX.1 [schnell]+[dev] provider crate: txt2img via candle-transformers `flux`
   candle-gen-flux2/         # FLUX.2-klein-9B provider crate: from-scratch MMDiT + Qwen3 + AutoencoderKL-Flux2
   candle-gen-qwen-image/    # Qwen-Image provider crate: from-scratch 60-layer MMDiT + Qwen2.5-VL + causal-Conv3d VAE
+  candle-gen-wan/           # Wan2.2 TI2V-5B video provider crate: WanTransformer3DModel + UMT5-XXL + temporal AutoencoderKLWan (from-scratch conv3d)
   scripts/
     check-gen-core-skew.sh  # version-skew gate: fails if >1 sceneworks-gen-core resolves
     check-cuda.ps1          # local cuda gate: vcvars + cargo build/test --features cuda (run pre-push)
