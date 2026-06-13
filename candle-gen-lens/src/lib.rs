@@ -21,6 +21,7 @@
 //! weights are dequantized to bf16 at load (sc-5108 bring-up). The eventual MXFP4 → GGUF Q4 `QMatMul`
 //! transcode that keeps the ~12 GB footprint is sc-5111.
 
+pub mod adapters;
 pub mod resolution;
 pub mod rope;
 pub mod schedule;
@@ -29,6 +30,9 @@ pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
 
+pub use adapters::{merge_adapters, MergeReport};
+
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -36,8 +40,8 @@ use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, WeightsSource,
+    self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 use rand::{rngs::StdRng, SeedableRng};
@@ -80,22 +84,28 @@ struct Components {
     vae: Arc<Flux2Vae>,
 }
 
-/// A loadable Lens pipeline (the snapshot root + device); components are loaded lazily on first use.
+/// A loadable Lens pipeline (the snapshot root + device + any DiT LoRA/LoKr adapters); components are
+/// loaded lazily on first use.
 struct Pipeline {
     root: PathBuf,
     device: Device,
+    /// LoRA/LoKr adapters merged into the `transformer/` weights on load (sc-5116). Empty = the stock
+    /// mmap path.
+    adapters: Vec<AdapterSpec>,
 }
 
 impl Pipeline {
-    fn load(root: &Path, device: &Device) -> Self {
+    fn load(root: &Path, device: &Device, adapters: Vec<AdapterSpec>) -> Self {
         Self {
             root: root.to_path_buf(),
             device: device.clone(),
+            adapters,
         }
     }
 
-    /// A `VarBuilder` over the `.safetensors` of a snapshot sub-dir, mmapped at `dtype`.
-    fn component_vb(&self, sub: &str, dtype: DType) -> CResult<VarBuilder<'static>> {
+    /// The sorted `.safetensors` files of a snapshot sub-dir (errors if the dir or its weights are
+    /// missing).
+    fn component_files(&self, sub: &str) -> CResult<Vec<PathBuf>> {
         let dir = self.root.join(sub);
         if !dir.is_dir() {
             return Err(CandleError::Msg(format!(
@@ -115,9 +125,34 @@ impl Pipeline {
                 dir.display()
             )));
         }
+        Ok(files)
+    }
+
+    /// A `VarBuilder` over the `.safetensors` of a snapshot sub-dir, mmapped at `dtype`.
+    fn component_vb(&self, sub: &str, dtype: DType) -> CResult<VarBuilder<'static>> {
+        let files = self.component_files(sub)?;
         // SAFETY: mmap of read-only weight files; standard candle loading path.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &self.device)? };
         Ok(vb)
+    }
+
+    /// The DiT `VarBuilder` with any [`AdapterSpec`]s merged into its weights (sc-5116). With no
+    /// adapters this is the stock mmap path; with adapters the `transformer/` shards load into a CPU
+    /// map, each LoRA/LoKr delta is folded in ([`adapters::merge_adapters`], f32 math), then the DiT
+    /// is built from the merged map — **merge, not residual** (the Lens flow-match sampler is
+    /// chaos-sensitive; `(W+δ)·x` ≠ `W·x + δ·x` to ~1 ULP, a visibly different image).
+    fn transformer_vb(&self) -> CResult<VarBuilder<'static>> {
+        if self.adapters.is_empty() {
+            return self.component_vb("transformer", DIT_DTYPE);
+        }
+        let files = self.component_files("transformer")?;
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        for f in &files {
+            let part = candle_gen::candle_core::safetensors::load(f, &Device::Cpu)?;
+            tensors.extend(part);
+        }
+        adapters::merge_adapters(&mut tensors, &self.adapters)?;
+        Ok(VarBuilder::from_tensors(tensors, DIT_DTYPE, &self.device))
     }
 
     fn load_components(&self) -> CResult<Components> {
@@ -127,10 +162,7 @@ impl Pipeline {
             &EncoderConfig::gpt_oss_20b(),
             self.component_vb("text_encoder", ENC_DTYPE)?,
         )?;
-        let transformer = LensTransformer::new(
-            &LensDitConfig::lens(),
-            self.component_vb("transformer", DIT_DTYPE)?,
-        )?;
+        let transformer = LensTransformer::new(&LensDitConfig::lens(), self.transformer_vb()?)?;
         let vae = Flux2Vae::new(self.component_vb("vae", VAE_DTYPE)?)?;
         Ok(Components {
             tokenizer: Arc::new(tokenizer),
@@ -412,7 +444,7 @@ impl LensGenerator {
         Ok(Self {
             descriptor: descriptor_turbo(),
             defaults: TURBO_DEFAULTS,
-            pipeline: Pipeline::load(root.as_ref(), &device),
+            pipeline: Pipeline::load(root.as_ref(), &device, Vec::new()),
             components: Mutex::new(None),
         })
     }
@@ -493,8 +525,8 @@ impl Generator for LensGenerator {
 
 /// Lens' identity + capabilities for `id` — constructible without loading weights. The norm-rescaled
 /// CFG path is always present; turbo simply defaults guidance to 1.0. **Standard guidance, not
-/// true-CFG.** LoRA/LoKr (sc-5116) and Q4/Q8 quant (sc-5111/5117) are advertised as the family's
-/// surface but rejected at load until those stories land.
+/// true-CFG.** LoRA/LoKr are wired (sc-5116, merged into the DiT on load); Q4/Q8 quant (sc-5111/5117)
+/// is advertised as the family's surface but rejected at load until those stories land.
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
         id,
@@ -557,8 +589,9 @@ fn validate_request(
 
 /// Construct a lazy candle Lens generator with the given per-variant defaults. `spec.weights` must be
 /// a `microsoft/Lens` / `microsoft/Lens-Turbo` diffusers snapshot dir (`tokenizer/`, `text_encoder/`,
-/// `transformer/`, `vae/`). Adapters / quant / control are advertised but not yet wired (sc-5116 /
-/// sc-5111 / sc-5117) and are rejected here.
+/// `transformer/`, `vae/`). DiT LoRA/LoKr adapters (`spec.adapters`) are merged into the transformer
+/// weights on first use (sc-5116). Quant / control are advertised but not yet wired (sc-5111 /
+/// sc-5117) and are rejected here.
 fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -570,12 +603,6 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Ge
             )));
         }
     };
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{}: LoRA/LoKr not yet wired (sc-5116)",
-            defaults.id
-        )));
-    }
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "{}: Q4/Q8 quantization not yet wired (sc-5111/sc-5117)",
@@ -592,7 +619,7 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Ge
     Ok(Box::new(LensGenerator {
         descriptor: descriptor_for(defaults.id),
         defaults,
-        pipeline: Pipeline::load(&root, &device),
+        pipeline: Pipeline::load(&root, &device, spec.adapters.clone()),
         components: Mutex::new(None),
     }))
 }
