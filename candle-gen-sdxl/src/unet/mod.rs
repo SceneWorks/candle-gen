@@ -24,8 +24,10 @@ mod embeddings;
 mod resnet;
 mod unet_2d;
 mod unet_2d_blocks;
+mod vae_encode;
 
 pub use unet_2d::{BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig};
+pub use vae_encode::VaeMomentsEncoder;
 
 #[cfg(test)]
 mod parity_tests {
@@ -34,7 +36,7 @@ mod parity_tests {
     //! output. This is the regression guard that the vendoring (candle::→candle_core::, the `conv`
     //! shim, the flash stub, the `LoraLinear` swap) changed nothing numerically.
     use super::{BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig};
-    use candle_core::{DType, Device, Module, Tensor};
+    use candle_core::{DType, Device, Tensor};
     use candle_nn::{VarBuilder, VarMap};
     use candle_transformers::models::stable_diffusion::unet_2d as stock;
 

@@ -71,7 +71,7 @@ use tokenizers::Tokenizer;
 
 /// diffusers SDXL VAE `scaling_factor` (candle's example hardcodes the SD1.5 value 0.18215 for `Xl`;
 /// 0.13025 is the diffusers-correct one and is what produced correctly-exposed output in the spike).
-const VAE_SCALE: f64 = 0.13025;
+pub(crate) const VAE_SCALE: f64 = 0.13025;
 /// Production SDXL defaults (the SceneWorks `sdxl` row): 30 steps, CFG 7.0 — used when the request
 /// omits them.
 const DEFAULT_STEPS: usize = 30;
@@ -88,8 +88,8 @@ pub(crate) fn image_seed(base_seed: u64, index: u32) -> u64 {
 
 /// The fp16-stable SDXL VAE (the base VAE NaNs in f16). Model-agnostic across every SDXL checkpoint,
 /// so it is fetched by repo id rather than read from the per-model snapshot.
-const VAE_FIX_REPO: &str = "madebyollin/sdxl-vae-fp16-fix";
-const VAE_FIX_FILE: &str = "diffusion_pytorch_model.safetensors";
+pub(crate) const VAE_FIX_REPO: &str = "madebyollin/sdxl-vae-fp16-fix";
+pub(crate) const VAE_FIX_FILE: &str = "diffusion_pytorch_model.safetensors";
 
 /// The SDXL VAE's tiling geometry (sc-4987): the decoder upsamples latents ×8 spatially, and an image
 /// VAE has **no temporal axis** — so temporal scale 1, non-causal (the `[B, 4, h, w]` latent is tiled
@@ -111,7 +111,7 @@ fn sdxl_tiling_config() -> TilingConfig {
 
 /// Which of the two SDXL CLIP encoders — selects the tokenizer repo, the snapshot weights subpath,
 /// and which `StableDiffusionConfig` clip config to use.
-enum Clip {
+pub(crate) enum Clip {
     /// CLIP-L (`text_encoder/`) — `openai/clip-vit-large-patch14` tokenizer.
     L,
     /// OpenCLIP bigG (`text_encoder_2/`) — `laion/CLIP-ViT-bigG-14-laion2B-39B-b160k` tokenizer.
@@ -120,7 +120,7 @@ enum Clip {
 
 impl Clip {
     /// `(tokenizer repo, snapshot weights subpath)`.
-    fn sources(&self) -> (&'static str, &'static str) {
+    pub(crate) fn sources(&self) -> (&'static str, &'static str) {
         match self {
             Clip::L => (
                 "openai/clip-vit-large-patch14",
@@ -135,7 +135,7 @@ impl Clip {
 }
 
 /// Resolve a file from a (cached) HF repo — used only for the model-agnostic tokenizers + fp16-VAE-fix.
-fn hf_get(repo: &str, path: &str) -> Result<PathBuf> {
+pub(crate) fn hf_get(repo: &str, path: &str) -> Result<PathBuf> {
     use hf_hub::api::sync::Api;
     Api::new()
         .and_then(|api| api.model(repo.to_string()).get(path))
@@ -487,7 +487,7 @@ fn tile_blend_decode(
 
 /// Resolve a component file inside the SDXL snapshot dir, erroring clearly if absent (e.g. a
 /// single-file RealVisXL checkpoint that lacks the diffusers multi-component tree — sc-3677).
-fn snapshot_file(root: &Path, sub: &str) -> Result<PathBuf> {
+pub(crate) fn snapshot_file(root: &Path, sub: &str) -> Result<PathBuf> {
     let p = root.join(sub);
     if !p.is_file() {
         return Err(CandleError::Msg(format!(

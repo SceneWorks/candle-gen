@@ -195,7 +195,10 @@ impl CrossAttention {
             let xs = query.matmul(&(key.t()? * self.scale)?)?;
             let xs = {
                 let _enter = self.span_softmax.enter();
-                nn::ops::softmax_last_dim(&xs)?
+                // The composable `softmax` (not the fused `softmax_last_dim`): the fused kernel is a
+                // `CustomOp` with no backward, so grads would never reach `to_q`/`to_k` through the
+                // scores (sc-5165). Numerically identical, so the stock forward-parity test still holds.
+                nn::ops::softmax(&xs, D::Minus1)?
             };
             xs.matmul(&value)?.to_dtype(in_dtype)?
         };

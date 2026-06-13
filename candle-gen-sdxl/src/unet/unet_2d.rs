@@ -5,7 +5,8 @@
 use super::conv::{conv2d, Conv2d};
 use super::embeddings::{TimestepEmbedding, Timesteps};
 use super::unet_2d_blocks::*;
-use candle_core::{Result, Tensor};
+use candle_core::{DType, Device, Result, Tensor};
+use candle_gen::train::gradient_checkpoint::Segment;
 use candle_gen::train::lora::{LoraHost, LoraLinear};
 use candle_nn as nn;
 use candle_nn::Module;
@@ -434,5 +435,108 @@ impl UNet2DConditionModel {
             Ok(())
         })?;
         Ok(paths)
+    }
+}
+
+/// Gradient-checkpointing decomposition of the forward (sc-5165): the trainer drives these pieces
+/// through [`candle_gen::train::gradient_checkpoint::checkpointed_backward`] so each down/mid/up block
+/// is recomputed in the backward instead of retained. The pieces reproduce
+/// [`forward`](UNet2DConditionModel::forward) exactly (no additional residuals; `upsample_size` is
+/// `None`, valid for the square, /32-bucketed training resolutions), so the checkpointed grads are the
+/// dense grads (modulo float reassociation) — pinned by the trainer's dense-vs-checkpoint parity test.
+impl UNet2DConditionModel {
+    /// The frozen time embedding (`timestep` → `[bsize, time_embed_dim]`): `time_proj` ∘
+    /// `time_embedding`, exactly as `forward`'s step 1. No adapter; the trainer detaches it as a
+    /// per-step constant shared across every block segment.
+    pub fn time_embed(
+        &self,
+        timestep: f64,
+        bsize: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Tensor> {
+        let emb = (Tensor::ones(bsize, dtype, device)? * timestep)?;
+        let emb = self.time_proj.forward(&emb)?;
+        self.time_embedding.forward(&emb)
+    }
+
+    /// The pre-process prelude: optional `center_input_sample`, then `conv_in` (`forward` steps 0+2).
+    /// Its output is both the first hidden state and the first skip residual (`res₀`).
+    pub fn conv_in_forward(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = if self.config.center_input_sample {
+            ((xs * 2.0)? - 1.0)?
+        } else {
+            xs.clone()
+        };
+        self.conv_in.forward(&xs)
+    }
+
+    /// The post-process tail: `conv_norm_out` → silu → `conv_out` (`forward` step 6). Frozen (no
+    /// adapter); the trainer folds it into its loss segment, so it is recomputed cheaply in the
+    /// backward like any other checkpointed work.
+    pub fn head_out(&self, xs: &Tensor) -> Result<Tensor> {
+        let xs = self.conv_norm_out.forward(xs)?;
+        let xs = nn::ops::silu(&xs)?;
+        self.conv_out.forward(&xs)
+    }
+
+    /// Build the down→mid→up [`Segment`]s over a `[hidden, res…]` state vector. The trainer seeds the
+    /// input state `[conv_in_out, conv_in_out]` (`hidden`, `res₀`), then appends a final loss segment
+    /// mapping the post-up `[hidden]` → `[loss]` (via [`head_out`](Self::head_out)).
+    ///
+    /// State convention: index 0 is the live hidden; indices `1..` are the skip residuals in append
+    /// order. A down block appends its residuals (so the up blocks pop the last `n_resnets` LIFO,
+    /// matching `forward`'s `split_off`); the mid block passes residuals through untouched.
+    pub fn block_segments<'a>(&'a self, emb: &'a Tensor, ehs: &'a Tensor) -> Vec<Segment<'a>> {
+        let mut segs: Vec<Segment<'a>> = Vec::with_capacity(self.down_blocks.len() * 2 + 1);
+
+        // Down: [hidden, res…] → [new_hidden, res…, new_res…] (append the produced residuals).
+        for i in 0..self.down_blocks.len() {
+            segs.push(Box::new(move |st: &[Tensor]| {
+                let (new_hidden, new_res) = match &self.down_blocks[i] {
+                    UNetDownBlock::Basic(b) => b.forward(&st[0], Some(emb))?,
+                    UNetDownBlock::CrossAttn(b) => b.forward(&st[0], Some(emb), Some(ehs))?,
+                };
+                let mut out = Vec::with_capacity(st.len() + new_res.len());
+                out.push(new_hidden);
+                out.extend_from_slice(&st[1..]);
+                out.extend(new_res);
+                Ok(out)
+            }));
+        }
+
+        // Mid: [hidden, res…] → [new_hidden, res…] (residuals untouched).
+        segs.push(Box::new(move |st: &[Tensor]| {
+            let new_hidden = self.mid_block.forward(&st[0], Some(emb), Some(ehs))?;
+            let mut out = Vec::with_capacity(st.len());
+            out.push(new_hidden);
+            out.extend_from_slice(&st[1..]);
+            Ok(out)
+        }));
+
+        // Up: pop the last `n_resnets` residuals (LIFO), [hidden, res…] → [new_hidden, res'…].
+        for j in 0..self.up_blocks.len() {
+            segs.push(Box::new(move |st: &[Tensor]| {
+                let n = match &self.up_blocks[j] {
+                    UNetUpBlock::Basic(b) => b.resnets.len(),
+                    UNetUpBlock::CrossAttn(b) => b.upblock.resnets.len(),
+                };
+                let res = &st[1..];
+                let split = res.len() - n;
+                let res_for_block = &res[split..];
+                let new_hidden = match &self.up_blocks[j] {
+                    UNetUpBlock::Basic(b) => b.forward(&st[0], res_for_block, Some(emb), None)?,
+                    UNetUpBlock::CrossAttn(b) => {
+                        b.forward(&st[0], res_for_block, Some(emb), None, Some(ehs))?
+                    }
+                };
+                let mut out = Vec::with_capacity(1 + split);
+                out.push(new_hidden);
+                out.extend_from_slice(&res[..split]);
+                Ok(out)
+            }));
+        }
+
+        segs
     }
 }

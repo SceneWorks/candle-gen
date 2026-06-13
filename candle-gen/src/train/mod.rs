@@ -18,12 +18,18 @@
 //! - [`schedule`] — the gen-core LR schedule (constant/linear/cosine + warmup), re-exported.
 //! - [`optim`] — the full optimizer set (`adamw`/`adam`/`rose`/`prodigy`) stepping factor `Var`s from
 //!   a `GradStore`, plus grad-norm clipping (candle ships neither Rose/Prodigy nor clipping).
-//! - [`checkpoint`] — intermediate-adapter file naming.
+//! - [`gradient_checkpoint`] — manual segmented vector-Jacobian product, the candle stand-in for
+//!   `mx.checkpoint` (candle has no activation-checkpointing primitive). Trades one extra forward for
+//!   `O(boundary)` instead of `O(all activations)` peak memory — all but required to fit SDXL LoRA
+//!   training on smaller cards.
+//! - [`checkpoint`] — intermediate-adapter file naming (the *file* kind of checkpoint, distinct from
+//!   [`gradient_checkpoint`]).
 //!
 //! The per-family training loop (cache latents/embeddings → noised forward → loss → backward → clip →
 //! step) lives in each provider crate's `Trainer`, built from these primitives.
 pub mod checkpoint;
 pub mod dataset;
+pub mod gradient_checkpoint;
 pub mod lora;
 pub mod optim;
 pub mod schedule;

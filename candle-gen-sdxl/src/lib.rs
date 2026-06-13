@@ -31,11 +31,18 @@
 
 mod pipeline;
 
-// Vendored, training-adapted SDXL UNet stack (sc-5165) — used by the native LoRA/LoKr trainer, which
-// lands in a later slice of this story. `allow(dead_code)` until the trainer wires it in; inference
-// continues to use the stock candle-transformers UNet via `pipeline`.
-#[allow(dead_code, unused_imports)]
+// Vendored, training-adapted SDXL UNet + VAE-encode stack (sc-5165) — used by the native LoRA/LoKr
+// trainer below. Inference continues to use the stock candle-transformers UNet via `pipeline`; the
+// vendored copy retains some unused upstream surface (decoder blocks, the additional-residuals
+// forward), hence `allow(dead_code)`.
+#[allow(dead_code)]
 mod unet;
+
+// The native candle SDXL LoRA/LoKr trainer (sc-5165) — implements `gen_core::Trainer` and
+// self-registers via `inventory` (kept linked by `force_link`), so `gen_core::load_trainer("sdxl", …)`
+// resolves the candle trainer.
+mod training;
+pub use training::{load_trainer, trainer_descriptor, SdxlTrainer};
 
 use std::path::PathBuf;
 use std::sync::Mutex;
