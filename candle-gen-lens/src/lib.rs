@@ -6,7 +6,8 @@
 //! 1. a **gpt-oss-20b** MoE LLM used **encoder-only** ([`text_encoder`]) — 24-layer / 32-expert /
 //!    top-4, attention sinks, alternating sliding/full attention, YaRN RoPE, clamped-SwiGLU experts,
 //!    MXFP4-native expert weights; run forward capturing hidden states at `[5, 11, 17, 23]`;
-//! 2. a **48-layer dual-stream MMDiT** (`LensTransformer2DModel`) — *to come, sc-5112*;
+//! 2. a **48-layer dual-stream MMDiT** ([`dit`], `LensTransformer2DModel`, sc-5112) — joint image+text
+//!    attention with complex axial RoPE, AdaLN modulation, and SwiGLU MLPs;
 //! 3. the **Flux.2 VAE** (`AutoencoderKLFlux2`) — *to come, sc-5113, reuses candle-gen-flux2*.
 //!
 //! This crate is being built story-by-story under epic **5107**. The first landed piece is the
@@ -18,5 +19,6 @@
 //! weights are dequantized to bf16 at load (sc-5108 bring-up). The eventual MXFP4 → GGUF Q4 `QMatMul`
 //! transcode that keeps the ~12 GB footprint is sc-5111.
 
+pub mod dit;
 pub mod text;
 pub mod text_encoder;
