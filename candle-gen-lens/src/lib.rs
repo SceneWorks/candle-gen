@@ -22,6 +22,7 @@
 //! transcode that keeps the ~12 GB footprint is sc-5111.
 
 pub mod adapters;
+pub mod dit_train;
 pub mod quant;
 pub mod reasoner;
 pub mod resolution;
@@ -29,6 +30,7 @@ pub mod rope;
 pub mod schedule;
 pub mod text;
 pub mod text_encoder;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 

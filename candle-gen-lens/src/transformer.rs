@@ -25,10 +25,11 @@ use candle_gen::gen_core::Quant;
 use crate::quant::QLinear;
 use crate::rope::{apply_rope, LensRope};
 
-/// Block / QK-norm / norm_out epsilon (the reference builds its norms at eps 1e-6).
-const EPS: f64 = 1e-6;
+/// Block / QK-norm / norm_out epsilon (the reference builds its norms at eps 1e-6). Shared with the
+/// trainable twin ([`crate::dit_train`]) so the two stay in lockstep.
+pub const EPS: f64 = 1e-6;
 /// The multi-layer text front-end RMSNorm epsilon (the `txt_norm` per-layer norms use eps 1e-5).
-const TXT_NORM_EPS: f64 = 1e-5;
+pub const TXT_NORM_EPS: f64 = 1e-5;
 
 /// The Lens / Lens-Turbo `transformer/config.json` values.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -69,12 +70,12 @@ impl LensDitConfig {
     }
 
     /// SwiGLU GateMLP hidden width: `inner/3·8` (= 4096).
-    fn mlp_hidden(&self) -> usize {
+    pub fn mlp_hidden(&self) -> usize {
         self.inner_dim / 3 * 8
     }
 
     /// Concatenated text front-end width: `enc_hidden_dim · num_text_layers` (= 11520).
-    fn txt_in_dim(&self) -> usize {
+    pub fn txt_in_dim(&self) -> usize {
         self.enc_hidden_dim * self.num_text_layers
     }
 }
@@ -99,15 +100,16 @@ fn chunk3(m: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
     Ok((shift, scale, gate))
 }
 
-/// AdaLN modulate: returns `(x·(1+scale) + shift, gate)`.
-fn modulate(x: &Tensor, m: &Tensor) -> Result<(Tensor, Tensor)> {
+/// AdaLN modulate: returns `(x·(1+scale) + shift, gate)`. Composable (no fused op), so the trainable
+/// twin ([`crate::dit_train`]) reuses it verbatim.
+pub fn modulate(x: &Tensor, m: &Tensor) -> Result<(Tensor, Tensor)> {
     let (shift, scale, gate) = chunk3(m)?;
     let out = x.broadcast_mul(&(scale + 1.0)?)?.broadcast_add(&shift)?;
     Ok((out, gate))
 }
 
-/// `x + gate·y`.
-fn gated(x: &Tensor, gate: &Tensor, y: &Tensor) -> Result<Tensor> {
+/// `x + gate·y`. Composable; reused by [`crate::dit_train`].
+pub fn gated(x: &Tensor, gate: &Tensor, y: &Tensor) -> Result<Tensor> {
     x.broadcast_add(&y.broadcast_mul(gate)?)
 }
 
@@ -129,15 +131,16 @@ fn timestep_embedding(sigma: f32, dim: usize, device: &Device) -> Result<Tensor>
     Tensor::cat(&[&cos, &sin], D::Minus1)
 }
 
-/// `temb = linear_2(silu(linear_1(proj(t))))`, `[1] → [1, inner]`.
-struct TimeEmbed {
+/// `temb = linear_2(silu(linear_1(proj(t))))`, `[1] → [1, inner]`. Frozen + composable, so the
+/// trainable twin ([`crate::dit_train`]) reuses it (the timestep embed is upstream of every adapter).
+pub struct TimeEmbed {
     linear_1: Linear,
     linear_2: Linear,
     channels: usize,
 }
 
 impl TimeEmbed {
-    fn new(cfg: &LensDitConfig, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &LensDitConfig, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.inner_dim;
         let te = vb.pp("timestep_embedder");
         Ok(Self {
@@ -147,7 +150,7 @@ impl TimeEmbed {
         })
     }
 
-    fn forward(&self, sigma: f32, device: &Device, dtype: DType) -> Result<Tensor> {
+    pub fn forward(&self, sigma: f32, device: &Device, dtype: DType) -> Result<Tensor> {
         let emb = timestep_embedding(sigma, self.channels, device)?.to_dtype(dtype)?;
         let h = self.linear_1.forward(&emb)?.silu()?;
         self.linear_2.forward(&h)
@@ -391,19 +394,19 @@ impl LensTransformerBlock {
 /// `AdaLayerNormContinuous`: affine-free LayerNorm scaled/shifted by `linear(silu(temb))`. The Lens
 /// checkpoint's `norm_out.linear` carries a **bias** the reference uses. `[scale | shift]` →
 /// `(1+scale)·LN(x) + shift`.
-struct NormOut {
+pub struct NormOut {
     linear: Linear,
 }
 
 impl NormOut {
-    fn new(cfg: &LensDitConfig, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &LensDitConfig, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.inner_dim;
         Ok(Self {
             linear: linear(inner, 2 * inner, vb.pp("linear"))?,
         })
     }
 
-    fn forward(&self, x: &Tensor, temb: &Tensor) -> Result<Tensor> {
+    pub fn forward(&self, x: &Tensor, temb: &Tensor) -> Result<Tensor> {
         let p = self.linear.forward(&temb.silu()?)?;
         let inner = p.dim(D::Minus1)? / 2;
         let scale = p.narrow(D::Minus1, 0, inner)?.unsqueeze(1)?;
@@ -559,8 +562,8 @@ impl LensTransformer {
 
 /// Additive joint attention mask `[B, 1, 1, img_len + txt_len]`: image tokens always valid; text
 /// positions follow `text_valid` (1 = valid). Padded positions get a large-negative additive term so
-/// the softmax masks them out (`(valid − 1)·1e9`, valid → 0).
-fn build_joint_mask(
+/// the softmax masks them out (`(valid − 1)·1e9`, valid → 0). Composable; reused by [`crate::dit_train`].
+pub fn build_joint_mask(
     text_valid: &Tensor,
     img_len: usize,
     dtype: DType,

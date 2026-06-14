@@ -42,3 +42,26 @@ pub fn to_uint8(image: &Tensor) -> Result<Tensor> {
     let x = image.to_dtype(DType::F32)?.clamp(-1f32, 1f32)?;
     ((x + 1.0)? * 127.5)?.to_dtype(DType::U8)
 }
+
+/// Encode an RGB image `[B, 3, H, W]` (NCHW, ~`[−1, 1]`) into the packed Lens DiT latent
+/// `[B, h·w, 128]` — the **inverse** of [`decode`], for the native training-latent path (sc-5147). The
+/// shared [`Flux2Vae::encode_packed`] does the neural encode → 2×2 patchify → bn-normalize into the
+/// packed grid `[B, 128, h, w]`; this shim only flattens that grid to the DiT's `[B, h·w, 128]`
+/// sequence, exactly mirroring how [`decode`] reshapes the DiT output *back* to the packed grid (the
+/// rearrange/patchify pair collapses to a transpose, so no explicit re-pack is needed). Returns
+/// `(x0, latent_h, latent_w)` with `latent_h = H/16, latent_w = W/16` — the grid the DiT forward
+/// consumes as `(frame = 1, h, w)`. Requires a [`Flux2Vae`] built with [`Flux2Vae::new_with_encoder`].
+///
+/// This is the deterministic posterior-**mean** latent (`encode_packed` uses the mean). The torch
+/// `lens_train_runner._encode_latents` samples the posterior; the mean is the reproducible choice for
+/// cached training latents (the flow-match target dominates the small posterior variance) and is what
+/// the parity gate pins.
+pub fn encode(vae: &Flux2Vae, image: &Tensor) -> Result<(Tensor, usize, usize)> {
+    let packed = vae.encode_packed(image)?; // [B, 128, h, w]
+    let (b, c, h, w) = packed.dims4()?;
+    let x0 = packed
+        .permute((0, 2, 3, 1))? // [B, h, w, 128]
+        .reshape((b, h * w, c))? // [B, h·w, 128]
+        .contiguous()?;
+    Ok((x0, h, w))
+}

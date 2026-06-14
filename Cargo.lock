@@ -265,10 +265,12 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-flux2",
+ "image",
  "inventory",
  "rand",
  "rand_distr",
  "safetensors 0.7.0",
+ "sceneworks-gen-core-testkit",
 ]
 
 [[package]]
