@@ -30,6 +30,7 @@ pub mod rope;
 pub mod schedule;
 pub mod text;
 pub mod text_encoder;
+pub mod training;
 pub mod transformer;
 pub mod vae;
 
