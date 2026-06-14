@@ -1,0 +1,39 @@
+[package]
+name = "candle-gen-instantid"
+version = "0.0.0"
+edition = "2021"
+description = "InstantID identity-preserving SDXL provider for candle-gen — the Windows/CUDA sibling of mlx-gen-instantid. The kps/openpose control-image renderers + face-restore compositing, plus the InstantID model composing the candle SDXL IP-Adapter/ControlNet stack and the gen-core FaceEmbedder (epic 5480, sc-5491)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "instantid", "sdxl", "inference"]
+categories = ["science"]
+
+[dependencies]
+# Core crate — re-exports gen_core (the neutral `Image` type the control-image renderers emit) +
+# candle, so this provider links exactly one gen-core / candle build (single resolution; see
+# scripts/check-gen-core-skew.sh). The heavy SDXL building blocks (IP-Adapter Resampler, ControlNet,
+# euler-ancestral, denoise_ip loops) land in `candle-gen-sdxl` and get wired in at the model.rs phase.
+candle-gen = { path = "../candle-gen" }
+# The SDXL building blocks (the IP-Adapter Resampler + decoupled cross-attn, the IdentityNet/OpenPose
+# ControlNet, the euler-ancestral sampler, the denoise_ip loops + conditioner/loaders) the InstantID
+# model composes — front-loaded here in sc-5491.
+candle-gen-sdxl = { path = "../candle-gen-sdxl" }
+# The native SCRFD + ArcFace face stack (sc-5490) — `largest_face` gives the reference's 512-d ArcFace
+# identity embedding + 5 landmarks that drive the kps control image.
+candle-gen-face = { path = "../candle-gen-face" }
+# The control-image `letterbox` uses a PIL-LANCZOS-analog resample (the sc-2009 IdentityNet aspect
+# rule). The `image` crate's Lanczos3 stands in — the control image is a directional gate, not
+# bit-parity vs PIL. Matches the `image` version candle-gen's trainer uses (one resolution).
+image = { version = "0.25", default-features = false }
+# The denoise loop draws its prior + per-step ancestral noise from a seeded `StdRng` (the launch-portable
+# determinism, sc-3673); the model seeds it per request. Must match candle-gen-sdxl's rand major (0.9)
+# so the `StdRng` handed to `denoise_ip_*` is the same type.
+rand = "0.9"
+
+[features]
+# Pass the backend selection through to the core crate AND the composed provider crates so a downstream
+# `--features cuda`/`metal` selects the matching candle backend everywhere (one device, one resolution).
+default = []
+metal = ["candle-gen/metal", "candle-gen-sdxl/metal", "candle-gen-face/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-sdxl/cuda", "candle-gen-face/cuda"]
+flash-attn = ["candle-gen/flash-attn", "candle-gen-sdxl/flash-attn", "candle-gen-face/flash-attn"]

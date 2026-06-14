@@ -44,12 +44,60 @@ mod adapters;
 // (`tests/trainer_e2e.rs`) asserts a trained adapter merges into every target with nothing skipped.
 pub use adapters::{merge_adapters, MergeReport};
 
+// IP-Adapter (sc-5491, epic 5480): the perceiver `Resampler` (`image_proj.*` → image/identity tokens)
+// + the decoupled cross-attn K/V pairs (`ip_adapter.*`), the candle twin of `mlx-gen-sdxl::ip_adapter`.
+// Built here (not in the InstantID glue crate) so the SDXL IP-Adapter-Plus path (sc-5488) reuses them.
+pub mod ip_adapter;
+// A small safetensors key→Tensor map for the IP-Adapter / ControlNet loads (non-VarBuilder weights).
+pub mod weights;
+
+// Euler / Euler-ancestral sampler (sc-5491) — the InstantID/diffusers-SDXL solver the InstantID
+// denoise loop runs (the txt2img `pipeline` keeps candle-transformers' non-ancestral DDIM). Port of
+// `mlx-gen-sdxl::sampler::EulerSampler`, with the ancestral noise injected (the loop owns the seeded
+// RNG, sc-3673) and the schedule scalars in host f64 (no Python parity to hold ULP-for-ULP).
+pub mod sampler;
+pub use sampler::EulerAncestralSampler;
+
+// InstantID denoise loop + the SDXL conditioning/prior/control/decode helpers (sc-5491) — the candle
+// twin of `mlx-gen-sdxl::pipeline`'s `denoise_ip_control` family, composing the IP-Adapter UNet, the
+// IdentityNet ControlNet, and the euler-ancestral sampler. Driven by the `candle-gen-instantid` glue.
+pub mod denoise;
+pub use denoise::{
+    decode_image, denoise_ip_control, denoise_ip_multi_control, preprocess_control_image,
+    seeded_prior, text_time_ids, ControlContext, Denoiser,
+};
+
+// SDXL dual-CLIP conditioning (sc-5491) — penultimate hidden (cross-attn) + pooled text-embeds
+// (add_embedding), the micro-conditioning the txt2img `pipeline` skips but `forward_instantid` needs.
+pub mod conditioning;
+pub use conditioning::SdxlConditioner;
+
+// SDXL component loaders for InstantID (sc-5491) — the vendored UNet (+ add_embedding), the fp16-fix
+// VAE, and a diffusers ControlNet, built from an SDXL snapshot. The candle twins of mlx-gen-sdxl's
+// load_unet_dtype/load_vae/load_controlnet.
+pub mod loaders;
+pub use loaders::{load_instantid_unet, load_sdxl_controlnet, load_sdxl_vae};
+
+// The SDXL VAE type the loader returns, re-exported so the `candle-gen-instantid` glue can hold one as
+// a field + pass it to `decode_image` without depending on candle-transformers directly.
+pub use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
+
+// The vendored UNet itself, re-exported so the `candle-gen-instantid` glue can hold one + drive its
+// InstantID surface (install_ip_adapter / set_ip_context / forward_instantid via the denoise loop).
+pub use unet::UNet2DConditionModel;
+
 // Vendored, training-adapted SDXL UNet + VAE-encode stack (sc-5165) — used by the native LoRA/LoKr
 // trainer below. Inference continues to use the stock candle-transformers UNet via `pipeline`; the
 // vendored copy retains some unused upstream surface (decoder blocks, the additional-residuals
 // forward), hence `allow(dead_code)`.
 #[allow(dead_code)]
 mod unet;
+
+// The InstantID inference surface built on the vendored UNet (sc-5491, epic 5480): the SDXL ControlNet
+// branch (the IdentityNet) — an encoder copy + conditioning embedding + zero-conv heads producing the
+// scaled down/mid residuals the InstantID UNet adds in. Re-exported so the `candle-gen-instantid` glue
+// crate composes it; also the SDXL ControlNet building block sc-5489 reuses.
+pub use unet::{ControlNet, ControlNetConfig, ControlResiduals};
 
 // The native candle SDXL LoRA/LoKr trainer (sc-5165) — implements `gen_core::Trainer` and
 // self-registers via `inventory` (kept linked by `force_link`), so `gen_core::load_trainer("sdxl", …)`

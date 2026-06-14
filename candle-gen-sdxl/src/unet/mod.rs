@@ -19,6 +19,7 @@
 //! As vendored this is a byte-faithful replica; the LoRA seam + checkpoint boundaries are layered on
 //! in subsequent slices of this story.
 mod attention;
+mod controlnet;
 mod conv;
 mod embeddings;
 mod resnet;
@@ -26,6 +27,9 @@ mod unet_2d;
 mod unet_2d_blocks;
 mod vae_encode;
 
+pub use controlnet::{ControlNet, ControlNetConfig, ControlResiduals};
+// The canonical SDXL UNet sub-config, shared by the InstantID UNet loader (sc-5491).
+pub(crate) use controlnet::sdxl_unet_config;
 pub use unet_2d::{BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig};
 pub use vae_encode::VaeMomentsEncoder;
 
