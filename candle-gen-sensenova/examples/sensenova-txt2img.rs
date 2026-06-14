@@ -25,14 +25,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|| "sensenova-out.png".to_string());
 
     let spec = LoadSpec::new(WeightsSource::Dir(snap.into()));
-    let generator = candle_gen_sensenova::load(&spec)?;
+    // SENSENOVA_FAST selects the 8-step distilled variant (exercises the distill-LoRA merge); steps
+    // left None so each variant's own default applies (fast=8/CFG1, base=50/CFG4).
+    let fast = std::env::var("SENSENOVA_FAST").is_ok();
+    let generator = if fast {
+        candle_gen_sensenova::load_fast(&spec)?
+    } else {
+        candle_gen_sensenova::load(&spec)?
+    };
+    let steps = std::env::var("SENSENOVA_STEPS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok());
 
     let req = GenerationRequest {
         prompt,
         width: 512,
         height: 512,
-        steps: Some(8),
-        guidance: Some(4.0),
+        steps,
         seed: Some(0),
         count: 1,
         ..Default::default()

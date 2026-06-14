@@ -30,11 +30,17 @@ pub struct DistillLora {
 }
 
 impl DistillLora {
-    /// mmap the LoRA `.safetensors` at f32 on `device`.
-    pub fn from_file(path: &Path, device: &Device) -> Result<Self> {
+    /// mmap the LoRA `.safetensors` at f32 **on CPU**, and compute the merge delta on CPU.
+    ///
+    /// The LoRA's `alpha` is an I32 scalar (and the factors are bf16/f16), so reading them through an
+    /// F32 VarBuilder casts dtypes. The candle CUDA build on Blackwell (sm_120) is missing the
+    /// I32→F32 cast kernel — loading the alpha on-device fails with `CUDA_ERROR_NOT_FOUND` ("named
+    /// symbol not found"). CPU has every cast; [`DistillLora::merge_linear`] moves the resulting F32
+    /// delta to the base weight's device before adding.
+    pub fn from_file(path: &Path) -> Result<Self> {
         // SAFETY: mmap of a read-only weight file; the standard candle loading path.
         let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[path.to_path_buf()], DType::F32, device)?
+            VarBuilder::from_mmaped_safetensors(&[path.to_path_buf()], DType::F32, &Device::Cpu)?
         };
         Ok(Self { vb })
     }
@@ -70,6 +76,8 @@ impl DistillLora {
     pub fn merge_linear(&self, lin: &Linear, target: &str) -> Result<Option<Linear>> {
         match self.delta(target)? {
             Some(delta) => {
+                // delta is computed on CPU; move it to the base weight's device before adding.
+                let delta = delta.to_device(lin.weight().device())?;
                 let merged = (lin.weight() + delta)?;
                 Ok(Some(Linear::new(merged, lin.bias().cloned())))
             }

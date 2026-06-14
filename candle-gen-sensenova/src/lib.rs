@@ -141,7 +141,7 @@ impl SenseNovaGenerator {
             // `7 · layers` gen-path projections + the 2 FM-head Linears — so a stale/mismatched LoRA
             // fails loudly rather than silently merging a subset.
             let lora_path = resolve_distill_lora(&self.root)?;
-            let lora = DistillLora::from_file(&lora_path, &self.device)?;
+            let lora = DistillLora::from_file(&lora_path)?;
             let applied = model.merge_distill_lora(&lora)?;
             let expected = cfg.llm.num_hidden_layers * 7 + 2;
             if applied != expected {
