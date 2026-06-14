@@ -41,3 +41,7 @@ rand_distr = "0.5"
 inventory = "0.3"
 # Error bridge (CandleError -> gen_core::Error). Major matches mlx-gen (thiserror 2).
 thiserror = "2"
+# JSON parsing for the PEFT/diffusers `lora_adapter_metadata` config blob (sc-5374) — the inference
+# adapter merge reads `lora_alpha`/`r` (+ per-module `alpha_pattern`/`rank_pattern`) out of it when a
+# file carries no per-target `.alpha` tensor. Already in the lock via `safetensors`; surfaced direct.
+serde_json = "1"
