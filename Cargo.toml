@@ -18,8 +18,14 @@ resolver = "2"
 # consumes none of the new weightsmeta surface; the bump is purely to keep the single-rev invariant.
 # Bumped `41c95a1` -> `af190c7` (sc-5500): adds the additive `TextLlm` contract (mlx-gen #448) that
 # `candle-gen-prompt-refine` implements. The worker re-pins to MATCH at its own cutover (sc-5525).
+# Bumped `af190c7` -> `fa0f75b` (sc-5551, candle-gen #55): lockstep with the worker's mlx pin bump
+# (SceneWorks #664) for the video-gen per-step cancel; gen-core additive, no candle surface change.
+# Bumped `fa0f75b` -> `d3ec5e5` (sc-5552): lockstep with the worker adding the native MLX
+# `mlx-gen-prompt-refine` provider (mlx-gen #457). gen-core is BYTE-IDENTICAL `fa0f75b` -> `d3ec5e5`
+# (the merge only adds an mlx provider crate); the bump is purely to keep the single-rev skew invariant
+# with the worker's mlx pin at its sc-5552 cutover.
 # The `sceneworks-gen-core-testkit` dev-deps below are bumped in lockstep for the same reason.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "fa0f75bfdfe264164aff4c867d0e2100a55c92e7" }
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "d3ec5e5e97ba3c0e71a49a001f2b8a975451bb76" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
