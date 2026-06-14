@@ -25,6 +25,7 @@
 use candle_gen::candle_core::{DType, Module, Result, Tensor, D};
 use candle_gen::candle_nn::ops::softmax;
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::train::gradient_checkpoint::Segment;
 use candle_gen::train::lora::{lora_linear, LoraHost, LoraLinear};
 
 use crate::config::TransformerConfig;
@@ -326,6 +327,10 @@ impl WanTransformerTrain {
     /// One DiT forward: `latents [B,C,F,Hl,Wl]`, projected `context [B,S,dim]`, scalar `t` (the
     /// `[0,1000]` integer timestep), RoPE `cos`/`sin` → **raw** predicted velocity `[B,C,F,Hl,Wl]`
     /// (f32). Byte-faithful to [`WanTransformer::forward`](crate::transformer).
+    ///
+    /// Factored into [`forward_pre_main`](Self::forward_pre_main) (patch + time embed) → the per-block
+    /// stack → [`velocity_out`](Self::velocity_out) (head), so the dense path and the gradient-checkpointed
+    /// backward share one source of truth; this composition is the dense path the `parity_tests` gate pins.
     pub fn forward(
         &self,
         latents: &Tensor,
@@ -334,6 +339,21 @@ impl WanTransformerTrain {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        let (mut hidden, ctx) = self.forward_pre_main(latents, t)?;
+        for blk in &self.blocks {
+            hidden = blk.forward(&hidden, &ctx.temb6, context, cos, sin)?;
+        }
+        self.velocity_out(&hidden, &ctx)
+    }
+
+    /// The **pre-main** forward: patchify+embed the latent into the token stream and build the timestep
+    /// modulation. Returns `(hidden, ctx)` where `ctx` ([`MainCtx`]) carries the constants the per-block
+    /// stack + head consume (`temb6`/`temb` modulation, token geometry). None of these depend on an
+    /// adapter `Var` (the patch/time/text embeds are frozen, NOT adapter targets), so the
+    /// gradient-checkpointing path runs this **detached** — there are no upstream adapter grads to stitch
+    /// (unlike Z-Image's pre-main refiners). `context` (the text embed) is likewise a frozen constant the
+    /// caller passes straight to the block segments.
+    pub fn forward_pre_main(&self, latents: &Tensor, t: f64) -> Result<(Tensor, MainCtx)> {
         let (b, _c, f, hl, wl) = latents.dims5()?;
         let (pt, ph, pw) = self.cfg.patch;
         let (ppf, pph, ppw) = (f / pt, hl / ph, wl / pw);
@@ -346,7 +366,7 @@ impl WanTransformerTrain {
             .to_dtype(self.dtype)?;
         let y = merged.conv2d(&self.patch_w, 0, ph, 1, 1)?;
         let y = y.broadcast_add(&self.patch_b)?;
-        let mut hidden = y
+        let hidden = y
             .reshape((b, f, self.cfg.dim, pph, ppw))?
             .permute((0, 1, 3, 4, 2))?
             .reshape((b, ppf * pph * ppw, self.cfg.dim))?
@@ -361,14 +381,48 @@ impl WanTransformerTrain {
             .forward(&temb.silu()?)?
             .reshape((b, 6, self.cfg.dim))?
             .to_dtype(DType::F32)?;
+        Ok((
+            hidden,
+            MainCtx {
+                temb,
+                temb6,
+                geom: (b, ppf, pph, ppw, pt, ph, pw),
+            },
+        ))
+    }
 
-        for blk in &self.blocks {
-            hidden = blk.forward(&hidden, &temb6, context, cos, sin)?;
-        }
+    /// One [`Segment`] per transformer block, each mapping `[hidden] → [hidden]` using `ctx`'s `temb6`
+    /// modulation + the (constant) `context`/`cos`/`sin`. Fed to
+    /// [`checkpointed_backward`](candle_gen::train::gradient_checkpoint::checkpointed_backward) so each
+    /// block is recomputed in the backward — bounding the peak to **one** block's transient weight
+    /// gradients (candle's matmul backward materializes a grad for the frozen base weight too, so a dense
+    /// 40-block backward would hold ~40 layers of f32 weight-grads at once — infeasible for the 14B
+    /// experts). The trainer appends a final `[hidden] → [loss]` segment ([`velocity_out`](Self::velocity_out)
+    /// + the flow-match regression).
+    pub fn main_block_segments<'a>(
+        &'a self,
+        ctx: &'a MainCtx,
+        context: &'a Tensor,
+        cos: &'a Tensor,
+        sin: &'a Tensor,
+    ) -> Vec<Segment<'a>> {
+        self.blocks
+            .iter()
+            .map(|blk| -> Segment<'a> {
+                Box::new(move |st: &[Tensor]| {
+                    Ok(vec![blk.forward(&st[0], &ctx.temb6, context, cos, sin)?])
+                })
+            })
+            .collect()
+    }
 
+    /// The **post-main** head: AdaLN-modulated `norm_out` (by `scale_shift_table + temb`) → `proj_out` →
+    /// unpatchify back to the raw velocity `[B, C, F, Hl, Wl]` (f32). `hidden` is the last block's output.
+    pub fn velocity_out(&self, hidden: &Tensor, ctx: &MainCtx) -> Result<Tensor> {
+        let (b, ppf, pph, ppw, pt, ph, pw) = ctx.geom;
         let head_mod = self
             .scale_shift_table
-            .broadcast_add(&temb.unsqueeze(1)?.to_dtype(DType::F32)?)?;
+            .broadcast_add(&ctx.temb.unsqueeze(1)?.to_dtype(DType::F32)?)?;
         let shift = head_mod.narrow(1, 0, 1)?;
         let scale = head_mod.narrow(1, 1, 1)?;
         let hf = hidden.to_dtype(DType::F32)?;
@@ -384,6 +438,19 @@ impl WanTransformerTrain {
             .reshape((b, oc, ppf * pt, pph * ph, ppw * pw))?
             .to_dtype(DType::F32)
     }
+}
+
+/// The constant side tensors the per-block stack + head consume, produced once by
+/// [`WanTransformerTrain::forward_pre_main`]. None depend on an adapter `Var`, so the
+/// gradient-checkpointing path captures them as detached constants shared across every recomputed block.
+#[derive(Debug, Clone)]
+pub struct MainCtx {
+    /// `[B, dim]` timestep embedding (the head modulation).
+    temb: Tensor,
+    /// `[B, 6, dim]` f32 per-block modulation (`scale_shift_table + time_proj`).
+    temb6: Tensor,
+    /// `(b, ppf, pph, ppw, pt, ph, pw)` token geometry for the head's unpatchify.
+    geom: (usize, usize, usize, usize, usize, usize, usize),
 }
 
 impl LoraHost for WanTransformerTrain {

@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::backprop::GradStore;
-use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor, Var};
 use candle_gen::candle_nn::VarBuilder;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -45,6 +45,7 @@ use candle_gen::gen_core::train::{
 use candle_gen::gen_core::{self, LoadSpec, Modality, WeightsSource};
 use candle_gen::train::checkpoint::file_stem;
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
+use candle_gen::train::gradient_checkpoint::checkpointed_backward;
 use candle_gen::train::lora::{
     build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraSet,
 };
@@ -168,12 +169,21 @@ fn sample_noise(shape: &[usize], seed: u64, device: &Device) -> Result<Tensor> {
 
 /// One micro-step's forward+backward over one expert's installed adapter `Var`s: build the noised
 /// latent at `t`, predict the **raw** velocity through the (LoRA-adapted) DiT, regress it toward
-/// `noise − x0`, return `(loss, grads)`. `loss.backward()` attributes grads to every adapter `Var` on
-/// the graph (the eager-`Var` install). A free function so the parity test can drive it against a tiny
-/// DiT. `cos`/`sin` are the (constant, per-resolution) RoPE tables.
+/// `noise − x0`, return `(loss, grads)` keyed by `lora_vars`. `cos`/`sin` are the (constant,
+/// per-resolution) RoPE tables. A free function so the tests can drive it against a tiny DiT.
+///
+/// `use_checkpoint` selects the **gradient-checkpointed** backward. This is not just a memory lever for
+/// the 14B experts — it is **required**: candle's matmul backward materializes a gradient for the
+/// *frozen* base weight as well as the activation, so a dense 40-block backward holds ~40 layers of f32
+/// base-weight grads at once (tens of GB), OOMing even a 96 GB card with both experts resident. The
+/// checkpointed path runs the (adapter-free) pre-main forward detached, then segments the per-block
+/// stack so only one block's transient weight-grads are live at a time (see
+/// [`WanTransformerTrain::main_block_segments`]). Both paths yield the same adapter grads (the
+/// `dense_and_checkpoint_grads_match` test pins this on a tiny DiT).
 #[allow(clippy::too_many_arguments)]
 fn compute_loss_grads(
     dit: &WanTransformerTrain,
+    lora_vars: &[Var],
     x0: &Tensor,
     umt5: &Tensor,
     t: f64,
@@ -182,17 +192,35 @@ fn compute_loss_grads(
     sin: &Tensor,
     mae: bool,
     compute_dtype: DType,
+    use_checkpoint: bool,
 ) -> Result<(f32, GradStore)> {
     let (x_t, target) = build_batch(x0, noise, t)?;
     let x_t = x_t.to_dtype(compute_dtype)?;
+    // Text context + timestep are adapter-free constants the blocks consume.
     let ctx = dit.embed_text(umt5)?;
     let timestep = t * NUM_TRAIN_TIMESTEPS as f64;
-    // Raw velocity (NO negation — Wan's flow-match step consumes the transformer output directly).
-    let v = dit.forward(&x_t, &ctx, timestep, cos, sin)?;
-    let loss = velocity_loss(&v, &target, mae)?;
-    let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
-    let grads = loss.backward()?;
-    Ok((loss_val, grads))
+
+    if use_checkpoint {
+        // Pre-main (patch + time embed) has no adapters → run it detached; no upstream grads to stitch.
+        let (hidden, mctx) = dit.forward_pre_main(&x_t, timestep)?;
+        let hidden_d = hidden.detach();
+        let mut segs = dit.main_block_segments(&mctx, &ctx, cos, sin);
+        // Final segment: head → raw velocity (NO negation) → flow-match regression → [loss].
+        let target_owned = target.clone();
+        let mctx_ref = &mctx;
+        segs.push(Box::new(move |st: &[Tensor]| {
+            let v = dit.velocity_out(&st[0], mctx_ref)?;
+            Ok(vec![velocity_loss(&v, &target_owned, mae)?])
+        }));
+        checkpointed_backward(&segs, std::slice::from_ref(&hidden_d), lora_vars)
+    } else {
+        // Dense backward (tiny models / tests only — see the `use_checkpoint` note re: OOM at scale).
+        let v = dit.forward(&x_t, &ctx, timestep, cos, sin)?;
+        let loss = velocity_loss(&v, &target, mae)?;
+        let loss_val = loss.to_dtype(DType::F32)?.to_scalar::<f32>()?;
+        let grads = loss.backward()?;
+        Ok((loss_val, grads))
+    }
 }
 
 /// Resolve the sorted `.safetensors` files in the snapshot component subdir `sub`.
@@ -471,9 +499,11 @@ impl WanMoeTrainer {
             component_vb(&self.root, "vae", device, DType::F32)?,
         )?;
         let te_cfg = TextEncoderConfig::umt5_xxl();
+        // Load the UMT5 encoder at bf16 for caching (11 GB vs 22 GB at f32) — it only produces the
+        // cached caption embeds (kept f32 in the cache), and is dropped before the experts load.
         let text_encoder = Umt5Encoder::new(
             &te_cfg,
-            component_vb(&self.root, "text_encoder", device, DType::F32)?,
+            component_vb(&self.root, "text_encoder", device, DType::BF16)?,
         )?;
 
         let total = req.items.len() as u32;
@@ -563,6 +593,9 @@ impl WanMoeTrainer {
         }
 
         // --- train loop (alternating experts) ---
+        // The 14B experts' dense backward is infeasible (candle materializes a grad for every frozen
+        // base weight too), so training always uses the gradient-checkpointed backward.
+        let use_checkpoint = true;
         let mut last_loss = 0.0f32;
         let mut steps_run = 0u32;
         for step in 1..=cfg.steps {
@@ -585,6 +618,7 @@ impl WanMoeTrainer {
             )?;
             let (loss, grads) = compute_loss_grads(
                 &experts[ei].dit,
+                &experts[ei].set.vars,
                 x0,
                 cap,
                 t,
@@ -593,6 +627,7 @@ impl WanMoeTrainer {
                 &sin,
                 mae,
                 compute_dtype,
+                use_checkpoint,
             )?;
             last_loss = loss;
             steps_run = step;
@@ -822,9 +857,20 @@ mod tests {
                 .unwrap();
         }
         let (x0, umt5, noise, cos, sin) = tiny_inputs(&cfg, &dev);
-        let (loss, grads) =
-            compute_loss_grads(&dit, &x0, &umt5, 0.5, &noise, &cos, &sin, false, DType::F32)
-                .unwrap();
+        let (loss, grads) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &umt5,
+            0.5,
+            &noise,
+            &cos,
+            &sin,
+            false,
+            DType::F32,
+            false,
+        )
+        .unwrap();
         assert!(loss.is_finite(), "loss must be finite, got {loss}");
         let mut saw_nonzero = false;
         for (i, v) in set.vars.iter().enumerate() {
@@ -848,6 +894,87 @@ mod tests {
         assert_eq!(set.vars.len(), 4 * 2 * cfg.num_layers * 2);
     }
 
+    /// The correctness gate for the gradient-checkpointed backward (the path real training always uses):
+    /// it must reproduce the dense `loss.backward()` grads (mod float reassociation) on the tiny DiT.
+    /// All Wan adapters live in the checkpointed block stack (no retained pre-main adapters), so this
+    /// spans every adapter target.
+    #[test]
+    fn dense_and_checkpoint_grads_match() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut dit = WanTransformerTrain::new(&cfg, vb).unwrap();
+        randomize_base(&vm, &dev);
+        let suffixes: Vec<String> = WAN_ATTN_TARGETS.iter().map(|s| s.to_string()).collect();
+        let set = build_lora_targets(&mut dit, &suffixes, 4, 8.0, 7, &dev).unwrap();
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+        let (x0, umt5, noise, cos, sin) = tiny_inputs(&cfg, &dev);
+        let (loss_d, g_d) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &umt5,
+            0.5,
+            &noise,
+            &cos,
+            &sin,
+            false,
+            DType::F32,
+            false,
+        )
+        .unwrap();
+        let (loss_c, g_c) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &umt5,
+            0.5,
+            &noise,
+            &cos,
+            &sin,
+            false,
+            DType::F32,
+            true,
+        )
+        .unwrap();
+        assert!(
+            (loss_d - loss_c).abs() < 1e-4,
+            "loss: dense {loss_d} vs checkpoint {loss_c}"
+        );
+        let mut saw_nonzero = false;
+        for (i, v) in set.vars.iter().enumerate() {
+            let a = g_d
+                .get(v.as_tensor())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let b = g_c
+                .get(v.as_tensor())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert!(
+                    (x - y).abs() < 1e-4,
+                    "grad mismatch for var {i} (dense {x} vs checkpoint {y})"
+                );
+                if x.abs() > 1e-6 {
+                    saw_nonzero = true;
+                }
+            }
+        }
+        assert!(saw_nonzero, "expected nonzero adapter grads to compare");
+    }
+
     /// A few optimizer steps on a fixed batch lower the loss — the step descends the flow-match
     /// objective end to end through the harness.
     #[test]
@@ -866,20 +993,53 @@ mod tests {
         }
         let (x0, umt5, noise, cos, sin) = tiny_inputs(&cfg, &dev);
         let mut opt = TrainOptimizer::from_config("adamw", set.vars.clone(), 1e-2, 0.0).unwrap();
-        let (loss0, mut grads) =
-            compute_loss_grads(&dit, &x0, &umt5, 0.5, &noise, &cos, &sin, false, DType::F32)
-                .unwrap();
+        let (loss0, mut grads) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &umt5,
+            0.5,
+            &noise,
+            &cos,
+            &sin,
+            false,
+            DType::F32,
+            false,
+        )
+        .unwrap();
         for _ in 0..5 {
             clip_grad_norm(&mut grads, &set.vars, 1.0).unwrap();
             opt.step(&grads).unwrap();
-            let (_l, g) =
-                compute_loss_grads(&dit, &x0, &umt5, 0.5, &noise, &cos, &sin, false, DType::F32)
-                    .unwrap();
+            let (_l, g) = compute_loss_grads(
+                &dit,
+                &set.vars,
+                &x0,
+                &umt5,
+                0.5,
+                &noise,
+                &cos,
+                &sin,
+                false,
+                DType::F32,
+                false,
+            )
+            .unwrap();
             grads = g;
         }
-        let (loss1, _) =
-            compute_loss_grads(&dit, &x0, &umt5, 0.5, &noise, &cos, &sin, false, DType::F32)
-                .unwrap();
+        let (loss1, _) = compute_loss_grads(
+            &dit,
+            &set.vars,
+            &x0,
+            &umt5,
+            0.5,
+            &noise,
+            &cos,
+            &sin,
+            false,
+            DType::F32,
+            false,
+        )
+        .unwrap();
         assert!(
             loss1 < loss0,
             "5 steps on a fixed batch should lower the loss: {loss0} -> {loss1}"
