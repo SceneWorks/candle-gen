@@ -214,6 +214,7 @@ dependencies = [
  "rand_distr",
  "safetensors 0.7.0",
  "sceneworks-gen-core",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

@@ -16,9 +16,12 @@
 //! adapter targets — attention (`to_q`/`to_k`/`to_v`/`to_out.0`), `proj_in`/`proj_out`, the GEGLU
 //! `ff.net.0.proj`/`ff.net.2`, and `mid_block.*`. This is diffusers' full ("complete") coverage by
 //! construction, no per-module routing table on our side. Two on-disk LoRA formats resolve:
-//!  - **PEFT** (`base_model.model.unet.<dotted>.lora_A/B[.default].weight` + per-target `.alpha`) —
-//!    what the candle trainer ([`save_lora_peft`](candle_gen::train::lora::save_lora_peft)) and
-//!    `peft.save_pretrained()` emit; the dotted path resolves directly (the prefix is optional).
+//!  - **PEFT** (`base_model.model.unet.<dotted>.lora_A/B[.default].weight`) — what the candle trainer
+//!    ([`save_lora_peft`](candle_gen::train::lora::save_lora_peft)) and `peft.save_pretrained()` /
+//!    diffusers `save_lora_adapter` emit; the dotted path resolves directly (the prefix is optional).
+//!    The scaling is a per-target `.alpha` tensor (candle trainer / kohya) or — when absent, as in the
+//!    diffusers format — `lora_alpha`/`r` (+ `alpha_pattern`/`rank_pattern`) in the
+//!    `lora_adapter_metadata` header blob ([`LoraAdapterMeta`](candle_gen::train::lora::LoraAdapterMeta), sc-5374).
 //!  - **kohya** (`lora_unet_<flat>.lora_down/up.weight` + `.alpha`) — community / diffusers LoRAs; the
 //!    `_`-flattened stem (ambiguous, since diffusers names contain `_`) resolves against a table built
 //!    from the base UNet's own Linear keys.
@@ -52,6 +55,7 @@ use candle_gen::gen_core::weightsmeta as wmeta;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::train::lora::{
     conv_lora_delta, reconstruct_loha_delta, reconstruct_lokr_delta, reconstruct_lora_delta,
+    LoraAdapterMeta,
 };
 use candle_gen::{CandleError, Result};
 
@@ -229,9 +233,11 @@ fn merge_into(
 
 /// Merge one LoRA file into `base` at `scale`: classify every key (PEFT + kohya), fold complete
 /// `(down, up)` pairs into `{path}.weight`. `rank` is `A`'s leading dim; `alpha` is the per-target
-/// `.alpha` (default `rank`). **2-D Linear** pairs fold via [`reconstruct_lora_delta`]; **4-D conv**
-/// pairs fuse via [`conv_lora_delta`] into the 4-D conv weight (sc-5225). Half-pairs, a conv LoRA
-/// targeting a non-conv weight, and other unexpected shapes are surfaced as skipped.
+/// `.alpha` tensor when present, else the `lora_adapter_metadata` blob's `alpha_pattern`/`lora_alpha`
+/// (the diffusers / PEFT `save_lora_adapter` format ships no `.alpha` tensor — sc-5374), else `rank`.
+/// **2-D Linear** pairs fold via [`reconstruct_lora_delta`]; **4-D conv** pairs fuse via
+/// [`conv_lora_delta`] into the 4-D conv weight (sc-5225). Half-pairs, a conv LoRA targeting a non-conv
+/// weight, and other unexpected shapes are surfaced as skipped.
 fn merge_lora_file(
     base: &mut HashMap<String, Tensor>,
     af: &AdapterFile,
@@ -251,12 +257,21 @@ fn merge_lora_file(
         }
     }
 
+    // PEFT/diffusers `save_lora_adapter` files carry no per-target `.alpha` tensor — `lora_alpha`/`r`
+    // (+ per-module overrides) live in the `lora_adapter_metadata` blob (sc-5374). `None` for kohya /
+    // candle-trainer files (those ship a `.alpha` tensor), in which case the per-target `.alpha` or the
+    // factor rank is used exactly as before.
+    let cfg = LoraAdapterMeta::from_file_metadata(&af.meta);
     for (path, t) in triples {
         let (Some(down), Some(up)) = (t.down, t.up) else {
             report.skipped_keys += 1; // half-pair (partner targeted a non-routable module)
             continue;
         };
         let base_key = format!("{path}.weight");
+        // Effective scaling: per-target `.alpha` tensor → `alpha_pattern`/`lora_alpha` blob → factor
+        // rank (today's last-resort default). The denominator is the blob `r`/`rank_pattern` when given,
+        // else the stored `A` leading dim (which equals it for a well-formed PEFT file).
+        let (cfg_alpha, cfg_rank) = cfg.as_ref().map_or((None, None), |c| c.effective(&path));
         let (dn, un) = (down.dims().len(), up.dims().len());
         if dn == 4 && un == 4 {
             // Conv-layer LoRA (sc-5225): fuse `down`∘`up` into a single NCHW conv-weight delta and fold
@@ -271,8 +286,8 @@ fn merge_lora_file(
                 report.skipped_keys += 1;
                 continue;
             }
-            let rank = down.dims()[0] as f32;
-            let alpha = t.alpha.unwrap_or(rank);
+            let rank = cfg_rank.unwrap_or(down.dims()[0] as f32);
+            let alpha = t.alpha.or(cfg_alpha).unwrap_or(rank);
             let delta = conv_lora_delta(&down, &up, alpha, rank, scale)?;
             merge_into(base, &base_key, &delta, report)?;
             continue;
@@ -285,8 +300,8 @@ fn merge_lora_file(
             report.skipped_keys += 1;
             continue;
         }
-        let rank = down.dims()[0] as f32;
-        let alpha = t.alpha.unwrap_or(rank);
+        let rank = cfg_rank.unwrap_or(down.dims()[0] as f32);
+        let alpha = t.alpha.or(cfg_alpha).unwrap_or(rank);
         let delta = reconstruct_lora_delta(&down, &up, alpha, rank, scale)?;
         merge_into(base, &base_key, &delta, report)?;
     }
@@ -764,6 +779,69 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(diff < 1e-4, "merged weight off by {diff}");
+    }
+
+    /// sc-5374: a diffusers-format LoRA with NO per-target `.alpha` tensor but a `lora_adapter_metadata`
+    /// blob (`lora_alpha = 16`, `r = 8`) merges at the metadata-derived strength `(16/8)·scale = 2.0`,
+    /// not the old `alpha = rank` default (which would halve it). Proves the blob is read and applied.
+    #[test]
+    fn merge_lora_honors_lora_adapter_metadata_alpha() {
+        let dev = Device::Cpu;
+        let mut map = base_map();
+        let path = "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q";
+        // A [r=8, in=4], B [out=4, r=8] — nonzero so ΔW ≠ 0; deliberately NO `.alpha` tensor.
+        let down = Tensor::randn(0f32, 1f32, (8, 4), &dev).unwrap();
+        let up = Tensor::randn(0f32, 1f32, (4, 8), &dev).unwrap();
+        let af = AdapterFile {
+            tensors: HashMap::from([
+                (
+                    format!("base_model.model.unet.{path}.lora_A.weight"),
+                    down.clone(),
+                ),
+                (
+                    format!("base_model.model.unet.{path}.lora_B.weight"),
+                    up.clone(),
+                ),
+            ]),
+            meta: HashMap::from([(
+                "lora_adapter_metadata".to_string(),
+                r#"{"lora_alpha": 16, "r": 8}"#.to_string(),
+            )]),
+        };
+        let table = build_kohya_table(&map);
+        let mut report = MergeReport::default();
+        merge_lora_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
+        assert_eq!(report.merged, 1);
+        let merged = map
+            .get(&format!("{path}.weight"))
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        // Effective alpha 16 over rank 8 ⇒ scale 2.0; base is zero, so the merged weight IS the delta.
+        let expected = reconstruct_lora_delta(&down, &up, 16.0, 8.0, 1.0).unwrap();
+        let diff = (&merged - &expected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(diff < 1e-4, "metadata-alpha merge off by {diff}");
+        // The pre-sc-5374 default (alpha = rank ⇒ scale 1.0) would diverge by a full factor of 2.
+        let buggy = reconstruct_lora_delta(&down, &up, 8.0, 8.0, 1.0).unwrap();
+        let gap = (&merged - &buggy)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            gap > 1e-3,
+            "metadata alpha must differ from the alpha=rank default (gap {gap})"
+        );
     }
 
     /// sc-5225: a conv-shaped LoRA (4-D factors) now folds into the 4-D conv weight (`conv_in`), via
