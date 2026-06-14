@@ -1,18 +1,21 @@
-//! The FLUX.2 **AutoencoderKL-Flux2** decoder (decode-only — txt2img needs no encode). Ported from
-//! `mlx-gen-flux2`'s `vae.rs`, run in candle-native **NCHW** f32.
+//! The FLUX.2 **AutoencoderKL-Flux2** — decoder (txt2img) plus an optional encoder (training latents
+//! / img2img, [`Flux2Vae::new_with_encoder`]). Ported from `mlx-gen-flux2`'s `vae.rs`, run in
+//! candle-native **NCHW** f32.
 //!
-//! FLUX.2 differs from a plain AutoencoderKL in two ways, both **outside** the conv decoder:
+//! FLUX.2 differs from a plain AutoencoderKL in two ways, both **outside** the conv en/decoder:
 //! 1. **2×2 pack/patchify** between the 32-ch VAE latent and the 128-ch transformer space — the
-//!    decoder itself is a standard 32-ch AutoencoderKL; the unpatchify (`[B,128,h,w] → [B,32,2h,2w]`)
-//!    happens here before `decode`.
+//!    en/decoder itself is a standard 32-ch AutoencoderKL; the (un)patchify (`[B,128,h,w] ⇄
+//!    [B,32,2h,2w]`) happens here around `decode`/`encode`.
 //! 2. **BatchNorm-stats normalization** of the packed 128-ch space (`bn.running_mean/var`): the
 //!    transformer works in a `(x − mean)/std`-normalized space, so decode first **de-normalizes**
-//!    `x·std + mean` (`std = sqrt(running_var + 1e-4)`).
+//!    `x·std + mean` and encode last **normalizes** `(x − mean)/std` (`std = sqrt(running_var + 1e-4)`).
 //!
 //! `scaling_factor = 1.0`, `shift_factor = 0.0` (identity), so there is no `z/scale + shift` step —
 //! the bn-stats step replaces it. GroupNorm eps is **1e-6** (not SDXL's 1e-5). The decoder is the
 //! diffusers tree: `conv_in → mid(resnet,attn,resnet) → 4 up_blocks(3 resnets each, 3 upsamplers) →
-//! groupnorm/silu → conv_out`.
+//! groupnorm/silu → conv_out`; the encoder is its 8× mirror: `conv_in(3→128) → 4 down_blocks(2 resnets
+//! each, 3 stride-2 downsamplers) → mid(resnet,attn,resnet) → groupnorm/silu → conv_out(512→64) →
+//! quant_conv → posterior mean/logvar`.
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{
@@ -26,6 +29,8 @@ const BLOCK_OUT: [usize; 4] = [128, 256, 512, 512];
 const LATENT_CHANNELS: usize = 32;
 /// Decoder up_blocks have `layers_per_block + 1 = 3` resnets each.
 const DECODER_RESNETS: usize = 3;
+/// Encoder down_blocks have `layers_per_block = 2` resnets each.
+const ENCODER_RESNETS: usize = 2;
 
 fn conv3x3(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Conv2d> {
     let cfg = Conv2dConfig {
@@ -163,7 +168,124 @@ impl UpBlock {
     }
 }
 
-/// The FLUX.2 VAE: decode-only, plus the bn-stats de-normalization and 2×2 unpatchify wrapper.
+/// Encoder spatial 2× downsample (diffusers `Downsample2D`, `padding=0`): an asymmetric `(0,1,0,1)`
+/// zero-pad (pad W right + H bottom) then a stride-2 3×3 conv — halves H and W.
+struct Downsampler {
+    conv: Conv2d,
+}
+
+impl Downsampler {
+    fn new(channels: usize, vb: VarBuilder) -> Result<Self> {
+        let cfg = Conv2dConfig {
+            padding: 0,
+            stride: 2,
+            ..Default::default()
+        };
+        Ok(Self {
+            conv: conv2d(channels, channels, 3, cfg, vb.pp("conv"))?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // F.pad((0,1,0,1)) = pad last dim (W) right by 1, second-last dim (H) bottom by 1.
+        let padded = x.pad_with_zeros(2, 0, 1)?.pad_with_zeros(3, 0, 1)?;
+        self.conv.forward(&padded)
+    }
+}
+
+struct DownBlock {
+    resnets: Vec<Resnet>,
+    downsampler: Option<Downsampler>,
+}
+
+impl DownBlock {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut h = x.clone();
+        for r in &self.resnets {
+            h = r.forward(&h)?;
+        }
+        if let Some(d) = &self.downsampler {
+            h = d.forward(&h)?;
+        }
+        Ok(h)
+    }
+}
+
+/// The AutoencoderKL-Flux2 encoder (the 8× mirror of the decoder): `conv_in → 4 down_blocks → mid →
+/// groupnorm/silu → conv_out`, emitting the `2·latent` moments (mean ++ logvar on the channel axis).
+struct Encoder {
+    conv_in: Conv2d,
+    down_blocks: Vec<DownBlock>,
+    mid_resnet0: Resnet,
+    mid_attn: MidAttention,
+    mid_resnet1: Resnet,
+    conv_norm_out: GroupNorm,
+    conv_out: Conv2d,
+}
+
+impl Encoder {
+    fn new(vb: VarBuilder) -> Result<Self> {
+        let conv_in = conv3x3(3, BLOCK_OUT[0], vb.pp("conv_in"))?;
+
+        // down_blocks iterate block_out forward; resnet 0 of block i bridges the previous block's
+        // output channels into block_out[i]. Downsample after every block except the last.
+        let mut down_blocks = Vec::with_capacity(BLOCK_OUT.len());
+        let mut in_c = BLOCK_OUT[0];
+        for (i, &out_c) in BLOCK_OUT.iter().enumerate() {
+            let db = vb.pp("down_blocks").pp(i);
+            let mut resnets = Vec::with_capacity(ENCODER_RESNETS);
+            for j in 0..ENCODER_RESNETS {
+                let rin = if j == 0 { in_c } else { out_c };
+                resnets.push(Resnet::new(rin, out_c, db.pp("resnets").pp(j))?);
+            }
+            let is_final = i == BLOCK_OUT.len() - 1;
+            let downsampler = if is_final {
+                None
+            } else {
+                Some(Downsampler::new(out_c, db.pp("downsamplers").pp("0"))?)
+            };
+            down_blocks.push(DownBlock {
+                resnets,
+                downsampler,
+            });
+            in_c = out_c;
+        }
+
+        let top = *BLOCK_OUT.last().unwrap(); // 512
+        let mid = vb.pp("mid_block");
+        let mid_resnet0 = Resnet::new(top, top, mid.pp("resnets").pp("0"))?;
+        let mid_attn = MidAttention::new(top, mid.pp("attentions").pp("0"))?;
+        let mid_resnet1 = Resnet::new(top, top, mid.pp("resnets").pp("1"))?;
+        let conv_norm_out = group_norm(GN_GROUPS, top, GN_EPS, vb.pp("conv_norm_out"))?;
+        let conv_out = conv3x3(top, 2 * LATENT_CHANNELS, vb.pp("conv_out"))?;
+
+        Ok(Self {
+            conv_in,
+            down_blocks,
+            mid_resnet0,
+            mid_attn,
+            mid_resnet1,
+            conv_norm_out,
+            conv_out,
+        })
+    }
+
+    /// `[B,3,H,W]` → moments `[B,64,H/8,W/8]` (pre-`quant_conv`).
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut h = self.conv_in.forward(x)?;
+        for db in &self.down_blocks {
+            h = db.forward(&h)?;
+        }
+        h = self.mid_resnet0.forward(&h)?;
+        h = self.mid_attn.forward(&h)?;
+        h = self.mid_resnet1.forward(&h)?;
+        let h = self.conv_norm_out.forward(&h)?.silu()?;
+        self.conv_out.forward(&h)
+    }
+}
+
+/// The FLUX.2 VAE: the decoder (always), plus an optional encoder + `quant_conv` and the bn-stats
+/// normalization / 2×2 (un)patchify wrappers.
 pub struct Flux2Vae {
     bn_mean: Tensor, // [1,128,1,1]
     bn_std: Tensor,  // [1,128,1,1]
@@ -175,11 +297,23 @@ pub struct Flux2Vae {
     up_blocks: Vec<UpBlock>,
     conv_norm_out: GroupNorm,
     conv_out: Conv2d,
+    encoder: Option<(Encoder, Conv2d)>, // (encoder, quant_conv 64→64)
 }
 
 impl Flux2Vae {
-    /// Build from a `vae/` VarBuilder (diffusers AutoencoderKLFlux2 keys, f32).
+    /// Build a **decode-only** VAE from a `vae/` VarBuilder (diffusers AutoencoderKLFlux2 keys, f32) —
+    /// the txt2img path (no `encoder.*` / `quant_conv` loaded).
     pub fn new(vb: VarBuilder) -> Result<Self> {
+        Self::build(vb, false)
+    }
+
+    /// Build the VAE **with the encoder** (training latents / img2img). Additionally loads `encoder.*`
+    /// and `quant_conv`, enabling [`Self::encode`] / [`Self::encode_packed`].
+    pub fn new_with_encoder(vb: VarBuilder) -> Result<Self> {
+        Self::build(vb, true)
+    }
+
+    fn build(vb: VarBuilder, with_encoder: bool) -> Result<Self> {
         // bn stats live at the top level (packed 128-ch space).
         let bn_mean = vb.get(128, "bn.running_mean")?.reshape((1, 128, 1, 1))?;
         let bn_var = vb.get(128, "bn.running_var")?;
@@ -220,6 +354,18 @@ impl Flux2Vae {
         let conv_norm_out = group_norm(GN_GROUPS, prev, GN_EPS, dec.pp("conv_norm_out"))?;
         let conv_out = conv3x3(prev, 3, dec.pp("conv_out"))?;
 
+        let encoder = if with_encoder {
+            let enc = Encoder::new(vb.pp("encoder"))?;
+            let quant_conv = conv1x1(
+                2 * LATENT_CHANNELS,
+                2 * LATENT_CHANNELS,
+                vb.pp("quant_conv"),
+            )?;
+            Some((enc, quant_conv))
+        } else {
+            None
+        };
+
         Ok(Self {
             bn_mean,
             bn_std,
@@ -231,6 +377,7 @@ impl Flux2Vae {
             up_blocks,
             conv_norm_out,
             conv_out,
+            encoder,
         })
     }
 
@@ -259,6 +406,43 @@ impl Flux2Vae {
         let h = self.conv_norm_out.forward(&h)?.silu()?;
         self.conv_out.forward(&h)
     }
+
+    /// Encode an RGB image `[B, 3, H, W]` (NCHW, ~`[-1, 1]`) into the diagonal-Gaussian posterior over
+    /// the 32-ch latent: `(mean, logvar)`, each `[B, 32, H/8, W/8]`. The standard AutoencoderKL encode
+    /// (`encoder → quant_conv → chunk`); `logvar` is clamped to `[-30, 20]` (the diffusers
+    /// `DiagonalGaussianDistribution` clamp). Requires encoder weights ([`Self::new_with_encoder`]).
+    pub fn encode_dist(&self, image: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (encoder, quant_conv) = self.encoder.as_ref().ok_or_else(|| {
+            candle_gen::candle_core::Error::Msg(
+                "Flux2Vae: encode needs encoder weights (build with new_with_encoder)".into(),
+            )
+        })?;
+        let image = image.to_dtype(DType::F32)?;
+        let moments = quant_conv.forward(&encoder.forward(&image)?)?; // [B, 64, H/8, W/8]
+        let mean = moments.narrow(1, 0, LATENT_CHANNELS)?.contiguous()?;
+        let logvar = moments
+            .narrow(1, LATENT_CHANNELS, LATENT_CHANNELS)?
+            .clamp(-30f32, 20f32)?;
+        Ok((mean, logvar))
+    }
+
+    /// Encode an image to the posterior **mean** latent `[B, 32, H/8, W/8]` — the deterministic encode
+    /// (no posterior sampling). Requires encoder weights ([`Self::new_with_encoder`]).
+    pub fn encode(&self, image: &Tensor) -> Result<Tensor> {
+        Ok(self.encode_dist(image)?.0)
+    }
+
+    /// Encode an image into the **packed, bn-normalized** transformer latent grid `[B, 128, H/16, W/16]`
+    /// — the exact inverse of [`Self::decode_packed`]'s input. Neural encode (posterior mean) → 2×2
+    /// patchify (32→128) → bn-normalize (`(x − mean)/std`). This is the Flux.2/Lens transformer latent
+    /// space; flatten to `[B, h·w, 128]` for the DiT. Requires encoder weights.
+    pub fn encode_packed(&self, image: &Tensor) -> Result<Tensor> {
+        let z = self.encode(image)?; // [B, 32, H/8, W/8]
+        let packed = patchify(&z)?; // [B, 128, H/16, W/16]
+        packed
+            .broadcast_sub(&self.bn_mean)?
+            .broadcast_div(&self.bn_std)
+    }
 }
 
 /// 2×2 unpatchify (NCHW): `[B, 128, h, w] → [B, 32, 2h, 2w]`. The 128 channel axis splits as
@@ -270,6 +454,18 @@ fn unpatchify(x: &Tensor) -> Result<Tensor> {
     x.reshape((b, c4, 2, 2, h, w))?
         .permute((0, 1, 4, 2, 5, 3))?
         .reshape((b, c4, h * 2, w * 2))
+}
+
+/// 2×2 patchify (NCHW): `[B, 32, 2h, 2w] → [B, 128, h, w]`, the exact inverse of [`unpatchify`]. Each
+/// 2×2 spatial block folds into the channel axis as `c·4 + ph·2 + pw` (c outermost) — the channel
+/// order [`unpatchify`] / [`Flux2Vae::decode_packed`] expect.
+pub fn patchify(x: &Tensor) -> Result<Tensor> {
+    let (b, c, h2, w2) = x.dims4()?;
+    let (h, w) = (h2 / 2, w2 / 2);
+    // [B,c,2h,2w] -> [B, c, h, 2, w, 2] -> [B, c, 2, 2, h, w] -> [B, c·4, h, w]
+    x.reshape((b, c, h, 2, w, 2))?
+        .permute((0, 1, 3, 5, 2, 4))?
+        .reshape((b, c * 4, h, w))
 }
 
 #[cfg(test)]
@@ -289,5 +485,19 @@ mod tests {
         // out[0, c, ph, pw] == c*4 + ph*2 + pw. Flattened over (c, ph, pw) row-major:
         // c=0: (0,0)=0,(0,1)=1,(1,0)=2,(1,1)=3 ; c=1: 4,5,6,7
         assert_eq!(v, vec![0., 1., 2., 3., 4., 5., 6., 7.]);
+    }
+
+    /// `patchify` is the exact left/right inverse of `unpatchify` (the encode/decode pack round-trip).
+    #[test]
+    fn patchify_inverts_unpatchify() {
+        // Random [1, 32, 4, 4] latent → patchify → unpatchify should recover it bit-for-bit.
+        let n = 32 * 4 * 4;
+        let data: Vec<f32> = (0..n).map(|x| (x as f32) * 0.5 - 7.0).collect();
+        let z = Tensor::from_vec(data.clone(), (1, 32, 4, 4), &Device::Cpu).unwrap();
+        let packed = patchify(&z).unwrap();
+        assert_eq!(packed.dims(), &[1, 128, 2, 2]);
+        let back = unpatchify(&packed).unwrap();
+        assert_eq!(back.dims(), &[1, 32, 4, 4]);
+        assert_eq!(back.flatten_all().unwrap().to_vec1::<f32>().unwrap(), data);
     }
 }
