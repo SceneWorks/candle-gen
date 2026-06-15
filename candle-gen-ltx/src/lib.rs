@@ -23,6 +23,7 @@
 //! connector). The Gemma-3-12B encoder + its `tokenizer.json` live in a separate snapshot, located via
 //! the `LTX_GEMMA_DIR` env var (falling back to `<root>/text_encoder`).
 
+pub mod audio_vae;
 pub mod config;
 pub mod connector;
 pub mod conv3d;
@@ -33,6 +34,7 @@ pub mod scheduler;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
+pub mod vocoder;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

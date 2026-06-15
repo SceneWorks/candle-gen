@@ -152,3 +152,208 @@ impl GemmaConfig {
         (i + 1).is_multiple_of(self.sliding_window_pattern)
     }
 }
+
+// =================================================================================================
+// Synchronized audio (sc-5495) — the LTX-2.3 audio VAE decoder + HiFi-GAN/BigVGAN vocoder + the
+// audio-stream dimensions of the dual-modal `AVTransformer3DModel`. These mirror `mlx-gen-ltx`
+// (`config.rs` / `positions.rs`), but the values are **hardcoded** to the shipped LTX-2.3 dense
+// checkpoint rather than parsed from `embedded_config.json` (the original `Lightricks/LTX-2.3` repo
+// ships no such file; the same values live in the safetensors `__metadata__["config"]` blob and are
+// fixed for this model family). Channel counts still ride on the weight shapes at load time.
+// =================================================================================================
+
+// --- Audio latent geometry (mlx-gen-ltx positions.rs `AUDIO_*`) ----------------------------------
+/// Audio VAE internal sample rate (`AUDIO_LATENT_SAMPLE_RATE`).
+pub const AUDIO_LATENT_SAMPLE_RATE: i64 = 16000;
+/// Mel hop length (`AUDIO_HOP_LENGTH`).
+pub const AUDIO_HOP_LENGTH: i64 = 160;
+/// Latent temporal downsample factor (`AUDIO_LATENT_DOWNSAMPLE_FACTOR`).
+pub const AUDIO_LATENT_DOWNSAMPLE_FACTOR: i64 = 4;
+/// Audio latent channels before patchifying (`AUDIO_LATENT_CHANNELS`).
+pub const AUDIO_LATENT_CHANNELS: i64 = 8;
+/// Audio latent mel bins (`AUDIO_MEL_BINS`) — the latent is `(1, 8, T, 16)`.
+pub const AUDIO_MEL_BINS: i64 = 16;
+/// `AUDIO_LATENT_SAMPLE_RATE / AUDIO_HOP_LENGTH / AUDIO_LATENT_DOWNSAMPLE_FACTOR` = 25.
+pub const AUDIO_LATENTS_PER_SECOND: f64 = 25.0;
+
+/// Python `round()` (round-half-to-even) — matches `compute_audio_frames`'s `round(...)`.
+fn py_round(x: f64) -> i64 {
+    let f = x.floor();
+    let diff = x - f;
+    if diff < 0.5 {
+        f as i64
+    } else if diff > 0.5 {
+        f as i64 + 1
+    } else {
+        let fi = f as i64;
+        if fi % 2 == 0 {
+            fi
+        } else {
+            fi + 1
+        }
+    }
+}
+
+/// Audio latent-frame count for a video duration — port of `compute_audio_frames`
+/// (`round(num_video_frames / fps · AUDIO_LATENTS_PER_SECOND)`). Computed in f64 (Python floats).
+pub fn compute_audio_frames(num_video_frames: usize, fps: f64) -> usize {
+    let duration = num_video_frames as f64 / fps;
+    py_round(duration * AUDIO_LATENTS_PER_SECOND).max(0) as usize
+}
+
+// --- Audio VAE decoder (`audio_vae.model.params.ddconfig`) ----------------------------------------
+/// The LTX-2.3 audio VAE decoder structure (2-D conv autoencoder, causal-on-time, PixelNorm). Fixed
+/// for the shipped checkpoint; channels are inferred from the weights at load (see `audio_vae.rs`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioVaeConfig {
+    pub ch: i32,
+    pub out_ch: i32,
+    pub ch_mult: Vec<i32>,
+    pub num_res_blocks: i32,
+    pub z_channels: i32,
+    pub mel_bins: i32,
+    /// `mid_block_add_attention` — `false` for the shipped 2.3 (no `mid.attn_1` weights).
+    pub mid_block_add_attention: bool,
+}
+
+impl AudioVaeConfig {
+    /// The shipped LTX-2.3 audio-VAE structure.
+    pub fn ltx_2_3() -> Self {
+        Self {
+            ch: 128,
+            out_ch: 2,
+            ch_mult: vec![1, 2, 4],
+            num_res_blocks: 2,
+            z_channels: 8,
+            mel_bins: 64,
+            mid_block_add_attention: false,
+        }
+    }
+
+    /// Number of resolution levels (`len(ch_mult)`); the decoder upsamples on levels `1..num`.
+    pub fn num_resolutions(&self) -> usize {
+        self.ch_mult.len()
+    }
+}
+
+// --- Vocoder (`vocoder.{vocoder,bwe}`) ------------------------------------------------------------
+/// One vocoder generator's config (HiFi-GAN / BigVGAN). Drives the `ConvTranspose1d` upsample
+/// strides + the dilated ResBlock/AMPBlock kernel sizes/dilations (channel counts ride on the
+/// weights). `is_bigvgan()` selects SnakeBeta+AMPBlock1 vs leaky-ReLU+ResBlock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VocoderGenConfig {
+    pub upsample_rates: Vec<i32>,
+    pub upsample_kernel_sizes: Vec<i32>,
+    pub resblock_kernel_sizes: Vec<i32>,
+    pub resblock_dilation_sizes: Vec<Vec<i32>>,
+    pub resblock: String,
+    pub activation: String,
+    pub use_tanh_at_final: bool,
+    pub apply_final_activation: bool,
+}
+
+impl VocoderGenConfig {
+    /// SnakeBeta + AMPBlock1 (BigVGAN) vs leaky-ReLU + ResBlock (HiFi-GAN).
+    pub fn is_bigvgan(&self) -> bool {
+        self.activation.eq_ignore_ascii_case("snakebeta")
+            || self.resblock.eq_ignore_ascii_case("AMP1")
+    }
+
+    /// The shipped LTX-2.3 **core** vocoder (BigVGAN, 6× upsample → 16 kHz).
+    pub fn ltx_2_3_core() -> Self {
+        Self {
+            upsample_rates: vec![5, 2, 2, 2, 2, 2],
+            upsample_kernel_sizes: vec![11, 4, 4, 4, 4, 4],
+            resblock_kernel_sizes: vec![3, 7, 11],
+            resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
+            resblock: "AMP1".into(),
+            activation: "snakebeta".into(),
+            use_tanh_at_final: false,
+            apply_final_activation: true,
+        }
+    }
+
+    /// The shipped LTX-2.3 **BWE** generator (BigVGAN, 5× upsample, 16 → 48 kHz; no final activation).
+    pub fn ltx_2_3_bwe() -> Self {
+        Self {
+            upsample_rates: vec![6, 5, 2, 2, 2],
+            upsample_kernel_sizes: vec![12, 11, 4, 4, 4],
+            resblock_kernel_sizes: vec![3, 7, 11],
+            resblock_dilation_sizes: vec![vec![1, 3, 5], vec![1, 3, 5], vec![1, 3, 5]],
+            resblock: "AMP1".into(),
+            activation: "snakebeta".into(),
+            use_tanh_at_final: false,
+            apply_final_activation: false,
+        }
+    }
+}
+
+/// The full vocoder config: the core generator + the bandwidth-extension (BWE) stage. The shipped
+/// 2.3 path is BigVGAN core (16 kHz) → BWE → 48 kHz.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VocoderConfig {
+    pub core: VocoderGenConfig,
+    pub bwe: Option<VocoderGenConfig>,
+    /// Core generator output sample rate (the BWE input rate).
+    pub output_sample_rate: i32,
+    pub bwe_input_sample_rate: i32,
+    pub bwe_output_sample_rate: i32,
+    pub bwe_hop_length: i32,
+    pub bwe_win_length: i32,
+}
+
+impl VocoderConfig {
+    /// The shipped LTX-2.3 vocoder (BigVGAN core + BWE, 48 kHz stereo output).
+    pub fn ltx_2_3() -> Self {
+        Self {
+            core: VocoderGenConfig::ltx_2_3_core(),
+            bwe: Some(VocoderGenConfig::ltx_2_3_bwe()),
+            output_sample_rate: 16000,
+            bwe_input_sample_rate: 16000,
+            bwe_output_sample_rate: 48000,
+            bwe_hop_length: 80,
+            bwe_win_length: 512,
+        }
+    }
+
+    /// The audio-track sample rate: the BWE output when present, else the core output.
+    pub fn final_sample_rate(&self) -> i32 {
+        if self.bwe.is_some() {
+            self.bwe_output_sample_rate
+        } else {
+            self.output_sample_rate
+        }
+    }
+}
+
+#[cfg(test)]
+mod audio_config_tests {
+    use super::*;
+
+    #[test]
+    fn compute_audio_frames_matches_reference() {
+        // round(num_frames / fps · 25). 33f@24fps: 33/24·25 = 34.375 → 34.
+        assert_eq!(compute_audio_frames(33, 24.0), 34);
+        assert_eq!(compute_audio_frames(9, 24.0), 9);
+        assert_eq!(compute_audio_frames(1, 24.0), 1);
+        // 121f@24fps: 121/24·25 = 126.04 → 126.
+        assert_eq!(compute_audio_frames(121, 24.0), 126);
+    }
+
+    #[test]
+    fn vocoder_is_bigvgan_and_48khz() {
+        let v = VocoderConfig::ltx_2_3();
+        assert!(v.core.is_bigvgan());
+        assert!(v.bwe.as_ref().unwrap().is_bigvgan());
+        assert_eq!(v.final_sample_rate(), 48000);
+        assert_eq!(v.core.upsample_rates.iter().product::<i32>(), 160);
+    }
+
+    #[test]
+    fn audio_vae_levels() {
+        let a = AudioVaeConfig::ltx_2_3();
+        assert_eq!(a.num_resolutions(), 3);
+        assert!(!a.mid_block_add_attention);
+        assert_eq!(a.z_channels, 8);
+    }
+}
