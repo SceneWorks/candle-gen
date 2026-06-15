@@ -87,6 +87,17 @@ pub struct CrossAttention {
     span_attn: tracing::Span,
     span_softmax: tracing::Span,
     use_flash_attn: bool,
+    // IP-Adapter decoupled cross-attention (sc-5491): extra bias-free K/V projections for the image /
+    // identity tokens, installed only on the cross-attn (`attn2`) modules. When present AND IP tokens
+    // are set, `o += ip_scale · sdpa(q, to_k_ip(ip), to_v_ip(ip))` before the output projection. Both
+    // `None` on a plain (training / stock) attention, so `forward` is byte-unchanged there — the
+    // vendored-vs-stock parity test still holds.
+    to_k_ip: Option<nn::Linear>,
+    to_v_ip: Option<nn::Linear>,
+    // The IP tokens + scale, constant across the denoise (computed once from the reference embedding),
+    // so set once per generation via [`set_ip`](CrossAttention::set_ip) rather than threaded per step.
+    ip_tokens: Option<Tensor>,
+    ip_scale: f64,
 }
 
 impl CrossAttention {
@@ -122,6 +133,10 @@ impl CrossAttention {
             span_attn,
             span_softmax,
             use_flash_attn,
+            to_k_ip: None,
+            to_v_ip: None,
+            ip_tokens: None,
+            ip_scale: 0.0,
         })
     }
 
@@ -222,10 +237,21 @@ impl CrossAttention {
                 Some(slice_size)
             }
         });
-        let xs = match slice_size {
+        let mut xs = match slice_size {
             None => self.attention(&query, &key, &value)?,
             Some(slice_size) => self.sliced_attention(&query, &key, &value, slice_size)?,
         };
+        // IP-Adapter decoupled branch (sc-5491): reuse the text query against the image/identity
+        // tokens' own K/V, scaled and added before the output projection. A no-op (skipped) unless the
+        // K/V are installed AND tokens are set — so the training / stock path is unchanged.
+        if let (Some(to_k_ip), Some(to_v_ip), Some(ip_tokens)) =
+            (&self.to_k_ip, &self.to_v_ip, &self.ip_tokens)
+        {
+            let key_ip = self.reshape_heads_to_batch_dim(&to_k_ip.forward(ip_tokens)?)?;
+            let value_ip = self.reshape_heads_to_batch_dim(&to_v_ip.forward(ip_tokens)?)?;
+            let ip_out = self.attention(&query, &key_ip, &value_ip)?;
+            xs = (xs + (ip_out * self.ip_scale)?)?;
+        }
         self.to_out.forward(&xs)
     }
 
@@ -240,6 +266,21 @@ impl CrossAttention {
         f(&mut self.to_v)?;
         f(&mut self.to_out)?;
         Ok(())
+    }
+
+    /// Install the IP-Adapter decoupled K/V projections (sc-5491): `k_ip`/`v_ip` are the
+    /// `ip_adapter.{n}.to_k_ip/to_v_ip` weights (`[inner, cross_attention_dim]`, bias-free).
+    pub fn install_ip(&mut self, k_ip: Tensor, v_ip: Tensor) {
+        self.to_k_ip = Some(nn::Linear::new(k_ip, None));
+        self.to_v_ip = Some(nn::Linear::new(v_ip, None));
+    }
+
+    /// Set (or clear, with `None`) the IP tokens + scale used by [`forward`](Self::forward)'s decoupled
+    /// branch. Constant across the denoise, so set once per generation; the clone is cheap (the face
+    /// tokens are `[B, 16, 2048]`).
+    pub fn set_ip(&mut self, tokens: Option<&Tensor>, scale: f64) {
+        self.ip_tokens = tokens.cloned();
+        self.ip_scale = scale;
     }
 }
 
@@ -313,6 +354,15 @@ impl BasicTransformerBlock {
         self.attn1.visit_lora_mut(f)?;
         self.attn2.visit_lora_mut(f)?;
         Ok(())
+    }
+
+    /// Visit this block's **cross-attention** (`attn2` only — never the self-attn `attn1`) for the
+    /// IP-Adapter install / token-set walk (sc-5491).
+    fn visit_cross_attn_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut CrossAttention) -> Result<()>,
+    ) -> Result<()> {
+        f(&mut self.attn2)
     }
 }
 
@@ -465,6 +515,18 @@ impl SpatialTransformer {
         }
         Ok(())
     }
+
+    /// Visit every transformer block's cross-attention for the IP-Adapter install / token-set walk
+    /// (sc-5491) — in block order, so an install consumes the K/V pairs in the diffusers attn order.
+    pub fn visit_cross_attn_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut CrossAttention) -> Result<()>,
+    ) -> Result<()> {
+        for block in self.transformer_blocks.iter_mut() {
+            block.visit_cross_attn_mut(f)?;
+        }
+        Ok(())
+    }
 }
 
 /// Configuration for an attention block.
@@ -596,5 +658,66 @@ impl Module for AttentionBlock {
             .t()?
             .reshape((batch, channel, height, width))?;
         (xs + residual)? / self.config.rescale_output_factor
+    }
+}
+
+#[cfg(test)]
+mod ip_tests {
+    use super::*;
+    use candle_core::Device;
+    use candle_nn::{VarBuilder, VarMap};
+
+    /// sc-5491: the decoupled IP-Adapter branch is a no-op until installed AND tokens are set; at
+    /// `ip_scale = 0` it is byte-identical to the plain cross-attention (so the stock/training path is
+    /// untouched); a positive scale changes the output; clearing the tokens reverts it. This pins the
+    /// `o += ip_scale·sdpa(q, k_ip, v_ip)` injection that the whole InstantID identity path rides on.
+    #[test]
+    fn cross_attention_ip_branch_is_gated_and_scaled() {
+        let dev = Device::Cpu;
+        let vb = VarBuilder::from_varmap(&VarMap::new(), DType::F32, &dev);
+        let (query_dim, ctx_dim, heads, dim_head) = (16usize, 24usize, 4usize, 4usize);
+        let inner = heads * dim_head; // 16
+        let mut xa =
+            CrossAttention::new(vb, query_dim, Some(ctx_dim), heads, dim_head, None, false)
+                .unwrap();
+
+        let xs = Tensor::randn(0f32, 1f32, (2, 5, query_dim), &dev).unwrap(); // [B, Nq, query_dim]
+        let ctx = Tensor::randn(0f32, 1f32, (2, 7, ctx_dim), &dev).unwrap(); // [B, S, cross_attention_dim]
+        let base = xa.forward(&xs, Some(&ctx)).unwrap();
+        let maxdiff = |a: &Tensor, b: &Tensor| {
+            (a - b)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max_all()
+                .unwrap()
+                .to_scalar::<f32>()
+                .unwrap()
+        };
+
+        // Install the decoupled K/V (`[inner, cross_attention_dim]`) and set tokens at scale 0.
+        let k_ip = Tensor::randn(0f32, 1f32, (inner, ctx_dim), &dev).unwrap();
+        let v_ip = Tensor::randn(0f32, 1f32, (inner, ctx_dim), &dev).unwrap();
+        xa.install_ip(k_ip, v_ip);
+        let ip_tokens = Tensor::randn(0f32, 1f32, (2, 3, ctx_dim), &dev).unwrap(); // [B, N_ip, cross_attention_dim]
+        xa.set_ip(Some(&ip_tokens), 0.0);
+        assert!(
+            maxdiff(&xa.forward(&xs, Some(&ctx)).unwrap(), &base) < 1e-6,
+            "ip_scale=0 must equal the no-IP output"
+        );
+
+        // A positive scale shifts the output.
+        xa.set_ip(Some(&ip_tokens), 0.8);
+        assert!(
+            maxdiff(&xa.forward(&xs, Some(&ctx)).unwrap(), &base) > 1e-4,
+            "ip_scale>0 must change the output"
+        );
+
+        // Clearing the tokens reverts to the plain cross-attention.
+        xa.set_ip(None, 0.0);
+        assert!(
+            maxdiff(&xa.forward(&xs, Some(&ctx)).unwrap(), &base) < 1e-6,
+            "clearing the IP tokens reverts to base"
+        );
     }
 }

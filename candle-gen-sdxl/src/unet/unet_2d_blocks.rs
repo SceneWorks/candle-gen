@@ -1,7 +1,8 @@
 //! 2D UNet Building Blocks
 //!
 use super::attention::{
-    AttentionBlock, AttentionBlockConfig, SpatialTransformer, SpatialTransformerConfig,
+    AttentionBlock, AttentionBlockConfig, CrossAttention, SpatialTransformer,
+    SpatialTransformerConfig,
 };
 use super::conv::{conv2d, Conv2d};
 use super::resnet::{ResnetBlock2D, ResnetBlock2DConfig};
@@ -473,6 +474,18 @@ impl UNetMidBlock2DCrossAttn {
         }
         Ok(())
     }
+
+    /// Visit the mid block's cross-attentions (`attn2`) for the IP-Adapter install / token-set walk
+    /// (sc-5491).
+    pub fn visit_cross_attn_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut CrossAttention) -> Result<()>,
+    ) -> Result<()> {
+        for (attn, _resnet) in self.attn_resnets.iter_mut() {
+            attn.visit_cross_attn_mut(f)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -681,6 +694,18 @@ impl CrossAttnDownBlock2D {
     ) -> candle_gen::Result<()> {
         for attn in self.attentions.iter_mut() {
             attn.visit_lora_mut(f)?;
+        }
+        Ok(())
+    }
+
+    /// Visit this down block's cross-attentions (`attn2`) for the IP-Adapter install / token-set walk
+    /// (sc-5491).
+    pub fn visit_cross_attn_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut CrossAttention) -> Result<()>,
+    ) -> Result<()> {
+        for attn in self.attentions.iter_mut() {
+            attn.visit_cross_attn_mut(f)?;
         }
         Ok(())
     }
@@ -896,6 +921,18 @@ impl CrossAttnUpBlock2D {
     ) -> candle_gen::Result<()> {
         for attn in self.attentions.iter_mut() {
             attn.visit_lora_mut(f)?;
+        }
+        Ok(())
+    }
+
+    /// Visit this up block's cross-attentions (`attn2`) for the IP-Adapter install / token-set walk
+    /// (sc-5491).
+    pub fn visit_cross_attn_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut CrossAttention) -> Result<()>,
+    ) -> Result<()> {
+        for attn in self.attentions.iter_mut() {
+            attn.visit_cross_attn_mut(f)?;
         }
         Ok(())
     }

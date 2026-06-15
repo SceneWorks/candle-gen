@@ -2,6 +2,7 @@
 //!
 //! The 2D Unet models take as input a noisy sample and the current diffusion
 //! timestep and return a denoised version of the input.
+use super::attention::CrossAttention;
 use super::conv::{conv2d, Conv2d};
 use super::embeddings::{TimestepEmbedding, Timesteps};
 use super::unet_2d_blocks::*;
@@ -98,6 +99,12 @@ pub struct UNet2DConditionModel {
     up_blocks: Vec<UNetUpBlock>,
     conv_norm_out: nn::GroupNorm,
     conv_out: Conv2d,
+    // SDXL `add_embedding` (`get_aug_embed`), loaded only for the InstantID inference path
+    // ([`with_add_embedding`](UNet2DConditionModel::with_add_embedding)); the vendored UNet's plain
+    // time embedding omits it. `None` on the training / stock build, so `forward` is unaffected (sc-5491).
+    add_time_proj: Option<Timesteps>,
+    add_embedding: Option<TimestepEmbedding>,
+    addition_time_embed_dim: usize,
     span: tracing::Span,
     config: UNet2DConditionModelConfig,
 }
@@ -293,6 +300,9 @@ impl UNet2DConditionModel {
             up_blocks,
             conv_norm_out,
             conv_out,
+            add_time_proj: None,
+            add_embedding: None,
+            addition_time_embed_dim: 0,
             span,
             config,
         })
@@ -316,8 +326,34 @@ impl UNet2DConditionModel {
         down_block_additional_residuals: Option<&[Tensor]>,
         mid_block_additional_residual: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let (bsize, _channels, height, width) = xs.dims4()?;
-        let device = xs.device();
+        // 1. time (the plain SDXL time embedding; the InstantID path folds in the `add_embedding`).
+        let bsize = xs.dim(0)?;
+        let emb = (Tensor::ones(bsize, xs.dtype(), xs.device())? * timestep)?;
+        let emb = self.time_proj.forward(&emb)?;
+        let emb = self.time_embedding.forward(&emb)?;
+        self.run_blocks(
+            xs,
+            &emb,
+            encoder_hidden_states,
+            down_block_additional_residuals,
+            mid_block_additional_residual,
+        )
+    }
+
+    /// The conv-in → down → mid → up → conv-out body, parameterized on the precomputed time embedding
+    /// `emb` (so the plain `forward` and the InstantID [`forward_instantid`](Self::forward_instantid) —
+    /// which differ only in whether the SDXL `add_embedding` is folded into `emb` — share it) + the
+    /// optional ControlNet residuals. Byte-identical to the previous inline body (the vendored-vs-stock
+    /// parity test pins it).
+    fn run_blocks(
+        &self,
+        xs: &Tensor,
+        emb: &Tensor,
+        encoder_hidden_states: &Tensor,
+        down_block_additional_residuals: Option<&[Tensor]>,
+        mid_block_additional_residual: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let (_bsize, _channels, height, width) = xs.dims4()?;
         let n_blocks = self.config.blocks.len();
         let num_upsamplers = n_blocks - 1;
         let default_overall_up_factor = 2usize.pow(num_upsamplers as u32);
@@ -329,10 +365,6 @@ impl UNet2DConditionModel {
         } else {
             xs.clone()
         };
-        // 1. time
-        let emb = (Tensor::ones(bsize, xs.dtype(), device)? * timestep)?;
-        let emb = self.time_proj.forward(&emb)?;
-        let emb = self.time_embedding.forward(&emb)?;
         // 2. pre-process
         let xs = self.conv_in.forward(&xs)?;
         // 3. down
@@ -340,9 +372,9 @@ impl UNet2DConditionModel {
         let mut xs = xs;
         for down_block in self.down_blocks.iter() {
             let (_xs, res_xs) = match down_block {
-                UNetDownBlock::Basic(b) => b.forward(&xs, Some(&emb))?,
+                UNetDownBlock::Basic(b) => b.forward(&xs, Some(emb))?,
                 UNetDownBlock::CrossAttn(b) => {
-                    b.forward(&xs, Some(&emb), Some(encoder_hidden_states))?
+                    b.forward(&xs, Some(emb), Some(encoder_hidden_states))?
                 }
             };
             down_block_res_xs.extend(res_xs);
@@ -366,7 +398,7 @@ impl UNet2DConditionModel {
         // 4. mid
         let xs = self
             .mid_block
-            .forward(&xs, Some(&emb), Some(encoder_hidden_states))?;
+            .forward(&xs, Some(emb), Some(encoder_hidden_states))?;
         let xs = match mid_block_additional_residual {
             None => xs,
             Some(m) => (m + xs)?,
@@ -385,11 +417,11 @@ impl UNet2DConditionModel {
                 upsample_size = Some((h, w))
             }
             xs = match up_block {
-                UNetUpBlock::Basic(b) => b.forward(&xs, &res_xs, Some(&emb), upsample_size)?,
+                UNetUpBlock::Basic(b) => b.forward(&xs, &res_xs, Some(emb), upsample_size)?,
                 UNetUpBlock::CrossAttn(b) => b.forward(
                     &xs,
                     &res_xs,
-                    Some(&emb),
+                    Some(emb),
                     upsample_size,
                     Some(encoder_hidden_states),
                 )?,
@@ -538,5 +570,288 @@ impl UNet2DConditionModel {
         }
 
         segs
+    }
+}
+
+/// InstantID inference surface on the vendored SDXL UNet (sc-5491, epic 5480): the SDXL
+/// `add_embedding` the plain forward omits, the decoupled IP-Adapter cross-attention install +
+/// per-generation token set, and the ControlNet-residual forward. All additive — the training / stock
+/// `forward` is untouched (the IP branch is inert until installed + set, and `add_embedding` is `None`).
+impl UNet2DConditionModel {
+    /// Load the SDXL `add_embedding` (`get_aug_embed`) for the InstantID path: the vendored UNet's
+    /// plain time embedding omits the pooled-text + `time_ids` micro-conditioning the SDXL identity
+    /// render needs. `vs` is the UNet `VarBuilder` (the `add_embedding.*` keys are in the stock SDXL
+    /// `unet/` checkpoint); `addition_time_embed_dim` is 256 and `projection_input_dim` is diffusers
+    /// `projection_class_embeddings_input_dim` (2816 = pooled 1280 + 6·256).
+    pub fn with_add_embedding(
+        mut self,
+        vs: nn::VarBuilder,
+        addition_time_embed_dim: usize,
+        projection_input_dim: usize,
+    ) -> Result<Self> {
+        let time_embed_dim = self.config.blocks[0].out_channels * 4;
+        self.add_time_proj = Some(Timesteps::new(
+            addition_time_embed_dim,
+            self.config.flip_sin_to_cos,
+            self.config.freq_shift,
+        ));
+        self.add_embedding = Some(TimestepEmbedding::new(
+            vs.pp("add_embedding"),
+            projection_input_dim,
+            time_embed_dim,
+        )?);
+        self.addition_time_embed_dim = addition_time_embed_dim;
+        Ok(self)
+    }
+
+    /// The SDXL time + `add_embedding` (`get_aug_embed`): `time_embedding(time_proj(t)) +
+    /// add_embedding(cat[pooled, add_time_proj(time_ids)])`. Errors if `add_embedding` is not loaded.
+    fn instantid_temb(
+        &self,
+        timestep: f64,
+        text_emb: &Tensor,
+        time_ids: &Tensor,
+        xs: &Tensor,
+    ) -> Result<Tensor> {
+        let (add_time_proj, add_embedding) = match (&self.add_time_proj, &self.add_embedding) {
+            (Some(p), Some(e)) => (p, e),
+            _ => {
+                return Err(candle_core::Error::Msg(
+                    "instantid: UNet add_embedding not loaded (call with_add_embedding)".into(),
+                ))
+            }
+        };
+        let bsize = xs.dim(0)?;
+        let emb = (Tensor::ones(bsize, xs.dtype(), xs.device())? * timestep)?;
+        let emb = self
+            .time_embedding
+            .forward(&self.time_proj.forward(&emb)?)?;
+        let (b, l) = time_ids.dims2()?;
+        let time_embeds = add_time_proj
+            .forward(&time_ids.flatten_all()?)?
+            .reshape((b, l * self.addition_time_embed_dim))?;
+        let add_embeds = Tensor::cat(&[text_emb, &time_embeds], 1)?;
+        let aug = add_embedding.forward(&add_embeds)?;
+        emb + aug
+    }
+
+    /// InstantID inference forward: the SDXL UNet with the `add_embedding` micro-conditioning
+    /// (`text_emb` pooled + `time_ids`), the decoupled IP-Adapter cross-attention (active once
+    /// [`set_ip_context`](Self::set_ip_context) has set the face tokens), and the optional IdentityNet /
+    /// OpenPose ControlNet residuals. Reuses the shared [`run_blocks`](Self::run_blocks).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_instantid(
+        &self,
+        xs: &Tensor,
+        timestep: f64,
+        encoder_hidden_states: &Tensor,
+        text_emb: &Tensor,
+        time_ids: &Tensor,
+        down_block_additional_residuals: Option<&[Tensor]>,
+        mid_block_additional_residual: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let emb = self.instantid_temb(timestep, text_emb, time_ids, xs)?;
+        self.run_blocks(
+            xs,
+            &emb,
+            encoder_hidden_states,
+            down_block_additional_residuals,
+            mid_block_additional_residual,
+        )
+    }
+
+    /// Install the IP-Adapter decoupled K/V `pairs` into the cross-attentions in the diffusers attn
+    /// order (down → mid → up) — 70 pairs for SDXL. Errors on a count mismatch (too few or too many)
+    /// rather than silently leaving cross-attentions un-/over-installed.
+    pub fn install_ip_adapter(&mut self, pairs: Vec<(Tensor, Tensor)>) -> Result<()> {
+        let mut pairs = pairs.into_iter();
+        self.visit_cross_attn_mut(&mut |xa| match pairs.next() {
+            Some((k, v)) => {
+                xa.install_ip(k, v);
+                Ok(())
+            }
+            None => Err(candle_core::Error::Msg(
+                "ip_adapter: fewer K/V pairs than UNet cross-attentions".into(),
+            )),
+        })?;
+        if pairs.next().is_some() {
+            return Err(candle_core::Error::Msg(
+                "ip_adapter: more K/V pairs than UNet cross-attentions".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Set (or clear, with `None`) the IP tokens + scale on every cross-attention. Constant across the
+    /// denoise, so call once per generation before the loop; `forward_instantid` then runs the decoupled
+    /// branch. `None` reverts to plain SDXL.
+    pub fn set_ip_context(&mut self, tokens: Option<&Tensor>, scale: f64) -> Result<()> {
+        self.visit_cross_attn_mut(&mut |xa| {
+            xa.set_ip(tokens, scale);
+            Ok(())
+        })
+    }
+
+    /// Walk every cross-attention (`attn2`) in diffusers attn order — down blocks, then mid, then up —
+    /// applying `f`. Drives [`install_ip_adapter`](Self::install_ip_adapter) (ordered pair consume) and
+    /// [`set_ip_context`](Self::set_ip_context) (same tokens everywhere).
+    fn visit_cross_attn_mut(
+        &mut self,
+        f: &mut dyn FnMut(&mut CrossAttention) -> Result<()>,
+    ) -> Result<()> {
+        for db in self.down_blocks.iter_mut() {
+            if let UNetDownBlock::CrossAttn(b) = db {
+                b.visit_cross_attn_mut(f)?;
+            }
+        }
+        self.mid_block.visit_cross_attn_mut(f)?;
+        for ub in self.up_blocks.iter_mut() {
+            if let UNetUpBlock::CrossAttn(b) = ub {
+                b.visit_cross_attn_mut(f)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod instantid_tests {
+    use super::*;
+    use candle_core::{DType, Device};
+    use candle_nn::{VarBuilder, VarMap};
+
+    /// A tiny SDXL-shaped config: one basic + one cross-attn down block, cross-attn mid, mirrored up.
+    /// Cross-attns: down1 (1) + mid (1) + up0 (2) = 4 — so the IP install consumes 4 pairs.
+    fn tiny_cfg() -> UNet2DConditionModelConfig {
+        UNet2DConditionModelConfig {
+            center_input_sample: false,
+            flip_sin_to_cos: true,
+            freq_shift: 0.,
+            blocks: vec![
+                BlockConfig {
+                    out_channels: 32,
+                    use_cross_attn: None,
+                    attention_head_dim: 8,
+                },
+                BlockConfig {
+                    out_channels: 64,
+                    use_cross_attn: Some(1),
+                    attention_head_dim: 8,
+                },
+            ],
+            layers_per_block: 1,
+            downsample_padding: 1,
+            mid_block_scale_factor: 1.,
+            norm_num_groups: 32,
+            norm_eps: 1e-5,
+            cross_attention_dim: 16,
+            sliced_attention_size: None,
+            use_linear_projection: false,
+        }
+    }
+
+    fn maxdiff(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    #[test]
+    fn forward_instantid_folds_add_embedding_and_threads_ip() {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let cfg = tiny_cfg();
+
+        // Without `with_add_embedding`, the InstantID forward errors loudly (no silent plain-time path).
+        let bare = UNet2DConditionModel::new(vb.clone(), 4, 4, false, cfg.clone()).unwrap();
+        let (b, dev_ref) = (2usize, &dev);
+        let x = Tensor::randn(0f32, 1f32, (b, 4, 16, 16), dev_ref).unwrap();
+        let ehs = Tensor::randn(0f32, 1f32, (b, 5, 16), dev_ref).unwrap();
+        let pooled = Tensor::randn(0f32, 1f32, (b, 16), dev_ref).unwrap();
+        let time_ids = Tensor::randn(0f32, 1f32, (b, 2), dev_ref).unwrap();
+        assert!(bare
+            .forward_instantid(&x, 500.0, &ehs, &pooled, &time_ids, None, None)
+            .is_err());
+
+        // pooled(16) + time_ids_len(2)·addition_time_embed_dim(8) = 32.
+        let mut unet = UNet2DConditionModel::new(vb.clone(), 4, 4, false, cfg)
+            .unwrap()
+            .with_add_embedding(vb, 8, 32)
+            .unwrap();
+
+        // The InstantID forward folds in the (random, nonzero) add_embedding, so it differs from the
+        // plain time-only `forward`; its shape matches the latents.
+        let base = unet
+            .forward_instantid(&x, 500.0, &ehs, &pooled, &time_ids, None, None)
+            .unwrap();
+        assert_eq!(base.dims(), &[b, 4, 16, 16]);
+        let plain = unet.forward(&x, 500.0, &ehs).unwrap();
+        assert!(
+            maxdiff(&base, &plain) > 1e-4,
+            "add_embedding must change the time embedding vs the plain forward"
+        );
+
+        // Install one K/V pair per cross-attn (inner 64, cross_attention_dim 16) + set tokens.
+        let pair = || {
+            (
+                Tensor::randn(0f32, 1f32, (64, 16), &dev).unwrap(),
+                Tensor::randn(0f32, 1f32, (64, 16), &dev).unwrap(),
+            )
+        };
+        unet.install_ip_adapter(vec![pair(), pair(), pair(), pair()])
+            .unwrap();
+        let ip_tokens = Tensor::randn(0f32, 1f32, (b, 3, 16), &dev).unwrap();
+        unet.set_ip_context(Some(&ip_tokens), 0.8).unwrap();
+        let with_ip = unet
+            .forward_instantid(&x, 500.0, &ehs, &pooled, &time_ids, None, None)
+            .unwrap();
+        assert!(
+            maxdiff(&with_ip, &base) > 1e-4,
+            "the decoupled IP branch must change the output once installed + set"
+        );
+
+        // Clearing the tokens reverts to the no-IP InstantID output.
+        unet.set_ip_context(None, 0.0).unwrap();
+        let cleared = unet
+            .forward_instantid(&x, 500.0, &ehs, &pooled, &time_ids, None, None)
+            .unwrap();
+        assert!(
+            maxdiff(&cleared, &base) < 1e-6,
+            "clearing the IP tokens reverts to the no-IP output"
+        );
+    }
+
+    /// An install with the wrong number of K/V pairs (too few / too many) errors rather than leaving
+    /// cross-attentions un-/over-installed.
+    #[test]
+    fn install_ip_adapter_rejects_pair_count_mismatch() {
+        let dev = Device::Cpu;
+        let vb = VarBuilder::from_varmap(&VarMap::new(), DType::F32, &dev);
+        let pair = || {
+            (
+                Tensor::randn(0f32, 1f32, (64, 16), &dev).unwrap(),
+                Tensor::randn(0f32, 1f32, (64, 16), &dev).unwrap(),
+            )
+        };
+        let mut unet = UNet2DConditionModel::new(vb, 4, 4, false, tiny_cfg()).unwrap();
+        assert!(unet.install_ip_adapter(vec![pair(), pair()]).is_err()); // too few (needs 4)
+        let mut unet2 = UNet2DConditionModel::new(
+            VarBuilder::from_varmap(&VarMap::new(), DType::F32, &dev),
+            4,
+            4,
+            false,
+            tiny_cfg(),
+        )
+        .unwrap();
+        assert!(unet2
+            .install_ip_adapter(vec![pair(), pair(), pair(), pair(), pair()])
+            .is_err()); // too many
     }
 }
