@@ -76,6 +76,40 @@ impl TransformerConfig {
     }
 }
 
+/// The dual-modal `AVTransformer3DModel` dims (sc-5495): the video stack ([`TransformerConfig`]) plus
+/// the audio stack + the cross-modal RoPE geometry. The audio stack mirrors the video block at the
+/// audio inner dim (heads 32 × head_dim 64 = 2048); the cross-modal attns + their 1-D time RoPE run
+/// at `cross_inner` (2048). Fixed for the shipped LTX-2.3 checkpoint.
+#[derive(Clone, Debug)]
+pub struct AvConfig {
+    pub video: TransformerConfig,
+    pub audio_heads: usize,
+    pub audio_head_dim: usize,
+    /// 1-D audio-self RoPE max position (`audio_positional_embedding_max_pos = [20]`).
+    pub audio_max_pos: i32,
+    /// Cross-modal RoPE inner dim (`audio_cross_attention_dim`, 2048).
+    pub cross_inner: usize,
+    /// Cross-modal (time-axis) RoPE max position (`cross_pe_max_pos`, 20).
+    pub cross_max_pos: i32,
+}
+
+impl AvConfig {
+    pub fn ltx_2_3() -> Self {
+        Self {
+            video: TransformerConfig::ltx_2_3(),
+            audio_heads: 32,
+            audio_head_dim: 64,
+            audio_max_pos: 20,
+            cross_inner: 2048,
+            cross_max_pos: 20,
+        }
+    }
+    /// Audio inner dim `heads × head_dim` = 2048.
+    pub fn audio_inner(&self) -> usize {
+        self.audio_heads * self.audio_head_dim
+    }
+}
+
 /// The 8-layer learnable-register text connector (video stream).
 #[derive(Clone, Debug)]
 pub struct ConnectorConfig {

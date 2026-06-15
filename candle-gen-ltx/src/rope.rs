@@ -194,6 +194,108 @@ pub fn precompute_connector_freqs(
     ))
 }
 
+/// N-dim SPLIT RoPE — the generalization of [`precompute_split_freqs`] over an arbitrary number of
+/// position axes (1 for audio/cross-modal, 3 for video). `positions` is `[1, D, T, 2]`; `max_pos`
+/// carries one maximum per axis (`len == D`). Each token's per-axis scaled position is
+/// `mid/max_pos·2−1`; the padded `dim/2` frequency slots are filled C-major over `(freq_index, axis)`.
+pub fn precompute_split_freqs_nd(
+    positions: &Tensor,
+    dim: usize,
+    theta: f64,
+    max_pos: &[i32],
+    num_heads: usize,
+    device: &Device,
+) -> Result<(Tensor, Tensor)> {
+    let (_b, n_pos_dims, seq, _two) = positions.dims4()?;
+    assert_eq!(
+        n_pos_dims,
+        max_pos.len(),
+        "split-rope: positions axes must match max_pos length"
+    );
+    let pos = positions.flatten_all()?.to_vec1::<f32>()?;
+    let idx = |d: usize, t: usize, e: usize| (d * seq + t) * 2 + e;
+
+    let n_elem = 2 * n_pos_dims;
+    let num_indices = (dim / n_elem).max(1);
+    let step = if num_indices == 1 {
+        0.0
+    } else {
+        1.0 / (num_indices - 1) as f64
+    };
+    let indices: Vec<f64> = (0..num_indices)
+        .map(|i| theta.powf(i as f64 * step) * (PI / 2.0))
+        .collect();
+
+    let current = num_indices * n_pos_dims;
+    let expected = dim / 2;
+    let pad_size = expected.saturating_sub(current);
+    let head_half = expected / num_heads;
+
+    let total = num_heads * seq * head_half;
+    let mut cos_out = vec![0f32; total];
+    let mut sin_out = vec![0f32; total];
+    for t in 0..seq {
+        let mut scaled = vec![0f64; n_pos_dims];
+        for (d, s) in scaled.iter_mut().enumerate() {
+            let start = pos[idx(d, t, 0)] as f64;
+            let end = pos[idx(d, t, 1)] as f64;
+            let mid = (start + end) / 2.0;
+            *s = mid / max_pos[d] as f64 * 2.0 - 1.0;
+        }
+        for h in 0..num_heads {
+            for p in 0..head_half {
+                let flat = h * head_half + p;
+                let (c, s) = if flat < pad_size {
+                    (1.0f32, 0.0f32)
+                } else {
+                    let k = flat - pad_size;
+                    let i = k / n_pos_dims;
+                    let d = k % n_pos_dims;
+                    let ang = scaled[d] * indices[i];
+                    (ang.cos() as f32, ang.sin() as f32)
+                };
+                let o = (h * seq + t) * head_half + p;
+                cos_out[o] = c;
+                sin_out[o] = s;
+            }
+        }
+    }
+    let shape = (1, num_heads, seq, head_half);
+    Ok((
+        Tensor::from_vec(cos_out, shape, device)?,
+        Tensor::from_vec(sin_out, shape, device)?,
+    ))
+}
+
+/// Extract the time (frame) axis of a position grid `[1, D, T, 2]` → `[1, 1, T, 2]` (`time_axis`).
+pub fn time_axis(grid: &Tensor) -> Result<Tensor> {
+    let (_b, _d, t, _two) = grid.dims4()?;
+    grid.narrow(1, 0, 1)?.reshape((1, 1, t, 2))
+}
+
+/// The audio RoPE position grid `[1, 1, T, 2]` (`[start, end]` timestamps in seconds). For latent
+/// frame `t`: `mel = max(t·4 + 1 − 4, 0)` (start) / `(t+1)·4 + 1 − 4` (end); `time = mel · hop /
+/// sample_rate` — the causal-aligned mel→second map (`create_audio_position_grid`). Always f32.
+pub fn create_audio_position_grid(audio_frames: usize, device: &Device) -> Result<Tensor> {
+    use crate::config::{
+        AUDIO_HOP_LENGTH, AUDIO_LATENT_DOWNSAMPLE_FACTOR, AUDIO_LATENT_SAMPLE_RATE,
+    };
+    let df = AUDIO_LATENT_DOWNSAMPLE_FACTOR as f32;
+    let hop = AUDIO_HOP_LENGTH as f32;
+    let sr = AUDIO_LATENT_SAMPLE_RATE as f32;
+    let time = |latent: i64| -> f32 {
+        let mel = ((latent as f32) * df + 1.0 - df).max(0.0);
+        (mel * hop) / sr
+    };
+    let t = audio_frames;
+    let mut data = vec![0f32; t * 2];
+    for f in 0..t {
+        data[f * 2] = time(f as i64);
+        data[f * 2 + 1] = time(f as i64 + 1);
+    }
+    Tensor::from_vec(data, (1, 1, t, 2), device)
+}
+
 /// Convenience: build the DiT video position grid + split-RoPE tables for a latent token grid.
 pub fn video_rope(
     cfg: &TransformerConfig,

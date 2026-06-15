@@ -14,8 +14,8 @@ use candle_gen::candle_nn::{
     ops::rms_norm, ops::sigmoid, ops::softmax_last_dim, Linear, Module, VarBuilder,
 };
 
-use crate::config::TransformerConfig;
-use crate::rope::apply_split_rope;
+use crate::config::{AvConfig, TransformerConfig};
+use crate::rope::{apply_split_rope, precompute_split_freqs_nd, time_axis};
 
 fn linear(vb: &VarBuilder, key: &str) -> Result<Linear> {
     let w = vb
@@ -92,6 +92,12 @@ struct Attention {
 
 impl Attention {
     fn load(vb: VarBuilder, cfg: &TransformerConfig) -> Result<Self> {
+        Self::load_with_dims(vb, cfg.num_heads, cfg.head_dim, cfg.norm_eps)
+    }
+
+    /// Load with explicit head dims — the cross-modal + audio attns run at the audio inner dim
+    /// (heads 32 × head_dim 64 = 2048), and the q/kv input dims ride on the loaded weight shapes.
+    fn load_with_dims(vb: VarBuilder, heads: usize, dim_head: usize, eps: f64) -> Result<Self> {
         Ok(Self {
             to_q: linear(&vb, "to_q")?,
             to_k: linear(&vb, "to_k")?,
@@ -100,9 +106,9 @@ impl Attention {
             q_norm: vb.get_unchecked("q_norm.weight")?.to_dtype(DType::BF16)?,
             k_norm: vb.get_unchecked("k_norm.weight")?.to_dtype(DType::BF16)?,
             gate: linear(&vb, "to_gate_logits")?,
-            heads: cfg.num_heads,
-            dim_head: cfg.head_dim,
-            eps: cfg.norm_eps,
+            heads,
+            dim_head,
+            eps,
         })
     }
 
@@ -112,12 +118,15 @@ impl Attention {
             .transpose(1, 2)
     }
 
-    /// Self-attn when `context` is `None` (RoPE applied); cross-attn otherwise (no RoPE).
+    /// `rope` rotates the query (and the key when `k_rope` is `None`); `k_rope` rotates the key
+    /// separately (cross-modal: video-positioned q, audio-positioned k, or vice-versa). `rope ==
+    /// None` ⇒ no RoPE on either (text cross-attention). Self-attn when `context` is `None`.
     fn forward(
         &self,
         x: &Tensor,
         context: Option<&Tensor>,
         rope: Option<(&Tensor, &Tensor)>,
+        k_rope: Option<(&Tensor, &Tensor)>,
     ) -> Result<Tensor> {
         let ctx = context.unwrap_or(x);
         // q/k RMSNorm over the full inner dim (pre-head), then head reshape.
@@ -137,7 +146,8 @@ impl Attention {
         let vh = self.to_heads(&v)?;
         if let Some((cos, sin)) = rope {
             qh = apply_split_rope(&qh, cos, sin)?;
-            kh = apply_split_rope(&kh, cos, sin)?;
+            let (kc, ks) = k_rope.unwrap_or((cos, sin));
+            kh = apply_split_rope(&kh, kc, ks)?;
         }
         // Attention in f32.
         let scale = 1.0 / (self.dim_head as f64).sqrt();
@@ -244,7 +254,7 @@ impl VideoBlock {
         // MSA (rows 0:3 = shift, scale, gate).
         let msa = ada_values(&self.scale_shift_table, ts_emb, 0, 3)?;
         let norm = modulate(&rms_noweight(x, self.eps)?, &msa[1], &msa[0])?;
-        let attn = self.attn1.forward(&norm, None, Some((cos, sin)))?;
+        let attn = self.attn1.forward(&norm, None, Some((cos, sin)), None)?;
         let mut x = gated(x, &attn, &msa[2])?;
 
         // prompt-adaLN on the text context (rows 0,1 = shift, scale).
@@ -254,7 +264,7 @@ impl VideoBlock {
         // Text cross-attention (rows 6:9).
         let ca = ada_values(&self.scale_shift_table, ts_emb, 6, 9)?;
         let norm_ca = modulate(&rms_noweight(&x, self.eps)?, &ca[1], &ca[0])?;
-        let cross = self.attn2.forward(&norm_ca, Some(&v_context), None)?;
+        let cross = self.attn2.forward(&norm_ca, Some(&v_context), None, None)?;
         x = gated(&x, &cross, &ca[2])?;
 
         // FeedForward (rows 3:6).
@@ -361,5 +371,433 @@ impl LtxDiT {
         let normed = layer_norm_noaffine(h, self.cfg.norm_eps)?;
         let out = modulate(&normed, &scale, &shift)?;
         self.proj_out.forward(&out)
+    }
+}
+
+// =================================================================================================
+// AvDiT — the dual-modal AudioVideo DiT (sc-5495). The video stack ([`AvStream`] + `VideoBlock`-shaped
+// attns) + an audio stack at the audio inner dim (2048) + bidirectional cross-modal attention. Per
+// block: video self+text-CA → audio self+text-CA → cross-modal (a2v updates video, v2a updates audio)
+// → video FF → audio FF. Predicts `(video_velocity, audio_velocity)`. Mirrors mlx-gen-ltx `AvDiT`.
+// =================================================================================================
+
+/// Precomputed per-stream adaLN timestep tensors (`Stream::prepare`).
+struct AvTs {
+    ts_emb: Tensor,        // (b,1,9·inner)
+    emb_ts: Tensor,        // (b,1,inner)
+    prompt_ts: Tensor,     // (b,1,2·inner)
+    cross_ss_ts: Tensor,   // (b,1,4·inner)
+    cross_gate_ts: Tensor, // (b,1,inner)
+}
+
+/// One modality's non-block modules + dims (the video or audio half of the AV DiT).
+struct AvStream {
+    patchify: Linear,
+    adaln: AdaLayerNormSingle,
+    prompt_adaln: AdaLayerNormSingle,
+    cross_ss_adaln: AdaLayerNormSingle,
+    cross_gate_adaln: AdaLayerNormSingle,
+    scale_shift_table: Tensor, // (2, inner) bf16
+    proj_out: Linear,
+    inner: usize,
+    coeff: usize, // adaLN row count (9 gated)
+    eps: f64,
+}
+
+impl AvStream {
+    #[allow(clippy::too_many_arguments)]
+    fn load(
+        vb: &VarBuilder,
+        patchify: &str,
+        adaln: &str,
+        prompt: &str,
+        cross_ss: &str,
+        cross_gate: &str,
+        sst: &str,
+        proj_out: &str,
+        inner: usize,
+        eps: f64,
+    ) -> Result<Self> {
+        Ok(Self {
+            patchify: linear(vb, patchify)?,
+            adaln: AdaLayerNormSingle::load(vb.pp(adaln))?,
+            prompt_adaln: AdaLayerNormSingle::load(vb.pp(prompt))?,
+            cross_ss_adaln: AdaLayerNormSingle::load(vb.pp(cross_ss))?,
+            cross_gate_adaln: AdaLayerNormSingle::load(vb.pp(cross_gate))?,
+            scale_shift_table: vb.get_unchecked(sst)?.to_dtype(DType::BF16)?,
+            proj_out: linear(vb, proj_out)?,
+            inner,
+            coeff: 9,
+            eps,
+        })
+    }
+
+    /// adaLN-single + prompt/cross controllers for a uniform T2V timestep `sigma`.
+    fn ts_embeds(&self, sigma: f64, ts_mult: f64, b: usize, device: &Device) -> Result<AvTs> {
+        let inner = self.inner;
+        let ts_scaled = (sigma * ts_mult) as f32;
+        let ts_flat = Tensor::from_vec(vec![ts_scaled; b], (b,), device)?;
+        let (ss, emb) = self.adaln.forward(&ts_flat, device)?;
+        let (pss, _) = self.prompt_adaln.forward(&ts_flat, device)?;
+        let (css, _) = self.cross_ss_adaln.forward(&ts_flat, device)?;
+        let (cgs, _) = self.cross_gate_adaln.forward(&ts_flat, device)?;
+        Ok(AvTs {
+            ts_emb: ss.reshape((b, 1, self.coeff * inner))?,
+            emb_ts: emb.reshape((b, 1, inner))?,
+            prompt_ts: pss.reshape((b, 1, 2 * inner))?,
+            cross_ss_ts: css.reshape((b, 1, 4 * inner))?,
+            cross_gate_ts: cgs.reshape((b, 1, inner))?,
+        })
+    }
+
+    fn output_head(&self, h: &Tensor, emb_ts: &Tensor) -> Result<Tensor> {
+        let b = h.dim(0)?;
+        let table = self.scale_shift_table.reshape((1, 1, 2, self.inner))?;
+        let ss = table.broadcast_add(&emb_ts.reshape((b, 1, 1, self.inner))?)?;
+        let shift = ss.narrow(2, 0, 1)?.squeeze(2)?;
+        let scale = ss.narrow(2, 1, 1)?.squeeze(2)?;
+        let normed = layer_norm_noaffine(h, self.eps)?;
+        self.proj_out.forward(&modulate(&normed, &scale, &shift)?)
+    }
+}
+
+/// Borrowed per-stream args threaded into an [`AvBlock`].
+struct AvStreamArgs<'a> {
+    ts_emb: &'a Tensor,
+    prompt_ts: &'a Tensor,
+    context: &'a Tensor,
+    cos: &'a Tensor,
+    sin: &'a Tensor,
+    cross_cos: &'a Tensor,
+    cross_sin: &'a Tensor,
+    cross_ss_ts: &'a Tensor,
+    cross_gate_ts: &'a Tensor,
+}
+
+/// `4·scale-shift + 1·gate` cross-modal adaLN values from the pre-split tables → `(scale_a2v,
+/// shift_a2v, scale_v2a, shift_v2a, gate)`.
+fn av_ca_ada(
+    ss_table: &Tensor,
+    gate_table: &Tensor,
+    ss_ts: &Tensor,
+    gate_ts: &Tensor,
+) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    let ss = ada_values(ss_table, ss_ts, 0, 4)?;
+    let g = ada_values(gate_table, gate_ts, 0, 1)?;
+    Ok((
+        ss[0].clone(),
+        ss[1].clone(),
+        ss[2].clone(),
+        ss[3].clone(),
+        g[0].clone(),
+    ))
+}
+
+/// One AudioVideo transformer block (`BasicAVTransformerBlock`).
+struct AvBlock {
+    attn1: Attention,
+    attn2: Attention,
+    ff: FeedForward,
+    v_sst: Tensor, // (9, 4096)
+    v_pst: Tensor, // (2, 4096)
+    a_attn1: Attention,
+    a_attn2: Attention,
+    a_ff: FeedForward,
+    a_sst: Tensor, // (9, 2048)
+    a_pst: Tensor, // (2, 2048)
+    a2v: Attention,
+    v2a: Attention,
+    ca_audio_ss: Tensor,   // (4, 2048)
+    ca_audio_gate: Tensor, // (1, 2048)
+    ca_video_ss: Tensor,   // (4, 4096)
+    ca_video_gate: Tensor, // (1, 4096)
+    eps: f64,
+}
+
+impl AvBlock {
+    fn load(vb: VarBuilder, cfg: &AvConfig) -> Result<Self> {
+        let eps = cfg.video.norm_eps;
+        let (vh, vdh) = (cfg.video.num_heads, cfg.video.head_dim);
+        let (ah, adh) = (cfg.audio_heads, cfg.audio_head_dim);
+        let bf = |k: &str| -> Result<Tensor> { vb.get_unchecked(k)?.to_dtype(DType::BF16) };
+        // Split a (5, dim) cross table → 4-row scale-shift + 1-row gate.
+        let split = |key: &str| -> Result<(Tensor, Tensor)> {
+            let t = bf(key)?;
+            Ok((t.narrow(0, 0, 4)?, t.narrow(0, 4, 1)?))
+        };
+        let (ca_audio_ss, ca_audio_gate) = split("scale_shift_table_a2v_ca_audio")?;
+        let (ca_video_ss, ca_video_gate) = split("scale_shift_table_a2v_ca_video")?;
+        Ok(Self {
+            attn1: Attention::load_with_dims(vb.pp("attn1"), vh, vdh, eps)?,
+            attn2: Attention::load_with_dims(vb.pp("attn2"), vh, vdh, eps)?,
+            ff: FeedForward::load(vb.pp("ff"))?,
+            v_sst: bf("scale_shift_table")?,
+            v_pst: bf("prompt_scale_shift_table")?,
+            a_attn1: Attention::load_with_dims(vb.pp("audio_attn1"), ah, adh, eps)?,
+            a_attn2: Attention::load_with_dims(vb.pp("audio_attn2"), ah, adh, eps)?,
+            a_ff: FeedForward::load(vb.pp("audio_ff"))?,
+            a_sst: bf("audio_scale_shift_table")?,
+            a_pst: bf("audio_prompt_scale_shift_table")?,
+            a2v: Attention::load_with_dims(vb.pp("audio_to_video_attn"), ah, adh, eps)?,
+            v2a: Attention::load_with_dims(vb.pp("video_to_audio_attn"), ah, adh, eps)?,
+            ca_audio_ss,
+            ca_audio_gate,
+            ca_video_ss,
+            ca_video_gate,
+            eps,
+        })
+    }
+
+    /// Self-attn (RoPE) → prompt-modulated text cross-attention (no RoPE), for one modality.
+    fn self_and_text(
+        &self,
+        x: &Tensor,
+        attn1: &Attention,
+        attn2: &Attention,
+        sst: &Tensor,
+        pst: &Tensor,
+        a: &AvStreamArgs,
+    ) -> Result<Tensor> {
+        let msa = ada_values(sst, a.ts_emb, 0, 3)?;
+        let norm = modulate(&rms_noweight(x, self.eps)?, &msa[1], &msa[0])?;
+        let attn = attn1.forward(&norm, None, Some((a.cos, a.sin)), None)?;
+        let x = gated(x, &attn, &msa[2])?;
+
+        let p = ada_values(pst, a.prompt_ts, 0, 2)?;
+        let context = modulate(a.context, &p[1], &p[0])?;
+
+        let ca = ada_values(sst, a.ts_emb, 6, 9)?;
+        let norm_ca = modulate(&rms_noweight(&x, self.eps)?, &ca[1], &ca[0])?;
+        let cross = attn2.forward(&norm_ca, Some(&context), None, None)?;
+        gated(&x, &cross, &ca[2])
+    }
+
+    fn feed_forward(
+        &self,
+        x: &Tensor,
+        ff: &FeedForward,
+        sst: &Tensor,
+        ts_emb: &Tensor,
+    ) -> Result<Tensor> {
+        let mlp = ada_values(sst, ts_emb, 3, 6)?;
+        let norm = modulate(&rms_noweight(x, self.eps)?, &mlp[1], &mlp[0])?;
+        let ff_out = ff.forward(&norm)?;
+        gated(x, &ff_out, &mlp[2])
+    }
+
+    /// Joint forward `(vx, ax)` → `(vx, ax)`.
+    fn forward(
+        &self,
+        vx: &Tensor,
+        ax: &Tensor,
+        v: &AvStreamArgs,
+        a: &AvStreamArgs,
+    ) -> Result<(Tensor, Tensor)> {
+        let mut vx =
+            self.self_and_text(vx, &self.attn1, &self.attn2, &self.v_sst, &self.v_pst, v)?;
+        let mut ax = self.self_and_text(
+            ax,
+            &self.a_attn1,
+            &self.a_attn2,
+            &self.a_sst,
+            &self.a_pst,
+            a,
+        )?;
+
+        // Cross-modal — both directions read the pre-update rms_norm snapshots.
+        let vx_n3 = rms_noweight(&vx, self.eps)?;
+        let ax_n3 = rms_noweight(&ax, self.eps)?;
+        let (sca_a2v, sha_a2v, sca_v2a, sha_v2a, gate_v2a) = av_ca_ada(
+            &self.ca_audio_ss,
+            &self.ca_audio_gate,
+            a.cross_ss_ts,
+            a.cross_gate_ts,
+        )?;
+        let (scv_a2v, shv_a2v, scv_v2a, shv_v2a, gate_a2v) = av_ca_ada(
+            &self.ca_video_ss,
+            &self.ca_video_gate,
+            v.cross_ss_ts,
+            v.cross_gate_ts,
+        )?;
+
+        // Audio-to-Video: Q from video (video cross-PE), K/V from audio (audio cross-PE).
+        let a2v = self.a2v.forward(
+            &modulate(&vx_n3, &scv_a2v, &shv_a2v)?,
+            Some(&modulate(&ax_n3, &sca_a2v, &sha_a2v)?),
+            Some((v.cross_cos, v.cross_sin)),
+            Some((a.cross_cos, a.cross_sin)),
+        )?;
+        vx = gated(&vx, &a2v, &gate_a2v)?;
+
+        // Video-to-Audio: Q from audio (audio cross-PE), K/V from video (video cross-PE).
+        let v2a = self.v2a.forward(
+            &modulate(&ax_n3, &sca_v2a, &sha_v2a)?,
+            Some(&modulate(&vx_n3, &scv_v2a, &shv_v2a)?),
+            Some((a.cross_cos, a.cross_sin)),
+            Some((v.cross_cos, v.cross_sin)),
+        )?;
+        ax = gated(&ax, &v2a, &gate_v2a)?;
+
+        vx = self.feed_forward(&vx, &self.ff, &self.v_sst, v.ts_emb)?;
+        ax = self.feed_forward(&ax, &self.a_ff, &self.a_sst, a.ts_emb)?;
+        Ok((vx, ax))
+    }
+}
+
+/// The LTX-2.3 **AudioVideo** DiT. Predicts `(video_velocity, audio_velocity)` from the two latent
+/// token streams + shared text conditioning.
+pub struct AvDiT {
+    video: AvStream,
+    audio: AvStream,
+    blocks: Vec<AvBlock>,
+    cfg: AvConfig,
+    device: Device,
+}
+
+impl AvDiT {
+    /// Build from a VarBuilder rooted at `model.diffusion_model.`.
+    pub fn new(vb: VarBuilder, cfg: &AvConfig) -> Result<Self> {
+        let device = vb.device().clone();
+        let video = AvStream::load(
+            &vb,
+            "patchify_proj",
+            "adaln_single",
+            "prompt_adaln_single",
+            "av_ca_video_scale_shift_adaln_single",
+            "av_ca_a2v_gate_adaln_single",
+            "scale_shift_table",
+            "proj_out",
+            cfg.video.inner_dim(),
+            cfg.video.norm_eps,
+        )?;
+        let audio = AvStream::load(
+            &vb,
+            "audio_patchify_proj",
+            "audio_adaln_single",
+            "audio_prompt_adaln_single",
+            "av_ca_audio_scale_shift_adaln_single",
+            "av_ca_v2a_gate_adaln_single",
+            "audio_scale_shift_table",
+            "audio_proj_out",
+            cfg.audio_inner(),
+            cfg.video.norm_eps,
+        )?;
+        let mut blocks = Vec::with_capacity(cfg.video.num_layers);
+        for i in 0..cfg.video.num_layers {
+            blocks.push(AvBlock::load(
+                vb.pp(format!("transformer_blocks.{i}")),
+                cfg,
+            )?);
+        }
+        Ok(Self {
+            video,
+            audio,
+            blocks,
+            cfg: cfg.clone(),
+            device,
+        })
+    }
+
+    /// Joint velocity forward.
+    ///
+    /// * `*_latent` — `[B, S, 128]` patchified tokens.
+    /// * `sigma` — scalar σ (uniform T2V timestep, shared by both streams).
+    /// * `*_context` — text embeddings (video 4096, audio 2048).
+    /// * `*_grid` — position grids (video `[1,3,Tv,2]`, audio `[1,1,Ta,2]`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        video_latent: &Tensor,
+        audio_latent: &Tensor,
+        sigma: f64,
+        video_context: &Tensor,
+        audio_context: &Tensor,
+        video_grid: &Tensor,
+        audio_grid: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let device = &self.device;
+        let b = video_latent.dim(0)?;
+        let theta = self.cfg.video.rope_theta;
+        let ts_mult = self.cfg.video.timestep_scale_multiplier;
+
+        let v_ts = self.video.ts_embeds(sigma, ts_mult, b, device)?;
+        let a_ts = self.audio.ts_embeds(sigma, ts_mult, b, device)?;
+
+        // Self RoPE (video 3-axis @4096, audio 1-axis @2048) + cross RoPE (time axis @2048 both).
+        let (v_cos, v_sin) = precompute_split_freqs_nd(
+            video_grid,
+            self.cfg.video.inner_dim(),
+            theta,
+            &self.cfg.video.rope_max_pos,
+            self.cfg.video.num_heads,
+            device,
+        )?;
+        let (vc_cos, vc_sin) = precompute_split_freqs_nd(
+            &time_axis(video_grid)?,
+            self.cfg.cross_inner,
+            theta,
+            &[self.cfg.cross_max_pos],
+            self.cfg.video.num_heads,
+            device,
+        )?;
+        let (a_cos, a_sin) = precompute_split_freqs_nd(
+            audio_grid,
+            self.cfg.audio_inner(),
+            theta,
+            &[self.cfg.audio_max_pos],
+            self.cfg.audio_heads,
+            device,
+        )?;
+        let (ac_cos, ac_sin) = precompute_split_freqs_nd(
+            &time_axis(audio_grid)?,
+            self.cfg.cross_inner,
+            theta,
+            &[self.cfg.cross_max_pos],
+            self.cfg.audio_heads,
+            device,
+        )?;
+
+        let mut vx = self
+            .video
+            .patchify
+            .forward(&video_latent.to_dtype(DType::BF16)?)?;
+        let mut ax = self
+            .audio
+            .patchify
+            .forward(&audio_latent.to_dtype(DType::BF16)?)?;
+        let v_ctx = video_context.to_dtype(DType::BF16)?;
+        let a_ctx = audio_context.to_dtype(DType::BF16)?;
+
+        let va = AvStreamArgs {
+            ts_emb: &v_ts.ts_emb,
+            prompt_ts: &v_ts.prompt_ts,
+            context: &v_ctx,
+            cos: &v_cos,
+            sin: &v_sin,
+            cross_cos: &vc_cos,
+            cross_sin: &vc_sin,
+            cross_ss_ts: &v_ts.cross_ss_ts,
+            cross_gate_ts: &v_ts.cross_gate_ts,
+        };
+        let aa = AvStreamArgs {
+            ts_emb: &a_ts.ts_emb,
+            prompt_ts: &a_ts.prompt_ts,
+            context: &a_ctx,
+            cos: &a_cos,
+            sin: &a_sin,
+            cross_cos: &ac_cos,
+            cross_sin: &ac_sin,
+            cross_ss_ts: &a_ts.cross_ss_ts,
+            cross_gate_ts: &a_ts.cross_gate_ts,
+        };
+
+        for block in &self.blocks {
+            let (nv, na) = block.forward(&vx, &ax, &va, &aa)?;
+            vx = nv;
+            ax = na;
+        }
+        let v_vel = self.video.output_head(&vx, &v_ts.emb_ts)?;
+        let a_vel = self.audio.output_head(&ax, &a_ts.emb_ts)?;
+        Ok((v_vel, a_vel))
     }
 }
