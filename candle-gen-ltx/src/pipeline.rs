@@ -2,12 +2,16 @@
 //! latent token flatten/unflatten, and frames → `gen_core::Image`.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::gen_core::Image;
+use candle_gen::gen_core::{AudioTrack, Image};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 
-use crate::config::{LATENT_CHANNELS, SPATIAL_SCALE, TEMPORAL_SCALE};
+use crate::audio_vae::AudioDecoder;
+use crate::config::{
+    AUDIO_LATENT_CHANNELS, AUDIO_MEL_BINS, LATENT_CHANNELS, SPATIAL_SCALE, TEMPORAL_SCALE,
+};
+use crate::vocoder::LtxVocoder;
 
 /// Latent dims `(t_lat, h_lat, w_lat)` for `frames × height × width`: temporal `(F-1)/8 + 1`, spatial
 /// `/32`.
@@ -49,6 +53,65 @@ pub fn unflatten_latent(tokens: &Tensor, f: usize, h: usize, w: usize) -> Result
         .transpose(1, 2)?
         .reshape((b, c, f, h, w))?
         .contiguous()
+}
+
+// --- Synchronized audio (sc-5495) ----------------------------------------------------------------
+
+/// Deterministic N(0,1) audio latent noise `[1, 8, audio_frames, 16]` (f32) — seed offset +2 keeps it
+/// distinct from the video noise stream (matches the reference's per-modality keys).
+pub fn create_audio_noise(seed: u64, audio_frames: usize, device: &Device) -> Result<Tensor> {
+    let ch = AUDIO_LATENT_CHANNELS as usize;
+    let mel = AUDIO_MEL_BINS as usize;
+    let n = ch * audio_frames * mel;
+    let mut rng = StdRng::seed_from_u64(seed.wrapping_add(2));
+    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    Tensor::from_vec(data, (1, ch, audio_frames, mel), device)
+}
+
+/// Audio latent `[1, 8, T, 16]` → tokens `[1, T, 128]` (per time-frame flatten of `(ch, mel)`,
+/// channel-major — matches the reference `(B,C,T,F)→(B,T,C·F)` patchify).
+pub fn flatten_audio_latent(latent: &Tensor) -> Result<Tensor> {
+    let (b, c, t, f) = latent.dims4()?;
+    latent
+        .permute((0, 2, 1, 3))?
+        .reshape((b, t, c * f))?
+        .contiguous()
+}
+
+/// Audio velocity tokens `[1, T, 128]` → latent `[1, 8, T, 16]`.
+pub fn unflatten_audio_latent(tokens: &Tensor, t: usize) -> Result<Tensor> {
+    let (b, _t, _) = tokens.dims3()?;
+    let c = AUDIO_LATENT_CHANNELS as usize;
+    let f = AUDIO_MEL_BINS as usize;
+    tokens
+        .reshape((b, t, c, f))?
+        .permute((0, 2, 1, 3))?
+        .contiguous()
+}
+
+/// Decode audio latents → an interleaved-PCM [`AudioTrack`]: `AudioDecoder` → mel `(1,2,T',64)` →
+/// `LtxVocoder` → waveform `(1,2,samples)` → interleaved stereo `f32`.
+pub fn decode_audio_track(
+    decoder: &AudioDecoder,
+    vocoder: &LtxVocoder,
+    audio_latents: &Tensor,
+    sample_rate: u32,
+) -> Result<AudioTrack> {
+    let mel = decoder.decode(audio_latents)?;
+    let wav = vocoder.forward(&mel)?; // (1, channels, samples)
+    let (_b, channels, samples) = wav.dims3()?;
+    // (1, C, S) → (S, C) → interleaved.
+    let interleaved = wav
+        .reshape((channels, samples))?
+        .transpose(0, 1)?
+        .contiguous()?
+        .to_dtype(DType::F32)?
+        .to_device(&Device::Cpu)?;
+    Ok(AudioTrack {
+        samples: interleaved.flatten_all()?.to_vec1::<f32>()?,
+        sample_rate,
+        channels: channels as u16,
+    })
 }
 
 /// Decoded video `[1, 3, T, H, W]` in `[-1, 1]` → one RGB8 [`Image`] per frame.

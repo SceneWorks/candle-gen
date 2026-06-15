@@ -7,12 +7,13 @@
 //! per-token-RMS aggregation + 8-layer learnable-register connector ([`text_encoder`], [`connector`]),
 //! and the rectified-flow distilled scheduler ([`scheduler`]) are all ported here.
 //!
-//! **txt2video (sc-3698), first slice:** [`LtxGenerator::generate`] runs Gemma-3-12B → text projection
-//! → connector → the 48-layer video DiT (split 3-D RoPE, per-head gated attention, adaLN-single) → the
-//! temporal VAE decoder, emitting `GenerationOutput::Video`. Registered under `"ltx_2_3_distilled"`.
-//! Single-stage distilled denoise (no CFG). **Deferred** to follow-up stories: the audio stack
-//! (audio-VAE + vocoder + AV-joint DiT paths), the 2-stage latent upsampler, I2V conditioning,
-//! prompt-enhance, LoRA/IC-LoRA, and fp8/quant.
+//! **txt2video+audio (sc-3698 / sc-5495):** [`LtxGenerator::generate`] runs Gemma-3-12B → video +
+//! audio text projections → connectors → the 48-layer dual-modal [`AvDiT`](transformer::AvDiT) (split
+//! 3-D RoPE, per-head gated attention, adaLN-single, bidirectional cross-modal attention) joint
+//! denoise → the temporal VAE decoder (frames) **plus** the [`AudioDecoder`](audio_vae::AudioDecoder)
+//! → [`LtxVocoder`](vocoder::LtxVocoder) → a synchronized 48 kHz stereo `AudioTrack`. Registered under
+//! `"ltx_2_3_distilled"`; single-stage distilled denoise (no CFG). **Deferred** to follow-up stories:
+//! the 2-stage latent upsampler, I2V conditioning, prompt-enhance, LoRA/IC-LoRA, and fp8/quant.
 //!
 //! **Dtypes:** the DiT, connector, text projection, and Gemma encoder run **bf16** (the checkpoint's
 //! native dtype; 22B+12B does not fit f32 on a single 96 GB GPU); the VAE runs **f32**; attention and
@@ -43,19 +44,22 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, WeightsSource,
+    self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
+    LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
+use audio_vae::AudioDecoder;
 use config::{
-    ConnectorConfig, GemmaConfig, TransformerConfig, DEFAULT_FPS, DEFAULT_FRAMES, DEFAULT_HEIGHT,
-    DEFAULT_WIDTH, MODEL_ID, STAGE1_SIGMAS, TEXT_MAX_LENGTH,
+    compute_audio_frames, AudioVaeConfig, AvConfig, ConnectorConfig, GemmaConfig, VocoderConfig,
+    DEFAULT_FPS, DEFAULT_FRAMES, DEFAULT_HEIGHT, DEFAULT_WIDTH, MODEL_ID, STAGE1_SIGMAS,
+    TEXT_MAX_LENGTH,
 };
 use gemma::GemmaEncoder;
 use text_encoder::LtxTextEncoder;
-use transformer::LtxDiT;
+use transformer::AvDiT;
 use vae::LtxVideoVae;
+use vocoder::LtxVocoder;
 
 const DIT_DTYPE: DType = DType::BF16;
 const VAE_DTYPE: DType = DType::F32;
@@ -64,15 +68,21 @@ const SIZE_MULTIPLE: u32 = config::SPATIAL_SCALE as u32;
 #[derive(Clone)]
 struct Components {
     te: Arc<LtxTextEncoder>,
-    dit: Arc<LtxDiT>,
+    avdit: Arc<AvDiT>,
     vae: Arc<LtxVideoVae>,
+    audio_decoder: Arc<AudioDecoder>,
+    vocoder: Arc<LtxVocoder>,
+    audio_sample_rate: u32,
     tokenizer: Arc<tokenizers::Tokenizer>,
 }
 
 struct Pipeline {
-    dit_cfg: TransformerConfig,
+    av_cfg: AvConfig,
     gemma_cfg: GemmaConfig,
     conn_cfg: ConnectorConfig,
+    audio_conn_cfg: ConnectorConfig,
+    audio_vae_cfg: AudioVaeConfig,
+    vocoder_cfg: VocoderConfig,
     root: PathBuf,
     device: Device,
 }
@@ -80,9 +90,12 @@ struct Pipeline {
 impl Pipeline {
     fn load(root: &Path, device: &Device) -> Self {
         Self {
-            dit_cfg: TransformerConfig::ltx_2_3(),
+            av_cfg: AvConfig::ltx_2_3(),
             gemma_cfg: GemmaConfig::gemma_3_12b(),
             conn_cfg: ConnectorConfig::ltx_2_3(),
+            audio_conn_cfg: ConnectorConfig::ltx_2_3_audio(),
+            audio_vae_cfg: AudioVaeConfig::ltx_2_3(),
+            vocoder_cfg: VocoderConfig::ltx_2_3(),
             root: root.to_path_buf(),
             device: device.clone(),
         }
@@ -159,15 +172,20 @@ impl Pipeline {
                 .pp("language_model.model");
 
         let dit_vb = vb_bf16.pp("model.diffusion_model");
-        let dit = LtxDiT::new(dit_vb.clone(), &self.dit_cfg)?;
-        let te = LtxTextEncoder::new(
+        let avdit = AvDiT::new(dit_vb.clone(), &self.av_cfg)?;
+        let te = LtxTextEncoder::new_av(
             gemma_vb,
             vb_bf16.clone(),
             dit_vb,
             &self.gemma_cfg,
             &self.conn_cfg,
+            &self.audio_conn_cfg,
         )?;
         let vae = LtxVideoVae::new(vb_f32.pp("vae"), config::LATENT_CHANNELS, 4)?;
+        // The audio VAE decoder + vocoder run f32 (post-sampling quality islands).
+        let audio_decoder = AudioDecoder::load(&vb_f32.pp("audio_vae"), &self.audio_vae_cfg)?;
+        let vocoder = LtxVocoder::load(vb_f32, &self.device, &self.vocoder_cfg)?;
+        let audio_sample_rate = self.vocoder_cfg.final_sample_rate() as u32;
 
         let tok_path = gemma_dir.join("tokenizer.json");
         let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
@@ -175,8 +193,11 @@ impl Pipeline {
 
         Ok(Components {
             te: Arc::new(te),
-            dit: Arc::new(dit),
+            avdit: Arc::new(avdit),
             vae: Arc::new(vae),
+            audio_decoder: Arc::new(audio_decoder),
+            vocoder: Arc::new(vocoder),
+            audio_sample_rate,
             tokenizer: Arc::new(tokenizer),
         })
     }
@@ -207,32 +228,47 @@ impl Pipeline {
         req: &GenerationRequest,
         comps: &Components,
         on_progress: &mut dyn FnMut(Progress),
-    ) -> CResult<(Vec<Image>, u32)> {
+    ) -> CResult<(Vec<Image>, u32, Option<AudioTrack>)> {
         let frames = req.frames.unwrap_or(DEFAULT_FRAMES);
         let fps = req.fps.unwrap_or(DEFAULT_FPS);
         let seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
-        // Text encode → context (1, 256, 4096).
+        // Text encode → video (1,256,4096) + audio (1,256,2048) contexts (one Gemma pass).
         let (input_ids, mask01) = self.tokenize(&comps.tokenizer, &req.prompt)?;
-        let context = comps.te.encode(&input_ids, &mask01)?;
+        let (video_ctx, audio_ctx) = comps.te.encode_both(&input_ids, &mask01)?;
 
-        // Latent geometry + split-RoPE for the token grid.
+        // Latent geometry + position grids (video 3-axis, audio 1-axis time).
         let (t_lat, h_lat, w_lat) = pipeline::latent_dims(frames, req.width, req.height);
-        let (cos, sin) =
-            rope::video_rope(&self.dit_cfg, t_lat, h_lat, w_lat, fps as f32, &self.device)?;
+        let af = compute_audio_frames(frames as usize, fps as f64).max(1);
+        let video_grid = rope::create_position_grid(t_lat, h_lat, w_lat, fps as f32, &self.device)?;
+        let audio_grid = rope::create_audio_position_grid(af, &self.device)?;
 
-        let mut latents = pipeline::create_noise(seed, t_lat, h_lat, w_lat, &self.device)?;
+        let mut vlat = pipeline::create_noise(seed, t_lat, h_lat, w_lat, &self.device)?;
+        let mut alat = pipeline::create_audio_noise(seed, af, &self.device)?;
         let steps = STAGE1_SIGMAS.len() - 1;
         for i in 0..steps {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
             let (sigma, sigma_next) = (STAGE1_SIGMAS[i] as f64, STAGE1_SIGMAS[i + 1] as f64);
-            let flat = pipeline::flatten_latent(&latents)?;
-            let vel = comps.dit.forward(&flat, sigma, &context, &cos, &sin)?;
-            let vel = pipeline::unflatten_latent(&vel.to_dtype(DType::F32)?, t_lat, h_lat, w_lat)?;
-            let denoised = scheduler::to_denoised(&latents, &vel, sigma)?;
-            latents = scheduler::euler_step(&latents, &denoised, sigma, sigma_next)?;
+            let vflat = pipeline::flatten_latent(&vlat)?;
+            let aflat = pipeline::flatten_audio_latent(&alat)?;
+            let (vvel, avel) = comps.avdit.forward(
+                &vflat,
+                &aflat,
+                sigma,
+                &video_ctx,
+                &audio_ctx,
+                &video_grid,
+                &audio_grid,
+            )?;
+            let vvel =
+                pipeline::unflatten_latent(&vvel.to_dtype(DType::F32)?, t_lat, h_lat, w_lat)?;
+            let avel = pipeline::unflatten_audio_latent(&avel.to_dtype(DType::F32)?, af)?;
+            let vden = scheduler::to_denoised(&vlat, &vvel, sigma)?;
+            vlat = scheduler::euler_step(&vlat, &vden, sigma, sigma_next)?;
+            let aden = scheduler::to_denoised(&alat, &avel, sigma)?;
+            alat = scheduler::euler_step(&alat, &aden, sigma, sigma_next)?;
             on_progress(Progress::Step {
                 current: i as u32 + 1,
                 total: steps as u32,
@@ -240,9 +276,15 @@ impl Pipeline {
         }
 
         on_progress(Progress::Decoding);
-        let decoded = comps.vae.decode(&latents)?;
+        let decoded = comps.vae.decode(&vlat)?;
         let images = pipeline::frames_to_images(&decoded)?;
-        Ok((images, fps))
+        let audio = pipeline::decode_audio_track(
+            &comps.audio_decoder,
+            &comps.vocoder,
+            &alat,
+            comps.audio_sample_rate,
+        )?;
+        Ok((images, fps, Some(audio)))
     }
 }
 
@@ -305,12 +347,8 @@ impl Generator for LtxGenerator {
         self.validate(req)?;
         let pipe = Pipeline::load(&self.root, &self.device);
         let components = self.components(&pipe)?;
-        let (frames, fps) = pipe.render(req, &components, on_progress)?;
-        Ok(GenerationOutput::Video {
-            frames,
-            fps,
-            audio: None,
-        })
+        let (frames, fps, audio) = pipe.render(req, &components, on_progress)?;
+        Ok(GenerationOutput::Video { frames, fps, audio })
     }
 }
 
