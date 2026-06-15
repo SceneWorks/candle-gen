@@ -25,6 +25,17 @@ mod sampler;
 mod tokenizer;
 mod unet;
 
+// IP-Adapter-Plus reference-image (identity) provider (sc-5488, epic 5480) — CLIP ViT-L/14-336 image
+// tokens injected into the vendored SDXL `UNet2DConditionModel` (candle-gen-sdxl) alongside the
+// encoder_hid_proj-projected ChatGLM3 text path, denoised with the Kolors leading-Euler sampler.
+// Invoked directly by the worker (a bespoke reference stream), not gen-core-registered.
+pub mod ip_provider;
+
+// Kolors IP-Adapter-Plus real-weight GPU validation (sc-5488) — env-driven, `#[ignore]`d integration
+// test (the Kolors sibling of the SDXL IP-Adapter Phase-5 harness).
+#[cfg(test)]
+mod ip_validate;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -36,6 +47,9 @@ use candle_gen::gen_core::{
 };
 
 pub use config::{descriptor, MODEL_ID, SIZE_MULTIPLE};
+pub use ip_provider::{
+    IpAdapterKolors, IpAdapterKolorsPaths, IpAdapterKolorsRequest, DEFAULT_IP_ADAPTER_SCALE,
+};
 use sampler::NUM_TRAIN_TIMESTEPS;
 
 use pipeline::{Components, Pipeline};

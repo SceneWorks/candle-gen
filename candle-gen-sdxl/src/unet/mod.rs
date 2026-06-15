@@ -28,8 +28,9 @@ mod unet_2d_blocks;
 mod vae_encode;
 
 pub use controlnet::{ControlNet, ControlNetConfig, ControlResiduals};
-// The canonical SDXL UNet sub-config, shared by the InstantID UNet loader (sc-5491).
-pub(crate) use controlnet::sdxl_unet_config;
+// The canonical SDXL UNet sub-config, shared by the InstantID UNet loader (sc-5491) and the Kolors
+// IP-Adapter provider (sc-5488), which loads the SDXL-family Kolors UNet into this vendored stack.
+pub use controlnet::sdxl_unet_config;
 pub use unet_2d::{BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig};
 pub use vae_encode::VaeMomentsEncoder;
 

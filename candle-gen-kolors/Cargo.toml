@@ -18,6 +18,13 @@ inventory = { workspace = true }
 # Kolors keeps the SDXL UNet skeleton + SDXL VAE; this crate composes those blocks and adds only the
 # Kolors deltas (the `encoder_hid_proj` context projection + the 5632-wide `text_time` add-embedding).
 candle-transformers = { workspace = true }
+# The vendored SDXL stack (sc-5488 Kolors IP-Adapter): the IP-capable `UNet2DConditionModel`
+# (decoupled cross-attention + the parameterized `add_embedding`), the IP-Adapter-Plus primitives
+# (`Resampler`/`load_ip_kv_pairs`/`IpImageEncoder`), the CLIP ViT image encoder, and the `Weights`
+# loader. Kolors txt2img composes the *stock* candle-transformers blocks (no IP seam), so the
+# IP-Adapter path reuses this IP-capable stack with the Kolors UNet weights + an external
+# `encoder_hid_proj`. Same candle build (backend features forwarded below) → no skew.
+candle-gen-sdxl = { path = "../candle-gen-sdxl" }
 # ChatGLM3 prompt tokenization. The fast `tokenizer.json` is loaded from the snapshot's `tokenizer/`
 # dir (materialized by Kolors' `tools/build_kolors_tokenizer.py`, mirroring the mlx provider), and
 # this wrapper applies the ChatGLM framing (GMASK/SOP prefix + left-pad + position_ids).
@@ -30,9 +37,13 @@ rand_distr = { workspace = true }
 # Pass the backend selection through to the core crate AND candle-transformers so a downstream
 # `--features metal`/`cuda` on this provider crate selects the matching candle backend everywhere.
 default = []
-metal = ["candle-gen/metal", "candle-transformers/metal"]
-cuda = ["candle-gen/cuda", "candle-transformers/cuda"]
-flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn"]
+metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-sdxl/metal"]
+cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-sdxl/cuda"]
+flash-attn = [
+    "candle-gen/flash-attn",
+    "candle-transformers/flash-attn",
+    "candle-gen-sdxl/flash-attn",
+]
 
 [dev-dependencies]
 # `examples/kolors-txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to

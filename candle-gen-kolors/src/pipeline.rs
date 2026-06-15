@@ -35,8 +35,9 @@ use crate::tokenizer::KolorsTokenizer;
 use crate::unet::KolorsUNet;
 
 /// diffusers SDXL VAE `scaling_factor` (Kolors reuses it). The latents are divided by this before
-/// decode — the diffusers-correct SDXL value (NOT candle's hardcoded SD1.5 0.18215).
-const VAE_SCALE: f64 = 0.13025;
+/// decode — the diffusers-correct SDXL value (NOT candle's hardcoded SD1.5 0.18215). `pub(crate)` so
+/// the IP-Adapter provider (sc-5488) shares the exact decode scale.
+pub(crate) const VAE_SCALE: f64 = 0.13025;
 
 /// A light pipeline handle: the snapshot `root` and compute device. Heavy components load via
 /// [`load_components`](Self::load_components) and are owned/cached by the generator.
@@ -235,7 +236,8 @@ impl Pipeline {
 }
 
 /// The SDXL VAE config (`stabilityai/stable-diffusion-xl-base-1.0/vae/config.json`) — Kolors reuses it.
-fn sdxl_vae_config() -> AutoEncoderKLConfig {
+/// `pub(crate)` so the IP-Adapter provider (sc-5488) builds the identical VAE.
+pub(crate) fn sdxl_vae_config() -> AutoEncoderKLConfig {
     AutoEncoderKLConfig {
         block_out_channels: vec![128, 256, 512, 512],
         layers_per_block: 2,

@@ -89,7 +89,9 @@ pub use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 
 // The vendored UNet itself, re-exported so the `candle-gen-instantid` glue can hold one + drive its
 // InstantID surface (install_ip_adapter / set_ip_context / forward_instantid via the denoise loop).
-pub use unet::UNet2DConditionModel;
+// `sdxl_unet_config` + `UNet2DConditionModelConfig`/`BlockConfig` are re-exported too so the Kolors
+// IP-Adapter provider (sc-5488) can build the same vendored stack from the SDXL-family Kolors UNet.
+pub use unet::{sdxl_unet_config, BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig};
 
 // SDXL IP-Adapter-Plus reference-image provider (sc-5488, epic 5480) — the [`ip_adapter`] +
 // [`denoise`] stack composed without a face embedder / ControlNet: CLIP ViT-H image tokens → pure-IP

@@ -35,8 +35,9 @@ use super::unet_2d_blocks::{
 /// The canonical SDXL UNet sub-config (`stabilityai/stable-diffusion-xl-base-1.0/unet/config.json`) —
 /// 3 blocks `320/640/1280`, transformer depths `[—, 2, 10]`, 5/10/20 heads, `cross_attention_dim 2048`,
 /// linear projection. Shared by the ControlNet (and the sc-5491 phase-2c InstantID UNet); mirrors the
-/// (private) copies in `training.rs` / `pipeline.rs`.
-pub(crate) fn sdxl_unet_config() -> UNet2DConditionModelConfig {
+/// (private) copies in `training.rs` / `pipeline.rs`. `pub` so the candle-gen-kolors IP-Adapter
+/// provider (sc-5488) builds the same vendored stack from the SDXL-family Kolors UNet.
+pub fn sdxl_unet_config() -> UNet2DConditionModelConfig {
     let bc = |out_channels, use_cross_attn, attention_head_dim| BlockConfig {
         out_channels,
         use_cross_attn,
