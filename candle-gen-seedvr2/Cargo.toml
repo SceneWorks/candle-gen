@@ -1,0 +1,26 @@
+[package]
+name = "candle-gen-seedvr2"
+version = "0.0.0"
+edition = "2021"
+description = "SeedVR2 provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-seedvr2: a one-step diffusion-transformer + 3D causal video VAE super-resolution upscaler (image; video lands in sc-5926)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "seedvr2", "upscale", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+inventory = { workspace = true }
+# Fixed-algorithm CPU RNG for deterministic, launch-portable one-step noise (matches the svd/wan
+# convention) — NOT candle's CUDA set_seed. `StdRng` (ChaCha) is reproducible across launches.
+rand = { workspace = true }
+rand_distr = { workspace = true }
+
+[features]
+default = []
+metal = ["candle-gen/metal"]
+cuda = ["candle-gen/cuda"]
+flash-attn = ["candle-gen/flash-attn"]
+
+[dev-dependencies]
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "32fdb34991b2945dc4af7d3d5b036239eac4ce81" }

@@ -386,6 +386,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-seedvr2"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "inventory",
+ "rand",
+ "rand_distr",
+ "sceneworks-gen-core-testkit",
+]
+
+[[package]]
 name = "candle-gen-sensenova"
 version = "0.0.0"
 dependencies = [
