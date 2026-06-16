@@ -24,6 +24,7 @@ pub mod convert;
 pub mod dit;
 pub mod nn;
 pub mod pipeline;
+pub mod quant;
 pub mod vae;
 pub mod video;
 pub mod weights;
@@ -36,7 +37,7 @@ use candle_gen::gen_core::registry::ModelRegistration;
 use candle_gen::gen_core::{
     self, default_seed, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
     GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, Precision, Progress,
-    WeightsSource,
+    Quant, WeightsSource,
 };
 
 use config::{DitConfig, VAE_SCALE};
@@ -44,9 +45,21 @@ use pipeline::Seedvr2Pipeline;
 
 pub const MODEL_ID: &str = "seedvr2";
 pub const MODEL_ID_3B: &str = "seedvr2_3b";
+pub const MODEL_ID_7B: &str = "seedvr2_7b";
 const DIT_FILE_3B: &str = "seedvr2_ema_3b_fp16.safetensors";
+const DIT_FILE_7B: &str = "seedvr2_ema_7b_fp16.safetensors";
 /// Output fps when the request omits one (the worker normally supplies the source cadence).
 const DEFAULT_FPS: u32 = 24;
+
+/// The DiT checkpoint file + transformer config for a registered id (3B default; 7B is the
+/// pixel-mode-RoPE variant — sc-5927). The VAE is shared across both.
+fn variant(id: &str) -> (&'static str, DitConfig) {
+    if id == MODEL_ID_7B {
+        (DIT_FILE_7B, DitConfig::seedvr2_7b())
+    } else {
+        (DIT_FILE_3B, DitConfig::seedvr2_3b())
+    }
+}
 
 fn descriptor_for(id: &'static str) -> ModelDescriptor {
     ModelDescriptor {
@@ -70,7 +83,7 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             mac_only: false,
             supports_kv_cache: false,
             requires_sigma_shift: false,
-            supported_quants: &[], // Linear-only DiT quant is sc-5927
+            supported_quants: &[Quant::Q4, Quant::Q8], // Linear-only DiT quant (sc-5927)
         },
     }
 }
@@ -81,14 +94,21 @@ pub fn descriptor() -> ModelDescriptor {
 pub fn descriptor_3b() -> ModelDescriptor {
     descriptor_for(MODEL_ID_3B)
 }
+pub fn descriptor_7b() -> ModelDescriptor {
+    descriptor_for(MODEL_ID_7B)
+}
 
-/// The lazy candle SeedVR2 generator (one-step image upscaler). The pipeline is loaded on first
-/// `generate` and cached behind a `Mutex` for the worker's `Arc<dyn Generator>` reuse.
+/// The lazy candle SeedVR2 generator (one-step image/video upscaler). The pipeline is loaded on first
+/// `generate` and cached behind a `Mutex` for the worker's `Arc<dyn Generator>` reuse. `dit_file`/`cfg`
+/// select the 3B (default) or 7B variant; `quant` applies int8/int4 DiT quantization at load (sc-5927).
 pub struct Seedvr2Generator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: Device,
     dtype: DType,
+    dit_file: &'static str,
+    cfg: DitConfig,
+    quant: Option<Quant>,
     pipe: Mutex<Option<std::sync::Arc<Seedvr2Pipeline>>>,
 }
 
@@ -106,14 +126,18 @@ impl Seedvr2Generator {
         if let Some(p) = guard.as_ref() {
             return Ok(p.clone());
         }
-        let cfg = DitConfig::seedvr2_3b();
-        let p = std::sync::Arc::new(Seedvr2Pipeline::load(
+        let mut p = Seedvr2Pipeline::load(
             &self.root,
-            DIT_FILE_3B,
-            &cfg,
+            self.dit_file,
+            &self.cfg,
             self.dtype,
             &self.device,
-        )?);
+        )?;
+        // sc-5927: int8/int4 quantize the DiT Linears at load (the VAE stays dense).
+        if let Some(q) = self.quant {
+            p.quantize(q)?;
+        }
+        let p = std::sync::Arc::new(p);
         *guard = Some(p.clone());
         Ok(p)
     }
@@ -207,8 +231,9 @@ impl Generator for Seedvr2Generator {
 }
 
 /// Construct a lazy candle SeedVR2 generator. `spec.weights` must be a [`WeightsSource::Dir`] pointing
-/// at a raw `numz/SeedVR2_comfyUI` checkpoint dir (`ema_vae_fp16.safetensors` + the 3B DiT file).
-/// Adapters / quantization (sc-5927) / control overlays are rejected.
+/// at a raw `numz/SeedVR2_comfyUI` checkpoint dir (`ema_vae_fp16.safetensors` + the 3B/7B DiT file).
+/// `spec.quantize` (Q4/Q8) int8/int4-quantizes the DiT Linears at load (sc-5927). Adapters / control
+/// overlays are rejected.
 fn load_with(spec: &LoadSpec, id: &'static str) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -221,11 +246,6 @@ fn load_with(spec: &LoadSpec, id: &'static str) -> gen_core::Result<Box<dyn Gene
     if !spec.adapters.is_empty() {
         return Err(gen_core::Error::Unsupported(format!(
             "{id}: LoRA/LoKr adapters are not part of SeedVR2"
-        )));
-    }
-    if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{id}: int8/int4 quantization lands in sc-5927"
         )));
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
@@ -241,11 +261,15 @@ fn load_with(spec: &LoadSpec, id: &'static str) -> gen_core::Result<Box<dyn Gene
         Precision::Bf16 if device.is_cpu() => DType::F32,
         Precision::Bf16 => DType::BF16,
     };
+    let (dit_file, cfg) = variant(id);
     Ok(Box::new(Seedvr2Generator {
         descriptor: descriptor_for(id),
         root,
         device,
         dtype,
+        dit_file,
+        cfg,
+        quant: spec.quantize,
         pipe: Mutex::new(None),
     }))
 }
@@ -256,12 +280,18 @@ fn load_registered(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
 fn load_registered_3b(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_with(spec, MODEL_ID_3B)
 }
+fn load_registered_7b(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_with(spec, MODEL_ID_7B)
+}
 
 inventory::submit! {
     ModelRegistration { descriptor, load: load_registered }
 }
 inventory::submit! {
     ModelRegistration { descriptor: descriptor_3b, load: load_registered_3b }
+}
+inventory::submit! {
+    ModelRegistration { descriptor: descriptor_7b, load: load_registered_7b }
 }
 
 /// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped).
@@ -284,11 +314,13 @@ mod tests {
         assert!(d.capabilities.accepts(ConditioningKind::Reference));
         assert!(d.capabilities.accepts(ConditioningKind::VideoClip));
         assert_eq!(d.capabilities.min_size, VAE_SCALE);
+        // sc-5927: int8/int4 DiT quant is now advertised.
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
     }
 
     #[test]
-    fn both_ids_resolve_in_registry() {
-        for id in [MODEL_ID, MODEL_ID_3B] {
+    fn all_ids_resolve_in_registry() {
+        for id in [MODEL_ID, MODEL_ID_3B, MODEL_ID_7B] {
             let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent/seedvr2".into()));
             let g = registry::load(id, &spec).expect("seedvr2 is registered");
             assert_eq!(g.descriptor().family, "seedvr2");
@@ -297,13 +329,31 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unwired_surfaces() {
+    fn variant_selects_7b_config_and_file() {
+        let (file_3b, cfg_3b) = variant(MODEL_ID_3B);
+        assert_eq!(file_3b, DIT_FILE_3B);
+        assert_eq!(cfg_3b.num_layers, 32);
+        assert!(!cfg_3b.rope_pixel);
+
+        let (file_7b, cfg_7b) = variant(MODEL_ID_7B);
+        assert_eq!(file_7b, DIT_FILE_7B);
+        assert_eq!(cfg_7b.num_layers, 36);
+        assert_eq!(cfg_7b.vid_dim, 3072);
+        assert!(cfg_7b.rope_pixel); // pixel-mode RoPE — the 7B delta (sc-5197)
+        assert!(!cfg_7b.rope_on_text);
+        assert!(!cfg_7b.swiglu_mlp); // GELU MLP
+    }
+
+    #[test]
+    fn load_accepts_quant_rejects_single_file() {
         use candle_gen::gen_core::Quant;
-        let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load_with(&quant, MODEL_ID).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        // Quant is now wired (sc-5927) — load succeeds lazily and carries the level.
+        for q in [Quant::Q4, Quant::Q8] {
+            let spec = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(q);
+            let g = load_with(&spec, MODEL_ID).expect("quant is wired");
+            assert_eq!(g.descriptor().family, "seedvr2");
+        }
+        // A single-file weights source is still rejected.
         let file = LoadSpec::new(WeightsSource::File("/w.safetensors".into()));
         assert!(load_with(&file, MODEL_ID).is_err());
     }

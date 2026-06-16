@@ -15,7 +15,7 @@
 //! no runtime text encoder), loaded at construction.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::gen_core::{imageops, Image};
+use candle_gen::gen_core::{imageops, Image, Quant};
 use candle_gen::{CandleError, Result as CResult};
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
@@ -138,6 +138,14 @@ impl Seedvr2Pipeline {
         let mut p = Self::from_parts(vae, transformer, neg_embed, dt, device.clone());
         p.weights_bytes = weights_bytes;
         Ok(p)
+    }
+
+    /// Quantize the DiT Linears to `quant` (`Q4_0`/`Q8_0`) — Linear-only (sc-5927); the VAE stays
+    /// dense. Call once after [`Self::load`], before the pipeline is shared. `weights_bytes` is
+    /// intentionally **not** reduced — keeping the dense estimate makes the video chunk-size budget
+    /// conservative (quant shrinks the weights, not the activations, so the headroom stays safe).
+    pub fn quantize(&mut self, quant: Quant) -> CResult<()> {
+        self.transformer.quantize(quant)
     }
 
     /// Build the static condition `[latent, ones-mask]` → `(B, 17, T', h, w)`.
