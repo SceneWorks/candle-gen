@@ -1,6 +1,6 @@
 //! SeedVR2 model configuration — the candle port of `mlx-gen-seedvr2/src/config.rs` (the 3B default
-//! + the 7B override set). Mirrors the mflux reference `SeedVR2Transformer` constructor defaults and
-//! `ModelConfig.seedvr2_3b/7b`. The VAE config is shared across both variants.
+//! plus the 7B override set). Mirrors the mflux reference `SeedVR2Transformer` constructor defaults
+//! and `ModelConfig.seedvr2_3b/7b`. The VAE config is shared across both variants.
 //!
 //! Dimensions are `usize` (candle's shape type); RoPE/MLP/AdaLN toggles are `bool`; `window` is the
 //! `(T,H,W)` attention window.
@@ -8,25 +8,25 @@
 /// Diffusion-transformer hyper-parameters.
 #[derive(Clone, Copy, Debug)]
 pub struct DitConfig {
-    pub vid_in_channels: usize,    // 33 = noise(16) + cond latent(16) + mask(1)
-    pub vid_out_channels: usize,   // 16
-    pub vid_dim: usize,            // 3B 2560 / 7B 3072
-    pub txt_in_dim: usize,         // 5120 (precomputed neg-prompt embedding width)
-    pub heads: usize,              // 3B 20 / 7B 24
-    pub head_dim: usize,           // 128
-    pub expand_ratio: usize,       // 4
-    pub num_layers: usize,         // 3B 32 / 7B 36
-    pub mm_layers: usize,          // dual-stream layers; >= this index uses shared (`.all`) weights
-    pub patch_t: usize,            // 1
-    pub patch_h: usize,            // 2
-    pub patch_w: usize,            // 2
-    pub rope_dim: usize,           // 3B 128 / 7B 64
-    pub rope_on_text: bool,        // 3B true / 7B false
-    pub rope_pixel: bool,          // freqs_for: 3B "lang"(false) / 7B "pixel"(true)
-    pub swiglu_mlp: bool,          // 3B swiglu(true) / 7B "normal" gelu(false)
-    pub use_output_ada: bool,      // 3B true / 7B false
+    pub vid_in_channels: usize,  // 33 = noise(16) + cond latent(16) + mask(1)
+    pub vid_out_channels: usize, // 16
+    pub vid_dim: usize,          // 3B 2560 / 7B 3072
+    pub txt_in_dim: usize,       // 5120 (precomputed neg-prompt embedding width)
+    pub heads: usize,            // 3B 20 / 7B 24
+    pub head_dim: usize,         // 128
+    pub expand_ratio: usize,     // 4
+    pub num_layers: usize,       // 3B 32 / 7B 36
+    pub mm_layers: usize,        // dual-stream layers; >= this index uses shared (`.all`) weights
+    pub patch_t: usize,          // 1
+    pub patch_h: usize,          // 2
+    pub patch_w: usize,          // 2
+    pub rope_dim: usize,         // 3B 128 / 7B 64
+    pub rope_on_text: bool,      // 3B true / 7B false
+    pub rope_pixel: bool,        // freqs_for: 3B "lang"(false) / 7B "pixel"(true)
+    pub swiglu_mlp: bool,        // 3B swiglu(true) / 7B "normal" gelu(false)
+    pub use_output_ada: bool,    // 3B true / 7B false
     pub last_layer_vid_only: bool, // 3B true / 7B false
-    pub norm_eps: f64,             // 1e-5
+    pub norm_eps: f64,           // 1e-5
     pub window: (usize, usize, usize), // (4,3,3)
 }
 

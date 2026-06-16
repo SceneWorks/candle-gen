@@ -193,7 +193,11 @@ impl Upsample3d {
             .permute([0usize, 4, 5, 3, 6, 1, 7, 2])?
             .contiguous()?
             .reshape((b, c, t * tf, h * sf, wd * sf))?;
-        let x = if t == 1 && tf > 1 { x.narrow(2, 0, 1)? } else { x };
+        let x = if t == 1 && tf > 1 {
+            x.narrow(2, 0, 1)?
+        } else {
+            x
+        };
         self.conv.forward(&x)
     }
 }
@@ -258,7 +262,11 @@ impl UpBlock3d {
             .map(|i| ResnetBlock3d::load(w, &format!("{prefix}.resnets.{i}"), cfg))
             .collect::<CResult<Vec<_>>>()?;
         let upsampler = if sample {
-            Some(Upsample3d::load(w, &format!("{prefix}.upsamplers.0"), temporal)?)
+            Some(Upsample3d::load(
+                w,
+                &format!("{prefix}.upsamplers.0"),
+                temporal,
+            )?)
         } else {
             None
         };
@@ -334,7 +342,13 @@ impl Encoder3d {
             h = d.forward(&h)?;
         }
         h = self.mid.forward(&h)?;
-        h = gn(&h, &self.norm_out_w, &self.norm_out_b, self.groups, self.eps)?;
+        h = gn(
+            &h,
+            &self.norm_out_w,
+            &self.norm_out_b,
+            self.groups,
+            self.eps,
+        )?;
         self.conv_out.forward(&nn::silu(&h)?)
     }
 }
@@ -376,7 +390,13 @@ impl Decoder3d {
         for u in &self.up_blocks {
             h = u.forward(&h)?;
         }
-        h = gn(&h, &self.norm_out_w, &self.norm_out_b, self.groups, self.eps)?;
+        h = gn(
+            &h,
+            &self.norm_out_w,
+            &self.norm_out_b,
+            self.groups,
+            self.eps,
+        )?;
         self.conv_out.forward(&nn::silu(&h)?)
     }
 }
@@ -404,7 +424,11 @@ impl Seedvr2Vae {
 
     /// `(B,3,T,H,W)` → scaled mean latent `(B,16,T',H',W')`. A 4-D `(B,3,H,W)` input gains `T=1`.
     pub fn encode(&self, x: &Tensor) -> Result<Tensor> {
-        let x = if x.rank() == 4 { x.unsqueeze(2)? } else { x.clone() };
+        let x = if x.rank() == 4 {
+            x.unsqueeze(2)?
+        } else {
+            x.clone()
+        };
         let h = self.encoder.forward(&x)?; // (B,32,T',H',W')
         let mean = h.narrow(1, 0, self.latent_channels)?; // first 16 channels
         mean * self.scaling_factor
@@ -412,7 +436,11 @@ impl Seedvr2Vae {
 
     /// `(B,16,T',H',W')` → `(B,3,T,H,W)`. A 4-D latent gains `T=1`.
     pub fn decode(&self, z: &Tensor) -> Result<Tensor> {
-        let z = if z.rank() == 4 { z.unsqueeze(2)? } else { z.clone() };
+        let z = if z.rank() == 4 {
+            z.unsqueeze(2)?
+        } else {
+            z.clone()
+        };
         let z = (z * (1.0 / self.scaling_factor))?;
         self.decoder.forward(&z)
     }

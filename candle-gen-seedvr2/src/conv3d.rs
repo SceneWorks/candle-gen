@@ -127,7 +127,14 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::{DType, Device};
 
-    fn conv(weight: Tensor, bias: Tensor, st: usize, ph: usize, pt: usize, upc: bool) -> CausalConv3d {
+    fn conv(
+        weight: Tensor,
+        bias: Tensor,
+        st: usize,
+        ph: usize,
+        pt: usize,
+        upc: bool,
+    ) -> CausalConv3d {
         let (_o, _i, kt, _kh, _kw) = weight.dims5().unwrap();
         let o = bias.dim(0).unwrap();
         CausalConv3d {

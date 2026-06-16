@@ -35,10 +35,7 @@ pub fn group_norm(x: &Tensor, w: &Tensor, b: &Tensor, groups: usize, eps: f64) -
     ws[1] = c;
     let wv = w.to_dtype(DType::F32)?.reshape(ws.clone())?;
     let bv = b.to_dtype(DType::F32)?.reshape(ws)?;
-    normed
-        .broadcast_mul(&wv)?
-        .broadcast_add(&bv)?
-        .to_dtype(dt)
+    normed.broadcast_mul(&wv)?.broadcast_add(&bv)?.to_dtype(dt)
 }
 
 /// RMSNorm over the last dim with a `[dim]` weight, computed in f32.
@@ -47,9 +44,7 @@ pub fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
     let xf = x.to_dtype(DType::F32)?;
     let ms = xf.sqr()?.mean_keepdim(D::Minus1)?;
     let normed = xf.broadcast_div(&ms.affine(1.0, eps)?.sqrt()?)?;
-    normed
-        .broadcast_mul(&w.to_dtype(DType::F32)?)?
-        .to_dtype(dt)
+    normed.broadcast_mul(&w.to_dtype(DType::F32)?)?.to_dtype(dt)
 }
 
 /// SiLU (x·sigmoid(x)).
