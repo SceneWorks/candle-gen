@@ -377,7 +377,8 @@ pub struct Generator {
 }
 
 impl Generator {
-    /// Build from `vb` under `prefix` (`"vocoder"` for the core, `"vocoder.bwe_generator"` for BWE).
+    /// Build from `vb` under `prefix` (`"vocoder.vocoder"` for the core, `"vocoder.bwe_generator"`
+    /// for BWE — the dense checkpoint nests the core generator one level deeper than the mlx bundle).
     fn load(vb: &Vb, prefix: &str, cfg: &VocoderGenConfig) -> Result<Self> {
         let bigvgan = cfg.is_bigvgan();
         let kind = if bigvgan {
@@ -571,7 +572,9 @@ impl VocoderWithBwe {
             .as_ref()
             .expect("VocoderWithBwe requires a bwe config");
         Ok(Self {
-            vocoder: Generator::load(vb, "vocoder", &cfg.core)?,
+            // In the dense checkpoint the core generator is nested under `vocoder.vocoder.*` (the
+            // VocoderWithBWE module's `.vocoder` submodule); the BWE under `vocoder.bwe_generator.*`.
+            vocoder: Generator::load(vb, "vocoder.vocoder", &cfg.core)?,
             bwe_generator: Generator::load(vb, "vocoder.bwe_generator", bwe_cfg)?,
             mel_stft: MelStft {
                 forward_basis: get(vb, "vocoder.mel_stft.stft_fn.forward_basis")?,
@@ -674,7 +677,9 @@ impl LtxVocoder {
             Ok(LtxVocoder::Bwe(Box::new(VocoderWithBwe::load(&vb, cfg)?)))
         } else {
             Ok(LtxVocoder::Plain(Generator::load(
-                &vb, "vocoder", &cfg.core,
+                &vb,
+                "vocoder.vocoder",
+                &cfg.core,
             )?))
         }
     }
