@@ -342,7 +342,7 @@ impl Pipeline {
 /// [`Pipeline::text_embeddings`] and the IP-Adapter provider ([`crate::ip_provider`]) so the two never
 /// drift on the parity-critical tokenization (T5 padded to the variant length; the vendored CLIP
 /// tokenizer). `t5` is locked only for the once-per-request encode.
-pub(crate) fn encode_text(
+pub fn encode_text(
     variant: Variant,
     root: &Path,
     device: &Device,
@@ -391,7 +391,7 @@ pub(crate) fn encode_text(
 /// [`Image`]. Shared by the txt2img [`Pipeline::decode`] and the IP-Adapter provider. The AutoEncoder
 /// applies its own `(z / scale) + shift` un-scale inside `decode`; the `[-1, 1]` output is mapped to
 /// `[0, 255]` u8.
-pub(crate) fn decode_latents(
+pub fn decode_latents(
     vae: &AutoEncoder,
     latents: &Tensor,
     height: usize,
@@ -423,7 +423,7 @@ pub(crate) fn image_seed(base_seed: u64, index: u32) -> u64 {
 
 /// The fixed CLIP-L (openai/clip-vit-large-patch14) text config FLUX uses — identical across
 /// schnell/dev. Mirrors the candle `flux` example's hardcoded `ClipTextConfig`.
-pub(crate) fn clip_config() -> ClipTextConfig {
+pub fn clip_config() -> ClipTextConfig {
     ClipTextConfig {
         vocab_size: 49408,
         projection_dim: 768,
@@ -438,7 +438,7 @@ pub(crate) fn clip_config() -> ClipTextConfig {
 }
 
 /// The FLUX DiT config for `variant` — schnell and dev differ only in `guidance_embed`.
-pub(crate) fn flux_config(variant: Variant) -> FluxConfig {
+pub fn flux_config(variant: Variant) -> FluxConfig {
     if variant.is_dev() {
         FluxConfig::dev()
     } else {
@@ -448,7 +448,7 @@ pub(crate) fn flux_config(variant: Variant) -> FluxConfig {
 
 /// The FLUX AutoEncoder config for `variant` (the scale/shift factors are identical across variants;
 /// the variant arm mirrors the candle example's per-model selection).
-pub(crate) fn ae_config(variant: Variant) -> AeConfig {
+pub fn ae_config(variant: Variant) -> AeConfig {
     if variant.is_dev() {
         AeConfig::dev()
     } else {

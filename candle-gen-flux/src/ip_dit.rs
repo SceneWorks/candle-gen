@@ -25,6 +25,28 @@ pub use candle_transformers::models::flux::model::Config;
 
 use crate::ip_adapter::FluxIpInjector;
 
+/// A per-block **additive residual** injector for the FLUX DiT image stream — the generic *post-block*
+/// seam the PuLID-FLUX id cross-attn (sc-5492, `candle-gen-pulid`) plugs into, the candle twin of
+/// `mlx-gen-flux`'s `transformer::DitImageInjector`. Kept model-agnostic so this crate carries no
+/// PuLID-specific code: the DiT just asks "is there a residual to add to the image tokens after block
+/// N?" and the injector (which owns the id_embedding + cross-attn modules) answers.
+///
+/// This is **distinct** from the XLabs IP-Adapter seam ([`FluxIpInjector`]), which injects *mid*-block
+/// on the image attention output using the captured pre-RoPE image query. This trait is consulted
+/// *after* a block completes, on the image hidden stream: `after_double` sees the image hidden directly;
+/// `after_single` sees the image-token tail of the joint `cat(txt, img)` stream (the DiT slices it out
+/// and writes the residual back). Returning `None` (a non-injection block index, or a 0 weight) leaves
+/// the stream untouched. The two seams are orthogonal — [`IpFlux::forward`] drives the IP one,
+/// [`IpFlux::forward_injected`] drives this one.
+pub trait DitImageInjector {
+    /// Residual to add to the image stream after double block `block_idx`, or `None`.
+    fn after_double(&self, block_idx: usize, img_hidden: &Tensor) -> Result<Option<Tensor>>;
+    /// Cheap gate so the DiT skips slicing the image-token tail on single blocks with no injection.
+    fn injects_after_single(&self, block_idx: usize) -> bool;
+    /// Residual to add to the image-token tail after single block `block_idx`, or `None`.
+    fn after_single(&self, block_idx: usize, img_tokens: &Tensor) -> Result<Option<Tensor>>;
+}
+
 fn layer_norm(dim: usize, vb: VarBuilder) -> Result<LayerNorm> {
     let ws = Tensor::ones(dim, vb.dtype(), vb.device())?;
     Ok(LayerNorm::new_no_bias(ws, 1e-6))
@@ -614,6 +636,81 @@ impl IpFlux {
             img = block.forward(&img, &vec_, &pe)?;
         }
         let img = img.i((.., txt.dim(1)?..))?;
+        self.final_layer.forward(&img, &vec_)
+    }
+
+    /// The upstream FLUX `forward`, plus an optional **post-block** image-stream residual injector —
+    /// the seam the PuLID-FLUX id cross-attn (sc-5492) hooks into. `injector = None` is byte-identical
+    /// to [`forward`](Self::forward) with `ip = None` (the plain FLUX path), so the no-id ablation
+    /// (`id_weight = 0` ⇒ every residual `None`) carries zero overhead.
+    ///
+    /// The injector is consulted after every double block (the image stream `img`) and after the single
+    /// blocks it opts into (the image-token tail of `joint = cat(txt, img)`), matching the reference
+    /// `flux/model.py` PuLID injection points (every 2nd double, every 4th single). The XLabs IP seam is
+    /// NOT engaged here (`ip = None` into the blocks) — PuLID uses only the post-block residuals.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_injected(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+        injector: Option<&dyn DitImageInjector>,
+    ) -> Result<Tensor> {
+        if txt.rank() != 3 {
+            candle_core::bail!("unexpected shape for txt {:?}", txt.shape())
+        }
+        if img.rank() != 3 {
+            candle_core::bail!("unexpected shape for img {:?}", img.shape())
+        }
+        let dtype = img.dtype();
+        let pe = {
+            let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
+            ids.apply(&self.pe_embedder)?
+        };
+        let mut txt = txt.apply(&self.txt_in)?;
+        let mut img = img.apply(&self.img_in)?;
+        let vec_ = timestep_embedding(timesteps, 256, dtype)?.apply(&self.time_in)?;
+        let vec_ = match (self.guidance_in.as_ref(), guidance) {
+            (Some(g_in), Some(guidance)) => {
+                (vec_ + timestep_embedding(guidance, 256, dtype)?.apply(g_in))?
+            }
+            _ => vec_,
+        };
+        let vec_ = (vec_ + y.apply(&self.vector_in))?;
+
+        // Double blocks (no IP seam) — the post-block PuLID residual is consulted on the image stream.
+        for (i, block) in self.double_blocks.iter().enumerate() {
+            (img, txt) = block.forward(&img, &txt, &vec_, &pe, None)?;
+            if let Some(inj) = injector {
+                if let Some(r) = inj.after_double(i, &img)? {
+                    img = (&img + r.to_dtype(img.dtype())?)?;
+                }
+            }
+        }
+
+        // Single blocks operate on the joint `cat(txt, img)`; the PuLID residual is added to the
+        // image-token tail (and written back) after the blocks it opts into.
+        let txt_len = txt.dim(1)?;
+        let mut joint = Tensor::cat(&[&txt, &img], 1)?;
+        for (i, block) in self.single_blocks.iter().enumerate() {
+            joint = block.forward(&joint, &vec_, &pe)?;
+            if let Some(inj) = injector {
+                if inj.injects_after_single(i) {
+                    let seq = joint.dim(1)?;
+                    let img_part = joint.narrow(1, txt_len, seq - txt_len)?;
+                    if let Some(r) = inj.after_single(i, &img_part)? {
+                        let added = (img_part + r.to_dtype(joint.dtype())?)?;
+                        let txt_part = joint.narrow(1, 0, txt_len)?;
+                        joint = Tensor::cat(&[&txt_part, &added], 1)?;
+                    }
+                }
+            }
+        }
+        let img = joint.i((.., txt_len..))?;
         self.final_layer.forward(&img, &vec_)
     }
 }

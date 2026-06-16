@@ -14,6 +14,7 @@
 //! embedder is a composed utility, so consumers construct it directly via [`load`] / [`load_on`].
 
 pub mod align;
+pub mod bisenet;
 mod common;
 pub mod face;
 pub mod iresnet;
@@ -40,6 +41,9 @@ const EMBEDDING_DIM: usize = 512;
 const SCRFD_FILE: &str = "scrfd_10g.safetensors";
 /// Recognizer checkpoint filename (shared with the MLX `convert_glintr100.py` output).
 const ARCFACE_FILE: &str = "arcface_iresnet100.safetensors";
+/// BiSeNet face-parsing checkpoint filename (the PuLID `face_features_image` path, sc-5492; shared
+/// with the MLX `convert_bisenet.py` output).
+const BISENET_FILE: &str = "bisenet_parsing.safetensors";
 
 /// The candle face embedder: a thin [`gen_core::FaceEmbedder`] adapter over [`FaceAnalysis`].
 pub struct CandleFaceAnalysis {
@@ -83,6 +87,28 @@ pub fn load_on(dir: &Path, device: &Device) -> Result<CandleFaceAnalysis> {
 pub fn load(dir: &Path) -> Result<CandleFaceAnalysis> {
     let device = candle_gen::default_device()?;
     load_on(dir, &device)
+}
+
+/// Load the SCRFD + ArcFace pair **plus** the BiSeNet parser (`bisenet_parsing.safetensors` in `dir`)
+/// onto `device` — the PuLID-FLUX path (sc-5492), which needs `face_features_image`. Reach the parser
+/// via [`CandleFaceAnalysis::inner`]`().face_features_image(..)`.
+pub fn load_with_parser_on(dir: &Path, device: &Device) -> Result<CandleFaceAnalysis> {
+    let scrfd_w = Weights::from_file(&dir.join(SCRFD_FILE), device)?;
+    let arcface_w = Weights::from_file(&dir.join(ARCFACE_FILE), device)?;
+    let bisenet_w = Weights::from_file(&dir.join(BISENET_FILE), device)?;
+    let scrfd = Scrfd::from_weights(&scrfd_w)?;
+    let arcface = ArcFace::from_weights(&arcface_w)?;
+    let inner = FaceAnalysis::new(scrfd, arcface, device.clone()).with_parser(&bisenet_w)?;
+    Ok(CandleFaceAnalysis {
+        inner,
+        descriptor: CandleFaceAnalysis::descriptor(),
+    })
+}
+
+/// Load the SCRFD + ArcFace + BiSeNet stack onto the build's default compute device (PuLID path).
+pub fn load_with_parser(dir: &Path) -> Result<CandleFaceAnalysis> {
+    let device = candle_gen::default_device()?;
+    load_with_parser_on(dir, &device)
 }
 
 /// `[x1,y1,x2,y2]` image-space dims of an [`Image`], rejecting a zero/oversized buffer.

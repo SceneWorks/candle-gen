@@ -352,6 +352,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-pulid"
+version = "0.0.0"
+dependencies = [
+ "candle-core",
+ "candle-gen",
+ "candle-gen-face",
+ "candle-gen-flux",
+ "candle-gen-sdxl",
+ "candle-nn",
+ "candle-transformers",
+ "rand",
+ "rand_distr",
+ "serde_json",
+]
+
+[[package]]
 name = "candle-gen-qwen-image"
 version = "0.0.0"
 dependencies = [

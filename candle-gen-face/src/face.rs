@@ -11,6 +11,8 @@ use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::{CandleError, Result};
 
 use crate::align;
+use crate::bisenet::{self, BiSeNet};
+use crate::common::Weights;
 use crate::iresnet::ArcFace;
 use crate::scrfd::{Detection, Scrfd, DET_SIZE};
 
@@ -147,10 +149,11 @@ pub fn detector_blob(img: &[u8], h: usize, w: usize, device: &Device) -> Result<
     Ok((nhwc.permute((0, 3, 1, 2))?.contiguous()?, det_scale))
 }
 
-/// The native face-analysis stack: SCRFD + ArcFace.
+/// The native face-analysis stack: SCRFD + ArcFace (+ optional BiSeNet for the PuLID crop path).
 pub struct FaceAnalysis {
     scrfd: Scrfd,
     arcface: ArcFace,
+    parser: Option<BiSeNet>,
     device: Device,
     /// Detection score / NMS thresholds (insightface defaults: 0.5 / 0.4).
     pub det_thresh: f32,
@@ -158,15 +161,24 @@ pub struct FaceAnalysis {
 }
 
 impl FaceAnalysis {
-    /// Build the detection + recognition stack from already-loaded sub-models on `device`.
+    /// Build the detection + recognition stack from already-loaded sub-models on `device`. For the
+    /// PuLID crop path, add the BiSeNet parser with [`FaceAnalysis::with_parser`].
     pub fn new(scrfd: Scrfd, arcface: ArcFace, device: Device) -> Self {
         Self {
             scrfd,
             arcface,
+            parser: None,
             device,
             det_thresh: 0.5,
             nms_thresh: 0.4,
         }
+    }
+
+    /// Attach the BiSeNet parser (enables [`FaceAnalysis::face_features_image`]) — the PuLID-FLUX
+    /// `face_features_image` path (sc-5492). InstantID / the Phase-5 kps surface don't need it.
+    pub(crate) fn with_parser(mut self, bisenet_weights: &Weights) -> Result<Self> {
+        self.parser = Some(BiSeNet::from_weights(bisenet_weights)?);
+        Ok(self)
     }
 
     /// Detect every face in an RGB `u8` image, sorted **largest-first** (insightface `app.get()`
@@ -235,6 +247,33 @@ impl FaceAnalysis {
             })
             .collect())
     }
+
+    /// PuLID `face_features_image`: facexlib 512² align of `face` → BiSeNet parse → background
+    /// whitened, foreground grayscale. Returns NCHW `[1,3,512,512]` f32 in `[0,1]` on the stack's
+    /// device. Requires [`FaceAnalysis::with_parser`].
+    pub fn face_features_image(
+        &self,
+        img: &[u8],
+        h: usize,
+        w: usize,
+        face: &Face,
+    ) -> Result<Tensor> {
+        let parser = self.parser.as_ref().ok_or_else(|| {
+            CandleError::Msg("face_features_image requires a BiSeNet parser (with_parser)".into())
+        })?;
+        let crop = align::align_face_512(img, h, w, &face.kps); // 512² RGB u8
+        let rgb01 = u8_to_rgb01_nchw(&crop, 512, 512, &self.device)?;
+        let mask = parser.parse_mask(&bisenet::to_parse_input(&rgb01)?)?;
+        bisenet::face_features_image(&rgb01, &mask)
+    }
+}
+
+/// RGB `u8` HWC → NCHW `[1,3,H,W]` f32 in `[0,1]` (the BiSeNet parse-net / `face_features_image` input
+/// layout — candle is channels-first where the MLX sibling is channels-last).
+fn u8_to_rgb01_nchw(crop: &[u8], h: usize, w: usize, device: &Device) -> Result<Tensor> {
+    let data: Vec<f32> = crop.iter().map(|&v| v as f32 / 255.0).collect();
+    let hwc = Tensor::from_vec(data, (1, h, w, 3), device)?;
+    Ok(hwc.permute((0, 3, 1, 2))?.contiguous()?)
 }
 
 #[cfg(test)]

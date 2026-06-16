@@ -39,6 +39,16 @@ pub mod ip_image_encoder;
 pub mod ip_provider;
 pub use ip_provider::{IpAdapterFlux, IpAdapterFluxPaths, IpAdapterFluxRequest, DEFAULT_IP_SCALE};
 
+// The vendored FLUX DiT + its post-block image-stream injector seam, re-exported for the PuLID-FLUX
+// provider (`candle-gen-pulid`, sc-5492), which composes the FLUX backbone with the EVA-CLIP tower +
+// IDFormer + the 20 PerceiverAttentionCA modules driven through [`DitImageInjector`]. `Config` is the
+// candle-transformers FLUX config the fork reuses (so it cannot drift on hyperparameters).
+pub use ip_dit::{Config as FluxConfig, DitImageInjector, IpFlux};
+// FLUX backbone helpers shared with the PuLID provider so the two never drift on the parity-critical
+// tokenization / VAE decode / config (the candle twin of `mlx-gen-flux`'s shared `Flux1` surface). The
+// IP-Adapter provider reaches these as `pub(crate)`; PuLID is a separate crate, hence `pub`.
+pub use pipeline::{ae_config, clip_config, decode_latents, encode_text, flux_config};
+
 /// FLUX XLabs IP-Adapter real-weight GPU validation (sc-5872) — env-driven, `#[ignore]`d integration
 /// test (the analog of the SDXL/Kolors IP-Adapter Phase-5 harnesses).
 #[cfg(test)]
@@ -70,14 +80,14 @@ const SIZE_MULTIPLE: u32 = 16;
 /// defaults, T5 length, checkpoint filename) as primitives so `lib.rs` stays candle-light — the
 /// pipeline maps the variant onto candle's `flux`/`autoencoder` configs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Variant {
+pub enum Variant {
     Schnell,
     Dev,
 }
 
 impl Variant {
     /// The registry / engine id.
-    pub(crate) const fn model_id(self) -> &'static str {
+    pub const fn model_id(self) -> &'static str {
         match self {
             Variant::Schnell => FLUX1_SCHNELL_ID,
             Variant::Dev => FLUX1_DEV_ID,
@@ -85,7 +95,7 @@ impl Variant {
     }
 
     /// Distilled default step count (mlx parity): schnell 4, dev 25.
-    pub(crate) const fn default_steps(self) -> u32 {
+    pub const fn default_steps(self) -> u32 {
         match self {
             Variant::Schnell => 4,
             Variant::Dev => 25,
@@ -94,18 +104,18 @@ impl Variant {
 
     /// Whether the DiT embeds a guidance scale. schnell is timestep-distilled (no guidance); dev is
     /// guidance-distilled. Drives both the descriptor's `supports_guidance` and the denoise.
-    pub(crate) const fn supports_guidance(self) -> bool {
+    pub const fn supports_guidance(self) -> bool {
         matches!(self, Variant::Dev)
     }
 
     /// Default guidance scale when a dev request omits one (mlx `DEFAULT_GUIDANCE`). Inert for schnell.
-    pub(crate) const fn default_guidance(self) -> f32 {
+    pub const fn default_guidance(self) -> f32 {
         3.5
     }
 
     /// T5 sequence length the prompt is padded to (diffusers FluxPipeline default): schnell 256,
     /// dev 512. FLUX attends every T5 position, so this is parity-critical.
-    pub(crate) const fn t5_max_len(self) -> usize {
+    pub const fn t5_max_len(self) -> usize {
         match self {
             Variant::Schnell => 256,
             Variant::Dev => 512,
@@ -113,7 +123,7 @@ impl Variant {
     }
 
     /// The root BFL DiT checkpoint filename in the snapshot.
-    pub(crate) const fn transformer_file(self) -> &'static str {
+    pub const fn transformer_file(self) -> &'static str {
         match self {
             Variant::Schnell => "flux1-schnell.safetensors",
             Variant::Dev => "flux1-dev.safetensors",
@@ -121,7 +131,7 @@ impl Variant {
     }
 
     /// Whether this is the dev variant (guidance + time-shifted schedule).
-    pub(crate) const fn is_dev(self) -> bool {
+    pub const fn is_dev(self) -> bool {
         matches!(self, Variant::Dev)
     }
 }

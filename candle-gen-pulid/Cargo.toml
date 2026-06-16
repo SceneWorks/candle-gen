@@ -1,0 +1,64 @@
+[package]
+name = "candle-gen-pulid"
+version = "0.0.0"
+edition = "2021"
+description = "PuLID-FLUX face-identity provider for candle-gen — the Windows/CUDA sibling of mlx-gen-pulid. The EVA02-CLIP-L-14-336 visual tower + IDFormer perceiver-resampler + the 20 PerceiverAttentionCA modules injected into the FLUX.1-dev DiT (via the candle-gen-flux post-block injector seam), composing the gen-core FaceEmbedder + BiSeNet face_features_image (epic 5480, sc-5492)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "pulid", "flux", "inference"]
+categories = ["science"]
+
+[dependencies]
+# Core crate — re-exports gen_core (the neutral `Image`/`Progress`/`CancelFlag`) + candle, so this
+# provider links exactly one gen-core / candle build (single resolution; check-gen-core-skew.sh).
+candle-gen = { path = "../candle-gen" }
+# The FLUX backbone (the forked `IpFlux` DiT + its post-block `DitImageInjector` seam, plus the shared
+# `encode_text`/`decode_latents`/`{flux,ae,clip}_config`/`Variant` helpers) — PuLID composes the dev
+# DiT and drives the 20 PerceiverAttentionCA residuals through `IpFlux::forward_injected`. Backend
+# features are forwarded below so the whole stack shares ONE candle build (single-rev skew gate).
+candle-gen-flux = { path = "../candle-gen-flux" }
+# The native SCRFD + ArcFace + BiSeNet face stack (sc-5490 + sc-5492): `analyze` gives the reference's
+# 512-d ArcFace embedding, and `face_features_image` (BiSeNet bg-whitened grayscale crop) feeds the
+# EVA tower — `load_with_parser` wires the parser.
+candle-gen-face = { path = "../candle-gen-face" }
+# The safetensors key→Tensor `Weights` loader (with the I64-passthrough float cast) used to load the
+# EVA02-CLIP tower + the PuLID encoder/CA checkpoint. Same loader the FLUX IP-Adapter uses.
+candle-gen-sdxl = { path = "../candle-gen-sdxl" }
+# FLUX building blocks reused for the backbone load (dual CLIP-L + T5-XXL text encoders, the
+# AutoEncoder VAE) — PuLID loads these exactly as the FLUX IP-Adapter provider does.
+candle-transformers = { workspace = true }
+# The EVA-CLIP tower / IDFormer / PerceiverAttentionCA are vendored as candle modules (Linear/LayerNorm
+# + raw tensor ops), so direct candle-core/candle-nn deps (same workspace pin as candle-transformers).
+candle-core = { workspace = true }
+candle-nn = { workspace = true }
+# Deterministic CPU-seeded initial noise (sc-3673 parity) — NOT candle's CUDA `randn`.
+rand = { workspace = true }
+rand_distr = { workspace = true }
+# Parse the FLUX snapshot's `text_encoder_2/config.json` into candle's `t5::Config` (the backbone load).
+serde_json = "1"
+
+[features]
+# Pass the backend selection through to the core crate AND the composed provider crates so a downstream
+# `--features cuda`/`metal` selects the matching candle backend everywhere (one device, one resolution).
+default = []
+metal = [
+    "candle-gen/metal",
+    "candle-transformers/metal",
+    "candle-gen-flux/metal",
+    "candle-gen-face/metal",
+    "candle-gen-sdxl/metal",
+]
+cuda = [
+    "candle-gen/cuda",
+    "candle-transformers/cuda",
+    "candle-gen-flux/cuda",
+    "candle-gen-face/cuda",
+    "candle-gen-sdxl/cuda",
+]
+flash-attn = [
+    "candle-gen/flash-attn",
+    "candle-transformers/flash-attn",
+    "candle-gen-flux/flash-attn",
+    "candle-gen-face/flash-attn",
+    "candle-gen-sdxl/flash-attn",
+]

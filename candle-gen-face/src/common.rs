@@ -82,3 +82,22 @@ impl Conv {
         Ok(self.forward(x, stride, padding)?.relu()?)
     }
 }
+
+/// A bias-less convolution (BiSeNet's FFM SE 1×1s and the final 1×1 parsing head — no BN, so no folded
+/// bias). Always stride 1, pad 0 (1×1 convs), mirroring `mlx-gen-face`'s `ConvW`. The kernel is stored
+/// OIHW (transposed from the file's OHWI at load, like [`Conv`]).
+pub(crate) struct ConvW {
+    pub w: Tensor,
+}
+
+impl ConvW {
+    pub fn load(w: &Weights, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            w: ohwi_to_oihw(&w.require(&format!("{prefix}.weight"))?)?,
+        })
+    }
+
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        Ok(x.conv2d(&self.w, 0, 1, 1, 1)?)
+    }
+}
