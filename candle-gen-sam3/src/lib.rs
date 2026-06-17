@@ -15,9 +15,11 @@
 //! * [`Sam3VisionEncoder`] — the shared PE ViT backbone + FPN neck (slice sc-6240).
 //! * [`Sam3TextEncoder`] / [`Sam3Tokenizer`] — the CLIP-H text tower + `text_projection`
 //!   (1024→256) and the CLIP BPE tokenizer that produce the concept conditioning the DETR stack
-//!   consumes (slice sc-6241; **this slice**).
-//! * `Sam3Detector` / `Sam3MaskHead` / `Sam3ImageSegmenter` / `Sam3VideoModel` — later slices
-//!   (sc-6242…sc-6246).
+//!   consumes (slice sc-6241).
+//! * [`Sam3Detector`] — the DETR encoder/decoder + presence + dot-product scoring that turns the
+//!   72² FPN feature + text conditioning into concept logits, boxes, and presence (slice sc-6242;
+//!   **this slice**).
+//! * `Sam3MaskHead` / `Sam3ImageSegmenter` / `Sam3VideoModel` — later slices (sc-6243…sc-6246).
 //!
 //! ## Layout note
 //! The MLX port runs NHWC and permutes the torch OIHW/IOHW conv kernels to MLX OHWI at load. candle's
@@ -28,10 +30,12 @@
 
 mod common;
 pub mod config;
+pub mod detr;
 pub mod text;
 pub mod vision;
 
 pub use common::Weights;
 pub use config::{Sam3DetrConfig, Sam3GeometryConfig, Sam3TextConfig, Sam3VisionConfig};
+pub use detr::{DetectorOutput, Sam3Detector};
 pub use text::{Sam3TextEncoder, Sam3Tokenizer};
 pub use vision::Sam3VisionEncoder;
