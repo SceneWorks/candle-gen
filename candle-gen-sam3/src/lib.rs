@@ -19,9 +19,11 @@
 //! * [`Sam3Detector`] — the DETR encoder/decoder + presence + dot-product scoring that turns the
 //!   72² FPN feature + text conditioning into concept logits, boxes, and presence (slice sc-6242).
 //! * [`Sam3MaskHead`] + [`Sam3ImageSegmenter`] — the MaskFormer-style mask head and the end-to-end
-//!   text-only **PCS** still-image segmenter (`pixel_values + "person" → per-instance masks`) that
-//!   assembles vision + text + DETR + mask head (slice sc-6243; **this slice**). The box-prompted
-//!   **PVS** path (geometry encoder) + `Sam3VideoModel` are later slices (sc-6244…sc-6246).
+//!   still-image segmenter (`pixel_values + "person" → per-instance masks`) that assembles vision +
+//!   text + DETR + mask head (slice sc-6243).
+//! * [`Sam3GeometryEncoder`] — the box/point **PVS** prompt encoder (`roi_align` + box sine-PE + 3
+//!   cross-attending layers) that feeds `Sam3ImageSegmenter::forward_with_boxes` (slice sc-6244;
+//!   **this slice**). `Sam3VideoModel` is a later slice (sc-6245).
 //!
 //! ## Layout note
 //! The MLX port runs NHWC and permutes the torch OIHW/IOHW conv kernels to MLX OHWI at load. candle's
@@ -33,6 +35,7 @@
 mod common;
 pub mod config;
 pub mod detr;
+pub mod geometry;
 pub mod mask;
 pub mod model;
 pub mod text;
@@ -41,6 +44,7 @@ pub mod vision;
 pub use common::Weights;
 pub use config::{Sam3DetrConfig, Sam3GeometryConfig, Sam3TextConfig, Sam3VisionConfig};
 pub use detr::{DetectorOutput, Sam3Detector};
+pub use geometry::Sam3GeometryEncoder;
 pub use mask::{post_process_instances, Instance, MaskOutput, Sam3MaskHead};
 pub use model::{Sam3ImageSegmenter, SegmentationOutput};
 pub use text::{Sam3TextEncoder, Sam3Tokenizer};
