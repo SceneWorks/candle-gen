@@ -204,20 +204,35 @@ impl QwenTextEncoder {
         })
     }
 
+    /// Token embeddings `[b, s, hidden]` (f32) — the LM-stack input, and the seam where the
+    /// Qwen-Image-Edit vision-language encoder splices vision embeds (sc-5487).
+    pub fn embed(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.embed_tokens.forward(input_ids)?.to_dtype(DType::F32)
+    }
+
+    /// Run the 28 LM layers + final RMSNorm over pre-embedded hidden states `[b, s, hidden]`,
+    /// returning the last layer's **normed** hidden state `[b, s, hidden]` (no template-token drop).
+    /// Single-prompt causal attention (no padding). The text path
+    /// ([`prompt_embeds`](Self::prompt_embeds)) and the VL edit path share this body.
+    pub fn forward_from_embeds(&self, embeds: &Tensor) -> Result<Tensor> {
+        let (b, s, _) = embeds.dims3()?;
+        let mask = causal_mask(b, s, embeds.device())?;
+        let mut hidden = embeds.clone();
+        for layer in &self.layers {
+            hidden = layer.forward(&hidden, &self.rotary, &mask)?;
+        }
+        self.norm.forward(&hidden)
+    }
+
     /// `input_ids` `[1, S]` → `prompt_embeds` `[1, S − drop_idx, 3584]` (f32): the last layer's normed
     /// hidden state with the leading `drop_idx` (=34) template tokens dropped. Single-prompt causal
     /// attention (no padding).
     pub fn prompt_embeds(&self, input_ids: &Tensor) -> Result<Tensor> {
-        let (b, s) = input_ids.dims2()?;
-        let mask = causal_mask(b, s, input_ids.device())?;
-        let mut hidden = self.embed_tokens.forward(input_ids)?.to_dtype(DType::F32)?;
-        for layer in &self.layers {
-            hidden = layer.forward(&hidden, &self.rotary, &mask)?;
-        }
-        let hidden = self.norm.forward(&hidden)?;
+        let s = input_ids.dim(1)?;
+        let embeds = self.embed(input_ids)?;
+        let hidden = self.forward_from_embeds(&embeds)?;
         // Drop the leading template tokens.
-        let keep = s - self.drop_idx;
-        hidden.narrow(1, self.drop_idx, keep)
+        hidden.narrow(1, self.drop_idx, s - self.drop_idx)
     }
 }
 
