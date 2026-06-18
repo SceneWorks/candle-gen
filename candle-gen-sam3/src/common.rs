@@ -175,6 +175,25 @@ pub(crate) fn conv2d_nhwc(
     Ok(y.permute([0, 2, 3, 1])?.contiguous()?) // NCHW → NHWC
 }
 
+/// `conv2d` on an NHWC activation with a torch-native OIHW kernel and an explicit `groups`. The
+/// depthwise case (`groups == channels`, kernel `[C, 1, k, k]`) is the memory encoder's ConvNeXt 7×7;
+/// `groups == 1` falls back to plain [`conv2d_nhwc`]. Bias is `[O]`.
+pub(crate) fn conv2d_nhwc_grouped(
+    x: &Tensor,
+    w: &Tensor,
+    bias: Option<&Tensor>,
+    stride: usize,
+    padding: usize,
+    groups: usize,
+) -> Result<Tensor> {
+    let xc = x.permute([0, 3, 1, 2])?.contiguous()?; // NHWC → NCHW
+    let mut y = xc.conv2d(w, padding, stride, 1, groups)?; // [N, O, H', W']
+    if let Some(b) = bias {
+        y = y.broadcast_add(&b.reshape((1, b.elem_count(), 1, 1))?)?;
+    }
+    Ok(y.permute([0, 2, 3, 1])?.contiguous()?) // NCHW → NHWC
+}
+
 /// `conv_transpose2d` on an NHWC activation with a torch-native IOHW kernel (loaded as-is), pad 0 /
 /// output_pad 0, plus the `[O]` bias.
 pub(crate) fn conv_transpose2d_nhwc(

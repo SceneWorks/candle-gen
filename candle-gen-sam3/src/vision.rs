@@ -351,7 +351,7 @@ pub(crate) struct FpnLayer {
 }
 
 impl FpnLayer {
-    fn load(w: &Weights, prefix: &str, scale: f32) -> Result<Self> {
+    pub(crate) fn load(w: &Weights, prefix: &str, scale: f32) -> Result<Self> {
         // Branch on an integer code (`scale·2` → 8/4/2/1) to avoid float-literal matching.
         // scale_layers indices: ConvTranspose at 0 (and 2 for scale 4), GELU at 1 (no weights),
         // MaxPool at 0 for scale 0.5 (no weights).
@@ -381,7 +381,7 @@ impl FpnLayer {
     }
 
     /// `x`: NHWC `[1, 72, 72, 1024]`. Returns NHWC `[1, Hs, Ws, fpn_dim]`.
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let mut h = x.clone();
         let n = self.up_stages.len();
         for (i, (w, b)) in self.up_stages.iter().enumerate() {
@@ -456,6 +456,13 @@ impl Sam3VisionEncoder {
             .iter()
             .map(|l| l.forward(features))
             .collect()
+    }
+
+    /// The shared PE [`Backbone`] handle (clone of the `Arc`) — exercised by the F-028 shared-backbone
+    /// parity check (the segmenter and tracker must point at one backbone).
+    #[cfg(test)]
+    pub(crate) fn backbone_arc(&self) -> Arc<Backbone> {
+        self.backbone.clone()
     }
 }
 

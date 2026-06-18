@@ -22,8 +22,11 @@
 //!   still-image segmenter (`pixel_values + "person" → per-instance masks`) that assembles vision +
 //!   text + DETR + mask head (slice sc-6243).
 //! * [`Sam3GeometryEncoder`] — the box/point **PVS** prompt encoder (`roi_align` + box sine-PE + 3
-//!   cross-attending layers) that feeds `Sam3ImageSegmenter::forward_with_boxes` (slice sc-6244;
-//!   **this slice**). `Sam3VideoModel` is a later slice (sc-6245).
+//!   cross-attending layers) that feeds `Sam3ImageSegmenter::forward_with_boxes` (slice sc-6244).
+//! * [`Sam3Tracker`] — the SAM2.1 single-frame box-prompt tracker (tracker neck + prompt encoder +
+//!   two-way mask decoder) plus the video memory primitives (memory encoder, RoPE memory attention,
+//!   per-object bank conditioning), and [`Sam3VideoModel`] — the multi-object video PCS pipeline that
+//!   orchestrates the detector + tracker frame-by-frame (slice sc-6245; **this slice**).
 //!
 //! ## Layout note
 //! The MLX port runs NHWC and permutes the torch OIHW/IOHW conv kernels to MLX OHWI at load. candle's
@@ -39,6 +42,8 @@ pub mod geometry;
 pub mod mask;
 pub mod model;
 pub mod text;
+pub mod tracker;
+pub mod video;
 pub mod vision;
 
 pub use common::Weights;
@@ -48,4 +53,6 @@ pub use geometry::Sam3GeometryEncoder;
 pub use mask::{post_process_instances, Instance, MaskOutput, Sam3MaskHead};
 pub use model::{Sam3ImageSegmenter, SegmentationOutput};
 pub use text::{Sam3TextEncoder, Sam3Tokenizer};
+pub use tracker::{MemoryFeatures, Sam3Tracker, TrackerFrameOutput, TrackerMask};
+pub use video::{Sam3VideoModel, VideoFrameOutput};
 pub use vision::Sam3VisionEncoder;

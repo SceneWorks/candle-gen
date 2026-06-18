@@ -9,12 +9,15 @@
 //! [`segment_with_boxes`](Sam3ImageSegmenter::segment_with_boxes), sc-6244) — the latter prepends
 //! geometry prompt tokens to the text features as the reference's `combined_prompt_features`.
 
+use std::sync::Arc;
+
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::Result;
 
 use crate::config::{Sam3DetrConfig, Sam3GeometryConfig, Sam3TextConfig, Sam3VisionConfig};
 use crate::detr::sine_position_embedding_flat;
 use crate::mask::{post_process_instances, Instance, Sam3MaskHead};
+use crate::vision::Backbone;
 use crate::{Sam3Detector, Sam3GeometryEncoder, Sam3TextEncoder, Sam3VisionEncoder};
 
 /// Full raw outputs of the image segmenter (pre-post-process).
@@ -64,6 +67,44 @@ impl Sam3ImageSegmenter {
             detector: Sam3Detector::from_weights(w, "detector_model", &detr_cfg)?,
             mask_head: Sam3MaskHead::from_weights(w, "detector_model", &detr_cfg)?,
         })
+    }
+
+    /// Load the segmenter reusing an already-loaded (and possibly shared) PE [`Backbone`]. Lets the
+    /// video model (sc-6245) share **one** backbone between the detector segmenter and the tracker
+    /// rather than holding two identical ~445M-param copies (F-028).
+    pub(crate) fn from_weights_with_backbone(
+        w: &crate::Weights,
+        backbone: Arc<Backbone>,
+    ) -> Result<Self> {
+        let detr_cfg = Sam3DetrConfig::sam3();
+        Ok(Self {
+            vision: Sam3VisionEncoder::from_weights_with_backbone(
+                w,
+                "detector_model.vision_encoder",
+                &Sam3VisionConfig::sam3(),
+                backbone,
+            )?,
+            text: Sam3TextEncoder::from_weights(
+                w,
+                "detector_model.text_encoder.text_model",
+                "detector_model.text_projection",
+                &Sam3TextConfig::sam3(),
+            )?,
+            geometry: Sam3GeometryEncoder::from_weights(
+                w,
+                "detector_model.geometry_encoder",
+                &Sam3GeometryConfig::sam3(),
+            )?,
+            detector: Sam3Detector::from_weights(w, "detector_model", &detr_cfg)?,
+            mask_head: Sam3MaskHead::from_weights(w, "detector_model", &detr_cfg)?,
+        })
+    }
+
+    /// The shared PE [`Backbone`] handle (clone of the `Arc`) — exercised by the F-028 shared-backbone
+    /// parity check (the segmenter and tracker must point at one backbone).
+    #[cfg(test)]
+    pub(crate) fn vision_backbone_arc(&self) -> Arc<Backbone> {
+        self.vision.backbone_arc()
     }
 
     /// `pixel_values`: NCHW `[1, 3, 1008, 1008]`; `input_ids`: `[1, 32]`; `text_mask`: per-token
