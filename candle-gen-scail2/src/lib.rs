@@ -33,14 +33,18 @@ mod common;
 
 pub mod clip;
 pub mod config;
+pub mod generate;
 pub mod model;
+pub mod pipeline;
 pub mod preprocess;
 pub mod resize;
 pub mod rope;
 
 pub use clip::{ClipVisionConfig, ScailClip};
 pub use config::Scail2Config;
+pub use generate::{generate, CharacterRef, Components, Scail2Job};
 pub use model::{Scail2Dit, Scail2Inputs};
+pub use pipeline::{descriptor, force_link, load, MODEL_ID};
 pub use preprocess::extract_and_compress_mask_to_latent;
 pub use resize::{clip_preprocess, downsample_half, interpolate, Interp};
 pub use rope::ScailRope;

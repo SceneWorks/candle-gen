@@ -13,11 +13,13 @@
 //! the f32 14B params (~28 GiB) fit the 96 GiB `minMemoryGb` budget. The `Conv3d` patch weights
 //! `[out, in, 1, 2, 2]` are read as `[out, in·4]` Linears via [`crate::common::conv_as_linear`].
 
-use candle_gen::candle_core::{DType, Result, Tensor};
+use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::{Linear, Module, VarBuilder};
 use candle_gen_wan::rope::apply_rope;
 
-use crate::common::{conv_as_linear, linear, ln_affine, ln_no_affine, patchify, rms, sdpa, unpatchify};
+use crate::common::{
+    conv_as_linear, linear, ln_affine, ln_no_affine, patchify, rms, sdpa, unpatchify,
+};
 use crate::config::Scail2Config;
 use crate::rope::ScailRope;
 
@@ -133,13 +135,17 @@ impl CrossAttnI2V {
         let q = to_heads(&rms(&self.q.forward(x)?, &self.norm_q, self.eps)?, s)?;
         let lt = text_ctx.dim(1)?;
         let li = img_ctx.dim(1)?;
-        let k = to_heads(&rms(&self.k.forward(text_ctx)?, &self.norm_k, self.eps)?, lt)?;
+        let k = to_heads(
+            &rms(&self.k.forward(text_ctx)?, &self.norm_k, self.eps)?,
+            lt,
+        )?;
         let v = to_heads(&self.v.forward(text_ctx)?, lt)?;
-        let k_img = to_heads(&rms(&self.k_img.forward(img_ctx)?, &self.norm_k_img, self.eps)?, li)?;
+        let k_img = to_heads(
+            &rms(&self.k_img.forward(img_ctx)?, &self.norm_k_img, self.eps)?,
+            li,
+        )?;
         let v_img = to_heads(&self.v_img.forward(img_ctx)?, li)?;
-        let flat = |o: Tensor| -> Result<Tensor> {
-            o.transpose(1, 2)?.reshape((b, s, n * d))
-        };
+        let flat = |o: Tensor| -> Result<Tensor> { o.transpose(1, 2)?.reshape((b, s, n * d)) };
         let x_txt = flat(sdpa(&q, &k, &v, self.scale)?)?;
         let x_img = flat(sdpa(&q, &k_img, &v_img, self.scale)?)?;
         self.o.forward(&(x_txt + x_img)?)
@@ -251,6 +257,7 @@ pub struct Scail2Dit {
     head: Linear,
     rope: ScailRope,
     cfg: Scail2Config,
+    device: Device,
 }
 
 impl Scail2Dit {
@@ -308,6 +315,7 @@ impl Scail2Dit {
             )?,
             rope: ScailRope::new(cfg.head_dim()),
             cfg: cfg.clone(),
+            device: vb.device().clone(),
         })
     }
 
@@ -316,9 +324,18 @@ impl Scail2Dit {
         self.blocks.len()
     }
 
+    /// The device the DiT weights live on.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     /// Sinusoidal timestep embedding → `(e, e0)`: `e` `[1, dim]` (head modulation), `e0` `[1, 6, dim]`
     /// (block modulation). Built in f64 then cast to f32, matching upstream `sinusoidal_embedding_1d`.
-    fn time_embed(&self, t: f64, dev: &candle_gen::candle_core::Device) -> Result<(Tensor, Tensor)> {
+    fn time_embed(
+        &self,
+        t: f64,
+        dev: &candle_gen::candle_core::Device,
+    ) -> Result<(Tensor, Tensor)> {
         let freq_dim = self.cfg.freq_dim;
         let half = freq_dim / 2;
         let mut emb = vec![0f32; freq_dim];
@@ -388,10 +405,16 @@ impl Scail2Dit {
         // --- append the i2v binary-mask channels (in_dim 20 = 16 + 4) ---
         let x20 = match inp.history_mask {
             Some(hm) => Tensor::cat(&[inp.x, hm], 0)?,
-            None => Tensor::cat(&[inp.x, &Tensor::zeros((i2v, tt, hh, ww), DType::F32, dev)?], 0)?,
+            None => Tensor::cat(
+                &[inp.x, &Tensor::zeros((i2v, tt, hh, ww), DType::F32, dev)?],
+                0,
+            )?,
         };
         let ref20 = Tensor::cat(
-            &[inp.ref_latent, &Tensor::ones((i2v, 1, hh, ww), DType::F32, dev)?],
+            &[
+                inp.ref_latent,
+                &Tensor::ones((i2v, 1, hh, ww), DType::F32, dev)?,
+            ],
             0,
         )?;
         let (_pc, pose_t, pose_h, pose_w) = inp.pose_latent.dims4()?;
@@ -440,15 +463,18 @@ impl Scail2Dit {
                 )
             })?;
             let (_arc, ar_n, _arh, _arw) = ar.dims4()?;
-            let ar20 = Tensor::cat(&[ar, &Tensor::ones((i2v, ar_n, hh, ww), DType::F32, dev)?], 0)?;
+            let ar20 = Tensor::cat(
+                &[ar, &Tensor::ones((i2v, ar_n, hh, ww), DType::F32, dev)?],
+                0,
+            )?;
             let (ar_tok, _) = patchify(&ar20, ps)?;
             let (arm_tok, _) = patchify(arm, ps)?;
             let ar_emb = (self.patch_embedding.forward(&ar_tok)?
                 + self.patch_embedding_mask.forward(&arm_tok)?)?;
             addref_count = ar_n;
-            let (c, s) = self
-                .rope
-                .chunk((addref_count, rope_h, rope_w), (0, h_shift, 0), false, dev)?;
+            let (c, s) =
+                self.rope
+                    .chunk((addref_count, rope_h, rope_w), (0, h_shift, 0), false, dev)?;
             tok_list.push(ar_emb);
             cos_list.push(c);
             sin_list.push(s);
@@ -456,9 +482,9 @@ impl Scail2Dit {
 
         // ref+video tokens (one block); RoPE splits ref (1 frame) and video (rope_t frames).
         tok_list.push(refvid_emb);
-        let (rc, rs) = self
-            .rope
-            .chunk((1, rope_h, rope_w), (addref_count, h_shift, 0), false, dev)?;
+        let (rc, rs) =
+            self.rope
+                .chunk((1, rope_h, rope_w), (addref_count, h_shift, 0), false, dev)?;
         let (vc, vs) = self.rope.chunk(
             (rope_t, rope_h, rope_w),
             (base_video_shift + addref_count, 0, 0),
@@ -506,7 +532,9 @@ impl Scail2Dit {
         let addref_length = addref_count * ref_length;
         let offset = addref_length + ref_length;
         let op = xh.dim(2)?;
-        let vid_tok = xh.narrow(1, offset, seq_length)?.reshape((seq_length, op))?;
+        let vid_tok = xh
+            .narrow(1, offset, seq_length)?
+            .reshape((seq_length, op))?;
         unpatchify(&vid_tok, (rope_t, rope_h, rope_w), cfg.out_dim, ps)
     }
 }

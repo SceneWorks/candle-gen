@@ -136,7 +136,13 @@ impl ScailRope {
                             for dw in 0..2 {
                                 let hi = ho_i * 2 + dh;
                                 let wi = wo_i * 2 + dw;
-                                self.fill(&mut fc, &mut fs, ti + shift_t, hi + shift_h, wi + shift_w);
+                                self.fill(
+                                    &mut fc,
+                                    &mut fs,
+                                    ti + shift_t,
+                                    hi + shift_h,
+                                    wi + shift_w,
+                                );
                                 for k in 0..hd {
                                     cos[d + k] += fc[k];
                                     sin[d + k] += fs[k];

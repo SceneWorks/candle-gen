@@ -64,7 +64,9 @@ pub(crate) fn rms(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
     let xf = x.to_dtype(DType::F32)?;
     let var = xf.sqr()?.mean_keepdim(D::Minus1)?;
     let normed = xf.broadcast_div(&(var + eps)?.sqrt()?)?;
-    normed.broadcast_mul(&weight.to_dtype(DType::F32)?)?.to_dtype(dt)
+    normed
+        .broadcast_mul(&weight.to_dtype(DType::F32)?)?
+        .to_dtype(dt)
 }
 
 /// Scaled-dot-product attention. `q,k,v`: `[B, H, S*, d]`; softmax upcast to f32.

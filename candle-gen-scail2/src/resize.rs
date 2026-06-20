@@ -155,6 +155,10 @@ mod tests {
         let x = Tensor::from_vec(data.clone(), (1, 1, 4, 4), &dev).unwrap();
         let y = interpolate(&x, 4, 4, Interp::Bicubic).unwrap();
         let v: Vec<f32> = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        assert!((v[5] - data[5]).abs() < 1e-3, "interior pixel changed: {}", v[5]);
+        assert!(
+            (v[5] - data[5]).abs() < 1e-3,
+            "interior pixel changed: {}",
+            v[5]
+        );
     }
 }
