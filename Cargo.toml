@@ -109,7 +109,12 @@ resolver = "2"
 # a Mac-only image family with no candle sibling; mlx-rs unchanged 44929a0), so this is a
 # behavior-neutral re-alignment — candle builds nothing new. Restores a SINGLE gen-core rev for the
 # worker's `--features backend-candle` lane.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "0b86fad4fb98a3b2a73d0a38e47616cd505094ca" }
+# Bumped `0b86fad` -> `dc40c74` (mlx-gen #505, sc-3459 VACE-Fun): the SceneWorks worker's mlx pin
+# advances to `dc40c74` (the native dual-expert Wan2.2 VACE-Fun engine — a Mac-only mlx-gen-wan
+# addition with no candle sibling), so candle-gen's gen-core must MATCH under the worker's
+# `--features backend-candle` skew gate. gen-core is BYTE-IDENTICAL `0b86fad` -> `dc40c74` (the mlx PR
+# touched only mlx-gen-wan; mlx-rs unchanged 44929a0) — candle builds nothing new.
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "dc40c74ea6d364010a8e0198eab6fceba2422e2a" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
