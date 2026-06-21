@@ -140,8 +140,18 @@ impl Pipeline {
         let out = tok
             .tokenize(prompt)
             .map_err(|e| CandleError::Msg(format!("wan: tokenize: {e}")))?;
-        let len = out.ids.len().max(1);
-        let ids: Vec<u32> = out.ids.iter().map(|&i| i as u32).collect();
+        let mut ids: Vec<u32> = out.ids.iter().map(|&i| i as u32).collect();
+        if ids.is_empty() {
+            // The gen_core tokenizer short-circuits an empty prompt to zero ids, but UMT5/T5 encode
+            // the empty string as a single token. A 0-length sequence here would build a degenerate
+            // `(1,1)` tensor (the old `.max(1)` padded the *shape* but not the data), and the f32
+            // embedding gather over zero indices is a 0-element CUDA `index_select` that reads out of
+            // bounds → `CUDA_ERROR_ILLEGAL_ADDRESS` (it surfaces deferred at the next cublas call as a
+            // misleading `CUBLAS_STATUS_EXECUTION_FAILED`). Emit one pad token so a 0-length sequence
+            // never reaches the gather. (sc-7078)
+            ids.push(self.te_cfg.pad_token_id as u32);
+        }
+        let len = ids.len();
         let input_ids = Tensor::from_vec(ids, (1, len), &self.device)?;
         let embeds = te.encode(&input_ids)?; // [1, S, 4096]
 

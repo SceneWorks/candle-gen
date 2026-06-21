@@ -133,8 +133,15 @@ impl Pipeline {
         let out = tok
             .tokenize(prompt)
             .map_err(|e| CandleError::Msg(format!("wan-vace: tokenize: {e}")))?;
-        let len = out.ids.len().max(1);
-        let ids: Vec<u32> = out.ids.iter().map(|&i| i as u32).collect();
+        let mut ids: Vec<u32> = out.ids.iter().map(|&i| i as u32).collect();
+        if ids.is_empty() {
+            // Empty prompt → zero ids → a degenerate `(1,1)` tensor (the old `.max(1)` padded the
+            // shape, not the data) whose 0-element f32 embedding gather reads out of bounds on CUDA
+            // (`CUDA_ERROR_ILLEGAL_ADDRESS`, surfacing as a misleading cublas failure). Emit one pad
+            // token so a 0-length sequence never reaches the gather. (sc-7078)
+            ids.push(self.te_cfg.pad_token_id as u32);
+        }
+        let len = ids.len();
         let input_ids = Tensor::from_vec(ids, (1, len), &self.device)?;
         let embeds = te.encode(&input_ids)?;
         let max_len = self.te_cfg.max_length;
