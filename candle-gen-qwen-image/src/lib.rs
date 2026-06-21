@@ -179,7 +179,6 @@ impl Pipeline {
             .unwrap_or(DEFAULT_STEPS as usize);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-        let total = steps as u32;
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
 
         let pos_embeds = self.encode(&comps.te, &req.prompt)?;
@@ -191,37 +190,48 @@ impl Pipeline {
             None
         };
 
-        let sigmas = pipeline::qwen_sigmas(steps, req.width, req.height);
+        // Routed through the unified curated sampler/scheduler framework (epic 7114 P4, sc-7123): the
+        // `scheduler` axis picks the σ schedule over the production dynamic-μ shift (`native` = the
+        // legacy `qwen_sigmas`), the `sampler` axis picks the integrator. The DEFAULT (`euler` over the
+        // native schedule) is the N1 no-op — algebraically the legacy `euler_step` loop. The model is
+        // fed the raw sigma (`Sigma` convention), and Qwen-Image is **true CFG** (a positive + negative
+        // forward + norm-rescaled blend per step), so the whole pos/neg/blend lives inside the `predict`
+        // closure — a multi-eval solver re-runs the whole closure.
+        let native = pipeline::qwen_sigmas(steps, req.width, req.height);
+        let mu = pipeline::qwen_mu(req.width, req.height);
+        let sigmas =
+            candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
 
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
             let seed = base_seed.wrapping_add(index as u64);
-            let mut latents = pipeline::create_noise(seed, req.width, req.height, &self.device)?
+            let latents = pipeline::create_noise(seed, req.width, req.height, &self.device)?
                 .to_dtype(DIT_DTYPE)?;
 
-            for i in 0..steps {
-                if req.cancel.is_cancelled() {
-                    return Err(CandleError::Canceled);
-                }
-                let sigma = sigmas[i];
-                let pos = comps
-                    .transformer
-                    .forward(&latents, &pos_embeds, sigma, lat_h, lat_w)?;
-                let v = match &neg_embeds {
-                    Some(neg) => {
-                        let neg = comps
+            let latents = candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                gen_core::sampling::TimestepConvention::Sigma,
+                &sigmas,
+                latents,
+                seed,
+                &req.cancel,
+                on_progress,
+                |latents, sigma| -> CResult<Tensor> {
+                    let pos =
+                        comps
                             .transformer
-                            .forward(&latents, neg, sigma, lat_h, lat_w)?;
-                        pipeline::compute_guided_noise(&pos, &neg, guidance)?
+                            .forward(latents, &pos_embeds, sigma, lat_h, lat_w)?;
+                    match &neg_embeds {
+                        Some(neg) => {
+                            let neg = comps
+                                .transformer
+                                .forward(latents, neg, sigma, lat_h, lat_w)?;
+                            Ok(pipeline::compute_guided_noise(&pos, &neg, guidance)?)
+                        }
+                        None => Ok(pos),
                     }
-                    None => pos,
-                };
-                latents = pipeline::euler_step(&latents, &v, &sigmas, i)?;
-                on_progress(Progress::Step {
-                    current: i as u32 + 1,
-                    total,
-                });
-            }
+                },
+            )?;
 
             on_progress(Progress::Decoding);
             let lat = pipeline::unpack_latents(&latents, req.width, req.height)?;
@@ -325,8 +335,11 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![],
             supports_lora: false,
             supports_lokr: false,
-            samplers: vec![],
-            schedulers: vec!["flow_match_euler"],
+            samplers: candle_gen::curated_sampler_names(),
+            schedulers: candle_gen::menu_with_aliases(
+                candle_gen::curated_scheduler_names(),
+                &["flow_match_euler"],
+            ),
             min_size: 256,
             max_size: 2048,
             max_count: 8,
@@ -409,6 +422,23 @@ mod tests {
         assert!(d.capabilities.conditioning.is_empty());
         assert!(!d.capabilities.accepts(ConditioningKind::Reference));
         assert!(!d.capabilities.supports_lora);
+        // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123): the full curated sampler menu,
+        // and the curated scheduler menu plus the legacy `flow_match_euler` alias (N3 fallback).
+        assert_eq!(
+            d.capabilities.samplers,
+            candle_gen::curated_sampler_names(),
+            "samplers expose the curated menu"
+        );
+        assert!(
+            d.capabilities.schedulers.contains(&"flow_match_euler"),
+            "schedulers keep the legacy alias"
+        );
+        for s in candle_gen::curated_scheduler_names() {
+            assert!(
+                d.capabilities.schedulers.contains(&s),
+                "scheduler menu missing {s}"
+            );
+        }
     }
 
     #[test]

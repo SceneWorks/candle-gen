@@ -62,6 +62,23 @@ pub fn pack_latents(latent: &Tensor, width: u32, height: u32) -> Result<Tensor> 
         .reshape((1, lat_h * lat_w, c * p * p))
 }
 
+/// The image-area-driven flow-match shift `μ` (the production [`qwen_sigmas`] axis): the fork's
+/// `qwen_scheduler` linear fit `μ = m·(W·H/256) + b` between the base/max shift endpoints. Exposed so
+/// the unified curated scheduler axis (epic 7114 P4, sc-7123) can warp an alternative schedule by the
+/// same per-resolution shift the production schedule uses. The native [`qwen_sigmas`] schedule is
+/// returned verbatim regardless, so `μ` only steers the (non-default) curated scheduler.
+pub fn qwen_mu(width: u32, height: u32) -> f32 {
+    let m = (SIGMA_MAX_SHIFT - SIGMA_BASE_SHIFT) / (SIGMA_MAX_SEQ_LEN - SIGMA_BASE_SEQ_LEN);
+    let b = SIGMA_BASE_SHIFT - m * SIGMA_BASE_SEQ_LEN;
+    m * (width as f32 * height as f32 / 256.0) + b
+}
+
+/// The Lightning flow-match shift `μ = ln 3` (the static `exp(μ) = 3.0`, see [`lightning_sigmas`]) —
+/// the curated scheduler axis for the few-step Lightning path (epic 7114 P4, sc-7123).
+pub fn lightning_mu() -> f32 {
+    LIGHTNING_SHIFT.ln()
+}
+
 /// The Qwen-Image sigma schedule (length `steps + 1`, descending to 0): a linspace `1 → 1/n` warped
 /// by an image-area-driven exponential μ shift, then rescaled so the terminal one-minus-σ hits
 /// `1 − 0.02`, then a trailing `0.0`.
@@ -78,10 +95,7 @@ pub fn qwen_sigmas(num_steps: usize, width: u32, height: u32) -> Vec<f32> {
             }
         })
         .collect();
-    let m = (SIGMA_MAX_SHIFT - SIGMA_BASE_SHIFT) / (SIGMA_MAX_SEQ_LEN - SIGMA_BASE_SEQ_LEN);
-    let b = SIGMA_BASE_SHIFT - m * SIGMA_BASE_SEQ_LEN;
-    let mu = m * (width as f32 * height as f32 / 256.0) + b;
-    let e = mu.exp();
+    let e = qwen_mu(width, height).exp();
     let mut shifted: Vec<f32> = linspace
         .iter()
         .map(|&s| e / (e + (1.0 / s - 1.0)))

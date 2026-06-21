@@ -46,6 +46,7 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress};
 use candle_gen::{CandleError, Result};
@@ -257,7 +258,6 @@ impl Pipeline {
     ) -> Result<Vec<Image>> {
         let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let total = steps as u32;
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
         let lat_w = (req.width / SPATIAL_SCALE) as usize;
 
@@ -301,36 +301,44 @@ impl Pipeline {
                 FlowMatchEulerDiscreteScheduler::new(SchedulerConfig::z_image_turbo());
             scheduler.set_timesteps(steps, Some(mu));
 
+            // Unified curated sampler/scheduler routing (epic 7114 P4, sc-7123). The NATIVE schedule is
+            // the scheduler's σ table verbatim (linear / un-shifted for the turbo config — see the
+            // comment above), so `resolve_flow_schedule(None, …)` returns it byte-for-byte and the
+            // default `euler` is the N1 no-op = the legacy `scheduler.step` loop
+            // `x + v·(σ_{i+1} − σ_i)`. The schedule is unshifted (`mu = 0.0` for the curated axis).
+            // Z-Image feeds the DiT the 1−σ conditioning (`OneMinusSigma`) and the predicted velocity
+            // is NEGATED before the step — both Z-Image-specific quirks live inside the `predict`
+            // closure, so a multi-eval solver re-applies them each eval.
+            let native: Vec<f32> = scheduler.sigmas.iter().map(|&s| s as f32).collect();
+            let sigmas =
+                candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
+
             // `prepare_inputs` pads cap_feats to SEQ_MULTI_OF (+ attention mask) and adds the
             // singleton frame axis to the latents → (1, 16, 1, lat_h, lat_w).
             let prepared = prepare_inputs(&noise, std::slice::from_ref(&cap), &self.device)?;
             let cap_feats = prepared.cap_feats;
             let cap_mask = prepared.cap_mask;
-            let mut latents = prepared.latents;
 
-            for step_i in 0..steps {
-                if req.cancel.is_cancelled() {
-                    return Err(CandleError::Canceled);
-                }
-                // The DiT timestep convention is 1−σ (the reference scheduler's
-                // `current_timestep_normalized`), matching the mlx FlowMatchEuler. The embedder
-                // upcasts to f32 internally, so f32 here is correct regardless of the model dtype.
-                let t_norm = scheduler.current_timestep_normalized();
-                let t = Tensor::from_vec(vec![t_norm as f32], (1,), &self.device)?;
-                // The Z-Image DiT's predicted velocity must be NEGATED before the flow-match Euler
-                // step — a Z-Image-specific sign convention (the candle `z_image` reference's
-                // `noise_pred.neg()`). Without it the update walks the latent AWAY from the data
-                // manifold and the VAE decode is pure noise.
-                let velocity = components
-                    .transformer
-                    .forward(&latents, &t, &cap_feats, &cap_mask)?
-                    .neg()?;
-                latents = scheduler.step(&velocity, &latents)?;
-                on_progress(Progress::Step {
-                    current: step_i as u32 + 1,
-                    total,
-                });
-            }
+            let latents = candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::OneMinusSigma,
+                &sigmas,
+                prepared.latents,
+                seed,
+                &req.cancel,
+                on_progress,
+                |latents, t| -> Result<Tensor> {
+                    // `t` is the 1−σ conditioning (OneMinusSigma) the DiT embeds — the same value the
+                    // reference scheduler's `current_timestep_normalized` returns. The embedder upcasts
+                    // to f32 internally, so f32 here is correct regardless of the model dtype.
+                    let t_tensor = Tensor::from_vec(vec![t], (1,), &self.device)?;
+                    let velocity = components
+                        .transformer
+                        .forward(latents, &t_tensor, &cap_feats, &cap_mask)?
+                        .neg()?;
+                    Ok(velocity)
+                },
+            )?;
 
             on_progress(Progress::Decoding);
             images.push(self.decode(&components.vae, &latents)?);

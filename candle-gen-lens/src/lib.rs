@@ -53,9 +53,8 @@ use candle_gen::{CandleError, Result as CResult};
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 
-use schedule::{
-    cfg_rescale, euler_step, lens_sigmas, timesteps, LensSamplingDefaults, BASE, TURBO,
-};
+use candle_gen::gen_core::sampling::TimestepConvention;
+use schedule::{cfg_rescale, lens_mu, lens_sigmas, LensSamplingDefaults, BASE, TURBO};
 use text::{LensTokenizer, TXT_OFFSET};
 use text_encoder::{Config as EncoderConfig, GptOssTextEncoder, DEFAULT_SELECTED_LAYERS};
 use transformer::{LensDitConfig, LensTransformer};
@@ -269,6 +268,14 @@ impl Pipeline {
 
     /// The denoising loop over the joint CFG conditioning + an initial latent
     /// (`[1, latent_h·latent_w, 128]`). Returns the final patch-space latents (feed to [`vae::decode`]).
+    ///
+    /// Routed through the unified curated sampler/scheduler framework (epic 7114 P4, sc-7123): the
+    /// `scheduler` axis picks the σ schedule over the Lens empirical-μ shift (`native` = the legacy
+    /// `flow_match` `build_flow_sigmas`), the `sampler` axis picks the integrator. The DEFAULT
+    /// (`euler` over the native schedule) is the N1 no-op — algebraically the legacy `euler_step` loop
+    /// `x + v·(σ_{i+1} − σ_i)` within the framework's `to_d` round-trip tolerance. Lens feeds the raw
+    /// (shifted) sigma as the model timestep (`Sigma` convention) and is standard-guidance, so the CFG
+    /// (`cfg_rescale`) lives inside the `predict` closure — a multi-eval solver re-runs the whole closure.
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
@@ -280,34 +287,41 @@ impl Pipeline {
         latent_w: usize,
         num_steps: usize,
         guidance: f32,
-        is_cancelled: &dyn Fn() -> bool,
-        on_step: &mut dyn FnMut(usize, usize),
+        sampler: Option<&str>,
+        scheduler: Option<&str>,
+        seed: u64,
+        cancel: &gen_core::CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<Tensor> {
-        let sigmas = lens_sigmas(num_steps, latent_h, latent_w);
-        let ts = timesteps(&sigmas);
-        let mut latents = init_latents.to_dtype(DIT_DTYPE)?;
-        for (i, &sigma) in ts.iter().enumerate() {
-            if is_cancelled() {
-                return Err(CandleError::Msg("lens: generation cancelled".into()));
-            }
-            // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call.
-            let hidden = Tensor::cat(&[&latents, &latents], 0)?; // [2, seq, 128]
-            let noise = comps.transformer.forward(
-                &hidden,
-                features,
-                Some(mask),
-                sigma,
-                1,
-                latent_h,
-                latent_w,
-            )?;
-            let cond = noise.narrow(0, 0, 1)?;
-            let uncond = noise.narrow(0, 1, 1)?;
-            let noise_pred = cfg_rescale(&cond, &uncond, guidance)?;
-            latents = euler_step(&latents, &noise_pred, &sigmas, i)?;
-            on_step(i + 1, num_steps);
-        }
-        Ok(latents)
+        let mu = lens_mu(num_steps, latent_h, latent_w);
+        let native = lens_sigmas(num_steps, latent_h, latent_w);
+        let sigmas = candle_gen::resolve_flow_schedule(scheduler, mu, num_steps, &native);
+        let init = init_latents.to_dtype(DIT_DTYPE)?;
+        candle_gen::run_flow_sampler(
+            sampler,
+            TimestepConvention::Sigma,
+            &sigmas,
+            init,
+            seed,
+            cancel,
+            on_progress,
+            |latents, sigma| -> CResult<Tensor> {
+                // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call.
+                let hidden = Tensor::cat(&[latents, latents], 0)?; // [2, seq, 128]
+                let noise = comps.transformer.forward(
+                    &hidden,
+                    features,
+                    Some(mask),
+                    sigma,
+                    1,
+                    latent_h,
+                    latent_w,
+                )?;
+                let cond = noise.narrow(0, 0, 1)?;
+                let uncond = noise.narrow(0, 1, 1)?;
+                Ok(cfg_rescale(&cond, &uncond, guidance)?)
+            },
+        )
     }
 
     fn render(
@@ -324,7 +338,6 @@ impl Pipeline {
         let guidance = req.guidance.unwrap_or(defaults.guidance);
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-        let total = steps as u32;
         let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
         let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;
 
@@ -343,13 +356,11 @@ impl Pipeline {
                 latent_w,
                 steps,
                 guidance,
-                &|| req.cancel.is_cancelled(),
-                &mut |cur, _| {
-                    on_progress(Progress::Step {
-                        current: cur as u32,
-                        total,
-                    })
-                },
+                req.sampler.as_deref(),
+                req.scheduler.as_deref(),
+                seed,
+                &req.cancel,
+                on_progress,
             )?;
             on_progress(Progress::Decoding);
             let decoded = vae::decode(&comps.vae, &latents, latent_h, latent_w)?;
@@ -507,6 +518,7 @@ impl LensGenerator {
         let (features, mask) = self
             .pipeline
             .encode_prompt(&comps, prompt, negative, date)?;
+        // Parity hook drives the default (euler over the native flow_match schedule), no cancel.
         let latents = self.pipeline.denoise(
             &comps,
             &features,
@@ -516,8 +528,11 @@ impl LensGenerator {
             latent_w,
             num_steps,
             guidance,
-            &|| false,
-            &mut |_, _| {},
+            None,
+            None,
+            0,
+            &gen_core::CancelFlag::new(),
+            &mut |_| {},
         )?;
         let decoded = vae::decode(&comps.vae, &latents, latent_h, latent_w)?;
         Ok((latents, decoded))
@@ -565,8 +580,16 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             conditioning: vec![], // pure T2I — no img2img / control / IP in the Lens port
             supports_lora: true,
             supports_lokr: true,
-            samplers: vec!["flow_match_euler"],
-            schedulers: vec!["flow_match"],
+            // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123) + the legacy aliases
+            // (`flow_match_euler`/`flow_match`), which fall back to euler / the native schedule (N3).
+            samplers: candle_gen::menu_with_aliases(
+                candle_gen::curated_sampler_names(),
+                &["flow_match_euler"],
+            ),
+            schedulers: candle_gen::menu_with_aliases(
+                candle_gen::curated_scheduler_names(),
+                &["flow_match"],
+            ),
             // Buckets span 736..2080 (all ÷16); allow any ÷16 size in a sane range.
             min_size: 256,
             max_size: 2080,

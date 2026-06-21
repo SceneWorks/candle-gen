@@ -207,10 +207,12 @@ pub fn descriptor() -> ModelDescriptor {
             // quantization is still deferred (rejected at load, not silently dropped).
             supports_lora: true,
             supports_lokr: true,
-            // Distilled: the worker sends no `sampler`/`scheduler` for Z-Image (the static-shift
-            // flow-match schedule is fixed), matching the mlx descriptor's empty lists.
-            samplers: vec![],
-            schedulers: vec![],
+            // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123). Z-Image-Turbo is
+            // guidance-distilled (4 steps, `euler` recommended), but the curated integrators +
+            // σ-schedules are exposed for ComfyUI parity; the default (`euler` over the native linear
+            // flow-match schedule) is the byte-faithful N1 no-op.
+            samplers: candle_gen::curated_sampler_names(),
+            schedulers: candle_gen::curated_scheduler_names(),
             min_size: 256,
             max_size: 2048,
             max_count: 8,
@@ -315,6 +317,12 @@ mod tests {
         assert_eq!(d.capabilities.min_size, 256);
         assert_eq!(d.capabilities.max_size, 2048);
         assert_eq!(d.capabilities.max_count, 8);
+        // Curated sampler/scheduler menu (epic 7114 P4, sc-7123): full vocabulary, euler the default.
+        assert_eq!(d.capabilities.samplers, candle_gen::curated_sampler_names());
+        assert_eq!(
+            d.capabilities.schedulers,
+            candle_gen::curated_scheduler_names()
+        );
     }
 
     /// A txt2img request passes validation; unsupported shapes are rejected clearly (not silently

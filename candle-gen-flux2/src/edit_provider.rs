@@ -26,6 +26,7 @@ use std::path::PathBuf;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
 
@@ -155,31 +156,44 @@ impl Flux2Edit {
         let mut img_ids = pipeline::prepare_grid_ids(lat_h, lat_w);
         img_ids.extend_from_slice(&ref_ids);
         let txt_ids = pipeline::prepare_text_ids(cfg.max_sequence_length);
-        let (sigmas, timesteps) = pipeline::schedule(req.steps, req.width, req.height);
 
-        let mut latents = pipeline::create_noise(cfg, req.seed, req.width, req.height, device)?;
-        let total = req.steps as u32;
-        for (i, &ts) in timesteps.iter().enumerate() {
-            if req.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            // Joint image stream [target, refs] — references re-concatenated with the current target.
-            let hidden = Tensor::cat(&[&latents, &ref_tokens], 1)?;
-            let v = self.velocity(&hidden, &prompt_embeds, &img_ids, &txt_ids, ts, target_seq)?;
-            let v = match &negative {
-                Some(neg) => {
-                    let vn = self.velocity(&hidden, neg, &img_ids, &txt_ids, ts, target_seq)?;
-                    // vn + guidance·(v − vn)
-                    (&vn + ((&v - &vn)? * guidance as f64)?)?
+        // Curated sampler/scheduler routing (epic 7114 P4, sc-7123) — the same driver the txt2img path
+        // uses. The bespoke edit request carries no per-generation sampler/scheduler knob, so this runs
+        // the default (`None`) euler over the native empirical-mu schedule: the N1 no-op that reproduces
+        // the legacy `euler_step` flow-match loop within tolerance.
+        let mu = pipeline::compute_mu(pipeline::image_seq_len(req.width, req.height), req.steps);
+        let (native, _timesteps) = pipeline::schedule(req.steps, req.width, req.height);
+        let sigmas = candle_gen::resolve_flow_schedule(None, mu, req.steps, &native);
+
+        let latents = pipeline::create_noise(cfg, req.seed, req.width, req.height, device)?;
+        // The driver does cancel + progress + the integrator step. The joint `[target, refs]` concat,
+        // the transformer forward, the target-slice, and the guidance>1 CFG blend all live inside the
+        // predict closure so a multi-eval solver re-runs them. FLUX.2 uses the Sigma convention but the
+        // model embeds σ×1000, so feed `sigma * 1000.0` to the transformer.
+        let latents = candle_gen::run_flow_sampler(
+            None,
+            TimestepConvention::Sigma,
+            &sigmas,
+            latents,
+            req.seed,
+            &req.cancel,
+            on_progress,
+            |latents, sigma| -> Result<Tensor> {
+                let ts = sigma * 1000.0;
+                // Joint image stream [target, refs] — references re-concatenated with the current target.
+                let hidden = Tensor::cat(&[latents, &ref_tokens], 1)?;
+                let v =
+                    self.velocity(&hidden, &prompt_embeds, &img_ids, &txt_ids, ts, target_seq)?;
+                match &negative {
+                    Some(neg) => {
+                        let vn = self.velocity(&hidden, neg, &img_ids, &txt_ids, ts, target_seq)?;
+                        // vn + guidance·(v − vn)
+                        Ok((&vn + ((&v - &vn)? * guidance as f64)?)?)
+                    }
+                    None => Ok(v),
                 }
-                None => v,
-            };
-            latents = pipeline::euler_step(&latents, &v, &sigmas, i)?;
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
-        }
+            },
+        )?;
 
         on_progress(Progress::Decoding);
         let packed = pipeline::unpack_latents(&latents, req.width, req.height)?;

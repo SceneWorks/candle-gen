@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::flux::sampling::unpack;
@@ -165,8 +166,12 @@ impl Pipeline {
                 neg.as_ref(),
                 rope_neg.as_ref(),
                 &sigmas,
+                steps,
                 guidance,
-                req,
+                req.sampler.as_deref(),
+                req.scheduler.as_deref(),
+                seed,
+                &req.cancel,
                 on_progress,
             )?;
             on_progress(Progress::Decoding);
@@ -219,48 +224,63 @@ impl Pipeline {
         pack(&noise)
     }
 
-    /// The true-CFG flow-match Euler denoise: `latents += pred·(σ_next − σ_cur)` over the descending
-    /// sigmas, where `pred = neg + g·(pos − neg)` (or `pred = pos` when `guidance ≤ 1`). The DiT
-    /// timestep is `σ_cur` (scaled `·1000` inside the Approximator).
+    /// The true-CFG flow-match denoise, routed through the unified curated sampler/scheduler driver
+    /// (epic 7114 P4, sc-7123). The `scheduler` axis picks the σ schedule over the variant's static
+    /// shift in log space (`mu = shift.ln()`; `native` = the byte-exact per-variant [`Self::sigmas`]),
+    /// the `sampler` axis picks the integrator. The DEFAULT (`euler` over the native schedule) is the
+    /// N1 no-op — algebraically the legacy flow-match Euler loop `latents += pred·(σ_next − σ_cur)`
+    /// within the framework's `to_d` round-trip tolerance.
+    ///
+    /// Chroma feeds the raw sigma as the DiT timestep ([`TimestepConvention::Sigma`]; the Approximator
+    /// scales `·1000` internally) and does true CFG, so the whole CFG blend `pred = neg + g·(pos − neg)`
+    /// (or `pred = pos` when `guidance ≤ 1`) lives INSIDE the `predict` closure — a multi-eval solver
+    /// re-runs it per eval. Cancellation + progress are driven by the framework.
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
         transformer: &ChromaTransformer,
-        mut latents: Tensor,
+        latents: Tensor,
         pos_embeds: &Tensor,
         rope_pos: &rope::RopeTable,
         neg_embeds: Option<&Tensor>,
         rope_neg: Option<&rope::RopeTable>,
-        sigmas: &[f32],
+        native: &[f32],
+        steps: usize,
         guidance: f32,
-        req: &GenerationRequest,
+        sampler: Option<&str>,
+        scheduler: Option<&str>,
+        seed: u64,
+        cancel: &gen_core::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
-        let total = sigmas.len().saturating_sub(1) as u32;
-        for t in 0..(sigmas.len() - 1) {
-            if req.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            let (sigma_cur, sigma_next) = (sigmas[t], sigmas[t + 1]);
-            let ts = Tensor::from_vec(vec![sigma_cur], 1, &self.device)?;
-            // pooled_temb depends only on the timestep — compute once and share across both branches.
-            let pooled = transformer.pooled_temb(&ts)?;
-            let pos = transformer.forward_prepared(&latents, pos_embeds, &pooled, rope_pos)?;
-            let pred = match (neg_embeds, rope_neg) {
-                (Some(neg), Some(rope_n)) => {
-                    let neg = transformer.forward_prepared(&latents, neg, &pooled, rope_n)?;
-                    // neg + g·(pos − neg)
-                    (&neg + ((&pos - &neg)? * guidance as f64)?)?
+        // The scheduler axis rides the variant's static shift in log space (HD shift=3 → ln(3);
+        // Flash/Base shift=1 → 0). Base's native beta schedule is returned verbatim on the default
+        // path, so `mu` only steers the alternative curated schedulers.
+        let mu = self.variant.sigma_shift().ln();
+        let sigmas = candle_gen::resolve_flow_schedule(scheduler, mu, steps, native);
+        candle_gen::run_flow_sampler(
+            sampler,
+            TimestepConvention::Sigma,
+            &sigmas,
+            latents,
+            seed,
+            cancel,
+            on_progress,
+            |latents, sigma| -> Result<Tensor> {
+                let ts = Tensor::from_vec(vec![sigma], 1, &self.device)?;
+                // pooled_temb depends only on the timestep — compute once and share across both branches.
+                let pooled = transformer.pooled_temb(&ts)?;
+                let pos = transformer.forward_prepared(latents, pos_embeds, &pooled, rope_pos)?;
+                match (neg_embeds, rope_neg) {
+                    (Some(neg), Some(rope_n)) => {
+                        let neg = transformer.forward_prepared(latents, neg, &pooled, rope_n)?;
+                        // neg + g·(pos − neg)
+                        Ok((&neg + ((&pos - &neg)? * guidance as f64)?)?)
+                    }
+                    _ => Ok(pos),
                 }
-                _ => pos,
-            };
-            latents = (&latents + (pred * (sigma_next - sigma_cur) as f64)?)?;
-            on_progress(Progress::Step {
-                current: t as u32 + 1,
-                total,
-            });
-        }
-        Ok(latents)
+            },
+        )
     }
 
     /// Unpack the denoised packed latent `[1, Si, 64]` → `[1, 16, H/8, W/8]`, VAE-decode to an RGB8

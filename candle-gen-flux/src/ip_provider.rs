@@ -28,6 +28,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 
 use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_gen_sdxl::weights::Weights;
@@ -35,7 +36,7 @@ use candle_gen_sdxl::weights::Weights;
 use crate::ip_adapter::{FluxIpAdapter, FluxIpInjector};
 use crate::ip_dit::IpFlux;
 use crate::ip_image_encoder::FluxIpImageEncoder;
-use crate::pipeline::{ae_config, clip_config, decode_latents, encode_text, flux_config};
+use crate::pipeline::{ae_config, clip_config, decode_latents, encode_text, flow_mu, flux_config};
 use crate::Variant;
 
 /// FLUX runs at bf16.
@@ -317,6 +318,7 @@ impl IpAdapterFlux {
             &timesteps,
             guidance,
             &injector,
+            req.seed,
             &req.cancel,
             on_progress,
         )?;
@@ -324,45 +326,60 @@ impl IpAdapterFlux {
         decode_latents(&self.vae, &latents, req.height as usize, req.width as usize)
     }
 
-    /// The flow-match Euler denoise with the XLabs IP injector — the txt2img `denoise` calling the
-    /// forked [`IpFlux::forward`] (`Some(injector)`) instead of the stock FLUX. `img += pred·(t_prev −
-    /// t_curr)` over the **descending** schedule.
+    /// The flow-match denoise with the XLabs IP injector, routed through the unified curated
+    /// sampler/scheduler driver (epic 7114 P4, sc-7123) — the IP twin of the txt2img
+    /// [`crate::pipeline`] `denoise`. The `scheduler` axis re-strides FLUX's native `get_schedule(..)`
+    /// over the time-shift `mu`; the `sampler` axis picks the integrator. The forked
+    /// [`IpFlux::forward`] (`Some(injector)`) replaces the stock FLUX forward, and the XLabs IP residual
+    /// injection stays INSIDE the `predict` closure so a multi-eval solver re-runs the whole step. The
+    /// DEFAULT (`euler` over the native schedule) is the N1 no-op for the legacy inline flow-match Euler
+    /// loop `img += pred·(σ_{i+1} − σ_i)`. FLUX feeds the raw timestep (`Sigma` convention: `t == σ`);
+    /// guidance is a per-batch tensor only embedded by the dev DiT. The provider request carries no
+    /// sampler/scheduler knob (the worker drives this stream directly), so it defaults to the native
+    /// flow-match Euler path. Cancellation + progress are owned by the driver.
+    #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
         state: &State,
         timesteps: &[f64],
         guidance: f64,
         injector: &FluxIpInjector,
+        seed: u64,
         cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
         let b_sz = state.img.dim(0)?;
         let guidance_t = Tensor::full(guidance as f32, b_sz, &self.device)?;
-        let total = timesteps.len().saturating_sub(1) as u32;
-        let mut img = state.img.clone();
-        for (i, window) in timesteps.windows(2).enumerate() {
-            if cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            let (t_curr, t_prev) = (window[0], window[1]);
-            let t_vec = Tensor::full(t_curr as f32, b_sz, &self.device)?;
-            let pred = self.transformer.forward(
-                &img,
-                &state.img_ids,
-                &state.txt,
-                &state.txt_ids,
-                &t_vec,
-                &state.vec,
-                Some(&guidance_t),
-                Some(injector),
-            )?;
-            img = (img + (pred * (t_prev - t_curr))?)?;
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
-        }
-        Ok(img)
+        // Native schedule = candle's verbatim `get_schedule(..)` (f32 descending, trailing 0.0); the
+        // IP request exposes no curated knob, so this defaults to the byte-exact native flow path.
+        let native: Vec<f32> = timesteps.iter().map(|&t| t as f32).collect();
+        let mu = flow_mu(self.variant, state.img.dim(1)?);
+        let steps = native.len().saturating_sub(1);
+        let sigmas = candle_gen::resolve_flow_schedule(None, mu, steps, &native);
+        candle_gen::run_flow_sampler(
+            None,
+            TimestepConvention::Sigma,
+            &sigmas,
+            state.img.clone(),
+            seed,
+            cancel,
+            on_progress,
+            |img, t| -> Result<Tensor> {
+                // The forked DiT forward returns a `candle_core::Result`; `?` bridges it into the
+                // driver's `CandleError`. The XLabs IP residual injection lives inside this closure.
+                let t_vec = Tensor::full(t, b_sz, &self.device)?;
+                Ok(self.transformer.forward(
+                    img,
+                    &state.img_ids,
+                    &state.txt,
+                    &state.txt_ids,
+                    &t_vec,
+                    &state.vec,
+                    Some(&guidance_t),
+                    Some(injector),
+                )?)
+            },
+        )
     }
 }
 

@@ -34,12 +34,19 @@ pub const BASE: LensSamplingDefaults = LensSamplingDefaults {
     guidance_scale: 5.0,
 };
 
+/// The Lens empirical time-shift `mu`, fit from the latent token count `latent_h · latent_w` (==
+/// the reference `compute_empirical_mu(seq_len, num_steps)`). Exposed so the unified scheduler axis
+/// (sc-7123) can build a curated `normal`/`karras`/… schedule over the SAME shift the native schedule
+/// uses (`resolve_flow_schedule`).
+pub fn lens_mu(num_steps: usize, latent_h: usize, latent_w: usize) -> f32 {
+    compute_mu(latent_h * latent_w, num_steps)
+}
+
 /// Build the Lens flow-match sigma schedule for `num_steps` at the given latent grid (length
 /// `num_steps + 1`, descending, trailing `0.0`). The empirical time-shift `mu` is fit from the latent
 /// token count `latent_h · latent_w` (== the reference `compute_empirical_mu(seq_len, num_steps)`).
 pub fn lens_sigmas(num_steps: usize, latent_h: usize, latent_w: usize) -> Vec<f32> {
-    let mu = compute_mu(latent_h * latent_w, num_steps);
-    build_flow_sigmas(num_steps, mu)
+    build_flow_sigmas(num_steps, lens_mu(num_steps, latent_h, latent_w))
 }
 
 /// The per-step transformer timesteps: the **shifted sigmas** `sigmas[0..num_steps]` (Lens feeds the

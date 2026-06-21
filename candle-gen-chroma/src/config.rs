@@ -96,11 +96,17 @@ impl ChromaVariant {
                 conditioning: vec![],
                 supports_lora: false,
                 supports_lokr: false,
-                // Advertise the same sampler/scheduler names the mlx descriptor does, so a request the
-                // worker builds for one backend validates on the other (the flow-match schedule is
-                // fixed per variant — the pipeline ignores any supplied value beyond these).
-                samplers: vec![DEFAULT_SAMPLER],
-                schedulers: vec!["linear"],
+                // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123) plus the legacy
+                // aliases (`flow_match` / `linear`), which fall back to euler / the native per-variant
+                // schedule (N3) so a request the worker builds for either backend still validates.
+                samplers: candle_gen::menu_with_aliases(
+                    candle_gen::curated_sampler_names(),
+                    &[DEFAULT_SAMPLER],
+                ),
+                schedulers: candle_gen::menu_with_aliases(
+                    candle_gen::curated_scheduler_names(),
+                    &["linear"],
+                ),
                 min_size: 256,
                 max_size: 2048,
                 max_count: 8,
@@ -203,6 +209,24 @@ mod tests {
             assert_eq!(d.capabilities.min_size, 256);
             assert_eq!(d.capabilities.max_size, 2048);
             assert_eq!(d.capabilities.max_count, 8);
+        }
+    }
+
+    /// epic 7114 P4 (sc-7123): each variant advertises the full curated sampler/scheduler menu plus
+    /// the legacy `flow_match` / `linear` aliases (which fall back to euler / the native schedule).
+    #[test]
+    fn descriptors_advertise_curated_sampler_scheduler_menu() {
+        for v in [ChromaVariant::Hd, ChromaVariant::Base, ChromaVariant::Flash] {
+            let caps = v.descriptor().capabilities;
+            for s in candle_gen::curated_sampler_names() {
+                assert!(caps.samplers.contains(&s), "missing sampler {s}");
+            }
+            for s in candle_gen::curated_scheduler_names() {
+                assert!(caps.schedulers.contains(&s), "missing scheduler {s}");
+            }
+            assert!(caps.samplers.contains(&DEFAULT_SAMPLER)); // legacy "flow_match" alias retained
+            assert!(caps.schedulers.contains(&"linear")); // legacy scheduler alias retained
+            assert!(caps.samplers.contains(&"euler")); // the N1 default integrator
         }
     }
 }

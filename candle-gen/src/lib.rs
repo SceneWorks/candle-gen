@@ -32,7 +32,10 @@ pub mod train;
 // impl over `candle_core::Tensor`. The candle twin of `mlx_gen::MlxLatentOps`; lets every candle
 // provider crate drive the shared gen-core callback samplers.
 pub mod sampler;
-pub use sampler::CandleLatentOps;
+pub use sampler::{
+    curated_sampler_names, curated_scheduler_names, menu_with_aliases, resolve_flow_schedule,
+    resolve_schedule, run_curated_sampler, run_flow_sampler, CandleLatentOps,
+};
 
 use thiserror::Error;
 
@@ -67,6 +70,26 @@ impl From<CandleError> for gen_core::Error {
             CandleError::Msg(s) => gen_core::Error::Msg(s),
             // Preserve the typed cancellation signal across the bridge (do NOT stringify to Msg).
             CandleError::Canceled => gen_core::Error::Canceled,
+        }
+    }
+}
+
+/// Reverse bridge: lift a backend-neutral [`gen_core::Error`] back into [`CandleError`]. The unified
+/// curated-sampler driver ([`sampler::run_curated_sampler`]) runs over the gen-core `Sampler` trait
+/// (which returns `gen_core::Result`), so a provider's rich-`Result` denoise body needs this to `?` the
+/// driver's output. The load-bearing arm is `Canceled -> Canceled`: a cooperative cancel tripped inside
+/// the driver's `denoise` callback surfaces as `gen_core::Error::Canceled` and MUST stay the typed
+/// [`CandleError::Canceled`] (not a stringified `Msg`) so the worker + conformance suite key off it.
+/// Mirrors mlx-gen's `From<gen_core::Error> for mlx_gen::Error`.
+impl From<gen_core::Error> for CandleError {
+    fn from(e: gen_core::Error) -> Self {
+        match e {
+            gen_core::Error::Canceled => CandleError::Canceled,
+            gen_core::Error::MissingTensor(s) => CandleError::Msg(format!("missing tensor: {s}")),
+            gen_core::Error::Unsupported(s) => CandleError::Msg(format!("unsupported: {s}")),
+            gen_core::Error::Io(io) => CandleError::Msg(io.to_string()),
+            gen_core::Error::Backend(b) => CandleError::Msg(b.to_string()),
+            gen_core::Error::Msg(s) => CandleError::Msg(s),
         }
     }
 }

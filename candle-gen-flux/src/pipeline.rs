@@ -50,6 +50,7 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::{Module, VarBuilder};
+use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::clip::text_model::{
@@ -79,6 +80,22 @@ const MAX_SHIFT: f64 = 1.15;
 /// T5 pad token id (`<pad>`) — FLUX pads the T5 sequence to the variant max length with this id, and
 /// attends every padded position (no attention mask), so it is parity-relevant.
 const T5_PAD_TOKEN_ID: u32 = 0;
+
+/// The flow-match time-shift `mu` for the unified scheduler axis (epic 7114 P4, sc-7123). It mirrors
+/// candle's `get_schedule(.., Some((seq_len, BASE_SHIFT, MAX_SHIFT)))` linear shift:
+/// `mu = m·seq_len + b` with `m = (MAX_SHIFT − BASE_SHIFT)/(4096 − 256)`, `b = BASE_SHIFT − m·256`,
+/// so gen-core's exponential time-shift (`time_shift(mu,1,v) = e/(e + (1/v − 1))`) lands on the SAME
+/// shift the native schedule uses. schnell applies no shift (`get_schedule(.., None)`), so `mu = 0`.
+/// Used ONLY to feed the curated `resolve_flow_schedule`; the native (default) schedule stays the
+/// verbatim `get_schedule(..)` so the N1 default path is byte-exact.
+pub(crate) fn flow_mu(variant: Variant, seq_len: usize) -> f32 {
+    if !variant.is_dev() {
+        return 0.0;
+    }
+    let m = (MAX_SHIFT - BASE_SHIFT) / (4096.0 - 256.0);
+    let b = BASE_SHIFT - m * 256.0;
+    (m * seq_len as f64 + b) as f32
+}
 
 /// A txt2img pipeline handle: the snapshot `root`, the variant, and the compute device/dtype (bf16).
 /// Loading the heavy components is done by [`load_components`](Self::load_components) and owned/cached
@@ -265,6 +282,7 @@ impl Pipeline {
                 &state,
                 &timesteps,
                 guidance,
+                seed,
                 req,
                 on_progress,
             )?;
@@ -280,47 +298,60 @@ impl Pipeline {
         Ok(images)
     }
 
-    /// The flow-match Euler denoise — candle's `flux::sampling::denoise` re-implemented inline so it
-    /// can emit per-step `Progress` and honor `req.cancel`. The update is `img += pred·(t_prev−t_curr)`
-    /// over the **descending** schedule (1→0); the FLUX sign convention lives in the descending step,
-    /// so there is no velocity negation (contrast Z-Image). `guidance` is passed as a per-batch tensor
-    /// and only embedded by the dev DiT.
+    /// The flow-match denoise, routed through the unified curated sampler/scheduler driver (epic 7114
+    /// P4, sc-7123). The `scheduler` axis (`req.scheduler`) picks where the σ steps land over FLUX's
+    /// time-shift `mu` (`native` = the verbatim `get_schedule(..)` schedule); the `sampler` axis
+    /// (`req.sampler`) picks the integrator. The DEFAULT (`sampler`/`scheduler` = `None`) is the N1
+    /// no-op: `euler` over the native schedule is algebraically the legacy inline flow-match Euler loop
+    /// `img += pred·(σ_{i+1} − σ_i)` within the driver's `to_d` round-trip tolerance, so default output
+    /// stays parity-matched to the candle reference. FLUX feeds the raw timestep (`Sigma` convention:
+    /// the model sees `t == σ` directly, NOT `t·1000`); guidance is a per-batch tensor only embedded by
+    /// the dev DiT. Cancellation + progress are owned by the driver; the per-step DiT forward (and the
+    /// guidance embed) live inside the `predict` closure, so a multi-eval solver re-runs the whole step.
+    #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
         model: &Flux,
         state: &State,
         timesteps: &[f64],
         guidance: f64,
+        seed: u64,
         req: &GenerationRequest,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
         let b_sz = state.img.dim(0)?;
         let dev = &self.device;
         let guidance_t = Tensor::full(guidance as f32, b_sz, dev)?;
-        let total = timesteps.len().saturating_sub(1) as u32;
-        let mut img = state.img.clone();
-        for (i, window) in timesteps.windows(2).enumerate() {
-            if req.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            let (t_curr, t_prev) = (window[0], window[1]);
-            let t_vec = Tensor::full(t_curr as f32, b_sz, dev)?;
-            let pred = model.forward(
-                &img,
-                &state.img_ids,
-                &state.txt,
-                &state.txt_ids,
-                &t_vec,
-                &state.vec,
-                Some(&guidance_t),
-            )?;
-            img = (img + (pred * (t_prev - t_curr))?)?;
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
-        }
-        Ok(img)
+        // The native schedule is candle's verbatim `get_schedule(..)` (the byte-exact N1 default), in
+        // f32 descending with a trailing 0.0; the curated `scheduler` axis re-strides it over `mu`.
+        let native: Vec<f32> = timesteps.iter().map(|&t| t as f32).collect();
+        let mu = flow_mu(self.variant, state.img.dim(1)?);
+        let steps = native.len().saturating_sub(1);
+        let sigmas =
+            candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
+        candle_gen::run_flow_sampler(
+            req.sampler.as_deref(),
+            TimestepConvention::Sigma,
+            &sigmas,
+            state.img.clone(),
+            seed,
+            &req.cancel,
+            on_progress,
+            |img, t| -> Result<Tensor> {
+                // The model is fed the raw timestep (`t == σ`) as a per-batch tensor. The forward
+                // returns a `candle_core::Result`; `?` bridges it into the driver's `CandleError`.
+                let t_vec = Tensor::full(t, b_sz, dev)?;
+                Ok(model.forward(
+                    img,
+                    &state.img_ids,
+                    &state.txt,
+                    &state.txt_ids,
+                    &t_vec,
+                    &state.vec,
+                    Some(&guidance_t),
+                )?)
+            },
+        )
     }
 
     /// Unpack the denoised latents `(1, h·w, 64)` back to `(1, 16, H/8, W/8)`, VAE-decode to an RGB8

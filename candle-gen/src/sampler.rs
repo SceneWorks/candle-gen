@@ -11,11 +11,12 @@
 //! equality of the draw is NOT a goal (the RNG differs from mlx).
 
 use candle_core::Tensor;
-use gen_core::sampling::LatentOps;
+use gen_core::sampling::{LatentOps, TimestepConvention};
+use gen_core::{CancelFlag, Progress};
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 
-use crate::CandleError;
+use crate::{CandleError, Result};
 
 /// Lift a `candle_core::Result` into the backend-neutral `gen_core::Result` (the `LatentOps` trait is
 /// declared in gen-core, so its methods return `gen_core::Result`). Routes through the existing
@@ -69,6 +70,204 @@ impl LatentOps for CandleLatentOps {
         let noise = ge(Tensor::from_vec(data, x.shape().clone(), x.device()))?;
         ge(noise.to_dtype(x.dtype()))
     }
+}
+
+// =================================================================================================
+// Curated-sampler driver (epic 7114 P4, sc-7123): the per-engine adoption seam. The candle twin of
+// mlx-gen's `run_curated_sampler` / `run_flow_sampler` / `resolve_schedule` (`mlx-gen/src/sampler.rs`),
+// adapted for candle's EAGER evaluation (no `eval()` boundary — candle runs each op as it is built,
+// so the cancel check + progress emit in the `denoise` callback already land per model eval).
+// =================================================================================================
+
+/// Drive a curated gen-core unified [`gen_core::sampling::Sampler`] over ANY prediction type — the
+/// generalized core behind [`run_flow_sampler`], the per-engine adoption seam.
+///
+/// An engine supplies its [`gen_core::sampling::ModelSampling`] (`FlowModelSampling` for the
+/// rectified-flow cohort, `DiscreteModelSampling` for the ε/DDPM cohort — SDXL/Kolors,
+/// `EdmModelSampling` for the v-prediction outliers — SVD), its σ schedule, and its model forward (as
+/// `predict`). The `ModelSampling` recombines the raw model output into a denoised `x0` estimate and
+/// supplies the `c_in` input scaling, so the curated solver (Euler / Heun / DPM++ 2M·SDE / UniPC /
+/// ancestral / LCM / DDIM) never sees the prediction type — it integrates `x0` in k-diffusion sigma
+/// space regardless. This is what lets one solver library serve flow, EPS, and EDM engines alike.
+///
+/// - `sampler_name`: the canonical curated solver name. Unknown / `None` / a non-solver alias falls
+///   back to plain Euler (N3 — never hard-fail a generation over a sampling knob).
+/// - `ms`: the engine's prediction-type + noise-schedule contract.
+/// - `sigmas`: the descending schedule, length `num_steps + 1`, trailing `0.0`.
+/// - `predict(x_in, timestep)`: the engine's model forward returning the RAW (already CFG-combined)
+///   output the prediction type expects — velocity for FLOW, ε for EPS, v for V. `x_in` is the
+///   `c_in`-scaled latent ([`gen_core::sampling::ModelSampling::input_scale`]; identity for FLOW) and
+///   `timestep` is the conditioning value the model embeds at this σ
+///   ([`gen_core::sampling::ModelSampling::timestep`]). Any per-step CFG combine, velocity negation,
+///   reference-latent concat, or adapter injection lives INSIDE this closure — the solver only sees
+///   the combined output, so a multi-eval solver (heun / dpmpp) re-runs the whole closure each eval.
+///
+/// Cancellation and progress route through the `denoise` callback, the sole per-eval hook the
+/// callback-form `Sampler` exposes; `cancel` bridges `gen_core::Error::Canceled` ⇄
+/// `CandleError::Canceled`. Progress is reported as the count of schedule nodes already descended past,
+/// robust to the multi-eval solvers (heun / dpmpp_sde call this twice per step; the count stays
+/// monotone and ≤ total).
+#[allow(clippy::too_many_arguments)]
+pub fn run_curated_sampler(
+    sampler_name: Option<&str>,
+    ms: &dyn gen_core::sampling::ModelSampling,
+    sigmas: &[f32],
+    latents: Tensor,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    mut predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
+) -> Result<Tensor> {
+    use gen_core::sampling::{denoise as gc_denoise, sampler_by_name, Euler, Sampler};
+
+    let ops = CandleLatentOps;
+    let total = sigmas.len().saturating_sub(1).max(1) as u32;
+    // N3: a curated name routes to its solver; an unknown name / non-solver alias falls back to Euler.
+    let sampler: Box<dyn Sampler<CandleLatentOps>> = sampler_name
+        .and_then(sampler_by_name::<CandleLatentOps>)
+        .unwrap_or_else(|| Box::new(Euler));
+
+    let mut denoise_fn = |x: &Tensor, sigma: f32| -> gen_core::Result<Tensor> {
+        if cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        // Progress as the count of schedule nodes already descended past — robust to the multi-eval
+        // solvers (heun / dpmpp_sde call this twice per step; the count stays monotone and ≤ total).
+        let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
+        on_progress(Progress::Step { current, total });
+        gc_denoise(&ops, ms, x, sigma, |xin, t| {
+            predict(xin, t).map_err(Into::into)
+        })
+    };
+
+    sampler
+        .sample(&ops, &mut denoise_fn, latents, sigmas, seed)
+        .map_err(CandleError::from)
+}
+
+/// Drive a curated solver over a flow-match (rectified-flow) sigma schedule — the thin
+/// [`run_curated_sampler`] wrapper for the FLOW cohort (Lens / FLUX / Qwen / Chroma / Z-Image / FLUX.2).
+/// `conv` selects whether the model is fed the raw sigma ([`TimestepConvention::Sigma`]) or `1 − σ`
+/// ([`TimestepConvention::OneMinusSigma`]); `predict` returns the RAW (already CFG-combined) velocity.
+/// `euler` over FLOW reproduces the legacy flow-match Euler loop within the N1 tolerance.
+///
+/// The time-shift lives entirely in `sigmas` (resolved by [`resolve_flow_schedule`]), so
+/// `FlowModelSampling::new(conv)` (mu = 0) is the correct integration contract here — its `timestep` /
+/// `denoised_coeffs` are mu-independent.
+#[allow(clippy::too_many_arguments)]
+pub fn run_flow_sampler(
+    sampler_name: Option<&str>,
+    conv: TimestepConvention,
+    sigmas: &[f32],
+    latents: Tensor,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let ms = gen_core::sampling::FlowModelSampling::new(conv);
+    run_curated_sampler(
+        sampler_name,
+        &ms,
+        sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        predict,
+    )
+}
+
+/// Resolve a descending σ schedule honoring a per-generation curated `scheduler`, over ANY
+/// [`gen_core::sampling::ModelSampling`] — the engine-side counterpart to the `sampler` knob: the
+/// *scheduler* picks where the steps land, the *sampler* picks how each step advances. An unset /
+/// unknown / native-aliased name returns `native` verbatim (the N1 byte-exact default); a curated name
+/// builds the schedule via [`gen_core::sampling::schedule_sigmas`] over `ms`, which reads its σ-table /
+/// timestep↔sigma map — so `normal` / `karras` / `sgm_uniform` / `simple` / `beta` / `ddim_uniform` /
+/// `exponential` land correctly for the ε/DDPM (`DiscreteModelSampling`), EDM (`EdmModelSampling`), and
+/// flow (`FlowModelSampling`) contracts alike. A curated scheduler may return a length other than
+/// `steps + 1` (`ddim_uniform` / `beta` re-stride), which simply changes the effective step count — the
+/// same behaviour ComfyUI / diffusers have.
+pub fn resolve_schedule(
+    scheduler_name: Option<&str>,
+    ms: &dyn gen_core::sampling::ModelSampling,
+    steps: usize,
+    native: &[f32],
+) -> Vec<f32> {
+    use gen_core::sampling::{schedule_sigmas, Scheduler};
+    match scheduler_name.and_then(Scheduler::from_name) {
+        Some(sched) => schedule_sigmas(sched, ms, steps),
+        None => native.to_vec(),
+    }
+}
+
+/// Resolve the descending flow sigma schedule for an engine, honoring a per-generation curated
+/// `scheduler` selection (epic 7114 scheduler axis) — the FLOW [`resolve_schedule`] wrapper.
+///
+/// - `scheduler_name`: the canonical curated scheduler name (`normal` / `simple` / `karras` /
+///   `exponential` / `sgm_uniform` / `beta` / `ddim_uniform`). `None`, an unknown name, or a native
+///   alias (e.g. `flow_match` / `flow_match_euler`) falls back to `native` (N3 — never hard-fail a
+///   generation over a scheduling knob; the engine's native schedule is the byte-exact default).
+/// - `mu`: the engine's time-shift (`compute_mu(image_seq_len, steps)` for the dynamic-shift models,
+///   `shift.ln()` for a static-shift model, `0.0` for an unshifted one). The curated schedule is built
+///   over a [`gen_core::sampling::FlowModelSampling::with_shift`] carrying this `mu` so `normal` /
+///   `sgm_uniform` / … stay consistent with the engine's resolution-/config-dependent shift instead of
+///   degrading to a linear σ ramp (which would starve a high-shift model of high-noise steps).
+/// - `steps`: the denoise step count.
+/// - `native`: the engine's exact native schedule (length `steps + 1`, trailing `0.0`), returned
+///   verbatim on the default path so the per-engine N1 default-parity gate holds.
+///
+/// Schedule construction is **convention-independent** — the σ schedule is the same noise-fraction ramp
+/// however the model consumes σ — so this always builds with [`TimestepConvention::Sigma`]; the engine's
+/// own conditioning convention is applied separately by [`run_flow_sampler`].
+pub fn resolve_flow_schedule(
+    scheduler_name: Option<&str>,
+    mu: f32,
+    steps: usize,
+    native: &[f32],
+) -> Vec<f32> {
+    let ms = gen_core::sampling::FlowModelSampling::with_shift(TimestepConvention::Sigma, mu);
+    resolve_schedule(scheduler_name, &ms, steps, native)
+}
+
+/// The curated unified-framework **sampler** menu (epic 7114 decision 2) as capability strings — every
+/// [`gen_core::sampling::Solver`] name, in menu order. A migrated engine advertises this in its
+/// [`gen_core::generator::Capabilities`] `samplers` list (plus any legacy alias it still honors, e.g.
+/// `flow_match`) so the per-generation `sampler` knob can select any curated integrator.
+pub fn curated_sampler_names() -> Vec<&'static str> {
+    gen_core::sampling::Solver::ALL
+        .iter()
+        .map(|s| s.name())
+        .collect()
+}
+
+/// The curated unified-framework **scheduler** menu (epic 7114 decision 2) as capability strings —
+/// every [`gen_core::sampling::Scheduler`] name, in menu order. Engines that expose the sigma-schedule
+/// axis advertise this in their `schedulers` list; selecting one builds the schedule via
+/// [`gen_core::sampling::schedule_sigmas`].
+pub fn curated_scheduler_names() -> Vec<&'static str> {
+    gen_core::sampling::Scheduler::ALL
+        .iter()
+        .map(|s| s.name())
+        .collect()
+}
+
+/// The curated `menu` plus any legacy `aliases` an engine still honors (deduped, preserving order).
+/// Each alias falls back to euler / the engine's native schedule through the N3 path in
+/// [`run_curated_sampler`] / [`resolve_schedule`], so it stays valid against
+/// [`gen_core::generator::Capabilities::validate_request`] without changing behaviour. A convenience for
+/// building a migrated engine's `samplers` / `schedulers` capability lists (e.g.
+/// `menu_with_aliases(curated_sampler_names(), &["flow_match_euler"])`).
+pub fn menu_with_aliases(
+    mut menu: Vec<&'static str>,
+    aliases: &[&'static str],
+) -> Vec<&'static str> {
+    for &a in aliases {
+        if !menu.contains(&a) {
+            menu.push(a);
+        }
+    }
+    menu
 }
 
 #[cfg(test)]
@@ -186,5 +385,251 @@ mod tests {
                 "{name} produced non-finite output"
             );
         }
+    }
+
+    // --- Curated-sampler driver (epic 7114 P4, sc-7123): the per-engine adoption seam ---------------
+
+    use super::{run_curated_sampler, run_flow_sampler};
+    use candle_core::DType;
+    use gen_core::sampling::{AlphaSchedule, DiscreteModelSampling, EdmModelSampling, Scheduler};
+    use gen_core::{CancelFlag, Progress};
+
+    /// N1 keystone: `run_flow_sampler` with the default `euler` over a FLOW schedule reproduces the
+    /// legacy inline flow-match loop `img += v·(σ_{i+1} − σ_i)` within tolerance (the `to_d` round-trip
+    /// is an f32-cancellation). This is the per-engine default-parity contract every flow engine relies
+    /// on after routing its denoise through the driver.
+    #[test]
+    fn run_flow_sampler_euler_matches_inline_flow_loop() {
+        let sigmas = build_flow_sigmas(8, compute_mu(image_seq_len(1024, 1024), 8));
+        let x_init = t(&[0.3, -1.1, 2.0, 0.05, -0.4, 1.7]);
+        // A reference flow velocity `v = 0.3·x + 0.1` (matches the gen-core byte-equiv stub).
+        let velocity = |x: &Tensor| -> Result<Tensor> { Ok(x.affine(0.3, 0.1)?) };
+
+        // Legacy inline loop: img += v·(σ_{i+1} − σ_i) over the descending schedule.
+        let mut legacy = x_init.clone();
+        for w in sigmas.windows(2) {
+            let v = velocity(&legacy).unwrap();
+            legacy = (&legacy + (v * (w[1] - w[0]) as f64).unwrap()).unwrap();
+        }
+
+        // Unified driver, default euler (sampler_name = None).
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        let out = run_flow_sampler(
+            None,
+            TimestepConvention::Sigma,
+            &sigmas,
+            x_init,
+            0,
+            &cancel,
+            &mut progress,
+            |xin, _t| velocity(xin),
+        )
+        .unwrap();
+        assert!(
+            max_abs(&vec1(&out), &vec1(&legacy)) < 1e-4,
+            "driver euler diverged from inline flow loop"
+        );
+    }
+
+    /// Keystone: `run_curated_sampler` over a `DiscreteModelSampling` (ε prediction) with `euler`
+    /// reproduces the legacy Kolors/diffusers Euler step `x + ε·(σ_{i+1} − σ_i)` EXACTLY for a constant
+    /// ε field — the rectified integral is `x_init − ε·σ_0` (the `to_d` round-trip cancels). This is the
+    /// equivalence the DDPM cohort's (sc-7124) curated path relies on.
+    #[test]
+    fn run_curated_sampler_eps_euler_matches_legacy_discrete_step() {
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012).unwrap();
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let sigmas = vec![8.0_f32, 4.0, 2.0, 1.0, 0.5, 0.0];
+        let x_init = t(&[0.3, -1.1, 2.0]);
+        let eps = [0.7_f32, -0.2, 0.4];
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        let out = run_curated_sampler(
+            Some("euler"),
+            &ms,
+            &sigmas,
+            x_init.clone(),
+            0,
+            &cancel,
+            &mut progress,
+            |_xin, _t| Ok(t(&eps)),
+        )
+        .unwrap();
+        for ((g, &x0), &e) in vec1(&out).iter().zip(&vec1(&x_init)).zip(&eps) {
+            let want = x0 - e * sigmas[0]; // x_init − ε·σ_0
+            assert!((g - want).abs() < 2e-3, "eps euler: got {g} want {want}");
+        }
+    }
+
+    /// Keystone: `run_curated_sampler` drives a v-prediction `EdmModelSampling` (SVD's contract, sc-7125)
+    /// to finite output over every curated solver — proving the driver is prediction-type-agnostic.
+    #[test]
+    fn run_curated_sampler_v_prediction_edm_is_finite_every_solver() {
+        let ms = EdmModelSampling::svd();
+        let sigmas = vec![80.0_f32, 20.0, 5.0, 1.0, 0.2, 0.0];
+        let x_init = t(&[0.2, -0.5, 1.0, 0.3]);
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        for name in [
+            "euler",
+            "euler_ancestral",
+            "heun",
+            "dpmpp_2m",
+            "dpmpp_sde",
+            "uni_pc",
+            "ddim",
+        ] {
+            let out = run_curated_sampler(
+                Some(name),
+                &ms,
+                &sigmas,
+                x_init.clone(),
+                7,
+                &cancel,
+                &mut progress,
+                // A mild v "model": v = 0.1·x_in (the input is c_in-scaled, keeping it bounded).
+                |xin, _t| Ok(xin.affine(0.1, 0.0)?),
+            )
+            .unwrap();
+            assert!(
+                vec1(&out).iter().all(|v| v.is_finite()),
+                "{name} (v-pred/EDM) produced non-finite output"
+            );
+        }
+    }
+
+    /// N3: an unknown / unset sampler name falls back to euler (never hard-fails), and a curated name
+    /// routes to a genuinely different solver (so the knob has an effect).
+    #[test]
+    fn driver_unknown_sampler_falls_back_to_euler() {
+        let sigmas = build_flow_sigmas(6, compute_mu(image_seq_len(512, 512), 6));
+        let x0 = t(&[0.2, -0.5, 1.0, 0.3]);
+        let run = |name: Option<&str>| {
+            let cancel = CancelFlag::new();
+            let mut p = |_p: Progress| {};
+            run_flow_sampler(
+                name,
+                TimestepConvention::Sigma,
+                &sigmas,
+                x0.clone(),
+                7,
+                &cancel,
+                &mut p,
+                |xin, _t| Ok(xin.affine(0.25, 0.1)?),
+            )
+            .unwrap()
+        };
+        // Unknown name == default == explicit euler.
+        assert_eq!(vec1(&run(Some("nope"))), vec1(&run(None)));
+        assert_eq!(vec1(&run(Some("euler"))), vec1(&run(None)));
+        // A real solver swap differs from euler.
+        assert_ne!(vec1(&run(Some("heun"))), vec1(&run(None)));
+    }
+
+    /// The driver bridges cancellation: a flag tripped before the first eval surfaces as the typed
+    /// `CandleError::Canceled` (not a stringified `Msg`).
+    #[test]
+    fn driver_cancellation_bridges_to_typed_canceled() {
+        let sigmas = build_flow_sigmas(4, compute_mu(image_seq_len(512, 512), 4));
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let mut progress = |_p: Progress| {};
+        let err = run_flow_sampler(
+            None,
+            TimestepConvention::Sigma,
+            &sigmas,
+            t(&[0.1, 0.2, 0.3, 0.4]),
+            0,
+            &cancel,
+            &mut progress,
+            |xin, _t| Ok(xin.clone()),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CandleError::Canceled));
+    }
+
+    /// `resolve_flow_schedule` returns the native schedule verbatim for the default/native-alias path
+    /// (N1 byte-exact), and a curated scheduler name builds a distinct descending-to-0 schedule.
+    #[test]
+    fn resolve_flow_schedule_default_is_native_curated_differs() {
+        use super::resolve_flow_schedule;
+        let mu = compute_mu(image_seq_len(1024, 1024), 12);
+        let native = build_flow_sigmas(12, mu);
+        // Default + native alias => byte-identical native.
+        assert_eq!(resolve_flow_schedule(None, mu, 12, &native), native);
+        assert_eq!(
+            resolve_flow_schedule(Some("flow_match"), mu, 12, &native),
+            native
+        );
+        // A curated scheduler builds a real schedule (descending, trailing 0), distinct from native.
+        let karras = resolve_flow_schedule(Some("karras"), mu, 12, &native);
+        assert_eq!(*karras.last().unwrap(), 0.0);
+        assert!(karras.windows(2).all(|w| w[0] >= w[1]));
+        assert_ne!(karras, native);
+        // Every curated scheduler resolves to a valid descending-to-0 schedule.
+        for s in Scheduler::ALL {
+            let sigs = resolve_flow_schedule(Some(s.name()), mu, 12, &native);
+            assert!(
+                sigs.len() >= 2 && *sigs.last().unwrap() == 0.0,
+                "{}",
+                s.name()
+            );
+        }
+    }
+
+    /// The curated menus expose exactly the gen-core vocabulary (decision 2).
+    #[test]
+    fn curated_menus_match_vocabulary() {
+        use super::{curated_sampler_names, curated_scheduler_names};
+        assert_eq!(
+            curated_sampler_names(),
+            vec![
+                "euler",
+                "euler_ancestral",
+                "heun",
+                "dpmpp_2m",
+                "dpmpp_sde",
+                "uni_pc",
+                "lcm",
+                "ddim"
+            ]
+        );
+        assert_eq!(
+            curated_scheduler_names(),
+            vec![
+                "normal",
+                "simple",
+                "karras",
+                "exponential",
+                "sgm_uniform",
+                "beta",
+                "ddim_uniform"
+            ]
+        );
+    }
+
+    /// Sanity: the driver runs at the engines' real dtype (bf16) without panicking and stays finite.
+    #[test]
+    fn driver_runs_in_bf16() {
+        let sigmas = build_flow_sigmas(4, compute_mu(image_seq_len(512, 512), 4));
+        let x0 = t(&[0.2, -0.5, 1.0, 0.3]).to_dtype(DType::BF16).unwrap();
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        let out = run_flow_sampler(
+            Some("dpmpp_2m"),
+            TimestepConvention::Sigma,
+            &sigmas,
+            x0,
+            7,
+            &cancel,
+            &mut progress,
+            |xin, _t| Ok(xin.affine(0.25, 0.1)?),
+        )
+        .unwrap();
+        assert_eq!(out.dtype(), DType::BF16);
+        assert!(vec1(&out.to_dtype(DType::F32).unwrap())
+            .iter()
+            .all(|v| v.is_finite()));
     }
 }

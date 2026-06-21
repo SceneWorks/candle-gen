@@ -239,10 +239,12 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // advertised, and rejected at load rather than silently dropped.
             supports_lora: false,
             supports_lokr: false,
-            // The worker sends no `sampler`/`scheduler` for this slice (the flow-match schedule is
-            // fixed per variant), matching the conservative SDXL/Z-Image descriptors.
-            samplers: vec![],
-            schedulers: vec![],
+            // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123): the denoise routes
+            // through the shared driver, so the per-generation `sampler`/`scheduler` knob can select any
+            // curated integrator/schedule. The DEFAULT (None/None) reproduces the native flow-match
+            // Euler path (N1). FLUX had no legacy sampler/scheduler aliases, so no `menu_with_aliases`.
+            samplers: candle_gen::curated_sampler_names(),
+            schedulers: candle_gen::curated_scheduler_names(),
             min_size: 256,
             max_size: 2048,
             max_count: 8,
@@ -384,6 +386,13 @@ mod tests {
             assert_eq!(d.capabilities.min_size, 256);
             assert_eq!(d.capabilities.max_size, 2048);
             assert_eq!(d.capabilities.max_count, 8);
+            // Unified curated sampler/scheduler menu (epic 7114 P4, sc-7123) — the denoise routes
+            // through the shared driver, so both variants now advertise the full curated vocabulary.
+            assert_eq!(d.capabilities.samplers, candle_gen::curated_sampler_names());
+            assert_eq!(
+                d.capabilities.schedulers,
+                candle_gen::curated_scheduler_names()
+            );
         }
     }
 

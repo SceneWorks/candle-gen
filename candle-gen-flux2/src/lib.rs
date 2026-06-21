@@ -12,6 +12,14 @@
 //! deterministic CPU-seeded-noise contract (sc-3673); the Qwen chat-template tokenization reuses
 //! gen-core's [`TextTokenizer`] with [`ChatTemplate::QwenInstructNoThink`].
 //!
+//! **Sampling (epic 7114 P4, sc-7123):** both denoise loops (txt2img [`Pipeline::render`] and the edit
+//! path [`Flux2Edit`]) route through the unified curated sampler/scheduler driver
+//! (`candle_gen::run_flow_sampler` / `resolve_flow_schedule`). FLUX.2 is a rectified-flow engine using
+//! the `Sigma` convention but embeds σ×1000, so the predict closure feeds `sigma * 1000.0` to the
+//! transformer; the guidance>1 CFG blend (and, on the edit path, the joint `[target, refs]` concat)
+//! lives inside that closure. The descriptor advertises the curated sampler/scheduler menus; the default
+//! (unset sampler/scheduler) path is the N1 no-op — euler over the native empirical-mu flow-match schedule.
+//!
 //! **First-slice surface:** txt2img only. The mlx provider's edit variants (`flux2_klein_9b_edit`,
 //! `flux2_klein_9b_kv_edit` — single/multi Reference, the reference-K/V cache), LoRA/LoKr, and Q4/Q8
 //! quantization are **not** wired here; they are a follow-up. The descriptor advertises only the
@@ -34,6 +42,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::registry::ModelRegistration;
+use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
@@ -151,7 +160,6 @@ impl Pipeline {
             .unwrap_or(DEFAULT_STEPS as usize);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
-        let total = steps as u32;
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
 
         // Prompt embeds are seed-independent: encode once.
@@ -166,38 +174,55 @@ impl Pipeline {
 
         let img_ids = pipeline::prepare_grid_ids(lat_h, lat_w);
         let txt_ids = pipeline::prepare_text_ids(self.cfg.max_sequence_length);
-        let (sigmas, timesteps) = pipeline::schedule(steps, req.width, req.height);
+
+        // Curated sampler/scheduler routing (epic 7114 P4, sc-7123). The NATIVE schedule is the legacy
+        // empirical-mu flow-match sigmas (descending, trailing 0.0); the same `mu` feeds the curated
+        // scheduler axis so `normal`/`karras`/etc. honor the resolution-dependent shift. The default path
+        // (sampler/scheduler unset) is the N1 no-op — euler over the native schedule reproduces the legacy
+        // `euler_step` flow-match loop within tolerance.
+        let mu = pipeline::compute_mu(pipeline::image_seq_len(req.width, req.height), steps);
+        let (native, _timesteps) = pipeline::schedule(steps, req.width, req.height);
+        let sigmas =
+            candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
 
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
             let seed = base_seed.wrapping_add(index as u64);
-            let mut latents =
+            let latents =
                 pipeline::create_noise(&self.cfg, seed, req.width, req.height, &self.device)?;
 
-            for (i, &ts) in timesteps.iter().enumerate() {
-                if req.cancel.is_cancelled() {
-                    return Err(CandleError::Canceled);
-                }
-                let v =
-                    comps
-                        .transformer
-                        .forward(&latents, &prompt_embeds, &img_ids, &txt_ids, ts)?;
-                let v = match &negative {
-                    Some(neg) => {
-                        let vn = comps
-                            .transformer
-                            .forward(&latents, neg, &img_ids, &txt_ids, ts)?;
-                        // vn + guidance·(v − vn)
-                        (&vn + ((&v - &vn)? * guidance as f64)?)?
+            // The driver does cancel + progress + the euler/curated integrator step. The forward (and the
+            // guidance>1 CFG blend) lives inside `predict` so a multi-eval solver re-runs it. FLUX.2 uses
+            // the Sigma convention but the model embeds σ×1000, so feed `sigma * 1000.0` to the transformer.
+            let latents = candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::Sigma,
+                &sigmas,
+                latents,
+                seed,
+                &req.cancel,
+                on_progress,
+                |latents, sigma| -> CResult<Tensor> {
+                    let ts = sigma * 1000.0;
+                    let v = comps.transformer.forward(
+                        latents,
+                        &prompt_embeds,
+                        &img_ids,
+                        &txt_ids,
+                        ts,
+                    )?;
+                    match &negative {
+                        Some(neg) => {
+                            let vn = comps
+                                .transformer
+                                .forward(latents, neg, &img_ids, &txt_ids, ts)?;
+                            // vn + guidance·(v − vn)
+                            Ok((&vn + ((&v - &vn)? * guidance as f64)?)?)
+                        }
+                        None => Ok(v),
                     }
-                    None => v,
-                };
-                latents = pipeline::euler_step(&latents, &v, &sigmas, i)?;
-                on_progress(Progress::Step {
-                    current: i as u32 + 1,
-                    total,
-                });
-            }
+                },
+            )?;
 
             on_progress(Progress::Decoding);
             let packed = pipeline::unpack_latents(&latents, req.width, req.height)?;
@@ -307,8 +332,13 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![],
             supports_lora: false,
             supports_lokr: false,
-            samplers: vec![],
-            schedulers: vec!["flow_match_euler"],
+            // Curated sampler/scheduler menu (epic 7114 P4, sc-7123). The legacy `flow_match_euler`
+            // scheduler alias is retained and falls back to the native schedule via the N3 path.
+            samplers: candle_gen::curated_sampler_names(),
+            schedulers: candle_gen::menu_with_aliases(
+                candle_gen::curated_scheduler_names(),
+                &["flow_match_euler"],
+            ),
             min_size: 256,
             max_size: 2048,
             max_count: 8,

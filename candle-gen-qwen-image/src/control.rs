@@ -211,7 +211,6 @@ impl QwenControl {
             return Err(CandleError::Canceled);
         }
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
-        let total = req.steps as u32;
 
         let pos = self.encode(&req.prompt)?;
         let neg = if req.guidance > 1.0 {
@@ -231,56 +230,70 @@ impl QwenControl {
         let control_cond =
             pipeline::pack_latents(&control_latent, req.width, req.height)?.to_dtype(DIT_DTYPE)?;
 
-        let sigmas = pipeline::qwen_sigmas(req.steps, req.width, req.height);
-        let mut latents = pipeline::create_noise(req.seed, req.width, req.height, &self.device)?
+        // Routed through the unified curated sampler/scheduler framework (epic 7114 P4, sc-7123): the
+        // `native` schedule is the legacy production `qwen_sigmas` (returned verbatim — N1 byte-exact for
+        // the default), `mu` steers the (non-default) curated scheduler axis by the production shift. The
+        // bespoke control provider has no `req.sampler`/`req.scheduler` surface yet, so both stay `None`
+        // (the N1 default: `euler` over the native schedule — algebraically the legacy `euler_step`
+        // loop). The model is fed the raw sigma (`Sigma` convention); the ControlNet branch + true-CFG
+        // pos/neg/blend all live inside the `predict` closure (a multi-eval solver re-runs the whole
+        // closure, control residuals and all).
+        let native = pipeline::qwen_sigmas(req.steps, req.width, req.height);
+        let mu = pipeline::qwen_mu(req.width, req.height);
+        let sigmas = candle_gen::resolve_flow_schedule(None, mu, req.steps, &native);
+        let latents = pipeline::create_noise(req.seed, req.width, req.height, &self.device)?
             .to_dtype(DIT_DTYPE)?;
 
-        for i in 0..req.steps {
-            if req.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            let sigma = sigmas[i];
-            let pos_res =
-                self.controlnet
-                    .forward(&latents, &control_cond, &pos, sigma, lat_h, lat_w)?;
-            let pos_v = self.transformer.forward_control(
-                &latents,
-                &pos,
-                sigma,
-                lat_h,
-                lat_w,
-                Some(&pos_res),
-                req.control_scale,
-            )?;
-            let v = match &neg {
-                Some(neg) => {
-                    let neg_res = self.controlnet.forward(
-                        &latents,
-                        &control_cond,
-                        neg,
-                        sigma,
-                        lat_h,
-                        lat_w,
-                    )?;
-                    let neg_v = self.transformer.forward_control(
-                        &latents,
-                        neg,
-                        sigma,
-                        lat_h,
-                        lat_w,
-                        Some(&neg_res),
-                        req.control_scale,
-                    )?;
-                    pipeline::compute_guided_noise(&pos_v, &neg_v, req.guidance)?
+        let latents = candle_gen::run_flow_sampler(
+            None,
+            candle_gen::gen_core::sampling::TimestepConvention::Sigma,
+            &sigmas,
+            latents,
+            req.seed,
+            &req.cancel,
+            on_progress,
+            |latents, sigma| -> Result<Tensor> {
+                let pos_res =
+                    self.controlnet
+                        .forward(latents, &control_cond, &pos, sigma, lat_h, lat_w)?;
+                let pos_v = self.transformer.forward_control(
+                    latents,
+                    &pos,
+                    sigma,
+                    lat_h,
+                    lat_w,
+                    Some(&pos_res),
+                    req.control_scale,
+                )?;
+                match &neg {
+                    Some(neg) => {
+                        let neg_res = self.controlnet.forward(
+                            latents,
+                            &control_cond,
+                            neg,
+                            sigma,
+                            lat_h,
+                            lat_w,
+                        )?;
+                        let neg_v = self.transformer.forward_control(
+                            latents,
+                            neg,
+                            sigma,
+                            lat_h,
+                            lat_w,
+                            Some(&neg_res),
+                            req.control_scale,
+                        )?;
+                        Ok(pipeline::compute_guided_noise(
+                            &pos_v,
+                            &neg_v,
+                            req.guidance,
+                        )?)
+                    }
+                    None => Ok(pos_v),
                 }
-                None => pos_v,
-            };
-            latents = pipeline::euler_step(&latents, &v, &sigmas, i)?;
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
-        }
+            },
+        )?;
 
         on_progress(Progress::Decoding);
         let lat = pipeline::unpack_latents(&latents, req.width, req.height)?;

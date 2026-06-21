@@ -104,6 +104,13 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             conditioning: vec![],
             supports_lora: false,
             supports_lokr: false,
+            // Bespoke-by-architecture (epic 7114 P4, sc-7123 — mirrors the mlx-gen SenseNova won't-do):
+            // SenseNova-U1 is an AUTOREGRESSIVE backbone whose `predict_v` mutates a per-step `KvCache`
+            // (`cache.len()` feeds the RoPE/position build) shared across the cond/uncond passes. The
+            // unified curated solvers do multiple model evals per step (heun = 2; dpmpp_2m/uni_pc reuse
+            // prior-step state) and would append to the cache multiple times → desynced AR positions →
+            // corrupt output. The native shifted-Euler (single eval/step, `req.scheduler_shift`) is the
+            // only valid integrator, so no curated sampler/scheduler menu is advertised (N3: empty list).
             samplers: Vec::new(),
             schedulers: Vec::new(),
             min_size: 256,

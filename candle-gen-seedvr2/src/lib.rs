@@ -75,6 +75,11 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
             conditioning: vec![ConditioningKind::Reference, ConditioningKind::VideoClip],
             supports_lora: false,
             supports_lokr: false,
+            // Bespoke-by-architecture (epic 7114 P4, sc-7123): SeedVR2 is a ONE-STEP restoration
+            // transformer (fixed timestep 1000.0, `denoised = noise − dit_out`), NOT a multi-step
+            // rectified-flow ODE — there is no sigma schedule to integrate and no sampler/scheduler axis
+            // to expose. It keeps its native single-step `seedvr2_euler` descriptor verbatim; the unified
+            // curated solvers/schedulers do not apply.
             samplers: vec!["seedvr2_euler"],
             schedulers: vec!["seedvr2_euler"],
             min_size: VAE_SCALE,

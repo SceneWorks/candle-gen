@@ -288,7 +288,6 @@ impl QwenEdit {
         })?;
         let last = references.last().expect("non-empty checked");
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
-        let total = req.steps as u32;
 
         // VL conditioning: preprocess the first reference once (image-only), run the vision tower once,
         // then encode the positive (+ negative for CFG) prompts reusing the vision embeds.
@@ -334,58 +333,77 @@ impl QwenEdit {
         let noise_seq = lat_h * lat_w;
 
         // Lightning uses the static-shift schedule (resolution-independent); production uses the
-        // dynamic-μ schedule (sc-6220).
-        let sigmas = if req.lightning {
-            pipeline::lightning_sigmas(req.steps)
+        // dynamic-μ schedule (sc-6220). Routed through the unified curated sampler/scheduler framework
+        // (epic 7114 P4, sc-7123): `native` is whichever legacy schedule the path uses (returned
+        // verbatim — N1 byte-exact for the default), and `mu` steers the (non-default) curated scheduler
+        // axis by the path's own shift. The bespoke edit provider has no `req.sampler`/`req.scheduler`
+        // surface yet, so both stay `None` (the N1 default: `euler` over the native schedule —
+        // algebraically the legacy `euler_step` loop). The model is fed the raw sigma (`Sigma`
+        // convention); Qwen-Image-Edit is **true CFG**, and the dual-latent concat/slice (concatenate the
+        // updating noise with the static reference latents over the sequence axis, then slice the noise
+        // prefix post-forward) lives — together with the pos/neg/blend — inside the `predict` closure.
+        let (native, mu) = if req.lightning {
+            (
+                pipeline::lightning_sigmas(req.steps),
+                pipeline::lightning_mu(),
+            )
         } else {
-            pipeline::qwen_sigmas(req.steps, req.width, req.height)
+            (
+                pipeline::qwen_sigmas(req.steps, req.width, req.height),
+                pipeline::qwen_mu(req.width, req.height),
+            )
         };
-        let mut latents = pipeline::create_noise(req.seed, req.width, req.height, &self.device)?
+        let sigmas = candle_gen::resolve_flow_schedule(None, mu, req.steps, &native);
+        let latents = pipeline::create_noise(req.seed, req.width, req.height, &self.device)?
             .to_dtype(DIT_DTYPE)?;
 
-        for i in 0..req.steps {
-            if req.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            let sigma = sigmas[i];
-            // Concatenate the (updating) noise with the (static) reference latents over the sequence.
-            let joint = Tensor::cat(&[&latents, &static_latents], 1)?;
-            let pos_v = self
-                .transformer
-                .forward_edit(
-                    &joint,
-                    &pos,
-                    sigma,
-                    lat_h,
-                    lat_w,
-                    &cond_grids,
-                    self.zero_cond_t,
-                )?
-                .narrow(1, 0, noise_seq)?;
-            let v = match &neg {
-                Some(neg) => {
-                    let neg_v = self
-                        .transformer
-                        .forward_edit(
-                            &joint,
-                            neg,
-                            sigma,
-                            lat_h,
-                            lat_w,
-                            &cond_grids,
-                            self.zero_cond_t,
-                        )?
-                        .narrow(1, 0, noise_seq)?;
-                    pipeline::compute_guided_noise(&pos_v, &neg_v, req.guidance)?
+        let latents = candle_gen::run_flow_sampler(
+            None,
+            candle_gen::gen_core::sampling::TimestepConvention::Sigma,
+            &sigmas,
+            latents,
+            req.seed,
+            &req.cancel,
+            on_progress,
+            |latents, sigma| -> Result<Tensor> {
+                // Concatenate the (updating) noise with the (static) reference latents over the sequence.
+                let joint = Tensor::cat(&[latents, &static_latents], 1)?;
+                let pos_v = self
+                    .transformer
+                    .forward_edit(
+                        &joint,
+                        &pos,
+                        sigma,
+                        lat_h,
+                        lat_w,
+                        &cond_grids,
+                        self.zero_cond_t,
+                    )?
+                    .narrow(1, 0, noise_seq)?;
+                match &neg {
+                    Some(neg) => {
+                        let neg_v = self
+                            .transformer
+                            .forward_edit(
+                                &joint,
+                                neg,
+                                sigma,
+                                lat_h,
+                                lat_w,
+                                &cond_grids,
+                                self.zero_cond_t,
+                            )?
+                            .narrow(1, 0, noise_seq)?;
+                        Ok(pipeline::compute_guided_noise(
+                            &pos_v,
+                            &neg_v,
+                            req.guidance,
+                        )?)
+                    }
+                    None => Ok(pos_v),
                 }
-                None => pos_v,
-            };
-            latents = pipeline::euler_step(&latents, &v, &sigmas, i)?;
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
-        }
+            },
+        )?;
 
         let _ = &self.te_cfg; // kept for symmetry with the other providers' config plumbing
         on_progress(Progress::Decoding);
