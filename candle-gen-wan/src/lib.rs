@@ -15,7 +15,9 @@
 //! upcast to f32. `backend = "candle"`, `mac_only = false`.
 //!
 //! **First-slice surface:** txt2video only. The mlx provider's image-conditioning (TI2V / I2V),
-//! VACE, LoRA, quantization, and tiling surface is **deferred** and rejected.
+//! VACE, LoRA, and quantization surface is **deferred**. The z48 vae22 decode is memory-bounded:
+//! the temporal axis streams per-frame ([`vae::WanVae::decode`]) and a budgeted **spatial** tiler
+//! ([`vae::WanVae::decode_budgeted`], sc-7111) caps a single high-res frame's VRAM spike.
 
 pub mod adapters;
 pub mod config;
@@ -218,7 +220,10 @@ impl Pipeline {
         }
 
         on_progress(Progress::Decoding);
-        let decoded = comps.vae.decode(&latents)?;
+        // Memory-bounded z48 vae22 decode (sc-7111): the per-frame streaming `decode` already bounds
+        // the temporal axis; `decode_budgeted` adds budgeted **spatial** tiling so a single high-res
+        // frame can't spike VRAM, and returns a catchable error rather than OOM-ing when over budget.
+        let decoded = comps.vae.decode_budgeted(&latents)?;
         let images = pipeline::frames_to_images(&decoded)?;
         Ok((images, fps))
     }
