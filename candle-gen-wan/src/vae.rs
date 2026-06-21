@@ -661,17 +661,30 @@ const WAN22_VAE_BUDGET_SAFE_FRAC: f64 = 0.85;
 /// Fallback budget when neither the env override nor `nvidia-smi` yields a value.
 const WAN22_VAE_DEFAULT_BUDGET_GIB: f64 = 16.0;
 
-// Cost-model constants. **PLACEHOLDER — CUDA-pending calibration (sc-7148).** The full-output
-// accumulator term is backend-identical to mlx (the f32 `output`/`weights` buffers + pad/add transients
-// are the same pad-and-accumulate algorithm). The per-frame term is candle-specific: because `decode`
-// streams, the activation spike scales with ONE output frame's area (`tile_h·tile_w`), NOT the whole
-// tile's volume — so it is seeded conservatively (over-estimates ⇒ tiles a touch early ⇒ never OOMs)
-// and MUST be re-measured on a CUDA box (a `vae_decode_sweep`-style harness over real z48 weights)
-// before the budget is trusted in prod. Until then the selector tiles *roughly* correctly: the
-// SELECTOR logic (single-pass-when-small / tile-under-budget / catchable-when-unfittable) is what the
-// unit tests below pin; the calibration is the CONSTANTS.
-const WAN22_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 40.0;
-const WAN22_VAE_FRAME_BYTES_PER_OUT_PX: f64 = 12_000.0;
+// Cost-model constants. **CUDA-CALIBRATED (sc-7148)** — fit from real-weight peak-VRAM anchors measured
+// by `tests/vae_decode_sweep.rs` on an RTX PRO 6000 Blackwell (sm_120, CUDA 12.9, f32, device-level
+// `nvidia-smi` peak) over real Wan2.2-TI2V-5B z48 weights. The five anchors (output WxHxF / largest
+// spatial tile → measured peak):
+//   768²×13  single-pass (full 768² frame)  → 29.17 GiB
+//   1280²×13 single-pass (full 1280² frame) → 76.46 GiB   (the high-res single-frame spike)
+//   1280²×13 tiled 256px                    →  6.30 GiB   (accumulator-dominated)
+//   1280²×13 tiled 512px                    → 22.87 GiB
+//   1280²×61 tiled 256px                    → 17.21 GiB   (accum ≈149 B/voxel from the out_vox slope)
+// Because `decode` STREAMS one latent frame at a time, the per-tile activation spike scales with ONE
+// output frame's area (`tile_h·tile_w`), not the whole tile's volume — so the model is `ACCUM·out_vox +
+// FRAME·frame_px`. The accumulator term (≈149 B/voxel, far above the mlx z48's 40 — candle's tiled
+// decode juggles more full-output buffers: the streaming per-tile `cat` plus the pad-and-accumulate
+// blend) and the per-frame term (≈50 000 B/px for a full frame, rising to ≈90 000 B/px for the smaller
+// tiles whose per-px decoder overhead amortizes worse) are rounded to the **conservative**
+// (over-predicting) side; the model reproduces every anchor at ratio 1.12–1.88× (never under).
+//
+// **The old placeholders (40 / 12 000) badly UNDER-predicted** — they forecast ~18 GiB for the 1280²
+// single-frame spike that really peaks 76 GiB, so the selector could have OK'd a single-pass / large
+// tile that OOMs. (The story's "even the conservative placeholder never OOMs" assumed the seed
+// over-estimated; the CUDA measurement shows it under-estimated by ~4×.) Re-run the sweep after a
+// decoder or candle-allocator change. See the `wan22_decode_peak_matches_cuda_anchors` test below.
+const WAN22_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 160.0;
+const WAN22_VAE_FRAME_BYTES_PER_OUT_PX: f64 = 92_000.0;
 
 /// Candidate spatial tile sizes (output px, multiples of the vae22 ×16 scale, overlap 64). Matches the
 /// mlx `VAE22_SPATIAL_PX` grid.
@@ -804,11 +817,12 @@ mod budget_tests {
 
     #[test]
     fn wan22_tiling_bounds_high_res_frame_peak() {
-        // A 1280×1280 frame's single-pass activation spike blows a 24 GiB-class budget; the selector
-        // must tile spatially and keep the recomputed peak under the safe ceiling (bounded/catchable).
-        // Cost constants are the CUDA-pending placeholders — this checks the SELECTOR logic, not the
-        // calibration.
-        let safe = 24.0 * 0.85;
+        // A 1280×1280 frame's single-pass activation spike (~76 GiB measured) blows a 48 GiB-class
+        // budget; the selector must tile spatially and keep the recomputed peak under the safe ceiling
+        // (bounded/catchable). 48 GiB (not 24) because the CUDA-calibrated accumulator floor for a
+        // 1280²×97 video is ~24 GiB on its own — a 24 GiB tier genuinely cannot assemble it (the model
+        // correctly returns AccumulatorsExceedBudget there; see the unfittable test).
+        let safe = 48.0 * 0.85;
         let cfg = plan_wan22_tiling(1280, 1280, 97, safe)
             .unwrap()
             .expect("high-res frame must tile spatially");
@@ -838,5 +852,35 @@ mod budget_tests {
         std::env::set_var("WAN_VAE_BUDGET_GIB", "42.5");
         assert_eq!(wan22_vae_safe_budget_gib(), 42.5);
         std::env::remove_var("WAN_VAE_BUDGET_GIB");
+    }
+
+    /// sc-7148: the calibrated streaming cost model must stay **conservative** against the real CUDA
+    /// peak-VRAM anchors (RTX PRO 6000 Blackwell, sm_120, f32, real Wan2.2-TI2V-5B z48 weights) it was
+    /// fit from — `estimated ≥ measured` for every anchor (never under-predict ⇒ the selector never OKs
+    /// a tile / single-pass that OOMs), and not absurdly over (≤ 2.5×). Regenerate with `cargo test -p
+    /// candle-gen-wan --features cuda --release --test vae_decode_sweep -- --ignored --nocapture` after
+    /// a decoder or candle-allocator change.
+    #[test]
+    fn wan22_decode_peak_matches_cuda_anchors() {
+        // (out_f, out_h, out_w, tile_h, tile_w, measured_peak_gib). `tile_f` is unused by the streaming
+        // model (passed as out_f). Single-pass ⇒ tile == out (the full-frame spike).
+        let anchors: [(i64, i64, i64, i64, i64, f64); 5] = [
+            (13, 768, 768, 768, 768, 29.1748),
+            (13, 1280, 1280, 1280, 1280, 76.4561),
+            (13, 1280, 1280, 256, 256, 6.2998),
+            (13, 1280, 1280, 512, 512, 22.8672),
+            (61, 1280, 1280, 256, 256, 17.2109),
+        ];
+        for (of, oh, ow, th, tw, measured) in anchors {
+            let est = estimated_wan22_decode_peak_gib(of, oh, ow, of, th, tw);
+            assert!(
+                est >= measured,
+                "under-predicts {ow}x{oh}x{of} tile {tw}x{th}: est {est:.2} < measured {measured:.2} GiB"
+            );
+            assert!(
+                est <= measured * 2.5,
+                "over-predicts {ow}x{oh}x{of} tile {tw}x{th}: est {est:.2} > 2.5x measured {measured:.2} GiB"
+            );
+        }
     }
 }

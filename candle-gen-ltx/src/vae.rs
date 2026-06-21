@@ -325,14 +325,26 @@ const LTX_VAE_BUDGET_SAFE_FRAC: f64 = 0.85;
 /// Fallback budget when neither the env override nor `nvidia-smi` yields a value.
 const LTX_VAE_DEFAULT_BUDGET_GIB: f64 = 16.0;
 
-// Cost-model constants. **PLACEHOLDER — seeded from the mlx-Metal real-weight anchors (sc-6894):
-// LTX is fixed-floor-dominated (resident decoder) + light per-voxel. The candle/CUDA peak profile
-// (discrete VRAM, different allocator) differs, so these MUST be re-measured on a CUDA box (a
-// `vae_decode_sweep`-style harness) before the budget is trusted in prod — they are directionally
-// right (conservative on Metal), not transferable. Until then the selector tiles *roughly* correctly.
-const LTX_VAE_FIXED_BYTES: f64 = 3.3e9;
-const LTX_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 40.0;
-const LTX_VAE_TILE_BYTES_PER_OUT_VOXEL: f64 = 300.0;
+// Cost-model constants. **CUDA-CALIBRATED (sc-7148)** — fit from real-weight peak-VRAM anchors measured
+// by `tests/vae_decode_sweep.rs` on an RTX PRO 6000 Blackwell (sm_120, CUDA 12.9, f32, device-level
+// `nvidia-smi` peak), replacing the mlx-Metal placeholders (sc-6894). The five anchors (output WxHxF /
+// largest-tile px·fr → measured peak):
+//   512²×25  single-pass                    →  5.99 GiB   (≈635 B/out-voxel above the floor)
+//   768²×25  single-pass                    → 10.86 GiB
+//   1024²×25 single-pass                    → 17.27 GiB
+//   1280²×121 tiled 256px/64fr              → 14.83 GiB   (accumulator-dominated: tiny per-tile term)
+//   1280²×121 tiled 512px/64fr              → 16.39 GiB
+// The peak splits into a fixed floor (resident VAE decoder + CUDA context, ≈2.2 GiB baseline), a
+// per-output-voxel accumulator term (the f32 `output`/`weights` buffers + pad/add transients, fit
+// ≈54 B/voxel from the tiled anchors), and a per-tile activation term that scales with the largest
+// tile's output volume (the single-pass anchors imply ≈635 B/voxel for the decoder's 1024-channel
+// stack). Constants are rounded to the **conservative** (over-predicting) side so the budgeted selector
+// never picks a tile that OOMs — the model reproduces every anchor at ratio 1.12–1.65× (never under).
+// The placeholders (40/300) under-predicted single-pass by ~1.9×; re-run the sweep after a decoder or
+// candle-allocator change. See the `ltx_decode_peak_matches_cuda_anchors` regression test below.
+const LTX_VAE_FIXED_BYTES: f64 = 2.7e9;
+const LTX_VAE_ACCUM_BYTES_PER_VOXEL: f64 = 80.0;
+const LTX_VAE_TILE_BYTES_PER_OUT_VOXEL: f64 = 620.0;
 
 /// Candidate spatial tile sizes (output px, multiples of the LTX ×32 scale, overlap 64).
 const LTX_VAE_SPATIAL_PX: [i32; 8] = [768, 640, 512, 448, 384, 320, 256, 192];
@@ -490,5 +502,33 @@ mod budget_tests {
         std::env::set_var("LTX_VAE_BUDGET_GIB", "42.5");
         assert_eq!(ltx_vae_safe_budget_gib(), 42.5);
         std::env::remove_var("LTX_VAE_BUDGET_GIB");
+    }
+
+    /// sc-7148: the calibrated cost model must stay **conservative** against the real CUDA peak-VRAM
+    /// anchors (RTX PRO 6000 Blackwell, sm_120, f32) it was fit from — `estimated ≥ measured` for every
+    /// anchor (never under-predict ⇒ the selector never OKs a tile that OOMs), and not absurdly over
+    /// (≤ 2.5×). Regenerate the anchors with `cargo test -p candle-gen-ltx --features cuda --release
+    /// --test vae_decode_sweep -- --ignored --nocapture` after a decoder or candle-allocator change.
+    #[test]
+    fn ltx_decode_peak_matches_cuda_anchors() {
+        // (out_f, out_h, out_w, tile_f, tile_h, tile_w, measured_peak_gib). Single-pass ⇒ tile == out.
+        let anchors: [(i64, i64, i64, i64, i64, i64, f64); 5] = [
+            (25, 512, 512, 25, 512, 512, 5.9873),
+            (25, 768, 768, 25, 768, 768, 10.8623),
+            (25, 1024, 1024, 25, 1024, 1024, 17.2686),
+            (121, 1280, 1280, 64, 256, 256, 14.8311),
+            (121, 1280, 1280, 64, 512, 512, 16.3936),
+        ];
+        for (of, oh, ow, tf, th, tw, measured) in anchors {
+            let est = estimated_ltx_decode_peak_gib(of, oh, ow, tf, th, tw);
+            assert!(
+                est >= measured,
+                "under-predicts {ow}x{oh}x{of} tile {tw}x{th}x{tf}: est {est:.2} < measured {measured:.2} GiB"
+            );
+            assert!(
+                est <= measured * 2.5,
+                "over-predicts {ow}x{oh}x{of} tile {tw}x{th}x{tf}: est {est:.2} > 2.5x measured {measured:.2} GiB"
+            );
+        }
     }
 }

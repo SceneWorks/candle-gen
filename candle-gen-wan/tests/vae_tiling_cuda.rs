@@ -111,8 +111,11 @@ fn wan_z48_spatial_tiling_decode() {
         "decode_budgeted(huge budget) must equal single-pass decode, max_abs_diff={maxd_big}"
     );
 
-    // Budgeted routing — tiny budget ⇒ must tile, stay finite/in-range, and differ from single-pass.
-    std::env::set_var("WAN_VAE_BUDGET_GIB", "0.5");
+    // Budgeted routing — tight budget ⇒ must tile, stay finite/in-range, and differ from single-pass.
+    // 8 GiB (not the old 0.5): the CUDA-calibrated cost model (sc-7148) puts even the smallest spatial
+    // tile of this 640²×5 decode at ~3.5 GiB, so 0.5 GiB is genuinely infeasible (SmallestTileExceeds-
+    // Budget); 8 GiB forces tiling (single-pass peaks ~35 GiB by the model) while staying fittable.
+    std::env::set_var("WAN_VAE_BUDGET_GIB", "8");
     let small = vae.decode_budgeted(&z).unwrap();
     std::env::remove_var("WAN_VAE_BUDGET_GIB");
     assert_eq!(small.dims(), base.dims());
