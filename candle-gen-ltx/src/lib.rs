@@ -47,7 +47,7 @@ use candle_gen::gen_core::{
     self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
     LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
-use candle_gen::{CandleError, Result as CResult};
+use candle_gen::{run_av_curated_sampler, AvLatents, CandleError, Result as CResult};
 
 use audio_vae::AudioDecoder;
 use config::{
@@ -267,37 +267,51 @@ impl Pipeline {
         let video_grid = rope::create_position_grid(t_lat, h_lat, w_lat, fps as f32, &self.device)?;
         let audio_grid = rope::create_audio_position_grid(af, &self.device)?;
 
-        let mut vlat = pipeline::create_noise(seed, t_lat, h_lat, w_lat, &self.device)?;
-        let mut alat = pipeline::create_audio_noise(seed, af, &self.device)?;
-        let steps = STAGE1_SIGMAS.len() - 1;
-        for i in 0..steps {
-            if req.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            let (sigma, sigma_next) = (STAGE1_SIGMAS[i] as f64, STAGE1_SIGMAS[i + 1] as f64);
-            let vflat = pipeline::flatten_latent(&vlat)?;
-            let aflat = pipeline::flatten_audio_latent(&alat)?;
-            let (vvel, avel) = comps.avdit.forward(
-                &vflat,
-                &aflat,
-                sigma,
-                &video_ctx,
-                &audio_ctx,
-                &video_grid,
-                &audio_grid,
-            )?;
-            let vvel =
-                pipeline::unflatten_latent(&vvel.to_dtype(DType::F32)?, t_lat, h_lat, w_lat)?;
-            let avel = pipeline::unflatten_audio_latent(&avel.to_dtype(DType::F32)?, af)?;
-            let vden = scheduler::to_denoised(&vlat, &vvel, sigma)?;
-            vlat = scheduler::euler_step(&vlat, &vden, sigma, sigma_next)?;
-            let aden = scheduler::to_denoised(&alat, &avel, sigma)?;
-            alat = scheduler::euler_step(&alat, &aden, sigma, sigma_next)?;
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total: steps as u32,
-            });
-        }
+        let vlat = pipeline::create_noise(seed, t_lat, h_lat, w_lat, &self.device)?;
+        let alat = pipeline::create_audio_noise(seed, af, &self.device)?;
+
+        // Unified curated sampling over the JOINT video+audio streams (epic 7114 P4, sc-7125). LTX is
+        // distilled rectified-flow with the fixed `STAGE1_SIGMAS` schedule, so per decision 3b it exposes
+        // the SAMPLER axis but NO scheduler axis (the baked σ schedule is the native default). The
+        // default `euler` reproduces the legacy per-stream `to_denoised`→`euler_step` loop exactly (the
+        // FLOW `x0 = x − σ·v` recombine + euler == the native scheduler), the N1 no-op. Both streams are
+        // velocity-prediction (`Sigma` convention); the AvDiT couples them via cross-modal attention each
+        // forward, so the per-step model eval (flatten → AvDiT → unflatten) lives inside the closure.
+        let out = run_av_curated_sampler(
+            req.sampler.as_deref(),
+            &STAGE1_SIGMAS[..],
+            AvLatents {
+                video: vlat,
+                audio: alat,
+            },
+            seed,
+            &req.cancel,
+            on_progress,
+            |av, sigma| -> CResult<AvLatents> {
+                let vflat = pipeline::flatten_latent(&av.video)?;
+                let aflat = pipeline::flatten_audio_latent(&av.audio)?;
+                let (vvel, avel) = comps.avdit.forward(
+                    &vflat,
+                    &aflat,
+                    sigma as f64,
+                    &video_ctx,
+                    &audio_ctx,
+                    &video_grid,
+                    &audio_grid,
+                )?;
+                Ok(AvLatents {
+                    video: pipeline::unflatten_latent(
+                        &vvel.to_dtype(DType::F32)?,
+                        t_lat,
+                        h_lat,
+                        w_lat,
+                    )?,
+                    audio: pipeline::unflatten_audio_latent(&avel.to_dtype(DType::F32)?, af)?,
+                })
+            },
+        )?;
+        let vlat = out.video;
+        let alat = out.audio;
 
         on_progress(Progress::Decoding);
         // sc-7076 — memory-bounded + catchable VAE decode (budgeted tiling), replacing the single-pass
@@ -393,7 +407,14 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![],
             supports_lora: false,
             supports_lokr: false,
-            samplers: vec!["rectified-flow"],
+            // Unified curated SAMPLER menu (epic 7114 P4, sc-7125) over the joint video+audio streams +
+            // the legacy `rectified-flow` alias (falls back to euler). Per decision 3b: sampler-only, NO
+            // scheduler axis — LTX is distilled with the fixed `STAGE1_SIGMAS` schedule; `euler` is the
+            // recommended default (the byte-faithful N1 path). The rest are exposed for ComfyUI parity.
+            samplers: candle_gen::menu_with_aliases(
+                candle_gen::curated_sampler_names(),
+                &["rectified-flow"],
+            ),
             schedulers: vec![],
             min_size: SIZE_MULTIPLE,
             max_size: 1280,
@@ -518,7 +539,11 @@ mod tests {
         assert!(!d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.conditioning.is_empty());
+        // sc-7125: curated sampler menu + the legacy `rectified-flow` alias; NO scheduler axis (3b).
         assert!(d.capabilities.samplers.contains(&"rectified-flow"));
+        assert!(d.capabilities.samplers.contains(&"euler"));
+        assert!(d.capabilities.samplers.contains(&"dpmpp_2m"));
+        assert!(d.capabilities.schedulers.is_empty());
     }
 
     #[test]

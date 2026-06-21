@@ -270,6 +270,112 @@ pub fn menu_with_aliases(
     menu
 }
 
+// =================================================================================================
+// Joint two-stream (video+audio) curated sampling — LTX's cross-modal denoise (epic 7114 P4, sc-7125).
+// The candle twin of mlx-gen's `AvLatents` / `MlxAvLatentOps` / `run_av_curated_sampler`.
+// =================================================================================================
+
+/// A joint video+audio latent pair — the [`gen_core::sampling::LatentOps::Latent`] for LTX's
+/// cross-modal denoise, whose two streams are integrated **together** by one curated solver each step
+/// (the AvDiT couples them via cross-modal attention). The single-`Tensor` [`CandleLatentOps`] cannot
+/// represent this, so the two-stream variant exists.
+#[derive(Clone)]
+pub struct AvLatents {
+    pub video: Tensor,
+    pub audio: Tensor,
+}
+
+/// [`gen_core::sampling::LatentOps`] over [`AvLatents`] — applies each solver op to BOTH streams, so the
+/// gen-core curated solvers (Euler / Heun / DPM++ 2M·SDE / UniPC / ancestral / DDIM) drive LTX's joint
+/// video+audio denoise. Each per-stream op reuses [`CandleLatentOps`], so the byte-parity rules
+/// (`scale(x, 1)` / `axpy(1, …)` elide the multiply) hold per stream.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CandleAvLatentOps;
+
+impl LatentOps for CandleAvLatentOps {
+    type Latent = AvLatents;
+
+    fn scale(&self, x: &AvLatents, scale: f32) -> gen_core::Result<AvLatents> {
+        Ok(AvLatents {
+            video: CandleLatentOps.scale(&x.video, scale)?,
+            audio: CandleLatentOps.scale(&x.audio, scale)?,
+        })
+    }
+
+    fn add(&self, a: &AvLatents, b: &AvLatents) -> gen_core::Result<AvLatents> {
+        Ok(AvLatents {
+            video: CandleLatentOps.add(&a.video, &b.video)?,
+            audio: CandleLatentOps.add(&a.audio, &b.audio)?,
+        })
+    }
+
+    fn sub(&self, a: &AvLatents, b: &AvLatents) -> gen_core::Result<AvLatents> {
+        Ok(AvLatents {
+            video: CandleLatentOps.sub(&a.video, &b.video)?,
+            audio: CandleLatentOps.sub(&a.audio, &b.audio)?,
+        })
+    }
+
+    fn axpy(&self, a: f32, x: &AvLatents, b: f32, y: &AvLatents) -> gen_core::Result<AvLatents> {
+        Ok(AvLatents {
+            video: CandleLatentOps.axpy(a, &x.video, b, &y.video)?,
+            audio: CandleLatentOps.axpy(a, &x.audio, b, &y.audio)?,
+        })
+    }
+
+    fn randn_like(&self, x: &AvLatents, seed: u64, step: usize) -> gen_core::Result<AvLatents> {
+        // Distinct subkeys per stream (the audio seed is XOR-shifted) so the two streams' stochastic
+        // noise is decorrelated; each reuses the per-step `StepRng`-equivalent derivation.
+        Ok(AvLatents {
+            video: CandleLatentOps.randn_like(&x.video, seed, step)?,
+            audio: CandleLatentOps.randn_like(&x.audio, seed ^ 0xA5A5_5A5A_C3C3_3C3C, step)?,
+        })
+    }
+}
+
+/// Drive a curated unified solver over LTX's **joint video+audio** flow-match schedule — the two-stream
+/// sibling of [`run_flow_sampler`] (epic 7114 P4, sc-7125). The model is velocity-prediction over the
+/// FLOW [`TimestepConvention::Sigma`] convention for BOTH streams; `predict(av_in, sigma)` returns the
+/// raw `(video_velocity, audio_velocity)` as an [`AvLatents`]. Cancel + progress route through the
+/// `denoise` callback exactly as [`run_curated_sampler`]. Used for LTX's distilled T2V+A path (the
+/// per-token-σ I2V path with its post-step mask blend stays native).
+#[allow(clippy::too_many_arguments)]
+pub fn run_av_curated_sampler(
+    sampler_name: Option<&str>,
+    sigmas: &[f32],
+    latents: AvLatents,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    mut predict: impl FnMut(&AvLatents, f32) -> Result<AvLatents>,
+) -> Result<AvLatents> {
+    use gen_core::sampling::{
+        denoise as gc_denoise, sampler_by_name, Euler, FlowModelSampling, Sampler,
+    };
+
+    let ops = CandleAvLatentOps;
+    let ms = FlowModelSampling::new(TimestepConvention::Sigma);
+    let total = sigmas.len().saturating_sub(1).max(1) as u32;
+    let sampler: Box<dyn Sampler<CandleAvLatentOps>> = sampler_name
+        .and_then(sampler_by_name::<CandleAvLatentOps>)
+        .unwrap_or_else(|| Box::new(Euler));
+
+    let mut denoise_fn = |x: &AvLatents, sigma: f32| -> gen_core::Result<AvLatents> {
+        if cancel.is_cancelled() {
+            return Err(gen_core::Error::Canceled);
+        }
+        let current = (sigmas.iter().filter(|&&s| s > sigma).count() as u32 + 1).min(total);
+        on_progress(Progress::Step { current, total });
+        gc_denoise(&ops, &ms, x, sigma, |xin, t| {
+            predict(xin, t).map_err(Into::into)
+        })
+    };
+
+    sampler
+        .sample(&ops, &mut denoise_fn, latents, sigmas, seed)
+        .map_err(CandleError::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,5 +737,92 @@ mod tests {
         assert!(vec1(&out.to_dtype(DType::F32).unwrap())
             .iter()
             .all(|v| v.is_finite()));
+    }
+
+    // --- Two-stream AV driver (epic 7114 P4, sc-7125): LTX's joint video+audio denoise --------------
+
+    use super::{run_av_curated_sampler, AvLatents};
+
+    /// N1 keystone: `run_av_curated_sampler` default euler over a constant per-stream velocity lands
+    /// exactly on `x_init − v·σ_0` per stream (the rectified-flow integral) — proving the two-stream
+    /// `CandleAvLatentOps` + driver reproduce the legacy per-stream LTX `euler_step`.
+    #[test]
+    fn run_av_curated_sampler_euler_matches_legacy_per_stream() {
+        let sigmas = vec![1.0_f32, 0.75, 0.5, 0.25, 0.0];
+        let v_video = [0.7_f32, -0.2, 0.4];
+        let v_audio = [0.1_f32, 0.5];
+        let init = AvLatents {
+            video: t(&[0.3, -1.1, 2.0]),
+            audio: t(&[0.05, -0.4]),
+        };
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        let out = run_av_curated_sampler(
+            None,
+            &sigmas,
+            init,
+            0,
+            &cancel,
+            &mut progress,
+            |_x, _sigma| {
+                Ok(AvLatents {
+                    video: t(&v_video),
+                    audio: t(&v_audio),
+                })
+            },
+        )
+        .unwrap();
+        for ((g, &x0), &v) in vec1(&out.video)
+            .iter()
+            .zip(&[0.3_f32, -1.1, 2.0])
+            .zip(&v_video)
+        {
+            assert!((g - (x0 - v * sigmas[0])).abs() < 2e-3, "video: got {g}");
+        }
+        for ((g, &x0), &v) in vec1(&out.audio).iter().zip(&[0.05_f32, -0.4]).zip(&v_audio) {
+            assert!((g - (x0 - v * sigmas[0])).abs() < 2e-3, "audio: got {g}");
+        }
+    }
+
+    /// Every curated solver drives the two-stream AV latents to finite output (the stochastic ones too).
+    #[test]
+    fn run_av_curated_sampler_every_solver_is_finite() {
+        let sigmas = build_flow_sigmas(6, compute_mu(image_seq_len(512, 512), 6));
+        let cancel = CancelFlag::new();
+        let mut progress = |_p: Progress| {};
+        for name in [
+            "euler",
+            "euler_ancestral",
+            "heun",
+            "dpmpp_2m",
+            "dpmpp_sde",
+            "uni_pc",
+            "ddim",
+        ] {
+            let init = AvLatents {
+                video: t(&[0.2, -0.5, 1.0, 0.3]),
+                audio: t(&[0.1, -0.2]),
+            };
+            let out = run_av_curated_sampler(
+                Some(name),
+                &sigmas,
+                init,
+                7,
+                &cancel,
+                &mut progress,
+                |x, _s| {
+                    Ok(AvLatents {
+                        video: x.video.affine(0.2, 0.0)?,
+                        audio: x.audio.affine(0.2, 0.0)?,
+                    })
+                },
+            )
+            .unwrap();
+            assert!(
+                vec1(&out.video).iter().all(|v| v.is_finite())
+                    && vec1(&out.audio).iter().all(|v| v.is_finite()),
+                "{name} (AV two-stream) produced non-finite output"
+            );
+        }
     }
 }

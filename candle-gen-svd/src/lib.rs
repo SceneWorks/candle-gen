@@ -165,7 +165,10 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: vec![ConditioningKind::Reference],
             supports_lora: false,
             supports_lokr: false,
-            samplers: Vec::new(),
+            // Unified curated SAMPLER menu (epic 7114 P4, sc-7125, decision 3b: sampler-only, NO
+            // scheduler axis — SVD keeps its native Karras EDM σ schedule). SVD is EDM v-prediction;
+            // the default `euler` over `EdmModelSampling` reproduces the native v-pred Euler loop (N1).
+            samplers: candle_gen::curated_sampler_names(),
             schedulers: Vec::new(),
             min_size: 256,
             max_size: 1024,
@@ -449,8 +452,6 @@ impl Generator for SvdGenerator {
             .map_err(CandleError::from)?;
         dbg("init_latents", &latents);
 
-        let total = params.num_inference_steps as u32;
-        on_progress(Progress::Step { current: 0, total });
         let final_latents = pipeline::denoise(
             &comps.unet,
             &sched_cfg,
@@ -462,13 +463,10 @@ impl Generator for SvdGenerator {
             params.num_inference_steps,
             params.min_guidance_scale,
             params.max_guidance_scale,
+            req.sampler.as_deref(),
+            seed,
             &req.cancel,
-            &mut |step| {
-                on_progress(Progress::Step {
-                    current: step as u32,
-                    total,
-                })
-            },
+            on_progress,
         )?;
         dbg("final_latents", &final_latents);
 
@@ -560,7 +558,9 @@ mod tests {
         assert!(!d.capabilities.supports_true_cfg);
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.accepts(ConditioningKind::Reference));
-        assert!(d.capabilities.samplers.is_empty());
+        // sc-7125: curated sampler menu (default euler); NO scheduler axis (decision 3b).
+        assert_eq!(d.capabilities.samplers, candle_gen::curated_sampler_names());
+        assert!(d.capabilities.schedulers.is_empty());
         assert_eq!(d.capabilities.min_size, 256);
         assert_eq!(d.capabilities.max_size, 1024);
     }

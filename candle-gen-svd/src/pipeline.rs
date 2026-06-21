@@ -5,14 +5,15 @@
 //! B=2 inside the step). Deterministic CPU-seeded noise (sc-3673 convention, matching candle-gen-wan).
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::gen_core::{CancelFlag, Image};
+use candle_gen::gen_core::sampling::EdmModelSampling;
+use candle_gen::gen_core::{CancelFlag, Image, Progress};
 use candle_gen::{CandleError, Result as CResult};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
 
 use crate::config::SchedulerConfig;
-use crate::scheduler::{euler_step, scale_model_input, v_pred_denoised, EdmSchedule};
+use crate::scheduler::EdmSchedule;
 use crate::unet::SvdUnet;
 use crate::vae::SvdVae;
 
@@ -107,9 +108,19 @@ fn guidance_schedule(
     Ok(Tensor::from_vec(vals, (1, f, 1, 1, 1), device)?)
 }
 
-/// The frame-wise CFG v-prediction Euler denoise loop. Inputs are the **conditional** rows (`[1, …]`);
-/// the uncond CFG branch zeros `image_embeds`/`image_latents` (the diffusers SVD uncond). Returns the
-/// final `[1, F, h, w, 4]`-ordered (`[1, F, 4, h, w]`) latents.
+/// The frame-wise CFG v-prediction denoise — routed through the unified curated sampler framework
+/// (epic 7114 P4, sc-7125). SVD is EDM **v-prediction** over a native Karras σ schedule, so this drives
+/// any curated solver (default `euler` = the byte-faithful N1 native path — `euler` over the EDM
+/// contract IS exactly the legacy `v_pred_denoised` → `euler_step` loop) via
+/// [`candle_gen::run_curated_sampler`] over [`EdmModelSampling::svd`]. Per **decision 3b** SVD exposes
+/// the sampler axis but NO scheduler axis: the native Karras EDM schedule is kept verbatim.
+///
+/// The [`EdmModelSampling`] supplies the `1/√(σ²+1)` input scaling + the v→x0 recombine, so the
+/// `predict` closure only does what's model-specific: the CFG batch, the image-latent **channel
+/// concat**, the UNet forward, and the **per-frame** guidance ramp (re-applied each eval, so multi-eval
+/// solvers stay correct). Inputs are the **conditional** rows (`[1, …]`); the uncond CFG branch zeros
+/// `image_embeds`/`image_latents` (the diffusers SVD uncond). Latents are the init noise scaled by
+/// `init_noise_sigma`. Returns the final `[1, F, 4, h, w]` latents.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise(
     unet: &SvdUnet,
@@ -122,11 +133,14 @@ pub fn denoise(
     steps: usize,
     min_g: f32,
     max_g: f32,
+    sampler: Option<&str>,
+    seed: u64,
     cancel: &CancelFlag,
-    on_step: &mut dyn FnMut(usize),
+    on_progress: &mut dyn FnMut(Progress),
 ) -> CResult<Tensor> {
     let device = latents.device().clone();
     let sched = EdmSchedule::karras(steps, scheduler);
+    let ms = EdmModelSampling::svd();
 
     // CFG conditioning batches (constant across steps): row 0 = uncond (zeros), row 1 = cond.
     let zeros_e = image_embeds.zeros_like()?;
@@ -136,30 +150,27 @@ pub fn denoise(
     let atid2 = Tensor::cat(&[added_time_ids, added_time_ids], 0)?; // [2, 3]
     let guidance = guidance_schedule(num_frames, min_g, max_g, &device)?;
 
-    let mut latents = latents.clone();
-    for i in 0..steps {
-        if cancel.is_cancelled() {
-            return Err(CandleError::Canceled);
-        }
-        let sigma = sched.sigmas[i];
-        let sigma_next = sched.sigmas[i + 1];
-        let t = sched.timesteps[i];
-
-        let scaled = scale_model_input(&latents, sigma)?; // [1, F, 4, h, w]
-        let lat2 = Tensor::cat(&[&scaled, &scaled], 0)?; // [2, F, 4, h, w]
-        let inp = Tensor::cat(&[&lat2, &img_lat2], 2)?; // [2, F, 8, h, w] (channel concat)
-
-        let pred = unet.forward(&inp, t, &embeds2, &atid2, num_frames)?; // [2, F, 4, h, w]
-        let uncond = pred.narrow(0, 0, 1)?;
-        let cond = pred.narrow(0, 1, 1)?;
-        // noise_pred = uncond + guidance · (cond − uncond), frame-wise.
-        let noise_pred = uncond.add(&guidance.broadcast_mul(&(cond - &uncond)?)?)?;
-
-        let denoised = v_pred_denoised(&noise_pred, &latents, sigma)?;
-        latents = euler_step(&latents, &denoised, sigma, sigma_next)?;
-        on_step(i + 1);
-    }
-    Ok(latents)
+    candle_gen::run_curated_sampler(
+        sampler,
+        &ms,
+        &sched.sigmas,
+        latents.clone(),
+        seed,
+        cancel,
+        on_progress,
+        |x_in, t| -> CResult<Tensor> {
+            // `x_in` is already the `1/√(σ²+1)`-scaled latent (`scale_model_input`) the driver applied
+            // via `EdmModelSampling::input_scale`; `t` is the continuous EDM timestep `0.25·ln σ`.
+            let lat2 = Tensor::cat(&[x_in, x_in], 0)?; // [2, F, 4, h, w]
+            let inp = Tensor::cat(&[&lat2, &img_lat2], 2)?; // [2, F, 8, h, w] (channel concat)
+            let pred = unet.forward(&inp, t, &embeds2, &atid2, num_frames)?; // [2, F, 4, h, w]
+            let uncond = pred.narrow(0, 0, 1)?;
+            let cond = pred.narrow(0, 1, 1)?;
+            // noise_pred = uncond + guidance · (cond − uncond), frame-wise (the raw v the EDM contract
+            // recombines into x0).
+            Ok(uncond.add(&guidance.broadcast_mul(&(cond - &uncond)?)?)?)
+        },
+    )
 }
 
 /// Chunked temporal VAE decode (diffusers `decode_latents`): divide by `scaling_factor`, decode in
