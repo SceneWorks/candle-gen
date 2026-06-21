@@ -182,13 +182,23 @@ fn encode_text(
     te: &Umt5Encoder,
     tok: &TextTokenizer,
     prompt: &str,
+    pad_token_id: u32,
     dev: &Device,
 ) -> CResult<Tensor> {
     let out = tok
         .tokenize(prompt)
         .map_err(|e| CandleError::Msg(format!("scail2: tokenize: {e}")))?;
-    let len = out.ids.len().max(1);
-    let ids: Vec<u32> = out.ids.iter().map(|&i| i as u32).collect();
+    let mut ids: Vec<u32> = out.ids.iter().map(|&i| i as u32).collect();
+    if ids.is_empty() {
+        // The gen_core tokenizer short-circuits an empty prompt to zero ids, but UMT5/T5 encode the
+        // empty string as a single token. A 0-length sequence here would build a degenerate `(1,1)`
+        // tensor (the old `.max(1)` padded the *shape* but not the data), and the f32 embedding gather
+        // over zero indices is a 0-element CUDA `index_select` that reads out of bounds →
+        // `CUDA_ERROR_ILLEGAL_ADDRESS` (it surfaced deferred at the next cublas call). Emit one pad
+        // token so the unconditional (empty negative-prompt) branch encodes a valid 1-token context.
+        ids.push(pad_token_id);
+    }
+    let len = ids.len();
     let input_ids = Tensor::from_vec(ids, (1, len), dev)?;
     let embeds = te.encode(&input_ids)?; // [1, L, 4096]
     let (_, l, d) = embeds.dims3()?;
@@ -267,11 +277,12 @@ pub fn generate(
         },
     )
     .map_err(|e| CandleError::Msg(format!("scail2: load tokenizer: {e}")))?;
-    let context = encode_text(&comps.te, &tok, job.prompt, dev)?;
+    let pad_id = te_cfg.pad_token_id.max(0) as u32;
+    let context = encode_text(&comps.te, &tok, job.prompt, pad_id, dev)?;
     let context_null = if cfg_disabled {
         context.clone()
     } else {
-        encode_text(&comps.te, &tok, job.negative_prompt, dev)?
+        encode_text(&comps.te, &tok, job.negative_prompt, pad_id, dev)?
     };
     let clip_fea = {
         let pixel = clip_preprocess(&ref_chw.reshape((1, 3, th, tw))?, 224)?;

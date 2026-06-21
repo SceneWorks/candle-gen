@@ -105,8 +105,14 @@ pub(crate) fn unpatchify(
 ) -> Result<Tensor> {
     let (tg, hg, wg) = grid;
     let (pt, ph, pw) = patch;
-    tok.reshape(&[tg, hg, wg, out, pt, ph, pw][..])?
-        .permute([3, 0, 4, 1, 5, 2, 6])? // [out, tg, pt, hg, ph, wg, pw]
+    // The head projects each token to `pt·ph·pw·out` features in `(pt, ph, pw, out)` order — the
+    // channel (`out`) is INNERMOST — matching upstream `u.view(*grid, *patch_size, c)` +
+    // `einsum('fhwpqrc->cfphqwr')` and the validated `mlx-gen-wan::unpatchify`. The previous
+    // `(out, pt, ph, pw)` split (channel OUTERMOST) round-trips correctly only for `out == 1`
+    // (so the C=1 unit test missed it) but for `out == 16` scrambles channels ↔ patch-pixels,
+    // decoding to pure structured noise (sc-7078).
+    tok.reshape(&[tg, hg, wg, pt, ph, pw, out][..])?
+        .permute([6, 0, 3, 1, 4, 2, 5])? // [out, tg, pt, hg, ph, wg, pw]
         .contiguous()?
         .reshape((out, tg * pt, hg * ph, wg * pw))
 }
