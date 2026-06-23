@@ -33,11 +33,12 @@ use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 
 use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_gen_flux::{
-    ae_config, clip_config, decode_latents, encode_text, flux_config, DitImageInjector, IpFlux,
-    Variant,
+    ae_config, clip_config, decode_latents, encode_text, flow_mu, flux_config, DitImageInjector,
+    IpFlux, Variant,
 };
 use candle_gen_sdxl::weights::Weights;
 
@@ -87,6 +88,15 @@ pub struct PulidFluxRequest {
     pub guidance: f32,
     /// PuLID id_weight (reference-face strength; `0.0` ⇒ the no-id ablation = plain FLUX).
     pub id_weight: f32,
+    /// Curated unified-sampler selection (epic 7114, sc-7389). `None` (or `flow_match`) keeps the native
+    /// flow-match Euler default byte-exact; a curated [`Solver`](candle_gen::gen_core::sampling::Solver)
+    /// name swaps the integrator over the SAME FLUX flow-match schedule, the PuLID CA injection running
+    /// inside each model eval. PuLID delegates to the FLUX flow denoise (the candle twin runs its own
+    /// loop, unlike mlx's backbone delegation — so the knob is honored here, not by a backbone).
+    pub sampler: Option<String>,
+    /// Curated σ-schedule selection (epic 7114). `None` ⇒ FLUX's native `get_schedule(..)`; a
+    /// [`Scheduler`](candle_gen::gen_core::sampling::Scheduler) name re-strides σ over the dev time-shift.
+    pub scheduler: Option<String>,
     pub seed: u64,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
@@ -101,6 +111,8 @@ impl Default for PulidFluxRequest {
             steps: 25,
             guidance: DEFAULT_GUIDANCE,
             id_weight: DEFAULT_ID_WEIGHT,
+            sampler: None,
+            scheduler: None,
             seed: 0,
             cancel: CancelFlag::default(),
         }
@@ -315,57 +327,63 @@ impl PulidFlux {
         let timesteps = get_schedule(req.steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)));
         let guidance = req.guidance as f64;
 
-        let latents = self.denoise(
-            &state,
-            &timesteps,
-            guidance,
-            &pulid_ca,
-            &req.cancel,
-            on_progress,
-        )?;
+        let latents = self.denoise(req, &state, &timesteps, guidance, &pulid_ca, on_progress)?;
         on_progress(Progress::Decoding);
         decode_latents(&self.vae, &latents, req.height as usize, req.width as usize)
     }
 
-    /// The flow-match Euler denoise with the PuLID CA injector — the FLUX denoise calling
-    /// [`IpFlux::forward_injected`] (`Some(injector)`). `img += pred·(t_prev − t_curr)` over the
-    /// **descending** schedule.
+    /// The flow-match denoise with the PuLID CA injector, routed through the unified curated
+    /// sampler/scheduler driver (epic 7114, sc-7389) — replacing the bespoke inline flow-match Euler
+    /// loop. The `scheduler` axis re-strides FLUX's native `get_schedule(..)` over the dev time-shift
+    /// `mu`; the `sampler` axis picks the integrator. The PuLID CA injection
+    /// ([`IpFlux::forward_injected`], `Some(injector)`) stays INSIDE the `predict` closure so a multi-eval
+    /// solver (heun / dpmpp) re-runs the whole step. The DEFAULT (no curated knob ⇒ `euler` over the
+    /// native schedule) is the N1 no-op for the legacy loop `img += pred·(σ_{i+1} − σ_i)`. FLUX feeds the
+    /// raw timestep (`Sigma` convention: `t == σ`); guidance is a per-batch tensor embedded by the dev
+    /// DiT. Cancellation + progress are owned by the driver. Mirrors the candle FLUX IP-Adapter denoise;
+    /// the mlx PuLID got this for free by delegating to the FLUX backbone, but the candle PuLID runs its
+    /// own loop, so the knob is honored here.
     fn denoise(
         &self,
+        req: &PulidFluxRequest,
         state: &State,
         timesteps: &[f64],
         guidance: f64,
         injector: &PulidCa,
-        cancel: &CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
         let b_sz = state.img.dim(0)?;
         let guidance_t = Tensor::full(guidance as f32, b_sz, &self.device)?;
-        let total = timesteps.len().saturating_sub(1) as u32;
-        let mut img = state.img.clone();
-        for (i, window) in timesteps.windows(2).enumerate() {
-            if cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            let (t_curr, t_prev) = (window[0], window[1]);
-            let t_vec = Tensor::full(t_curr as f32, b_sz, &self.device)?;
-            let pred = self.transformer.forward_injected(
-                &img,
-                &state.img_ids,
-                &state.txt,
-                &state.txt_ids,
-                &t_vec,
-                &state.vec,
-                Some(&guidance_t),
-                Some(injector as &dyn DitImageInjector),
-            )?;
-            img = (img + (pred * (t_prev - t_curr))?)?;
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
-        }
-        Ok(img)
+        // Native schedule = candle's verbatim `get_schedule(..)` (f32 descending, trailing 0.0); a
+        // curated `scheduler` re-derives σ over the dev time-shift `mu` (FLUX.1-dev is the only backbone).
+        let native: Vec<f32> = timesteps.iter().map(|&t| t as f32).collect();
+        let mu = flow_mu(Variant::Dev, state.img.dim(1)?);
+        let steps = native.len().saturating_sub(1);
+        let sigmas =
+            candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
+        candle_gen::run_flow_sampler(
+            req.sampler.as_deref(),
+            TimestepConvention::Sigma,
+            &sigmas,
+            state.img.clone(),
+            req.seed,
+            &req.cancel,
+            on_progress,
+            |img, t| -> Result<Tensor> {
+                // The PuLID CA residual injection lives inside this closure (re-run per model eval).
+                let t_vec = Tensor::full(t, b_sz, &self.device)?;
+                Ok(self.transformer.forward_injected(
+                    img,
+                    &state.img_ids,
+                    &state.txt,
+                    &state.txt_ids,
+                    &t_vec,
+                    &state.vec,
+                    Some(&guidance_t),
+                    Some(injector as &dyn DitImageInjector),
+                )?)
+            },
+        )
     }
 }
 

@@ -75,8 +75,9 @@ pub use sampler::EulerAncestralSampler;
 // IdentityNet ControlNet, and the euler-ancestral sampler. Driven by the `candle-gen-instantid` glue.
 pub mod denoise;
 pub use denoise::{
-    decode_image, denoise_ip_control, denoise_ip_multi_control, preprocess_control_image,
-    seeded_prior, text_time_ids, ControlContext, Denoiser,
+    decode_image, denoise_curated, denoise_ip_control, denoise_ip_multi_control,
+    preprocess_control_image, sdxl_alpha_schedule, seeded_prior, seeded_sigma_prior, text_time_ids,
+    ControlContext, Denoiser,
 };
 
 // SDXL dual-CLIP conditioning (sc-5491) — penultimate hidden (cross-attn) + pooled text-embeds

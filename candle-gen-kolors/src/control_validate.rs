@@ -106,6 +106,20 @@ fn real_weight_control() {
     let model = KolorsControl::load(&paths).expect("load KolorsControl");
     println!("loaded in {:?}", t0.elapsed());
 
+    // Curated unified-sampler hook (epic 7114, sc-7389): unset ⇒ the native leading-Euler default
+    // (byte-exact N1); `KOLORS_CTRL_SAMPLER=euler|heun|dpmpp_2m|…` / `KOLORS_CTRL_SCHEDULER=karras|…`
+    // routes the ControlNet denoise through `denoise_curated`, gated here before S4 advertises it.
+    let sampler = std::env::var("KOLORS_CTRL_SAMPLER")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let scheduler = std::env::var("KOLORS_CTRL_SCHEDULER")
+        .ok()
+        .filter(|s| !s.is_empty());
+    println!(
+        "sampler: {} / scheduler: {}",
+        sampler.as_deref().unwrap_or("(leading-euler default)"),
+        scheduler.as_deref().unwrap_or("(native default)"),
+    );
     let base = KolorsControlRequest {
         prompt: "a person standing, full body, photorealistic, studio lighting, sharp focus".into(),
         negative: "blurry, lowres, deformed, extra limbs, watermark".into(),
@@ -114,6 +128,8 @@ fn real_weight_control() {
         steps: 30,
         guidance: 5.0,
         control_scale: 1.0,
+        sampler,
+        scheduler,
         seed: 12345,
         cancel: CancelFlag::new(),
     };

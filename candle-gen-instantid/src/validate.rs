@@ -17,6 +17,8 @@
 //! $env:IID_OPENPOSE    = "<xinsir snapshot dir>"              # optional → enables PoseSet
 //! $env:IID_REF         = "<reference face .ppm (P6)>"
 //! $env:IID_OUT         = "<output dir for the .ppm renders>"
+//! $env:IID_SAMPLER     = "euler"   # optional → curated k-diffusion path (sc-7389); unset = ancestral
+//! $env:IID_SCHEDULER   = "karras"  # optional → curated σ schedule
 //! cargo test -p candle-gen-instantid --features cuda --release validate::real_weight -- --ignored --nocapture
 //! ```
 
@@ -198,6 +200,19 @@ fn real_weight_instantid() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
+    // Curated unified-sampler hook (epic 7114, sc-7389): unset ⇒ the bespoke ancestral default
+    // (byte-exact N1); `IID_SAMPLER=euler|heun|dpmpp_2m|…` / `IID_SCHEDULER=karras|…` routes the whole
+    // identity smoke through `denoise_curated`, so the curated path's identity adherence is gated here
+    // before S4 advertises it. Mirrors mlx-gen-instantid's INSTANTID_SAMPLER/INSTANTID_SCHEDULER hook.
+    let sampler = std::env::var("IID_SAMPLER").ok().filter(|s| !s.is_empty());
+    let scheduler = std::env::var("IID_SCHEDULER")
+        .ok()
+        .filter(|s| !s.is_empty());
+    eprintln!(
+        "sampler: {} / scheduler: {}",
+        sampler.as_deref().unwrap_or("(ancestral default)"),
+        scheduler.as_deref().unwrap_or("(discrete default)"),
+    );
     // The worker's `instantid_realvisxl` production defaults (RealVisXL is tuned for a low CFG).
     let base = InstantIdRequest {
         prompt: "a professional studio portrait photograph of a person, looking at the camera, \
@@ -213,6 +228,8 @@ fn real_weight_instantid() {
         ip_adapter_scale: 0.8,
         controlnet_scale: 0.8,
         openpose_scale: 0.7,
+        sampler,
+        scheduler,
         seed: 12345,
         cancel: CancelFlag::new(),
     };

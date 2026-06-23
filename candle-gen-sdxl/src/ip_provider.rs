@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::{schedule_sigmas, DiscreteModelSampling, Scheduler, Solver};
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
 
@@ -27,7 +28,8 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 use crate::denoise::{
-    decode_image, denoise_ip_multi_control, seeded_prior, text_time_ids, Denoiser,
+    decode_image, denoise_curated, denoise_ip_multi_control, sdxl_alpha_schedule, seeded_prior,
+    seeded_sigma_prior, text_time_ids, Denoiser,
 };
 use crate::ip_adapter::{load_ip_kv_pairs, IpImageEncoder, Resampler, ResamplerConfig};
 use crate::loaders::{load_instantid_unet, load_sdxl_vae};
@@ -74,6 +76,13 @@ pub struct IpAdapterSdxlRequest {
     pub guidance: f32,
     /// IP-Adapter scale (the decoupled cross-attn weight on the image tokens).
     pub ip_adapter_scale: f32,
+    /// Curated unified-sampler selection (epic 7114, sc-7389). `None` (or `euler_ancestral`) keeps the
+    /// bespoke ancestral default byte-exact; a curated [`Solver`] name routes the IP denoise through
+    /// [`denoise_curated`] over the SDXL [`DiscreteModelSampling`].
+    pub sampler: Option<String>,
+    /// Curated σ-schedule selection (epic 7114). `None` ⇒ the discrete default; a [`Scheduler`] name
+    /// re-shapes σ. A curated scheduler alone also engages the curated path.
+    pub scheduler: Option<String>,
     pub seed: u64,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
@@ -89,6 +98,8 @@ impl Default for IpAdapterSdxlRequest {
             steps: 30,
             guidance: 5.0,
             ip_adapter_scale: DEFAULT_IP_ADAPTER_SCALE,
+            sampler: None,
+            scheduler: None,
             seed: 0,
             cancel: CancelFlag::default(),
         }
@@ -192,32 +203,78 @@ impl IpAdapterSdxl {
         let batch = conditioning.dim(0)?;
         let time_ids = text_time_ids(batch, &self.device, DTYPE)?;
         let ip_tokens = self.ip_tokens(reference, cfg_on)?;
-        let prior = self.seeded_prior_with(req.seed, req.width, req.height)?;
 
         // Set the IP image tokens on the UNet (constant across the denoise — phase 2c/2e design).
         self.unet
             .set_ip_context(Some(&ip_tokens), req.ip_adapter_scale as f64)?;
 
-        let d = Denoiser {
-            unet: &self.unet,
-            sampler: &self.sampler,
+        // Curated unified-sampler gate (epic 7114, sc-7389): a curated [`Solver`] name (≠ the bespoke
+        // `euler_ancestral` default) OR a curated [`Scheduler`] name routes the pure-IP denoise through
+        // the additive k-diffusion `denoise_curated` (IP tokens already on the UNet, empty `controls`);
+        // otherwise the bespoke ancestral default stays byte-exact (N1).
+        let sampler_name = req.sampler.as_deref().unwrap_or("euler_ancestral");
+        let scheduler_curated = req
+            .scheduler
+            .as_deref()
+            .and_then(Scheduler::from_name)
+            .is_some();
+        let sampler_curated =
+            Solver::from_name(sampler_name).is_some() && sampler_name != "euler_ancestral";
+
+        let latents = if sampler_curated || scheduler_curated {
+            let ms = DiscreteModelSampling::sdxl(&sdxl_alpha_schedule()?);
+            let native = schedule_sigmas(Scheduler::Normal, &ms, req.steps);
+            let sigmas =
+                candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, req.steps, &native);
+            // VE σ-prior `noise · σ_max`, seeded by `seed` so the first draw is the init noise.
+            let mut prior_rng = StdRng::seed_from_u64(req.seed);
+            let prior = seeded_sigma_prior(
+                &mut prior_rng,
+                req.width,
+                req.height,
+                sigmas[0],
+                &self.device,
+            )?;
+            denoise_curated(
+                &self.unet,
+                Some(sampler_name),
+                &ms,
+                &sigmas,
+                prior,
+                &conditioning,
+                &pooled,
+                &time_ids,
+                req.guidance as f64,
+                req.seed,
+                &req.cancel,
+                on_progress,
+                &[],           // pure IP — no ControlNet branches
+                &conditioning, // controlnet_encoder is unused with no controls
+                DTYPE,
+            )?
+        } else {
+            let prior = self.seeded_prior_with(req.seed, req.width, req.height)?;
+            let d = Denoiser {
+                unet: &self.unet,
+                sampler: &self.sampler,
+            };
+            let steps = self.sampler.timesteps(req.steps, self.sampler.max_time());
+            let mut rng = StdRng::seed_from_u64(req.seed.wrapping_add(STEP_RNG_SALT));
+            denoise_ip_multi_control(
+                &d,
+                prior,
+                &conditioning,
+                &pooled,
+                &time_ids,
+                req.guidance as f64,
+                &steps,
+                &mut rng,
+                &req.cancel,
+                on_progress,
+                &[],           // pure IP — no ControlNet branches
+                &conditioning, // controlnet_encoder is unused with no controls
+            )?
         };
-        let steps = self.sampler.timesteps(req.steps, self.sampler.max_time());
-        let mut rng = StdRng::seed_from_u64(req.seed.wrapping_add(STEP_RNG_SALT));
-        let latents = denoise_ip_multi_control(
-            &d,
-            prior,
-            &conditioning,
-            &pooled,
-            &time_ids,
-            req.guidance as f64,
-            &steps,
-            &mut rng,
-            &req.cancel,
-            on_progress,
-            &[],           // pure IP — no ControlNet branches
-            &conditioning, // controlnet_encoder is unused with no controls
-        )?;
         on_progress(Progress::Decoding);
         decode_image(&self.vae, &latents)
     }

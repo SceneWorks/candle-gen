@@ -156,6 +156,16 @@ fn real_weight_ip_adapter() {
     let mut model = IpAdapterSdxl::load(&paths).expect("load IpAdapterSdxl");
     println!("loaded in {:?}", t0.elapsed());
 
+    // Curated unified-sampler hook (epic 7114, sc-7389): unset ⇒ the bespoke ancestral default
+    // (byte-exact N1); `IP_SAMPLER=euler|heun|dpmpp_2m|…` / `IP_SCHEDULER=karras|…` routes the pure-IP
+    // denoise through `denoise_curated`, gated here before S4 advertises it.
+    let sampler = std::env::var("IP_SAMPLER").ok().filter(|s| !s.is_empty());
+    let scheduler = std::env::var("IP_SCHEDULER").ok().filter(|s| !s.is_empty());
+    println!(
+        "sampler: {} / scheduler: {}",
+        sampler.as_deref().unwrap_or("(ancestral default)"),
+        scheduler.as_deref().unwrap_or("(discrete default)"),
+    );
     let base = IpAdapterSdxlRequest {
         prompt: "a cinematic portrait photo, soft natural light, photorealistic, sharp focus"
             .into(),
@@ -165,6 +175,8 @@ fn real_weight_ip_adapter() {
         steps: 30,
         guidance: 5.0,
         ip_adapter_scale: 0.7,
+        sampler,
+        scheduler,
         seed: 12345,
         cancel: CancelFlag::new(),
     };

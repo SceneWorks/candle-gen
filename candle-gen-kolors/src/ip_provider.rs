@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::{self as nn, Linear, Module, VarBuilder};
 use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::{schedule_sigmas, DiscreteModelSampling, Scheduler, Solver};
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
@@ -42,11 +43,11 @@ use rand_distr::{Distribution, StandardNormal};
 use candle_gen_sdxl::ip_adapter::{load_ip_kv_pairs, IpImageEncoder, Resampler, ResamplerConfig};
 use candle_gen_sdxl::vision_encoder::{check_layer_count, ClipVisionEncoder, VisionConfig};
 use candle_gen_sdxl::weights::Weights;
-use candle_gen_sdxl::{sdxl_unet_config, UNet2DConditionModel};
+use candle_gen_sdxl::{denoise_curated, sdxl_unet_config, UNet2DConditionModel};
 
 use crate::chatglm3::ChatGlmModel;
-use crate::config::ChatGlmConfig;
-use crate::pipeline::{sdxl_vae_config, VAE_SCALE};
+use crate::config::{ChatGlmConfig, DEFAULT_SAMPLER};
+use crate::pipeline::{kolors_alpha_schedule, sdxl_vae_config, VAE_SCALE};
 use crate::sampler::KolorsEulerSampler;
 use crate::tokenizer::KolorsTokenizer;
 
@@ -99,6 +100,13 @@ pub struct IpAdapterKolorsRequest {
     pub guidance: f32,
     /// IP-Adapter scale (the decoupled cross-attn weight on the image tokens).
     pub ip_adapter_scale: f32,
+    /// Curated unified-sampler selection (epic 7114, sc-7389). `None` (or the native `euler_discrete`)
+    /// keeps the bespoke leading-Euler default byte-exact; a curated [`Solver`] name routes the IP
+    /// denoise through [`denoise_curated`] over the Kolors [`DiscreteModelSampling`].
+    pub sampler: Option<String>,
+    /// Curated σ-schedule selection (epic 7114). `None` ⇒ the native schedule; a [`Scheduler`] name
+    /// re-shapes σ. A curated scheduler alone also engages the curated path.
+    pub scheduler: Option<String>,
     pub seed: u64,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
@@ -114,6 +122,8 @@ impl Default for IpAdapterKolorsRequest {
             steps: 50,
             guidance: 5.0,
             ip_adapter_scale: DEFAULT_IP_ADAPTER_SCALE,
+            sampler: None,
+            scheduler: None,
             seed: 0,
             cancel: CancelFlag::default(),
         }
@@ -262,48 +272,92 @@ impl IpAdapterKolors {
         let time_ids = self.build_time_ids(batch, req.height, req.width)?;
         let ip_tokens = self.ip_tokens(reference, use_guide)?;
 
-        let sampler = KolorsEulerSampler::new(req.steps).map_err(CandleError::Msg)?;
         let (lat_h, lat_w) = ((req.height / 8) as usize, (req.width / 8) as usize);
-        let noise = self.initial_noise(req.seed, lat_h, lat_w)?;
-        let mut latents = (noise * sampler.init_noise_sigma() as f64)?;
 
         // Set the IP image tokens on the UNet (constant across the denoise).
         self.unet
             .set_ip_context(Some(&ip_tokens), req.ip_adapter_scale as f64)?;
 
-        let total = sampler.num_steps() as u32;
-        for i in 0..sampler.num_steps() {
-            if req.cancel.is_cancelled() {
-                return Err(CandleError::Canceled);
-            }
-            let scaled = (&latents / sampler.scale_in(i) as f64)?;
-            let model_in = if use_guide {
-                Tensor::cat(&[&scaled, &scaled], 0)?
-            } else {
-                scaled
-            };
-            let eps = self.unet.forward_instantid(
-                &model_in,
-                sampler.timestep(i) as f64,
+        // Curated unified-sampler gate (epic 7114, sc-7389): a curated [`Solver`] name (≠ the native
+        // `euler_discrete` default) OR a curated [`Scheduler`] name routes the IP denoise through the
+        // additive k-diffusion `denoise_curated` (IP tokens already on the UNet, no ControlNet branch);
+        // otherwise the bespoke leading-Euler default stays byte-exact (N1).
+        let scheduler_curated = req
+            .scheduler
+            .as_deref()
+            .and_then(Scheduler::from_name)
+            .is_some();
+        let curated_sampler: Option<&str> = req
+            .sampler
+            .as_deref()
+            .filter(|n| Solver::from_name(n).is_some() && *n != DEFAULT_SAMPLER);
+
+        let latents = if curated_sampler.is_some() || scheduler_curated {
+            let ms = DiscreteModelSampling::sdxl(&kolors_alpha_schedule()?);
+            let native = schedule_sigmas(Scheduler::Normal, &ms, req.steps);
+            let sigmas =
+                candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, req.steps, &native);
+            // VE σ-prior `noise · σ_max` (the launch-portable Kolors noise lifted into k-diffusion space).
+            let prior = (self.initial_noise(req.seed, lat_h, lat_w)? * sigmas[0] as f64)?;
+            // Pure IP: no ControlNet branch (empty `controls`), so `controlnet_encoder` is unused — pass
+            // the UNet text context to satisfy the signature.
+            denoise_curated(
+                &self.unet,
+                curated_sampler,
+                &ms,
+                &sigmas,
+                prior,
                 &projected,
                 &pooled,
                 &time_ids,
-                None, // pure IP — no ControlNet down residuals
-                None, // … and no mid residual
-            )?;
-            let eps = if use_guide {
-                let ch = eps.chunk(2, 0)?;
-                let (uncond, cond) = (&ch[0], &ch[1]);
-                (uncond + ((cond - uncond)? * req.guidance as f64)?)?
-            } else {
-                eps
-            };
-            latents = (&latents + (eps * sampler.step_dt(i) as f64)?)?;
-            on_progress(Progress::Step {
-                current: i as u32 + 1,
-                total,
-            });
-        }
+                req.guidance as f64,
+                req.seed,
+                &req.cancel,
+                on_progress,
+                &[],
+                &projected,
+                DTYPE,
+            )?
+        } else {
+            // Bespoke leading-Euler default (byte-exact N1).
+            let sampler = KolorsEulerSampler::new(req.steps).map_err(CandleError::Msg)?;
+            let noise = self.initial_noise(req.seed, lat_h, lat_w)?;
+            let mut latents = (noise * sampler.init_noise_sigma() as f64)?;
+            let total = sampler.num_steps() as u32;
+            for i in 0..sampler.num_steps() {
+                if req.cancel.is_cancelled() {
+                    return Err(CandleError::Canceled);
+                }
+                let scaled = (&latents / sampler.scale_in(i) as f64)?;
+                let model_in = if use_guide {
+                    Tensor::cat(&[&scaled, &scaled], 0)?
+                } else {
+                    scaled
+                };
+                let eps = self.unet.forward_instantid(
+                    &model_in,
+                    sampler.timestep(i) as f64,
+                    &projected,
+                    &pooled,
+                    &time_ids,
+                    None, // pure IP — no ControlNet down residuals
+                    None, // … and no mid residual
+                )?;
+                let eps = if use_guide {
+                    let ch = eps.chunk(2, 0)?;
+                    let (uncond, cond) = (&ch[0], &ch[1]);
+                    (uncond + ((cond - uncond)? * req.guidance as f64)?)?
+                } else {
+                    eps
+                };
+                latents = (&latents + (eps * sampler.step_dt(i) as f64)?)?;
+                on_progress(Progress::Step {
+                    current: i as u32 + 1,
+                    total,
+                });
+            }
+            latents
+        };
 
         on_progress(Progress::Decoding);
         self.decode(&latents)

@@ -87,8 +87,10 @@ const T5_PAD_TOKEN_ID: u32 = 0;
 /// so gen-core's exponential time-shift (`time_shift(mu,1,v) = e/(e + (1/v − 1))`) lands on the SAME
 /// shift the native schedule uses. schnell applies no shift (`get_schedule(.., None)`), so `mu = 0`.
 /// Used ONLY to feed the curated `resolve_flow_schedule`; the native (default) schedule stays the
-/// verbatim `get_schedule(..)` so the N1 default path is byte-exact.
-pub(crate) fn flow_mu(variant: Variant, seq_len: usize) -> f32 {
+/// verbatim `get_schedule(..)` so the N1 default path is byte-exact. Public so the PuLID-FLUX provider
+/// ([`candle_gen_pulid`], sc-7389), which rides the same FLUX flow-match schedule, shares this one shift
+/// source rather than re-deriving the linear fit.
+pub fn flow_mu(variant: Variant, seq_len: usize) -> f32 {
     if !variant.is_dev() {
         return 0.0;
     }

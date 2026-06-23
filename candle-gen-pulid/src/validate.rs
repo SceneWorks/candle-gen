@@ -174,6 +174,21 @@ fn real_weight_pulid() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(25);
+    // Curated unified-sampler hook (epic 7114, sc-7389): unset ⇒ the native flow-match Euler default
+    // (byte-exact N1); `PULID_SAMPLER=heun|dpmpp_2m|…` / `PULID_SCHEDULER=karras|…` routes the PuLID
+    // denoise through the curated flow driver, so the identity adherence under a curated solver is gated
+    // here before S4 advertises it.
+    let sampler = std::env::var("PULID_SAMPLER")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let scheduler = std::env::var("PULID_SCHEDULER")
+        .ok()
+        .filter(|s| !s.is_empty());
+    eprintln!(
+        "sampler: {} / scheduler: {}",
+        sampler.as_deref().unwrap_or("(flow-match default)"),
+        scheduler.as_deref().unwrap_or("(native default)"),
+    );
     let base = PulidFluxRequest {
         prompt: "portrait of a person, color photo, cinematic lighting, sharp focus, high detail"
             .to_owned(),
@@ -182,6 +197,8 @@ fn real_weight_pulid() {
         steps,
         guidance: 4.0,
         id_weight: 1.0,
+        sampler,
+        scheduler,
         seed: 12345,
         cancel: CancelFlag::new(),
     };

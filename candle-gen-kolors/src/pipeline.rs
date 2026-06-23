@@ -46,9 +46,17 @@ pub(crate) const VAE_SCALE: f64 = 0.13025;
 /// config the native [`KolorsEulerSampler`](crate::sampler) is built from (β₁ = **0.014**, NOT SDXL's
 /// 0.012; N = **1100**, NOT SDXL's 1000). The curated [`DiscreteModelSampling`] σ-table (sc-7124) is
 /// built from these same values so the ε/DDPM menu integrates over Kolors' own noise schedule.
-const KOLORS_BETA_START: f32 = 0.00085;
-const KOLORS_BETA_END: f32 = 0.014;
-const KOLORS_TRAIN_STEPS: usize = crate::sampler::NUM_TRAIN_TIMESTEPS;
+pub(crate) const KOLORS_BETA_START: f32 = 0.00085;
+pub(crate) const KOLORS_BETA_END: f32 = 0.014;
+pub(crate) const KOLORS_TRAIN_STEPS: usize = crate::sampler::NUM_TRAIN_TIMESTEPS;
+
+/// The Kolors `scaled_linear` α-cumprod [`AlphaSchedule`] (β 0.00085→0.014 over the 1100 train steps) —
+/// the [`DiscreteModelSampling`] source for the curated unified-sampler path, shared by this txt2img
+/// pipeline and the conditioned sub-providers ([`crate::control`], [`crate::ip_provider`]; sc-7389).
+pub(crate) fn kolors_alpha_schedule() -> Result<AlphaSchedule> {
+    AlphaSchedule::scaled_linear(KOLORS_TRAIN_STEPS, KOLORS_BETA_START, KOLORS_BETA_END)
+        .map_err(|e| CandleError::Msg(format!("kolors curated schedule: {e}")))
+}
 
 /// A light pipeline handle: the snapshot `root` and compute device. Heavy components load via
 /// [`load_components`](Self::load_components) and are owned/cached by the generator.
@@ -252,9 +260,7 @@ impl Pipeline {
         seed: u64,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
-        let sched =
-            AlphaSchedule::scaled_linear(KOLORS_TRAIN_STEPS, KOLORS_BETA_START, KOLORS_BETA_END)
-                .map_err(|e| CandleError::Msg(format!("kolors curated schedule: {e}")))?;
+        let sched = kolors_alpha_schedule()?;
         let ms = DiscreteModelSampling::sdxl(&sched);
         // Native curated schedule = ComfyUI's default (`normal`); the scheduler axis overrides it.
         let native = schedule_sigmas(Scheduler::Normal, &ms, steps);

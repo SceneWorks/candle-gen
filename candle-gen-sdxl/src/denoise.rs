@@ -30,6 +30,7 @@ use rand::rngs::StdRng;
 use rand_distr::{Distribution, StandardNormal};
 
 use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::{AlphaSchedule, DiscreteModelSampling};
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
 
@@ -311,6 +312,161 @@ pub fn denoise_ip_control(
         std::slice::from_ref(control),
         controlnet_encoder,
     )
+}
+
+/// SDXL ε-prediction noise-schedule constants (`scaled_linear` β over 1000 train steps) — the same
+/// values [`crate::pipeline`]'s DDIM / Lightning / curated-txt2img paths carry, so the curated
+/// conditioned path lands on the identical [`DiscreteModelSampling`].
+pub const SDXL_TRAIN_STEPS: usize = 1000;
+pub const SDXL_BETA_START: f32 = 0.00085;
+pub const SDXL_BETA_END: f32 = 0.012;
+
+/// The SDXL `scaled_linear` α-cumprod [`AlphaSchedule`] — the [`DiscreteModelSampling`] source for the
+/// curated unified-sampler conditioned path (epic 7114, sc-7389). Cheap (a 1000-element cumprod); the
+/// conditioned crates build it once at load and borrow it per generation.
+pub fn sdxl_alpha_schedule() -> Result<AlphaSchedule> {
+    AlphaSchedule::scaled_linear(SDXL_TRAIN_STEPS, SDXL_BETA_START, SDXL_BETA_END)
+        .map_err(|e| CandleError::Msg(format!("sdxl curated schedule: {e}")))
+}
+
+/// Sample the curated VE-σ prior latents `noise · σ_max` for a `width × height` render — the k-diffusion
+/// entry point [`denoise_curated`] integrates from. Unlike [`seeded_prior`] (which applies the ancestral
+/// `rsqrt(σ²+1)` renorm), this scales by the raw largest σ (`sigmas[0]`), the start of the curated
+/// schedule's variance-exploding σ-space. Drawn from the seeded CPU `StdRng` (the sc-3673 launch-portable
+/// contract) and returned **f32** NCHW `[1, 4, height/8, width/8]` — the curated latents stay f32 through
+/// the solver; [`denoise_curated`]'s closure casts to the UNet compute dtype per eval.
+pub fn seeded_sigma_prior(
+    rng: &mut StdRng,
+    width: u32,
+    height: u32,
+    sigma_max: f32,
+    device: &Device,
+) -> Result<Tensor> {
+    let (lh, lw) = (
+        (height / SPATIAL_SCALE) as usize,
+        (width / SPATIAL_SCALE) as usize,
+    );
+    let noise = draw_noise(rng, LATENT_CHANNELS, lh, lw, device)?;
+    Ok((noise * sigma_max as f64)?)
+}
+
+/// Curated unified-sampler conditioned denoise (epic 7114, sc-7389) — the **additive** k-diffusion
+/// alternative to InstantID / Kolors' bespoke ancestral default, carrying the SAME dual conditioning
+/// (summed ControlNet residuals across `controls` + the decoupled IP tokens **preconditioned on the
+/// UNet** via [`UNet2DConditionModel::set_ip_context`]). Drives any [`gen_core::sampling::Solver`] over a
+/// [`DiscreteModelSampling`] (ε-prediction) through the shared [`candle_gen::run_curated_sampler`], the
+/// candle twin of `mlx-gen-sdxl::denoise_curated`. The fixed-ancestral [`denoise_ip_multi_control`] is
+/// left untouched — this is selected only when the request names a curated sampler/scheduler, so the N1
+/// default-parity gate stays byte-exact (the legacy loop is not entered).
+///
+/// **Precondition (the candle divergence from mlx):** the IP tokens are NOT a parameter. The caller must
+/// have called [`UNet2DConditionModel::set_ip_context`] once before this loop (and `install_ip_adapter`
+/// at load), exactly as for [`denoise_ip_multi_control`]. [`UNet2DConditionModel::forward_instantid`]
+/// picks up whatever IP context is set (inert if cleared), so one loop serves IdentityNet-only,
+/// IdentityNet+OpenPose (multi-control), IP-only, and (cleared IP + empty `controls`) plain SDXL alike.
+///
+/// `latents` live in raw k-diffusion VE σ-space — the caller builds the prior via [`seeded_sigma_prior`]
+/// (`noise · σ_max`). `run_curated_sampler`'s `denoise()` applies the `1/√(σ²+1)` input scaling
+/// ([`DiscreteModelSampling::input_scale`]) and the ε→x0 recombine, so the closure only CFG-batches, sums
+/// residuals, runs `forward_instantid`, and CFG-combines, returning the RAW ε in f32; the solver math
+/// stays f32 and the result is cast to `dtype` for the decode. `controlnet_encoder` is the ControlNet
+/// cross-attn conditioning (the face tokens for InstantID; the text conditioning for Kolors — mlx's
+/// `control_encoder = None ⇒ conditioning`). `dtype` is the UNet compute dtype (f16 InstantID / f32
+/// Kolors).
+///
+/// CFG batch convention matches the candle txt2img + `denoise` path: **row 0 = uncond, row 1 = cond**,
+/// `eps = eps_uncond + cfg·(eps_cond − eps_uncond)` (mlx is positive-first; candle is uncond-first).
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_curated(
+    unet: &UNet2DConditionModel,
+    sampler_name: Option<&str>,
+    ms: &DiscreteModelSampling,
+    sigmas: &[f32],
+    latents: Tensor,
+    conditioning: &Tensor,
+    pooled: &Tensor,
+    time_ids: &Tensor,
+    cfg: f64,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    controls: &[ControlContext],
+    controlnet_encoder: &Tensor,
+    dtype: DType,
+) -> Result<Tensor> {
+    let cfg_on = cfg > 1.0;
+    let out = candle_gen::run_curated_sampler(
+        sampler_name,
+        ms,
+        sigmas,
+        latents,
+        seed,
+        cancel,
+        on_progress,
+        |x_in, t| -> Result<Tensor> {
+            // `x_in` is already `1/√(σ²+1)`-scaled by run_curated_sampler's denoise(); cast to the UNet
+            // compute dtype, then CFG-batch ([uncond, cond] — the candle convention). `t` is the nearest
+            // training-step index the UNet/ControlNet embed (DiscreteModelSampling::timestep).
+            let x16 = x_in.to_dtype(dtype)?;
+            let x_unet = if cfg_on {
+                Tensor::cat(&[&x16, &x16], 0)?
+            } else {
+                x16
+            };
+            // Sum each branch's (already `scale`'d) residuals — the MultiControlNet rule. One branch ⇒
+            // the single residual unchanged; zero ⇒ `None` (no injection). All branches share
+            // `controlnet_encoder` as their cross-attention conditioning.
+            let mut combined: Option<ControlResiduals> = None;
+            for cc in controls {
+                let res = cc.controlnet.forward(
+                    &x_unet,
+                    &cc.cond_embed,
+                    t as f64,
+                    controlnet_encoder,
+                    pooled,
+                    time_ids,
+                    cc.scale,
+                )?;
+                combined = Some(match combined {
+                    None => res,
+                    Some(prev) => prev.add(&res)?,
+                });
+            }
+            // The UNet forward: add_embedding micro-conditioning + the decoupled IP branch (from the set
+            // context) + the (summed) control residuals.
+            let eps = match &combined {
+                Some(r) => unet.forward_instantid(
+                    &x_unet,
+                    t as f64,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    Some(r.down.as_slice()),
+                    Some(&r.mid),
+                )?,
+                None => unet.forward_instantid(
+                    &x_unet,
+                    t as f64,
+                    conditioning,
+                    pooled,
+                    time_ids,
+                    None,
+                    None,
+                )?,
+            };
+            // Classifier-free guidance: row 0 = uncond, row 1 = cond (the candle txt2img convention).
+            let eps = if cfg_on {
+                let chunks = eps.chunk(2, 0)?;
+                let (uncond, cond) = (&chunks[0], &chunks[1]);
+                (uncond + ((cond - uncond)? * cfg)?)?
+            } else {
+                eps
+            };
+            // Raw ε in f32 so the DiscreteModelSampling x0 recombine + solver math stay f32.
+            Ok(eps.to_dtype(DType::F32)?)
+        },
+    )?;
+    Ok(out.to_dtype(dtype)?)
 }
 
 #[cfg(test)]
@@ -612,6 +768,91 @@ mod tests {
                 .zip(vals(&inactive).iter())
                 .any(|(x, y)| (x - y).abs() > 1e-4),
             "a positive ControlNet scale must change the denoise output"
+        );
+    }
+
+    /// The CURATED conditioned denoise (`denoise_curated`) over the tiny InstantID UNet + a matching
+    /// ControlNet: preserves shape, stays finite, a real solver swap (euler → heun) changes the output
+    /// (the curated knob has an effect), and a positive ControlNet scale changes the output vs scale 0
+    /// (the summed residuals reach the UNet through the curated path too). The CPU guard for the new
+    /// k-diffusion conditioned seam before the GPU/real-weight smoke (sc-7389 task 6).
+    #[test]
+    fn denoise_curated_with_controlnet() {
+        use candle_gen::gen_core::sampling::{schedule_sigmas, Scheduler};
+
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut unet = build_unet(vb.clone(), &dev);
+        let c = cond(&dev);
+        unet.set_ip_context(Some(&c.ip_tokens), 0.8).unwrap();
+
+        let cn_cfg = ControlNetConfig {
+            unet: unet_cfg(),
+            addition_time_embed_dim: ADD_TIME_DIM,
+            projection_class_embeddings_input_dim: PROJ_DIM,
+            conditioning_channels: 3,
+            cond_block_out_channels: vec![4, 8, 16, 32],
+        };
+        let cn = ControlNet::new(vb, &cn_cfg).unwrap();
+        let control = Tensor::randn(0f32, 1f32, (2, 3, 64, 64), &dev).unwrap();
+        let cond_embed = cn.embed_cond(&control).unwrap();
+
+        // SDXL DiscreteModelSampling + a 3-node normal schedule; VE σ-prior = noise · σ_max.
+        let sched = sdxl_alpha_schedule().unwrap();
+        let ms = DiscreteModelSampling::sdxl(&sched);
+        let sigmas = schedule_sigmas(Scheduler::Normal, &ms, 3);
+
+        let run = |sampler: &str, scale: f64| -> Tensor {
+            let cc = ControlContext {
+                controlnet: &cn,
+                cond_embed: cond_embed.clone(),
+                scale,
+            };
+            let mut rng = StdRng::seed_from_u64(3);
+            let prior = seeded_sigma_prior(&mut rng, 64, 64, sigmas[0], &dev).unwrap();
+            let cancel = CancelFlag::new();
+            let mut prog = |_p: Progress| {};
+            denoise_curated(
+                &unet,
+                Some(sampler),
+                &ms,
+                &sigmas,
+                prior,
+                &c.text,
+                &c.pooled,
+                &c.time_ids,
+                5.0,
+                7,
+                &cancel,
+                &mut prog,
+                std::slice::from_ref(&cc),
+                &c.text, // the ControlNet cross-attn conditioning
+                DType::F32,
+            )
+            .unwrap()
+        };
+
+        let active = run("euler", 0.9);
+        assert_eq!(active.dims(), &[1, 4, 8, 8]);
+        assert!(finite(&active));
+        // A real solver swap (euler → heun) changes the output: the curated sampler knob is honored.
+        let heun = run("heun", 0.9);
+        assert!(
+            vals(&active)
+                .iter()
+                .zip(vals(&heun).iter())
+                .any(|(x, y)| (x - y).abs() > 1e-4),
+            "swapping the curated solver must change the denoise output"
+        );
+        // scale = 0 ⇒ the zero-conv-scaled residuals vanish ⇒ the control has no effect.
+        let inactive = run("euler", 0.0);
+        assert!(
+            vals(&active)
+                .iter()
+                .zip(vals(&inactive).iter())
+                .any(|(x, y)| (x - y).abs() > 1e-4),
+            "a positive ControlNet scale must change the curated denoise output"
         );
     }
 }
