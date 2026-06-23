@@ -162,7 +162,7 @@ impl BooguConfig {
                 self.num_double_stream_layers, self.num_layers
             )));
         }
-        if self.num_attention_heads % self.num_kv_heads != 0 {
+        if !self.num_attention_heads.is_multiple_of(self.num_kv_heads) {
             return Err(CandleError::Msg(format!(
                 "boogu: num_attention_heads ({}) not divisible by num_kv_heads ({})",
                 self.num_attention_heads, self.num_kv_heads
