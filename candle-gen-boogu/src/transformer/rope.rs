@@ -45,27 +45,35 @@ impl RopeTables {
         from_positions(&positions, axes_dim, theta, cap_len, 0, device)
     }
 
-    /// Build the joint table for an **edit** forward (one reference image): `cap_len` text positions,
-    /// then a `ref_h × ref_w` reference grid at t-axis `cap_len`, then the `h × w` target grid at
-    /// t-axis `cap_len + max(ref_h, ref_w)` (the reference's `pe_shift` advance) — matching the
-    /// `[instruct; ref; noise]` packing the DiT runs the single-stream over.
+    /// Build the joint table for an **edit** forward with one or more reference images (the OmniGen2
+    /// unified-RoPE multi-image scheme): `cap_len` text positions, then each reference's `rh × rw`
+    /// grid placed at its own t-axis position `pe_shift` (starting at `cap_len` and advancing by
+    /// `max(rh, rw)` after each reference), then the `h × w` target grid at the final
+    /// `pe_shift = cap_len + Σ max(rh_j, rw_j)` — matching the `[instruct; ref₀; …; ref_{N-1}; noise]`
+    /// packing the DiT runs the single-stream over. `ref_grids` are `(rh_tokens, rw_tokens)` per
+    /// reference, in order; a single-element slice reproduces the single-reference table exactly.
     #[allow(clippy::too_many_arguments)]
     pub fn build_edit(
         cap_len: usize,
-        ref_h: usize,
-        ref_w: usize,
+        ref_grids: &[(usize, usize)],
         h_tokens: usize,
         w_tokens: usize,
         axes_dim: usize,
         theta: f32,
         device: &Device,
     ) -> Result<Self> {
-        let ref_len = ref_h * ref_w;
+        let ref_len: usize = ref_grids.iter().map(|(h, w)| h * w).sum();
         let mut positions = Vec::with_capacity(cap_len + ref_len + h_tokens * w_tokens);
         text_positions(&mut positions, cap_len);
-        grid_positions(&mut positions, cap_len as f32, ref_h, ref_w);
-        let noise_t = (cap_len + ref_h.max(ref_w)) as f32;
-        grid_positions(&mut positions, noise_t, h_tokens, w_tokens);
+        // Each reference grid at its own t-axis position; `pe_shift` advances by the reference's longer
+        // side after each (the OmniGen2 `pe_shift += max(ref_H_tokens, ref_W_tokens)`), so references
+        // occupy disjoint t-ranges and the noise grid follows the last one.
+        let mut pe_shift = cap_len;
+        for &(rh, rw) in ref_grids {
+            grid_positions(&mut positions, pe_shift as f32, rh, rw);
+            pe_shift += rh.max(rw);
+        }
+        grid_positions(&mut positions, pe_shift as f32, h_tokens, w_tokens);
         from_positions(&positions, axes_dim, theta, cap_len, ref_len, device)
     }
 
@@ -77,11 +85,22 @@ impl RopeTables {
         ))
     }
 
-    /// `(cos, sin)` for the reference-image patch tokens only (`ref_image_refiner`).
+    /// `(cos, sin)` for **all** reference-image patch tokens (the full `[ref₀; …; ref_{N-1}]` block).
     pub fn ref_image(&self) -> Result<(Tensor, Tensor)> {
         Ok((
             self.cos.narrow(1, self.cap_len, self.ref_len)?,
             self.sin.narrow(1, self.cap_len, self.ref_len)?,
+        ))
+    }
+
+    /// `(cos, sin)` for one reference image's tokens — the sub-range at local offset `local_start`
+    /// (relative to the start of the reference block) of length `len`. Used to refine each reference
+    /// independently (the OmniGen2 per-image batched `ref_image_refiner`: no cross-image attention).
+    pub fn ref_image_slice(&self, local_start: usize, len: usize) -> Result<(Tensor, Tensor)> {
+        let start = self.cap_len + local_start;
+        Ok((
+            self.cos.narrow(1, start, len)?,
+            self.sin.narrow(1, start, len)?,
         ))
     }
 
@@ -203,4 +222,50 @@ pub fn apply_interleaved_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<
     // Re-interleave: stack on a new trailing axis → [b, s, h, half, 2] → [b, s, h, hd].
     let out = Tensor::stack(&[&out_e, &out_o], D::Minus1)?.reshape((b, s, h, hd))?;
     out.to_dtype(dt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // head_dim 120 ⇒ axes_dim 40 per axis ⇒ half = 3·20 = 60.
+    const AXES_DIM: usize = 40;
+    const HALF: usize = 60;
+    const THETA: f32 = 10000.0;
+
+    #[test]
+    fn build_edit_multi_ref_token_accounting() {
+        let dev = Device::Cpu;
+        let cap = 3;
+        // Two references of different shapes (2×2 and 3×1 tokens) + a 4×4 noise grid.
+        let refs = [(2usize, 2usize), (3usize, 1usize)];
+        let (ht, wt) = (4usize, 4usize);
+        let r = RopeTables::build_edit(cap, &refs, ht, wt, AXES_DIM, THETA, &dev).unwrap();
+
+        let ref_len: usize = refs.iter().map(|(h, w)| h * w).sum(); // 4 + 3 = 7
+        let noise_len = ht * wt; // 16
+        let total = cap + ref_len + noise_len; // 26
+        assert_eq!(r.joint().0.dims(), &[1, total, HALF]);
+
+        assert_eq!(r.text().unwrap().0.dim(1).unwrap(), cap);
+        assert_eq!(r.ref_image().unwrap().0.dim(1).unwrap(), ref_len);
+        assert_eq!(r.image().unwrap().0.dim(1).unwrap(), noise_len);
+        assert_eq!(
+            r.combined_image().unwrap().0.dim(1).unwrap(),
+            ref_len + noise_len
+        );
+        // Per-image ref slices partition the reference block in order.
+        assert_eq!(r.ref_image_slice(0, 4).unwrap().0.dim(1).unwrap(), 4);
+        assert_eq!(r.ref_image_slice(4, 3).unwrap().0.dim(1).unwrap(), 3);
+    }
+
+    #[test]
+    fn build_edit_single_ref_matches_legacy_shape() {
+        // A one-element `ref_grids` slice reproduces the single-reference table.
+        let dev = Device::Cpu;
+        let r = RopeTables::build_edit(5, &[(8, 8)], 16, 16, AXES_DIM, THETA, &dev).unwrap();
+        assert_eq!(r.text().unwrap().0.dim(1).unwrap(), 5);
+        assert_eq!(r.ref_image().unwrap().0.dim(1).unwrap(), 64);
+        assert_eq!(r.image().unwrap().0.dim(1).unwrap(), 256);
+    }
 }

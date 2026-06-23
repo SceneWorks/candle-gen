@@ -32,15 +32,16 @@ fn render_chat(system: &str, user: &str) -> String {
     format!("<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n")
 }
 
-/// Render the ChatML string for an image-conditioned `(system, user)` turn, with the reference image
-/// block (`<|vision_start|>` + `num_image_tokens`×`<|image_pad|>` + `<|vision_end|>`) prepended to the
-/// user text — the Qwen3-VL chat template + processor expansion for `content = [image, text]` (image
-/// first, no separator, then the instruction).
-fn render_chat_with_image(system: &str, user: &str, num_image_tokens: usize) -> String {
-    let pads = IMAGE_PAD.repeat(num_image_tokens);
-    format!(
-        "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{VISION_START}{pads}{VISION_END}{user}<|im_end|>\n"
-    )
+/// Render the ChatML string for an image-conditioned `(system, user)` turn: one
+/// `<|vision_start|>` + `n_k`×`<|image_pad|>` + `<|vision_end|>` block per reference (in order), all
+/// prepended to the user text — the Qwen3-VL chat template + processor expansion for
+/// `content = [image₀, …, image_{N-1}, text]` (images first, no separators, then the instruction).
+fn render_chat_with_images(system: &str, user: &str, num_image_tokens: &[usize]) -> String {
+    let blocks: String = num_image_tokens
+        .iter()
+        .map(|&n| format!("{VISION_START}{}{VISION_END}", IMAGE_PAD.repeat(n)))
+        .collect();
+    format!("<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{blocks}{user}<|im_end|>\n")
 }
 
 /// The Boogu condition tokenizer: the snapshot's `mllm/tokenizer.json` wrapped so we can render the
@@ -111,10 +112,45 @@ impl BooguTokenizer {
         instruction: &str,
         num_image_tokens: usize,
     ) -> Result<Tensor> {
-        self.encode(&render_chat_with_image(
+        self.encode_edit_with_images(instruction, &[num_image_tokens])
+    }
+
+    /// Encode the **multi-image-conditioned edit** instruction → `input_ids` `[1, L]`, with one
+    /// `<|image_pad|>` block per reference (`num_image_tokens[k]` placeholders for reference k, in
+    /// order). The text encoder splices each reference's vision-tower output into its block
+    /// ([`crate::text_encoder::BooguTextEncoder::last_hidden_with_images`]).
+    pub fn encode_edit_with_images(
+        &self,
+        instruction: &str,
+        num_image_tokens: &[usize],
+    ) -> Result<Tensor> {
+        self.encode(&render_chat_with_images(
             SYSTEM_PROMPT_DROP,
             instruction,
             num_image_tokens,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_image_template_emits_one_block_per_reference() {
+        let s = render_chat_with_images("sys", "edit it", &[2, 3]);
+        // One vision block per reference, in order, before the instruction.
+        assert_eq!(s.matches(VISION_START).count(), 2);
+        assert_eq!(s.matches(VISION_END).count(), 2);
+        // Total `<|image_pad|>` placeholders = sum of per-reference token counts.
+        assert_eq!(s.matches(IMAGE_PAD).count(), 5);
+        // Images precede the instruction text in the user turn.
+        let vis = s.find(VISION_START).unwrap();
+        let txt = s.find("edit it").unwrap();
+        assert!(vis < txt);
+        // A single-image render is the one-element case.
+        let one = render_chat_with_images("sys", "x", &[4]);
+        assert_eq!(one.matches(VISION_START).count(), 1);
+        assert_eq!(one.matches(IMAGE_PAD).count(), 4);
     }
 }

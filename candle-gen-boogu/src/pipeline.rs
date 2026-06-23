@@ -239,40 +239,48 @@ pub(crate) fn load_edit_components(root: &Path, device: &Device) -> Result<EditC
     })
 }
 
-/// Render the **Edit** (single-reference TI2I, true-CFG) path for `req` with source `reference`.
+/// Render the **Edit** (true-CFG TI2I) path for `req` with one or more source `references`.
 ///
-/// Mirrors `mlx-gen-boogu`'s `generate_edit`: VAE-encode the reference into a clean spatial latent,
-/// build image-conditioned instruction features (Qwen3-VL vision tower → MLLM splice + deepstack), and
-/// flow-match denoise with the reference threaded through the DiT's `forward_edit` (the reference
-/// shapes the DiT image sequence; the instruction drives the edit). Same static-v1 scheduler /
-/// true-CFG as the Base path. The CFG-negative is the text-only empty/drop instruction
-/// (`use_input_images_4_neg_instruct = false`, the reference default).
+/// Mirrors `mlx-gen-boogu`'s `generate_edit`, generalized to multiple references (the OmniGen2-lineage
+/// multi-image path, max 5): VAE-encode each reference into a clean spatial latent, build
+/// image-conditioned instruction features (Qwen3-VL vision tower over each reference → MLLM splice +
+/// deepstack at one `<|image_pad|>` block per reference), and flow-match denoise with all references
+/// threaded through the DiT's `forward_edit` (the references shape the DiT image sequence; the
+/// instruction drives the edit). Same static-v1 scheduler / true-CFG as the Base path. The CFG-negative
+/// is the text-only empty/drop instruction (`use_input_images_4_neg_instruct = false`, the reference
+/// default). `references` must be non-empty (the caller validates 1..=5).
 pub(crate) fn render_edit(
     comps: &Components,
     edit: &EditComponents,
     req: &GenerationRequest,
-    reference: &Image,
+    references: &[&Image],
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
-    // The reference is VAE-encoded at its own dimensions; the latent must be patchify-able (p=2 over
+    // Each reference is VAE-encoded at its own dimensions; the latent must be patchify-able (p=2 over
     // an /8 latent ⇒ multiple of 16), matching the mlx twin's `validate_multiple_of_16(reference)`.
-    if !reference.width.is_multiple_of(16) || !reference.height.is_multiple_of(16) {
-        return Err(CandleError::Msg(format!(
-            "boogu_image_edit: reference dims must be multiples of 16 (got {}x{})",
-            reference.width, reference.height
-        )));
+    for (i, r) in references.iter().enumerate() {
+        if !r.width.is_multiple_of(16) || !r.height.is_multiple_of(16) {
+            return Err(CandleError::Msg(format!(
+                "boogu_image_edit: reference {i} dims must be multiples of 16 (got {}x{})",
+                r.width, r.height
+            )));
+        }
     }
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_STEPS);
     let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
 
-    // Reference → clean VAE latent [1, 16, rH/8, rW/8] (seed-independent).
-    let ref_latent = vae_encode(&edit.vae_encoder, reference, device)?;
+    // Each reference → clean VAE latent [1, 16, rH/8, rW/8] (seed-independent).
+    let ref_latents: Vec<Tensor> = references
+        .iter()
+        .map(|r| vae_encode(&edit.vae_encoder, r, device))
+        .collect::<Result<_>>()?;
 
-    // Condition encoding (seed-independent): image-conditioned edit instruction + text-only
-    // CFG-negative (empty/drop instruction). Both DiT passes carry the same reference latent.
-    let cond = encode_image_instruction(comps, edit, reference, &req.prompt, device)?;
+    // Condition encoding (seed-independent): image-conditioned edit instruction (the MLLM sees every
+    // reference) + text-only CFG-negative (empty/drop instruction). Both DiT passes carry the same
+    // reference latents.
+    let cond = encode_image_instruction(comps, edit, references, &req.prompt, device)?;
     let do_cfg = guidance > 1.0;
     let uncond = if do_cfg {
         Some(comps.te.last_hidden(&comps.tok.encode_negative()?)?)
@@ -302,10 +310,10 @@ pub(crate) fn render_edit(
             on_progress,
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
-                let cond_v = comps.dit.forward_edit(x, &ref_latent, &t, &cond)?;
+                let cond_v = comps.dit.forward_edit(x, &ref_latents, &t, &cond)?;
                 let pred = match &uncond {
                     Some(u_hidden) => {
-                        let uncond_v = comps.dit.forward_edit(x, &ref_latent, &t, u_hidden)?;
+                        let uncond_v = comps.dit.forward_edit(x, &ref_latents, &t, u_hidden)?;
                         // pred = cond + (scale − 1)·(cond − uncond)
                         (&cond_v + ((&cond_v - &uncond_v)? * (guidance - 1.0) as f64)?)?
                     }
@@ -320,32 +328,42 @@ pub(crate) fn render_edit(
     Ok(images)
 }
 
-/// Image-conditioned instruction features for the edit path: preprocess the reference, run the
-/// Qwen3-VL vision tower, render the chat template with the reference image block, and run the
-/// image-conditioned MLLM forward. Returns `[1, L, 4096]` (f32) — the `<|image_pad|>` positions now
-/// carry the vision tower's merged embeds + deepstack injections.
+/// Image-conditioned instruction features for the edit path: preprocess each reference, run the
+/// Qwen3-VL vision tower **per reference** (separately — no cross-image attention in the ViT, matching
+/// Qwen3-VL's per-image encoding), render the chat template with one `<|image_pad|>` block per
+/// reference, and run the multi-image MLLM forward. Returns `[1, L, 4096]` (f32) — each reference's
+/// `<|image_pad|>` block now carries that reference's merged vision embeds + deepstack injections.
 fn encode_image_instruction(
     comps: &Components,
     edit: &EditComponents,
-    reference: &Image,
+    references: &[&Image],
     instruction: &str,
     device: &Device,
 ) -> Result<Tensor> {
-    let (pixel_values, grid) = preprocess_image(
-        &reference.pixels,
-        reference.height as usize,
-        reference.width as usize,
-        device,
-    )?;
-    let (image_embeds, deepstack) = edit.vision.forward(&pixel_values, &[grid])?;
+    let mut image_embeds = Vec::with_capacity(references.len());
+    let mut deepstacks = Vec::with_capacity(references.len());
+    let mut grids = Vec::with_capacity(references.len());
+    let mut counts = Vec::with_capacity(references.len());
+    for r in references {
+        let (pixel_values, grid) =
+            preprocess_image(&r.pixels, r.height as usize, r.width as usize, device)?;
+        let (embeds, deepstack) = edit.vision.forward(&pixel_values, &[grid])?;
+        counts.push(embeds.dim(0)?);
+        image_embeds.push(embeds);
+        deepstacks.push(deepstack);
+        grids.push(grid);
+    }
 
-    // Chat template with N = merged vision tokens worth of `<|image_pad|>` placeholders, then the
-    // image-conditioned MLLM forward (vision splice + 3-D MRoPE + deepstack injection).
-    let n = image_embeds.dim(0)?;
-    let ids = comps.tok.encode_edit_with_image(instruction, n)?;
-    Ok(comps
-        .te
-        .last_hidden_with_image(&ids, &image_embeds, &deepstack, grid, IMAGE_TOKEN_ID)?)
+    // Chat template with one block of merged vision tokens (`<|image_pad|>`) per reference, then the
+    // multi-image MLLM forward (per-block vision splice + 3-D MRoPE + deepstack injection).
+    let ids = comps.tok.encode_edit_with_images(instruction, &counts)?;
+    Ok(comps.te.last_hidden_with_images(
+        &ids,
+        &image_embeds,
+        &deepstacks,
+        &grids,
+        IMAGE_TOKEN_ID,
+    )?)
 }
 
 /// VAE-encode an RGB8 reference [`Image`] → clean latent `[1, 16, H/8, W/8]` (f32). Takes the latent

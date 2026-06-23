@@ -9,8 +9,9 @@
 //!   static-shift (`mu = 1.15`) schedule, routed through the unified curated-sampler framework.
 //! * **`boogu_image_turbo`** — the same Base weights-arch + a DMD-distilled few-step (4) sampler loop,
 //!   CFG-free (guidance inert). The default fast surface.
-//! * **`boogu_image_edit`** — single-reference text+image-to-image (sc-7523): the source
-//!   [`ConditioningKind::Reference`] image is VAE-encoded into the DiT's spatial reference latent
+//! * **`boogu_image_edit`** — text+image-to-image with one or more reference images (sc-7523 single,
+//!   sc-7645 multi up to 5): each source ([`ConditioningKind::Reference`] /
+//!   [`ConditioningKind::MultiReference`]) is VAE-encoded into the DiT's spatial reference sequence
 //!   (`forward_edit`) **and** read by the Qwen3-VL **vision tower** so the MLLM "sees" it
 //!   (image-conditioned instruction features). Same true-CFG / static-shift schedule as Base.
 //!
@@ -45,11 +46,15 @@ use pipeline::{Components, EditComponents};
 pub const BOOGU_IMAGE_ID: &str = "boogu_image";
 /// Registry id for the Turbo variant (DMD few-step, CFG-free).
 pub const BOOGU_IMAGE_TURBO_ID: &str = "boogu_image_turbo";
-/// Registry id for the instruction image-edit variant (single-reference TI2I).
+/// Registry id for the instruction image-edit variant (single- or multi-reference TI2I).
 pub const BOOGU_IMAGE_EDIT_ID: &str = "boogu_image_edit";
 
 /// Patch(2)·ae_scale(8) = 16 — `patchify` requires latent dims divisible by this.
 const SIZE_MULTIPLE: u32 = 16;
+
+/// Maximum reference images the Edit lane accepts — the DiT's `image_index_embedding` row count (the
+/// OmniGen2-lineage `[5, hidden]` parameter supports up to 5 distinct reference index slots).
+const MAX_EDIT_REFERENCES: usize = 5;
 
 /// The curated samplers the Turbo DMD student stays coherent under (the stochastic / re-noising
 /// solvers — `lcm` most of all). The deterministic ODE solvers feed the few-step student
@@ -63,7 +68,7 @@ enum Variant {
     Base,
     /// Turbo — CFG-free DMD few-step text-to-image.
     Turbo,
-    /// Edit — single-reference TI2I (true-CFG, with a reference image VAE-encoded + vision-conditioned).
+    /// Edit — TI2I (true-CFG) with one or more reference images VAE-encoded + vision-conditioned.
     Edit,
 }
 
@@ -129,10 +134,10 @@ impl Generator for BooguGenerator {
                 req.width, req.height
             )));
         }
-        // The Edit variant needs exactly one source reference; the capability floor already rejects a
-        // Reference on Base/Turbo (their `conditioning` surface is empty).
+        // The Edit variant needs 1..=5 source references; the capability floor already rejects any
+        // Reference/MultiReference on Base/Turbo (their `conditioning` surface is empty).
         if self.variant == Variant::Edit {
-            resolve_edit_reference(req)?;
+            resolve_edit_references(req)?;
         }
         Ok(())
     }
@@ -148,35 +153,41 @@ impl Generator for BooguGenerator {
             Variant::Turbo => pipeline::render_turbo(&comps, req, &self.device, on_progress)?,
             Variant::Base => pipeline::render_base(&comps, req, &self.device, on_progress)?,
             Variant::Edit => {
-                let reference = resolve_edit_reference(req)?;
+                let references = resolve_edit_references(req)?;
                 let edit = self.edit_components()?;
-                pipeline::render_edit(&comps, &edit, req, reference, &self.device, on_progress)?
+                pipeline::render_edit(&comps, &edit, req, &references, &self.device, on_progress)?
             }
         };
         Ok(GenerationOutput::Images(images))
     }
 }
 
-/// The single img2img/instruction-edit source [`Conditioning::Reference`] image. More than one
-/// reference, or none, is an error (the Edit path needs exactly one source).
-fn resolve_edit_reference(req: &GenerationRequest) -> gen_core::Result<&Image> {
-    let mut source: Option<&Image> = None;
+/// The img2img/instruction-edit source images, in order — collected from both
+/// [`Conditioning::Reference`] (single) and [`Conditioning::MultiReference`] (multi). At least one and
+/// at most [`MAX_EDIT_REFERENCES`] (the DiT's `image_index_embedding` row count) is required; zero or
+/// more than the cap is an error.
+fn resolve_edit_references(req: &GenerationRequest) -> gen_core::Result<Vec<&Image>> {
+    let mut refs: Vec<&Image> = Vec::new();
     for c in &req.conditioning {
-        if let Conditioning::Reference { image, .. } = c {
-            if source.is_some() {
-                return Err(gen_core::Error::Msg(
-                    "boogu_image_edit: only one reference (source) image is supported for edit"
-                        .into(),
-                ));
-            }
-            source = Some(image);
+        match c {
+            Conditioning::Reference { image, .. } => refs.push(image),
+            Conditioning::MultiReference { images } => refs.extend(images.iter()),
+            _ => {} // the capability floor already rejects other conditioning kinds.
         }
     }
-    source.ok_or_else(|| {
-        gen_core::Error::Msg(
-            "boogu_image_edit: an instruction edit requires a source reference image".into(),
-        )
-    })
+    if refs.is_empty() {
+        return Err(gen_core::Error::Msg(
+            "boogu_image_edit: an instruction edit requires at least one source reference image"
+                .into(),
+        ));
+    }
+    if refs.len() > MAX_EDIT_REFERENCES {
+        return Err(gen_core::Error::Msg(format!(
+            "boogu_image_edit: at most {MAX_EDIT_REFERENCES} reference images are supported (got {})",
+            refs.len()
+        )));
+    }
+    Ok(refs)
 }
 
 /// Boogu Base descriptor — true-CFG text-to-image; no user negative prompt (the CFG-negative is the
@@ -220,13 +231,17 @@ pub fn descriptor_turbo() -> ModelDescriptor {
     d
 }
 
-/// Boogu Edit descriptor — same true-CFG surface as the Base path plus a single img2img/instruction
-/// -edit source [`ConditioningKind::Reference`]: the source image is read by the Qwen3-VL vision
-/// tower (semantic edit) and VAE-encoded into the DiT's spatial reference latent.
+/// Boogu Edit descriptor — same true-CFG surface as the Base path plus one or more img2img/instruction
+/// -edit source images ([`ConditioningKind::Reference`] for a single source, or
+/// [`ConditioningKind::MultiReference`] for up to [`MAX_EDIT_REFERENCES`]): each source is read by the
+/// Qwen3-VL vision tower (semantic edit) and VAE-encoded into the DiT's spatial reference sequence.
 pub fn descriptor_edit() -> ModelDescriptor {
     let mut d = descriptor();
     d.id = BOOGU_IMAGE_EDIT_ID;
-    d.capabilities.conditioning = vec![ConditioningKind::Reference];
+    d.capabilities.conditioning = vec![
+        ConditioningKind::Reference,
+        ConditioningKind::MultiReference,
+    ];
     d
 }
 
@@ -343,23 +358,32 @@ mod tests {
         let d = descriptor_edit();
         assert_eq!(d.id, BOOGU_IMAGE_EDIT_ID);
         assert!(d.capabilities.supports_guidance);
+        // Edit advertises both single- and multi-reference conditioning.
         assert!(d
             .capabilities
             .conditioning
             .contains(&ConditioningKind::Reference));
-        // Base/Turbo keep an empty conditioning surface (only Edit advertises a reference).
+        assert!(d
+            .capabilities
+            .conditioning
+            .contains(&ConditioningKind::MultiReference));
+        // Base/Turbo keep an empty conditioning surface (only Edit advertises references).
         assert!(descriptor().capabilities.conditioning.is_empty());
         assert!(descriptor_turbo().capabilities.conditioning.is_empty());
     }
 
     #[test]
-    fn edit_validate_requires_exactly_one_reference() {
+    fn edit_validate_reference_count() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let g = registry::load(BOOGU_IMAGE_EDIT_ID, &spec).unwrap();
         let img = |w: u32, h: u32| Image {
             width: w,
             height: h,
             pixels: vec![0u8; (w * h * 3) as usize],
+        };
+        let one_ref = || Conditioning::Reference {
+            image: img(512, 512),
+            strength: None,
         };
         let base = GenerationRequest {
             prompt: "make it autumn".into(),
@@ -369,30 +393,34 @@ mod tests {
         };
         // No reference → error.
         assert!(g.validate(&base).is_err());
-        // Exactly one reference → ok.
+        // A single `Reference` → ok.
         let one = GenerationRequest {
-            conditioning: vec![Conditioning::Reference {
-                image: img(512, 512),
-                strength: None,
-            }],
+            conditioning: vec![one_ref()],
             ..base.clone()
         };
         assert!(g.validate(&one).is_ok());
-        // Two references → error.
+        // Two references (now supported, up to 5) → ok.
         let two = GenerationRequest {
-            conditioning: vec![
-                Conditioning::Reference {
-                    image: img(512, 512),
-                    strength: None,
-                },
-                Conditioning::Reference {
-                    image: img(512, 512),
-                    strength: None,
-                },
-            ],
+            conditioning: vec![one_ref(), one_ref()],
+            ..base.clone()
+        };
+        assert!(g.validate(&two).is_ok());
+        // A `MultiReference` with the max 5 images → ok.
+        let five = GenerationRequest {
+            conditioning: vec![Conditioning::MultiReference {
+                images: (0..5).map(|_| img(512, 512)).collect(),
+            }],
+            ..base.clone()
+        };
+        assert!(g.validate(&five).is_ok());
+        // Six references → error (past the `image_index_embedding` cap).
+        let six = GenerationRequest {
+            conditioning: vec![Conditioning::MultiReference {
+                images: (0..6).map(|_| img(512, 512)).collect(),
+            }],
             ..base
         };
-        assert!(g.validate(&two).is_err());
+        assert!(g.validate(&six).is_err());
     }
 
     #[test]

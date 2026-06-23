@@ -1,17 +1,23 @@
-//! GPU-validation harness for the candle Boogu **Edit** lane (sc-7523): load the Edit snapshot, take
-//! a reference PNG + an edit instruction, render one edited image, write a PNG.
+//! GPU-validation harness for the candle Boogu **Edit** lane (sc-7523 single, sc-7645 multi): load the
+//! Edit snapshot, take one or more reference PNGs + an edit instruction, render one edited image,
+//! write a PNG.
 //!
 //! ```text
+//! # single reference
 //! cargo run -p candle-gen-boogu --example boogu-edit --features cuda --release -- \
 //!   D:\models\Boogu-Image-0.1-Edit ref.png "make it autumn" 0 0 0 42 edit_out.png
+//! # multiple references (comma-separated, up to 5): compose subject from ref A into scene from ref B
+//! cargo run -p candle-gen-boogu --example boogu-edit --features cuda --release -- \
+//!   D:\models\Boogu-Image-0.1-Edit "subject.png,scene.png" "place the cat into the garden" \
+//!   1024 1024 0 42 compose_out.png
 //! ```
-//! Arg order: <snapshot_dir> <reference.png> <instruction> [width] [height] [steps(0=default)] \
-//!            [seed] [out.png]
+//! Arg order: <snapshot_dir> <ref.png[,ref2.png,...]> <instruction> [width] [height] \
+//!            [steps(0=default)] [seed] [out.png]
 //!
-//! `width`/`height` are the OUTPUT generation size; `0` (the default) keeps the reference's own
-//! (snapped-to-multiple-of-16) dimensions, so the edit preserves resolution. The reference is
-//! VAE-encoded at its own dims and must be a multiple of 16 per side; this harness snaps it down to
-//! the nearest multiple of 16 (≥ 256) with a Lanczos resize so any input PNG works.
+//! `width`/`height` are the OUTPUT generation size; `0` (the default) keeps the FIRST reference's own
+//! (snapped-to-multiple-of-16) dimensions, so a single-reference edit preserves resolution. Each
+//! reference is VAE-encoded at its own dims and must be a multiple of 16 per side; this harness snaps
+//! each down to the nearest multiple of 16 (≥ 256) with a Lanczos resize so any input PNG works.
 
 use candle_gen::gen_core::{
     registry, Conditioning, GenerationOutput, GenerationRequest, Image, LoadSpec, Progress,
@@ -24,6 +30,27 @@ fn snap16(n: u32) -> u32 {
     (n - n % 16).max(256)
 }
 
+/// Load a reference PNG and snap it to a multiple-of-16 RGB8 [`Image`].
+fn load_reference(path: &str) -> Result<Image, Box<dyn std::error::Error>> {
+    let img = image::open(path)?.to_rgb8();
+    let (rw, rh) = (snap16(img.width()), snap16(img.height()));
+    let img = if (rw, rh) != (img.width(), img.height()) {
+        eprintln!(
+            "snapping reference {path} {}x{} -> {rw}x{rh} (multiple of 16)",
+            img.width(),
+            img.height()
+        );
+        image::imageops::resize(&img, rw, rh, FilterType::Lanczos3)
+    } else {
+        img
+    };
+    Ok(Image {
+        width: rw,
+        height: rh,
+        pixels: img.into_raw(),
+    })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     candle_gen_boogu::force_link();
 
@@ -32,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(1)
         .cloned()
         .unwrap_or_else(|| "D:/models/Boogu-Image-0.1-Edit".into());
-    let ref_path = a.get(2).cloned().unwrap_or_else(|| "ref.png".into());
+    let ref_arg = a.get(2).cloned().unwrap_or_else(|| "ref.png".into());
     let instruction = a.get(3).cloned().unwrap_or_else(|| "make it autumn".into());
     let arg_w: u32 = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
     let arg_h: u32 = a.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -40,28 +67,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let seed: u64 = a.get(7).and_then(|s| s.parse().ok()).unwrap_or(42);
     let out = a.get(8).cloned().unwrap_or_else(|| "boogu_edit.png".into());
 
-    // Load the reference PNG and snap it to a multiple-of-16 RGB8 buffer.
-    let img = image::open(&ref_path)?.to_rgb8();
-    let (rw, rh) = (snap16(img.width()), snap16(img.height()));
-    let img = if (rw, rh) != (img.width(), img.height()) {
-        eprintln!(
-            "snapping reference {}x{} -> {rw}x{rh} (multiple of 16)",
-            img.width(),
-            img.height()
-        );
-        image::imageops::resize(&img, rw, rh, FilterType::Lanczos3)
-    } else {
-        img
-    };
-    let reference = Image {
-        width: rw,
-        height: rh,
-        pixels: img.into_raw(),
-    };
+    // One or more references (comma-separated paths), each snapped to a multiple-of-16 RGB8 buffer.
+    let references: Vec<Image> = ref_arg
+        .split(',')
+        .map(|p| load_reference(p.trim()))
+        .collect::<Result<_, _>>()?;
+    let (rw, rh) = (references[0].width, references[0].height);
 
-    // Output size: default to the reference dims (preserve resolution), else the CLI override.
+    // Output size: default to the first reference dims (preserve resolution), else the CLI override.
     let width = if arg_w == 0 { rw } else { arg_w };
     let height = if arg_h == 0 { rh } else { arg_h };
+
+    // One reference → `Reference`; several → `MultiReference` (the sc-7645 multi-image path).
+    let conditioning = if references.len() == 1 {
+        vec![Conditioning::Reference {
+            image: references.into_iter().next().unwrap(),
+            strength: None,
+        }]
+    } else {
+        eprintln!("multi-reference edit with {} references", references.len());
+        vec![Conditioning::MultiReference { images: references }]
+    };
 
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot.into()));
     let gen = registry::load("boogu_image_edit", &spec)?;
@@ -73,10 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         count: 1,
         seed: Some(seed),
         steps: if steps == 0 { None } else { Some(steps) },
-        conditioning: vec![Conditioning::Reference {
-            image: reference,
-            strength: None,
-        }],
+        conditioning,
         ..Default::default()
     };
 
