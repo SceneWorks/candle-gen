@@ -170,8 +170,9 @@ impl ClipTextEmbedder {
     pub fn from_snapshot(root: &Path) -> Result<Self> {
         let file = resolve_weights_file(root)?;
         let device = candle_gen::default_device()?;
-        let vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&[file.clone()], DType::F32, &device)? };
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(std::slice::from_ref(&file), DType::F32, &device)?
+        };
         let body = ClipTextTransformer::new(vb.pp("text_model"), &clip_text_config())?;
         let weights = Weights::from_file(&file, &device, DType::F32)?;
         let text_projection = Linear::new(weights.require("text_projection.weight")?, None);
