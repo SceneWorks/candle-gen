@@ -397,17 +397,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "candle-gen-prompt-refine"
-version = "0.0.0"
-dependencies = [
- "candle-gen",
- "candle-transformers",
- "inventory",
- "sceneworks-gen-core-testkit",
- "serde_json",
-]
-
-[[package]]
 name = "candle-gen-pulid"
 version = "0.0.0"
 dependencies = [
