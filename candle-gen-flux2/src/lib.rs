@@ -28,13 +28,17 @@
 //! curated sampler/scheduler menus; the default (unset sampler/scheduler) path is the N1 no-op — euler
 //! over the native empirical-mu flow-match schedule.
 //!
-//! **Surface:** txt2img for both variants. The mlx provider's edit variants (`flux2_klein_9b_edit`,
-//! `flux2_klein_9b_kv_edit`, `flux2_dev_edit`/`flux2_dev_control`), LoRA/LoKr, and the **Q4 pre-quant
-//! packed loader** dev needs to fit under the memory ceiling are **not** wired yet (epic 6564 stories
-//! 1 follow-on / 4); until the packed loader lands, dev loads **dense** (fixture-only — the full 32B
-//! needs the packed path). `backend = "candle"`, `mac_only = false`.
+//! **Surface:** txt2img for both variants (gen-core-registered). Conditioned dev surfaces are bespoke,
+//! worker-invoked-by-name providers (the candle pattern, NOT registry entries): klein reference edit
+//! [`Flux2Edit`] (sc-5487) — extended to **dev** multi-reference edit (sc-7460) via the DiT token
+//! concat with the embedded-guidance forward — and dev strict-pose ControlNet [`Flux2Control`]
+//! (sc-7460), the `FLUX.2-dev-Fun-Controlnet-Union` VACE branch. The dev conditioned paths run the
+//! CPU-stage → quantize-onto-GPU loader ([`quant`]) so the 32B fits the memory ceiling. Still not
+//! wired: the klein weight-variant edits (`flux2_klein_9b_kv_edit`) and LoRA/LoKr. `backend =
+//! "candle"`, `mac_only = false`.
 
 pub mod config;
+pub mod control_provider;
 pub mod convert;
 pub mod edit_provider;
 pub mod pipeline;
@@ -44,8 +48,12 @@ pub mod text_encoder;
 pub mod transformer;
 pub mod vae;
 
+pub use control_provider::{Flux2Control, Flux2ControlPaths, Flux2ControlRequest};
 pub use convert::convert_and_assemble;
 pub use edit_provider::{Flux2Edit, Flux2EditPaths, Flux2EditRequest};
+pub use transformer::{
+    Flux2ControlBranch, Flux2ControlTransformer, Flux2Transformer, CONTROL_IN_DIM,
+};
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -63,7 +71,6 @@ use candle_gen::{CandleError, Result as CResult};
 
 use config::{Flux2Config, Flux2Variant, SIZE_MULTIPLE};
 use text_encoder::Qwen3TextEncoder;
-use transformer::Flux2Transformer;
 use vae::Flux2Vae;
 
 /// Qwen3 `<|endoftext|>` pad token id (klein FLUX.2 text encoder).

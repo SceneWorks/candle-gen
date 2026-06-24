@@ -27,7 +27,7 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{Image, Progress, Quant};
 use candle_gen::{CandleError, Result};
 
 use crate::config::{Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_STEPS, SIZE_MULTIPLE};
@@ -36,10 +36,12 @@ use crate::transformer::Flux2Transformer;
 use crate::vae::Flux2Vae;
 use crate::{pipeline, to_image, Pipeline};
 
-/// Paths to the FLUX.2-klein edit checkpoints — just the klein snapshot dir (`text_encoder/`,
-/// `transformer/`, `vae/`, `tokenizer/`), the same snapshot the txt2img path loads.
+/// Path to the FLUX.2 edit snapshot — just the diffusers snapshot dir (`text_encoder/`,
+/// `transformer/`, `vae/`, `tokenizer/`), the same snapshot the txt2img path loads. klein at
+/// `black-forest-labs/FLUX.2-klein-9B` ([`Flux2Edit::load`]); dev at `black-forest-labs/FLUX.2-dev`
+/// ([`Flux2Edit::load_dev`], sc-7460).
 pub struct Flux2EditPaths {
-    /// FLUX.2-klein-9B diffusers snapshot dir.
+    /// FLUX.2 diffusers snapshot dir (klein or dev).
     pub root: PathBuf,
 }
 
@@ -80,23 +82,56 @@ impl Default for Flux2EditRequest {
 /// edits.
 pub struct Flux2Edit {
     pipe: Pipeline,
+    variant: Flux2Variant,
     te: Qwen3TextEncoder,
     transformer: Flux2Transformer,
     vae: Flux2Vae,
 }
 
 impl Flux2Edit {
-    /// Load the klein backbone with the VAE encoder enabled (the reference encode); everything else is
-    /// the txt2img load (f32 compute, parity-sensitive).
+    /// Load the **klein** edit backbone (dense) with the VAE encoder enabled (the reference encode);
+    /// distilled — guidance 1.0 (CFG-free), > 1 adds a negative pass.
     pub fn load(paths: &Flux2EditPaths) -> Result<Self> {
+        Self::load_variant(paths, Flux2Variant::Klein9b, None)
+    }
+
+    /// Load the **dev** edit backbone (sc-7460): the 32B flagship via the CPU-stage → quantize-onto-GPU
+    /// loader (`quant` Q4/Q8 required in practice — the dense 32B does not fit the GPU), guidance-
+    /// distilled (embedded scalar, no negative pass), text-only Mistral prompt + reference token concat.
+    pub fn load_dev(paths: &Flux2EditPaths, quant: Option<Quant>) -> Result<Self> {
+        Self::load_variant(paths, Flux2Variant::Dev, quant)
+    }
+
+    /// Shared loader: the backbone for `variant` with the VAE encoder enabled (the reference encode).
+    /// The dev quant path stages the TE + DiT dense in CPU RAM and quantizes each projection onto the
+    /// GPU; klein (and dev on a fixture) loads dense on-device. f32 compute (parity-sensitive).
+    fn load_variant(
+        paths: &Flux2EditPaths,
+        variant: Flux2Variant,
+        quant: Option<Quant>,
+    ) -> Result<Self> {
         let device = candle_gen::default_device()?;
-        // The klein edit path loads the klein snapshot dense (dev edit is epic 6564 story 4).
-        let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &paths.root, &device);
-        let te = Qwen3TextEncoder::new(&pipe.cfg, pipe.component_vb("text_encoder")?)?;
-        let transformer = Flux2Transformer::new(&pipe.cfg, pipe.component_vb("transformer")?)?;
+        let pipe = Pipeline::load(variant, quant, &paths.root, &device);
+        let (te, transformer) = match quant {
+            Some(q) => {
+                let cpu = Device::Cpu;
+                let mut te =
+                    Qwen3TextEncoder::new(&pipe.cfg, pipe.component_vb_on("text_encoder", &cpu)?)?;
+                te.quantize(q, &device)?;
+                let mut transformer =
+                    Flux2Transformer::new(&pipe.cfg, pipe.component_vb_on("transformer", &cpu)?)?;
+                transformer.quantize(q, &device)?;
+                (te, transformer)
+            }
+            None => (
+                Qwen3TextEncoder::new(&pipe.cfg, pipe.component_vb("text_encoder")?)?,
+                Flux2Transformer::new(&pipe.cfg, pipe.component_vb("transformer")?)?,
+            ),
+        };
         let vae = Flux2Vae::new_with_encoder(pipe.component_vb("vae")?)?;
         Ok(Self {
             pipe,
+            variant,
             te,
             transformer,
             vae,
@@ -132,9 +167,12 @@ impl Flux2Edit {
         let device = &self.pipe.device;
         let cfg = &self.pipe.cfg;
         let guidance = req.guidance;
-        let cfg_on = guidance > 1.0;
+        // dev is guidance-distilled (embedded scalar, single forward); klein is distilled / true-CFG
+        // (a classifier-free negative pass only when guidance > 1).
+        let embedded_guidance = self.variant.uses_embedded_guidance();
+        let cfg_on = !embedded_guidance && guidance > 1.0;
 
-        // Prompt embeds are seed-independent: encode once. Negative only under CFG.
+        // Prompt embeds are seed-independent: encode once. Negative only under klein CFG.
         let prompt_embeds = self.pipe.encode(&self.te, &req.prompt)?;
         let negative = if cfg_on {
             let neg = if req.negative.trim().is_empty() {
@@ -183,11 +221,32 @@ impl Flux2Edit {
                 let ts = sigma * 1000.0;
                 // Joint image stream [target, refs] — references re-concatenated with the current target.
                 let hidden = Tensor::cat(&[latents, &ref_tokens], 1)?;
-                let v =
-                    self.velocity(&hidden, &prompt_embeds, &img_ids, &txt_ids, ts, target_seq)?;
+                if embedded_guidance {
+                    // dev: a single forward feeding the embedded guidance scalar to the DiT.
+                    return self.velocity(
+                        &hidden,
+                        &prompt_embeds,
+                        &img_ids,
+                        &txt_ids,
+                        ts,
+                        Some(guidance),
+                        target_seq,
+                    );
+                }
+                // klein: distilled (CFG-free) or true-CFG via a negative pass when guidance > 1.
+                let v = self.velocity(
+                    &hidden,
+                    &prompt_embeds,
+                    &img_ids,
+                    &txt_ids,
+                    ts,
+                    None,
+                    target_seq,
+                )?;
                 match &negative {
                     Some(neg) => {
-                        let vn = self.velocity(&hidden, neg, &img_ids, &txt_ids, ts, target_seq)?;
+                        let vn =
+                            self.velocity(&hidden, neg, &img_ids, &txt_ids, ts, None, target_seq)?;
                         // vn + guidance·(v − vn)
                         Ok((&vn + ((&v - &vn)? * guidance as f64)?)?)
                     }
@@ -204,7 +263,9 @@ impl Flux2Edit {
 
     /// Run the transformer on the joint `[target, refs]` image stream and keep the leading
     /// `target_seq` velocity tokens (the target image stream; `proj_out` is per-token, so the slice is
-    /// exact).
+    /// exact). `guidance` is `Some(scale)` for dev (embedded guidance) and `None` for klein (distilled
+    /// / true-CFG via the caller's negative pass).
+    #[allow(clippy::too_many_arguments)]
     fn velocity(
         &self,
         hidden: &Tensor,
@@ -212,12 +273,12 @@ impl Flux2Edit {
         img_ids: &[[i64; 4]],
         txt_ids: &[[i64; 4]],
         ts: f32,
+        guidance: Option<f32>,
         target_seq: usize,
     ) -> Result<Tensor> {
-        // klein edit is distilled (CFG-free / true-CFG via the negative pass) — no embedded guidance.
         let out = self
             .transformer
-            .forward(hidden, embeds, img_ids, txt_ids, ts, None)?;
+            .forward(hidden, embeds, img_ids, txt_ids, ts, guidance)?;
         Ok(out.narrow(1, 0, target_seq)?)
     }
 
@@ -251,7 +312,9 @@ impl Flux2Edit {
 /// Lanczos-resize a reference [`Image`] (RGB8) to the render size, normalize `[0,255] → [-1,1]`, lay
 /// out as NCHW `[1, 3, H, W]` — the input [`Flux2Vae::encode_packed`] expects. Mirrors the mlx
 /// `preprocess_ref_image` (`2·x − 1`). A no-op resize when the source is already the render size.
-fn preprocess_ref(
+/// `pub(crate)` so the control provider ([`crate::control_provider`]) reuses it to VAE-encode the
+/// pose/union control image (sc-7460).
+pub(crate) fn preprocess_ref(
     image: &Image,
     width: u32,
     height: u32,

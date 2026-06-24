@@ -94,6 +94,22 @@ impl QLinear {
         *self = Self::Quantized { matmul, bias };
         Ok(())
     }
+
+    /// Move a still-**dense** projection (weight + optional bias) to `device`, in place. A no-op when
+    /// already quantized (the `QMatMul` already lives on its device). Used by the CPU-staged quant path
+    /// for the leaves it must keep dense — e.g. the control branch's `control_img_in` (260 in-features
+    /// is not a multiple of the Q4_0/Q8_0 block 32, so it can't quantize) (sc-7460).
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        if let Self::Dense(l) = self {
+            let w = l.weight().to_device(device)?;
+            let b = match l.bias() {
+                Some(b) => Some(b.to_device(device)?),
+                None => None,
+            };
+            *self = Self::Dense(Linear::new(w, b));
+        }
+        Ok(())
+    }
 }
 
 /// Rebuild a dense `RmsNorm` on `device` at `eps` (a no-op-cost move when already there). Used by the

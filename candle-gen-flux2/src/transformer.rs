@@ -616,6 +616,59 @@ impl Flux2Transformer {
         timestep: f32,
         guidance: Option<f32>,
     ) -> Result<Tensor> {
+        self.forward_inner(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            None,
+        )
+    }
+
+    /// FLUX.2-dev Fun-Controlnet-Union forward (sc-7460/sc-2292): [`Self::forward`] plus a VACE control
+    /// branch. `control = (branch, control_context, scale)` — the branch's per-block hints are computed
+    /// once from the post-embedder image+caption streams and added to the base image stream after each
+    /// base double block in `branch.places`, scaled by `scale`. At `scale = 0` the result is
+    /// byte-identical to the base forward (the parity self-check).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_control(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        img_ids: &[[i64; 4]],
+        txt_ids: &[[i64; 4]],
+        timestep: f32,
+        guidance: Option<f32>,
+        control: (&Flux2ControlBranch, &Tensor, f32),
+    ) -> Result<Tensor> {
+        self.forward_inner(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            Some(control),
+        )
+    }
+
+    /// Shared body behind [`forward`](Self::forward) and [`forward_with_control`](Self::forward_with_control).
+    /// `control` (when `Some`) injects the VACE control hints (dev pose, sc-7460); `None` is the plain
+    /// base forward. The control hints are computed once from the post-embedder streams before the base
+    /// double-block loop, then added into the base image stream after the mapped base double blocks.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_inner(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        img_ids: &[[i64; 4]],
+        txt_ids: &[[i64; 4]],
+        timestep: f32,
+        guidance: Option<f32>,
+        control: Option<(&Flux2ControlBranch, &Tensor, f32)>,
+    ) -> Result<Tensor> {
         let temb = self.time_embed.forward(timestep, guidance, &self.device)?;
         let mut img = self
             .x_embedder
@@ -632,10 +685,27 @@ impl Flux2Transformer {
 
         let img_mod = self.mod_img.forward(&temb)?;
         let txt_mod = self.mod_txt.forward(&temb)?;
-        for block in &self.double_blocks {
+
+        // VACE control hints (sc-7460): computed once from the post-embedder image+caption streams,
+        // before the base double-block loop (the fork's `forward_control`), then injected per block.
+        let hints = match control {
+            Some((branch, cc, _)) => {
+                Some(branch.forward_control(&img, &txt, cc, &img_mod, &txt_mod, &cos, &sin)?)
+            }
+            None => None,
+        };
+
+        for (idx, block) in self.double_blocks.iter().enumerate() {
             let (t, i) = block.forward(&img, &txt, &img_mod, &txt_mod, &cos, &sin)?;
             txt = t;
             img = i;
+            // Add the control hint into the base image stream (`img + hints[n]·scale`) at the mapped
+            // base double blocks. `scale = 0` → `+0` → byte-identical to the base forward.
+            if let (Some(hints), Some((branch, _, scale))) = (&hints, &control) {
+                if let Some(n) = branch.hint_index(idx) {
+                    img = (&img + (&hints[n] * (*scale as f64))?)?;
+                }
+            }
         }
 
         let txt_seq = txt.dim(1)?;
@@ -649,6 +719,209 @@ impl Flux2Transformer {
         let img_out = hidden.narrow(1, txt_seq, img_seq)?;
         let img_out = self.norm_out.forward(&img_out.contiguous()?, &temb)?;
         self.proj_out.forward(&img_out)
+    }
+}
+
+// ---- sc-7460: FLUX.2-dev Fun-Controlnet-Union (VACE-style strict pose) -------------------------
+//
+// Port of `alibaba-pai/FLUX.2-dev-Fun-Controlnet-Union` (`videox_fun/models/flux2_transformer2d_control.py`),
+// mirroring the merged mlx-gen control branch (sc-2292): a VACE-style ControlNet on the FIRST 4 of
+// dev's 8 base double blocks (`control_layers = range(0, num_double_layers, 2) = [0, 2, 4, 6]`). A
+// `control_img_in` patch embedder maps the packed control context (control latent 128 + zero mask 4 +
+// zero inpaint latent 128 = 260) into the inner dim; N control double blocks thread an internal
+// `(c_image, txt)` pair — block 0 seeds `c = before_proj(c) + img_embed`, each runs a full base
+// double-block forward and emits `after_proj(c)` as its hint — and the hints are added into the base
+// image stream after the matching base double blocks, scaled by `control_context_scale`. The control
+// blocks reuse the base `double_stream_modulation_{img,txt}` + RoPE (passed through); the threaded
+// `txt` is local to the control stack (the base caption stream is untouched).
+
+/// In-features of `control_img_in` = the packed control-context width: control latent 128, a zero
+/// inpaint mask 4, and a zero inpaint latent 128 → 260, per `pipeline_flux2_control.py`
+/// (`torch.concat([control_latents, mask_condition, inpaint_latent], dim=2)`). The union ControlNet's
+/// pose-only layout zeros the mask + inpaint, leaving the VAE-encoded pose skeleton in `control_latents`.
+pub const CONTROL_IN_DIM: usize = 260;
+
+/// One VACE control block: a full FLUX.2 double block (its own attn / ff / ff_context weights) plus
+/// the `after_proj` hint projection (every block) and `before_proj` (block 0 only) seeding the control
+/// branch from the base image embedding. Port of `Flux2ControlTransformerBlock`. All three control
+/// Linears are bias-carrying.
+struct Flux2ControlBlock {
+    base: DoubleBlock,
+    /// `before_proj(c) + img_embed` seeds block 0 (`None` for the rest).
+    before_proj: Option<QLinear>,
+    /// `after_proj(c)` — the per-block hint added into the base image stream.
+    after_proj: QLinear,
+}
+
+impl Flux2ControlBlock {
+    fn new(cfg: &Flux2Config, vb: VarBuilder, has_before_proj: bool) -> Result<Self> {
+        let inner = cfg.inner_dim();
+        // The control block's attn/ff/ff_context keys match a base double block 1:1 (diffusers naming,
+        // `attn.to_out.0` read natively by `DoubleBlock`); load dense, quantized in place after load.
+        let base = DoubleBlock::new(cfg, vb.clone())?;
+        let after_proj = QLinear::linear(inner, inner, vb.pp("after_proj"))?;
+        let before_proj = if has_before_proj {
+            Some(QLinear::linear(inner, inner, vb.pp("before_proj"))?)
+        } else {
+            None
+        };
+        Ok(Self {
+            base,
+            before_proj,
+            after_proj,
+        })
+    }
+
+    /// Quantize the block's base double block + the `after_proj`/`before_proj` projections **onto**
+    /// `device` (all `% 32 == 0`). The only control Linear left dense is `control_img_in` (260
+    /// in-features), handled in [`Flux2ControlBranch::quantize`].
+    fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.base.quantize_onto(quant, device)?;
+        self.after_proj.quantize_onto(quant, device)?;
+        if let Some(bp) = &mut self.before_proj {
+            bp.quantize_onto(quant, device)?;
+        }
+        Ok(())
+    }
+}
+
+/// The FLUX.2-dev Fun-Controlnet-Union control branch (sc-7460): the `control_img_in` patch embedder
+/// plus the N control blocks injecting hints into the base double blocks at `control_layers`. Built
+/// from the Fun-Controlnet-Union checkpoint and driven by [`Flux2Transformer::forward_with_control`].
+pub struct Flux2ControlBranch {
+    /// `control_img_in`: 260 → inner. Kept **dense** (260 in-features is not a multiple of the
+    /// Q4_0/Q8_0 block size 32), matching the fork's `nn.quantize` predicate. Bias-carrying.
+    control_img_in: QLinear,
+    blocks: Vec<Flux2ControlBlock>,
+    /// Base double-block indices each control block injects into (`control_layers`); `places[n]` is
+    /// the base index for hint `n` (`[0, 2, 4, 6]` for dev's 8 double blocks).
+    places: Vec<usize>,
+}
+
+impl Flux2ControlBranch {
+    /// Build from the Fun-Controlnet-Union checkpoint VarBuilder. Keys are un-prefixed for a real
+    /// checkpoint (`control_img_in.*`, `control_transformer_blocks.{i}.*`). `control_layers =
+    /// range(0, num_double_layers, 2)`.
+    pub fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
+        let inner = cfg.inner_dim();
+        let places = cfg.control_layer_places();
+        let control_img_in = QLinear::linear(CONTROL_IN_DIM, inner, vb.pp("control_img_in"))?;
+        let mut blocks = Vec::with_capacity(places.len());
+        for i in 0..places.len() {
+            blocks.push(Flux2ControlBlock::new(
+                cfg,
+                vb.pp("control_transformer_blocks").pp(i),
+                i == 0,
+            )?);
+        }
+        Ok(Self {
+            control_img_in,
+            blocks,
+            places,
+        })
+    }
+
+    /// Quantize the control blocks (+ their `after_proj`/`before_proj`) **onto** `device`;
+    /// `control_img_in` stays dense and is moved to `device`.
+    pub fn quantize(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.control_img_in.to_device(device)?;
+        for b in &mut self.blocks {
+            b.quantize_onto(quant, device)?;
+        }
+        Ok(())
+    }
+
+    /// The hint index injected at base double-block `idx`, or `None`.
+    fn hint_index(&self, idx: usize) -> Option<usize> {
+        self.places.iter().position(|&p| p == idx)
+    }
+
+    /// Run the control stack → per-block hints (the fork's `forward_control`). `img_embed`/`txt_embed`
+    /// are the post-embedder base streams; `control_context` is the packed 260-ch control context;
+    /// `img_mod`/`txt_mod`/`cos`/`sin` are the shared base double-stream modulation + RoPE (the control
+    /// blocks reuse the base modulation, per the fork). The threaded `txt` is local to the control
+    /// stack — only the image-stream hints leave.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_control(
+        &self,
+        img_embed: &Tensor,
+        txt_embed: &Tensor,
+        control_context: &Tensor,
+        img_mod: &[(Tensor, Tensor, Tensor)],
+        txt_mod: &[(Tensor, Tensor, Tensor)],
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Vec<Tensor>> {
+        let mut c = self
+            .control_img_in
+            .forward(&control_context.to_dtype(DType::F32)?)?;
+        let mut txt = txt_embed.clone();
+        let mut hints = Vec::with_capacity(self.blocks.len());
+        for (i, block) in self.blocks.iter().enumerate() {
+            if i == 0 {
+                let bp = block.before_proj.as_ref().ok_or_else(|| {
+                    candle_gen::candle_core::Error::Msg(
+                        "flux2 control block 0 is missing before_proj".into(),
+                    )
+                })?;
+                c = (&bp.forward(&c)? + img_embed)?;
+            }
+            // The base double block returns `(txt, img)`; the control image stream is `img` (`new_c`).
+            let (new_txt, new_c) = block.base.forward(&c, &txt, img_mod, txt_mod, cos, sin)?;
+            hints.push(block.after_proj.forward(&new_c)?);
+            c = new_c;
+            txt = new_txt;
+        }
+        Ok(hints)
+    }
+}
+
+/// The FLUX.2-dev base MMDiT + its Fun-Controlnet-Union control branch (sc-7460). Composes the
+/// parity-proven [`Flux2Transformer`] with a [`Flux2ControlBranch`]; [`forward`](Self::forward)
+/// threads the control context + scale, and [`quantize`](Self::quantize) packs both onto the device.
+pub struct Flux2ControlTransformer {
+    base: Flux2Transformer,
+    branch: Flux2ControlBranch,
+}
+
+impl Flux2ControlTransformer {
+    pub fn new(base: Flux2Transformer, branch: Flux2ControlBranch) -> Self {
+        Self { base, branch }
+    }
+
+    /// Quantize the base DiT + the control branch **onto** `device` (the dev CPU-stage path). The base
+    /// is staged dense in CPU RAM and quantized onto the GPU; the control overlay is small and may be
+    /// loaded dense on the GPU and quantized in place — either way `device` is the compute device.
+    pub fn quantize(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.base.quantize(quant, device)?;
+        self.branch.quantize(quant, device)?;
+        Ok(())
+    }
+
+    /// Control forward: latent `[B, seq, in]` + text embeds + ids + timestep (σ·1000) + embedded
+    /// `guidance` + packed `control_context` (260ch, same image seq as the latent) + `scale`. Returns
+    /// the velocity `[B, seq_img, out]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        hidden_states: &Tensor,
+        encoder_hidden_states: &Tensor,
+        img_ids: &[[i64; 4]],
+        txt_ids: &[[i64; 4]],
+        timestep: f32,
+        guidance: Option<f32>,
+        control_context: &Tensor,
+        control_context_scale: f32,
+    ) -> Result<Tensor> {
+        self.base.forward_with_control(
+            hidden_states,
+            encoder_hidden_states,
+            img_ids,
+            txt_ids,
+            timestep,
+            guidance,
+            (&self.branch, control_context, control_context_scale),
+        )
     }
 }
 

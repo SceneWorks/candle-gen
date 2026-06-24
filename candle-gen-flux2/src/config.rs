@@ -7,6 +7,12 @@
 pub const FLUX2_KLEIN_9B_ID: &str = "flux2_klein_9b";
 /// Registry id for FLUX.2-dev txt2img (the undistilled 32B flagship: embedded guidance + more steps).
 pub const FLUX2_DEV_ID: &str = "flux2_dev";
+/// Engine id for FLUX.2-dev strict-pose control (`FLUX.2-dev-Fun-Controlnet-Union`, sc-7460). Bespoke
+/// provider invoked by name (the candle twin of mlx `flux2_dev_control`), not gen-core-registered.
+pub const FLUX2_DEV_CONTROL_ID: &str = "flux2_dev_control";
+/// Engine id for FLUX.2-dev multi-reference edit (sc-7460). Bespoke provider invoked by name (the
+/// candle twin of mlx `flux2_dev_edit`).
+pub const FLUX2_DEV_EDIT_ID: &str = "flux2_dev_edit";
 
 pub const DEFAULT_WIDTH: u32 = 1024;
 pub const DEFAULT_HEIGHT: u32 = 1024;
@@ -227,6 +233,14 @@ impl Flux2Config {
     /// Single-block SwiGLU hidden width (`mlp_ratio * inner_dim`, 9b: 12288, dev: 18432).
     pub fn single_mlp_hidden(&self) -> usize {
         (self.mlp_ratio * self.inner_dim() as f32) as usize
+    }
+
+    /// The base double-block indices the Fun-Controlnet-Union control branch injects a hint into
+    /// (`control_layers = range(0, num_double_layers, 2)`, sc-7460/sc-2292): dev's 8 double blocks →
+    /// `[0, 2, 4, 6]`, i.e. one control block per two base double blocks. The control branch has
+    /// exactly `control_layer_places().len()` blocks.
+    pub fn control_layer_places(&self) -> Vec<usize> {
+        (0..self.num_double_layers).step_by(2).collect()
     }
 }
 
