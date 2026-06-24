@@ -133,8 +133,10 @@ fn main() -> Result<()> {
 
     if lo == hi {
         return Err(format!(
-            "DEGENERATE render: constant image (all pixels = {lo}). On Blackwell this is the unfixed \
-             sm_80-only quant kernel no-op — the multi-arch fatbin is missing/broken."
+            "DEGENERATE render: constant image (all pixels = {lo}). On Blackwell a quantized black \
+             render means either the sc-7544 multi-arch fatbin is missing/broken, OR the sc-7702 \
+             dequant path in `candle-gen-lens::quant` regressed to candle's int8 `QMatMul` (its q8_1 \
+             activation quant diverges to NaN on the gpt-oss outlier activations)."
         )
         .into());
     }
