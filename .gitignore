@@ -34,3 +34,6 @@ dist-*/
 # Smoke-example output artifacts (examples/sensenova-*.rs write to CWD)
 /sensenova-interleave-*.png
 /sensenova-out.png
+
+# Local Claude Code worktrees/state (never committed)
+.claude/

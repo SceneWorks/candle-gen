@@ -45,4 +45,4 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 # (cancel / progress / seed-determinism / capability honesty). Pinned to the SAME gen-core rev the
 # workspace pins so it shares one contract build. Used by tests/conformance.rs (cuda-gated,
 # #[ignore]d — it runs a real generate, so it needs weights + GPU).
-sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "014f7c4c9f1386a0a31908004757251daf5df853" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "cf6f338c68fe6b6cf4b76f22c61a230010d35c51" }
