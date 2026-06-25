@@ -156,11 +156,13 @@ impl Captioner for JoyCaptioner {
                 role: Role::System,
                 content: vec![Content::Text(SYSTEM_PROMPT.to_owned())],
                 thinking: None,
+                tool_calls: Vec::new(),
             },
             Message {
                 role: Role::User,
                 content: vec![Content::Image(image), Content::Text(req.prompt.clone())],
                 thinking: None,
+                tool_calls: Vec::new(),
             },
         ];
 
