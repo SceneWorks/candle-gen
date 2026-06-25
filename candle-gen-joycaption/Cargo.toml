@@ -18,7 +18,11 @@ inventory = { workspace = true }
 # is a single candle build and one `Tensor` type; `core-llm` is `branch = "main"` everywhere, so cargo
 # locks one rev. The in-core SigLIP tower + projector + splice + Llama decoder that used to live here
 # moved into candle-llm's `candle-llava` provider (story 7634).
-candle-llm = { git = "https://github.com/SceneWorks/candle-llm", rev = "8ab61c8dd2b5617cfc6dba1cda978c73bf9d34bf" }
+# Bumped `8ab61c8` -> `54ef5a1` (sc-8002): the SceneWorks worker's mlx-llm bump pulls `core-llm` to the
+# Qwen3.6 tool-calling API (`core_llm::Message.tool_calls` et al.); `54ef5a1` is the candle-llm rev that
+# carries the matching wiring (candle-llm #35) so cargo still unifies ONE candle-llm in the worker graph.
+# The shim's own `Message {…}` literals get `tool_calls: Vec::new()` for the new field (see src/lib.rs).
+candle-llm = { git = "https://github.com/SceneWorks/candle-llm", rev = "54ef5a1ed43b8918f01858fe431bfec0eb2a3f25" }
 
 [features]
 default = []
