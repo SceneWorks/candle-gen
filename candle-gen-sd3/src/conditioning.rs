@@ -65,6 +65,17 @@ pub fn aggregate(cfg: &Sd3Config, enc: &EncoderOutputs) -> Result<Sd3Conditionin
 
     // ---- CLIP context [B, 77, 2048] -> zero-pad hidden axis to [B, 77, 4096] ----
     let clip_context = Tensor::cat(&[&enc.clip_l_hidden, &enc.clip_g_hidden], D::Minus1)?;
+    // The concatenated CLIP width must be the configured `clip_concat_dim` (768 + 1280 = 2048); a
+    // mismatch means a mis-shaped encoder output, caught here before the pad rather than producing a
+    // silently wrong context.
+    let clip_w = clip_context.dim(D::Minus1)?;
+    if clip_w != cfg.clip_concat_dim {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "sd3 aggregator: concatenated CLIP context width {clip_w} != configured \
+             clip_concat_dim {} (clip_l_dim {} + clip_g_dim {})",
+            cfg.clip_concat_dim, cfg.clip_l_dim, cfg.clip_g_dim
+        )));
+    }
     let clip_padded = pad_hidden_to(&clip_context, cfg.joint_attention_dim)?;
 
     // ---- context = cat([clip_padded, t5], seq) -> [B, 333, 4096] ----
@@ -185,6 +196,15 @@ mod tests {
         let out = aggregate(&cfg, &enc).unwrap();
         assert_eq!(out.context.dims(), &[2, 77 + 512, 4096]);
         assert_eq!(out.pooled.dims(), &[2, 2048]);
+    }
+
+    #[test]
+    fn aggregate_rejects_misshaped_clip_width() {
+        // A config whose clip_concat_dim disagrees with clip_l_dim + clip_g_dim trips the guard.
+        let mut cfg = Sd3Config::large();
+        cfg.clip_concat_dim = 999; // != 768 + 1280
+        let enc = fixture(&cfg, 1);
+        assert!(aggregate(&cfg, &enc).is_err());
     }
 
     #[test]

@@ -280,8 +280,7 @@ mod tests {
         let mut progress = |_p: Progress| {};
         let err = g
             .generate(&req, &mut progress)
-            .err()
-            .expect("C1 generate is un-wired");
+            .expect_err("C1 generate is un-wired");
         assert!(
             matches!(err, gen_core::Error::Unsupported(_)),
             "got: {err:?}"
@@ -291,24 +290,29 @@ mod tests {
     #[test]
     fn load_rejects_unwired_surfaces() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec, Quant};
+        // `Box<dyn Generator>` is not `Debug`, so `unwrap_err()` won't compile here; bind the error
+        // with a `let Err(..) else { panic! }` instead.
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load(&quant).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        let Err(e) = load(&quant) else {
+            panic!("quant load must be refused")
+        };
+        assert!(matches!(e, gen_core::Error::Unsupported(_)), "got: {e:?}");
+
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
-        assert!(matches!(
-            load(&lora).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        let Err(e) = load(&lora) else {
+            panic!("lora load must be refused")
+        };
+        assert!(matches!(e, gen_core::Error::Unsupported(_)), "got: {e:?}");
     }
 
     #[test]
     fn load_rejects_single_file_source() {
         let spec = LoadSpec::new(WeightsSource::File("/tmp/sd3.safetensors".into()));
-        let err = load(&spec).err().expect("expected an error").to_string();
-        assert!(err.contains("snapshot directory"), "got: {err}");
+        let Err(e) = load(&spec) else {
+            panic!("single-file source must be refused")
+        };
+        assert!(e.to_string().contains("snapshot directory"), "got: {e}");
     }
 }

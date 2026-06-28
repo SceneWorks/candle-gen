@@ -24,7 +24,7 @@
 //! 16-channel latent. C1 builds the FULL Large forward at real shapes; C2 drives it from a pipeline.
 
 use candle_gen::candle_core::{DType, Module, Result, Tensor, D};
-use candle_gen::candle_nn::{self, LayerNorm, Linear, RmsNorm, VarBuilder};
+use candle_gen::candle_nn::{self, Linear, RmsNorm, VarBuilder};
 
 use crate::config::Sd3Config;
 
@@ -455,45 +455,30 @@ impl JointBlock {
     }
 }
 
-/// AdaLayerNormContinuous output head: `silu(temb) -> linear -> (shift, scale)`, then
-/// `(1+scale)·LN(x) + shift`. diffusers `AdaLayerNormContinuous` splits the linear output as
-/// `chunk(2) -> [scale, shift]`? No — diffusers emits `[shift, scale]` for `norm_out`? It is
-/// `emb = linear(silu(temb)); shift, scale = emb.chunk(2)`. We follow diffusers `norm_out`:
-/// `scale, shift` order is `chunk(2)` with shift first. We pin the order in [`tests`].
+/// AdaLayerNormContinuous output head (the diffusers `norm_out`): `emb = linear(silu(temb))`, then
+/// `shift, scale = emb.chunk(2)` — **shift is the first half, scale the second** — and the result is
+/// `(1 + scale)·LN(x) + shift`. The chunk order (shift narrowed first, scale second) is pinned by
+/// [`tests`].
 struct AdaLayerNormContinuous {
     linear: Linear,
-    norm: LayerNorm,
-    has_affine: bool,
 }
 
 impl AdaLayerNormContinuous {
     fn new(inner: usize, vb: VarBuilder) -> Result<Self> {
+        // diffusers `norm_out.norm` is an affine-free LayerNorm, so there are no norm weights to
+        // load — `forward` runs the parameterless `layer_norm` then applies the AdaLN scale/shift.
         let linear = candle_nn::linear(inner, 2 * inner, vb.pp("linear"))?;
-        // diffusers `norm_out.norm` is affine-free LayerNorm; we keep a parameterless LayerNorm
-        // (weight=1, bias=0) so `forward` is the plain normalization, then apply scale/shift.
-        let weight = Tensor::ones(inner, DType::F32, vb.device())?;
-        let bias = Tensor::zeros(inner, DType::F32, vb.device())?;
-        let norm = LayerNorm::new(weight, bias, LN_EPS);
-        Ok(Self {
-            linear,
-            norm,
-            has_affine: false,
-        })
+        Ok(Self { linear })
     }
 
     fn forward(&self, x: &Tensor, temb: &Tensor) -> Result<Tensor> {
         let emb = self.linear.forward(&temb.silu()?)?.unsqueeze(1)?; // [B,1,2*inner]
         let inner = emb.dim(D::Minus1)? / 2;
-        // diffusers AdaLayerNormContinuous: `shift, scale = emb.chunk(2, dim=1)`; x = norm(x) * (1 +
-        // scale) + shift.
+        // diffusers `AdaLayerNormContinuous`: `shift, scale = emb.chunk(2)` — shift is the first
+        // half, scale the second; result is `(1 + scale)·LN(x) + shift`.
         let shift = emb.narrow(D::Minus1, 0, inner)?;
         let scale = emb.narrow(D::Minus1, inner, inner)?;
-        let normed = if self.has_affine {
-            self.norm.forward(&x.to_dtype(DType::F32)?)?
-        } else {
-            layer_norm(x)?
-        };
-        modulate(&normed, &scale, &shift)
+        modulate(&layer_norm(x)?, &scale, &shift)
     }
 }
 
@@ -637,6 +622,36 @@ mod tests {
         assert_eq!(chunks.len(), 6);
         for c in &chunks {
             assert_eq!(c.dims(), &[1, 1, inner]);
+        }
+    }
+
+    /// `AdaLayerNormContinuous` splits the linear output as `shift, scale = chunk(2)` (shift FIRST),
+    /// then applies `(1+scale)·LN(x) + shift`. Drive it with a hand-built linear so the chunk order
+    /// is observable: a constant LN(x)=0 input isolates the shift, and a constant LN(x)=1 isolates
+    /// `(1+scale)+shift`.
+    #[test]
+    fn adaln_continuous_chunk_order_is_shift_then_scale() {
+        let dev = Device::Cpu;
+        let inner = 4usize;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut ada = AdaLayerNormContinuous::new(inner, vb.pp("norm_out")).unwrap();
+        // Replace the linear with a known one: weight maps silu(temb) -> [shift(4)=7, scale(4)=2].
+        // Use a zero weight + a bias of [7,7,7,7, 2,2,2,2] so the output is constant regardless of
+        // temb: emb = bias = [shift..., scale...].
+        let w = Tensor::zeros((2 * inner, inner), DType::F32, &dev).unwrap();
+        let b = Tensor::from_vec(vec![7f32, 7., 7., 7., 2., 2., 2., 2.], 2 * inner, &dev).unwrap();
+        ada.linear = Linear::new(w, Some(b));
+        let temb = Tensor::randn(0f32, 1f32, (1, inner), &dev).unwrap();
+        // x already zero-mean-unit-ish: feed an x whose LN is ~constant. A single token row of all-1s
+        // normalizes to 0 (zero variance) → LN(x)=0, so out = shift = 7 everywhere (NOT scale=2).
+        let x = Tensor::ones((1, 1, inner), DType::F32, &dev).unwrap();
+        let out = ada.forward(&x, &temb).unwrap();
+        for v in out.flatten_all().unwrap().to_vec1::<f32>().unwrap() {
+            assert!(
+                (v - 7.0).abs() < 1e-4,
+                "shift must be the FIRST chunk (got {v}, expected 7)"
+            );
         }
     }
 
