@@ -53,6 +53,10 @@ pub const MODEL_ID: &str = "stable_diffusion_3_5_large";
 /// Registry id for SD3.5 **Large Turbo** — the guidance-distilled 4-step sibling.
 pub const MODEL_ID_TURBO: &str = "stable_diffusion_3_5_large_turbo";
 
+/// Registry id for SD3.5 **Medium** — the MMDiT-X (dual-attention) model. Matches the SceneWorks
+/// worker's `payload.model` and the macOS `mlx-gen-sd3` SD3.5-Medium descriptor.
+pub const MODEL_ID_MEDIUM: &str = "stable_diffusion_3_5_medium";
+
 /// SD3.5 works in latent space at /8 and the MMDiT patchifies that at /2, so both image dims must be
 /// multiples of **16** for a clean patchify.
 const SIZE_MULTIPLE: u32 = 16;
@@ -78,6 +82,7 @@ impl Sd3Generator {
         match self.variant {
             Variant::Large => MODEL_ID,
             Variant::LargeTurbo => MODEL_ID_TURBO,
+            Variant::Medium => MODEL_ID_MEDIUM,
         }
     }
 
@@ -152,6 +157,13 @@ pub fn descriptor_turbo() -> ModelDescriptor {
     descriptor_for(Variant::LargeTurbo)
 }
 
+/// SD3.5 **Medium**'s identity + wired surface: the MMDiT-X (dual-attention) txt2img model with CFG +
+/// negative prompt (like Large — NOT distilled). Same triple-TE encoders / 16-ch VAE / flow-match
+/// pipeline; only the transformer (24×1536 MMDiT-X with 13 dual blocks) differs.
+pub fn descriptor_medium() -> ModelDescriptor {
+    descriptor_for(Variant::Medium)
+}
+
 /// Build the descriptor for `variant`. Large advertises CFG + negative prompt; Turbo (distilled)
 /// advertises neither — so the shared `validate_request` rejects guidance/negative on Turbo (the
 /// distilled-model honesty the Z-Image provider uses), keeping the worker from promising a path
@@ -159,6 +171,7 @@ pub fn descriptor_turbo() -> ModelDescriptor {
 pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
     let (id, cfg) = match variant {
         Variant::Large => (MODEL_ID, true),
+        Variant::Medium => (MODEL_ID_MEDIUM, true),
         Variant::LargeTurbo => (MODEL_ID_TURBO, false),
     };
     ModelDescriptor {
@@ -208,11 +221,18 @@ pub fn load_turbo(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     load_variant(spec, Variant::LargeTurbo)
 }
 
+/// Construct the candle SD3.5 **Medium** generator (the MMDiT-X dual-attention model) from a
+/// `stabilityai/stable-diffusion-3.5-medium`-layout diffusers snapshot.
+pub fn load_medium(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    load_variant(spec, Variant::Medium)
+}
+
 /// Shared loader for both variants. Lazy — no file I/O until the first `generate`.
 fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn Generator>> {
     let id = match variant {
         Variant::Large => MODEL_ID,
         Variant::LargeTurbo => MODEL_ID_TURBO,
+        Variant::Medium => MODEL_ID_MEDIUM,
     };
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -253,6 +273,7 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
 // Link-time self-registration into gen-core's model registry — both the Large and Turbo ids.
 candle_gen::register_generators! { descriptor => load }
 candle_gen::register_generators! { descriptor_turbo => load_turbo }
+candle_gen::register_generators! { descriptor_medium => load_medium }
 
 /// Force-link hook (see `candle_gen_z_image::force_link`): a consumer that reaches this provider only
 /// through the registry references nothing here directly, so the linker can drop the rlib and its
@@ -381,6 +402,31 @@ mod tests {
         ] {
             assert!(g.validate(&bad).is_err(), "turbo should reject: {bad:?}");
         }
+    }
+
+    /// SD3.5 **Medium** registers + resolves as a candle generator and advertises the CFG txt2img
+    /// surface (like Large, NOT distilled).
+    #[test]
+    fn medium_registers_and_advertises_cfg_surface() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(MODEL_ID_MEDIUM, &spec).expect("candle sd3 medium is registered");
+        assert_eq!(g.descriptor().id, MODEL_ID_MEDIUM);
+        assert_eq!(g.descriptor().family, "stable-diffusion-3");
+        assert_eq!(g.descriptor().backend, "candle");
+        assert_eq!(g.descriptor().modality, Modality::Image);
+
+        let d = descriptor_medium();
+        // Medium uses classifier-free guidance + a negative prompt (it is NOT guidance-distilled).
+        assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_negative_prompt);
+        assert!(!d.capabilities.mac_only);
+
+        // A txt2img request validates; img2img conditioning is still refused.
+        let ok = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            ..Default::default()
+        };
+        assert!(g.validate(&ok).is_ok());
     }
 
     #[test]

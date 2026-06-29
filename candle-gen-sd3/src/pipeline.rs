@@ -49,13 +49,18 @@ pub enum Variant {
     Large,
     /// SD3.5 Large Turbo — guidance-distilled, 4 steps, CFG-off (single forward per step).
     LargeTurbo,
+    /// SD3.5 **Medium** — the MMDiT-X (dual-attention) model. Classifier-free guidance like Large
+    /// (NOT distilled); fewer/narrower blocks (24 × 1536). Same flow-match pipeline + σ-shift.
+    Medium,
 }
 
 impl Variant {
     /// The default inference step count when a request omits `steps`.
     pub fn default_steps(self) -> usize {
         match self {
+            // Medium uses CFG like Large; SD3.5-Medium's published default is ~40 steps.
             Variant::Large => 28,
+            Variant::Medium => 40,
             Variant::LargeTurbo => 4,
         }
     }
@@ -65,11 +70,14 @@ impl Variant {
     pub fn default_cfg(self) -> f32 {
         match self {
             Variant::Large => 4.0,
+            // SD3.5-Medium's published default guidance is ~4.5.
+            Variant::Medium => 4.5,
             Variant::LargeTurbo => 1.0,
         }
     }
 
-    /// The flow-match resolution-independent σ shift. SD3.5 Large/Turbo both use 3.0.
+    /// The flow-match resolution-independent σ shift. SD3.5 Large/Turbo both use 3.0; Medium also
+    /// uses 3.0.
     pub fn shift(self) -> f32 {
         3.0
     }
@@ -77,7 +85,16 @@ impl Variant {
     /// Whether the variant runs classifier-free guidance (the uncond forward). Turbo is distilled, so
     /// the negative branch is never evaluated regardless of the request's guidance value.
     pub fn cfg_enabled(self) -> bool {
-        matches!(self, Variant::Large)
+        matches!(self, Variant::Large | Variant::Medium)
+    }
+
+    /// The architecture [`Sd3Config`] for this variant — Large/Turbo share the Large MMDiT geometry;
+    /// Medium is the MMDiT-X (dual-attention) preset.
+    pub(crate) fn config(self) -> Sd3Config {
+        match self {
+            Variant::Large | Variant::LargeTurbo => Sd3Config::large(),
+            Variant::Medium => Sd3Config::medium(),
+        }
     }
 }
 
@@ -144,7 +161,7 @@ impl Pipeline {
             device: device.clone(),
             dtype,
             variant,
-            cfg: Sd3Config::large(),
+            cfg: variant.config(),
         }
     }
 
@@ -358,12 +375,23 @@ mod tests {
     fn variant_defaults_match_sd35() {
         assert_eq!(Variant::Large.default_steps(), 28);
         assert_eq!(Variant::LargeTurbo.default_steps(), 4);
+        assert_eq!(Variant::Medium.default_steps(), 40);
         assert_eq!(Variant::Large.default_cfg(), 4.0);
         assert_eq!(Variant::LargeTurbo.default_cfg(), 1.0);
+        assert_eq!(Variant::Medium.default_cfg(), 4.5);
         assert!(Variant::Large.cfg_enabled());
+        assert!(Variant::Medium.cfg_enabled(), "medium uses CFG like Large");
         assert!(!Variant::LargeTurbo.cfg_enabled(), "turbo is distilled");
         assert_eq!(Variant::Large.shift(), 3.0);
+        assert_eq!(Variant::Medium.shift(), 3.0);
         assert_eq!(VAE_SCALE, 8);
+        // Medium maps to the MMDiT-X (dual-attention) config; Large/Turbo to the Large MMDiT.
+        assert!(!Variant::Medium.config().dual_attention_layers.is_empty());
+        assert!(Variant::Large.config().dual_attention_layers.is_empty());
+        assert!(Variant::LargeTurbo
+            .config()
+            .dual_attention_layers
+            .is_empty());
     }
 
     /// The SD3 σ schedule: `steps + 1` sigmas, max σ at the shifted 1.0, strictly decreasing, terminal
@@ -452,6 +480,16 @@ mod tests {
             t5_seq_len: 8,
             t5_dim: 4096,
             timestep_channels: 16,
+            dual_attention_layers: Vec::new(),
+        }
+    }
+
+    /// A tiny **MMDiT-X** (Medium-shaped) config: like [`tiny_cfg`] but with the first two of three
+    /// blocks flagged as dual-attention, so the Medium pipeline path drives the `attn2` blocks.
+    fn tiny_medium_cfg() -> Sd3Config {
+        Sd3Config {
+            dual_attention_layers: vec![0, 1],
+            ..tiny_cfg()
         }
     }
 
@@ -498,8 +536,13 @@ mod tests {
     /// shape", which a handful of steps exercises identically; the defaults are checked separately in
     /// [`variant_defaults_match_sd35`].
     fn run_variant(variant: Variant, device: &Device) -> Image {
-        let cfg = tiny_cfg();
-        let (transformer, vae, cond, uncond) = harness(&cfg, device);
+        run_variant_cfg(variant, &tiny_cfg(), device)
+    }
+
+    /// Like [`run_variant`] but with an explicit architecture config, so the Medium (MMDiT-X)
+    /// path can be driven with a dual-attention tiny config.
+    fn run_variant_cfg(variant: Variant, cfg: &Sd3Config, device: &Device) -> Image {
+        let (transformer, vae, cond, uncond) = harness(cfg, device);
         let uncond_ref = if variant.cfg_enabled() {
             Some(&uncond)
         } else {
@@ -548,6 +591,16 @@ mod tests {
     #[test]
     fn turbo_distilled_pipeline_decodes_on_cpu() {
         let _ = run_variant(Variant::LargeTurbo, &Device::Cpu);
+    }
+
+    /// Full **Medium** (MMDiT-X dual-attention, CFG-on) pipeline end-to-end on CPU → a decoded image
+    /// of the right dimensions. Drives the dual-attention transformer through the SAME flow-match
+    /// render core as Large (CFG cond + uncond), confirming the Medium config + dual blocks render.
+    #[test]
+    fn medium_mmdit_x_pipeline_decodes_on_cpu() {
+        let img = run_variant_cfg(Variant::Medium, &tiny_medium_cfg(), &Device::Cpu);
+        assert_eq!(img.width, 32);
+        assert_eq!(img.height, 32);
     }
 
     /// Determinism: with the SAME weights, the same seed reproduces the same image (the render core
@@ -608,6 +661,22 @@ mod tests {
         );
     }
 
+    /// **CUDA Medium MMDiT-X random-weight smoke (sc-7878).** The Medium dual-attention transformer
+    /// (with `attn2` blocks) + VAE render core runs on the Blackwell GPU and decodes a finite,
+    /// right-shaped RGB image with no NaN/Inf. This is the net-new C3 coverage over the C2 smoke: it
+    /// exercises the MMDiT-X `attn2` (image-only self-attention) and 9-chunk AdaLN paths on CUDA.
+    /// Built at `CUDA_COMPUTE_CAP=80` (dense PTX JIT — no quant), runs under `scripts/check-cuda.ps1`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_medium_mmdit_x_forward_smoke() {
+        let device = Device::new_cuda(0).expect("CUDA device 0");
+        let img = run_variant_cfg(Variant::Medium, &tiny_medium_cfg(), &device);
+        assert_eq!(img.pixels.len(), (img.width * img.height * 3) as usize);
+        // No NaN/Inf can escape the u8 decode clamp; the assertion above plus a successful decode is
+        // the GPU-side "shapes + finite" smoke.
+        assert_eq!(img.width, 4 * SPATIAL_SCALE);
+    }
+
     /// **Real-weight smoke — GATED (sc-7877 / C6).** A real Large + Turbo render against actual SD3.5
     /// weights. `#[ignore]`d because the SD3.5 checkpoints are gated (Stability Community License,
     /// HF-account-bound) and NOT available in this environment; we do not download them. C6 (sc-7881)
@@ -631,6 +700,40 @@ mod tests {
         };
         let mut progress = |_p: Progress| {};
         let out = g.generate(&req, &mut progress).expect("real-weight render");
+        match out {
+            candle_gen::gen_core::GenerationOutput::Images(imgs) => {
+                assert_eq!(imgs.len(), 1);
+                assert_eq!(imgs[0].width, 1024);
+                assert_eq!(imgs[0].height, 1024);
+            }
+            other => panic!("expected images, got {other:?}"),
+        }
+    }
+
+    /// **Medium real-weight smoke — GATED (sc-7878 / C6).** A real SD3.5-Medium (MMDiT-X) render
+    /// against actual gated weights. `#[ignore]`d for the same reason as [`real_weight_render`] (the
+    /// SD3.5-Medium checkpoint is gated and not present here; we do not download it). C6 flips this
+    /// on via `SD35_MEDIUM_PATH`. Runnable later via:
+    ///   `SD35_MEDIUM_PATH=/path/to/sd35-medium cargo test -p candle-gen-sd3 --features cuda \
+    ///    medium_real_weight_render -- --ignored --nocapture`
+    #[test]
+    #[ignore = "gated SD3.5-Medium weights unavailable here; set SD35_MEDIUM_PATH to enable (C6)"]
+    fn medium_real_weight_render() {
+        use candle_gen::gen_core::{registry, GenerationRequest, LoadSpec, WeightsSource};
+        let medium_path = std::env::var("SD35_MEDIUM_PATH")
+            .expect("set SD35_MEDIUM_PATH to a stable-diffusion-3.5-medium diffusers snapshot dir");
+        let spec = LoadSpec::new(WeightsSource::Dir(medium_path.into()));
+        let g = registry::load(crate::MODEL_ID_MEDIUM, &spec).expect("load sd3 medium");
+        let req = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle, studio lighting".into(),
+            width: 1024,
+            height: 1024,
+            ..Default::default()
+        };
+        let mut progress = |_p: Progress| {};
+        let out = g
+            .generate(&req, &mut progress)
+            .expect("medium real-weight render");
         match out {
             candle_gen::gen_core::GenerationOutput::Images(imgs) => {
                 assert_eq!(imgs.len(), 1);

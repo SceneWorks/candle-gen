@@ -346,6 +346,58 @@ impl JointAttention {
     }
 }
 
+/// The **MMDiT-X** second attention (`attn2`): an image-token-ONLY self-attention (diffusers
+/// `Attention(cross_attention_dim=None, added_kv_proj_dim=None)`) present on the dual-attention
+/// blocks. Same per-head q/k RMSNorm and `to_out.0` projection as the joint attention's image side,
+/// but it does NOT touch the text stream and runs over the image sequence alone (NO RoPE, like the
+/// rest of SD3.5). Only constructed for `dual_attention_layers` blocks.
+struct SelfAttention {
+    to_q: Linear,
+    to_k: Linear,
+    to_v: Linear,
+    to_out: Linear,
+    norm_q: Option<RmsNorm>,
+    norm_k: Option<RmsNorm>,
+    heads: usize,
+    head_dim: usize,
+}
+
+impl SelfAttention {
+    fn new(cfg: &Sd3Config, vb: VarBuilder) -> Result<Self> {
+        let inner = cfg.inner_dim;
+        let hd = cfg.head_dim;
+        let (norm_q, norm_k) = if cfg.qk_norm {
+            (
+                Some(candle_nn::rms_norm(hd, RMS_EPS, vb.pp("norm_q"))?),
+                Some(candle_nn::rms_norm(hd, RMS_EPS, vb.pp("norm_k"))?),
+            )
+        } else {
+            (None, None)
+        };
+        Ok(Self {
+            to_q: candle_nn::linear(inner, inner, vb.pp("to_q"))?,
+            to_k: candle_nn::linear(inner, inner, vb.pp("to_k"))?,
+            to_v: candle_nn::linear(inner, inner, vb.pp("to_v"))?,
+            to_out: candle_nn::linear(inner, inner, vb.pp("to_out").pp("0"))?,
+            norm_q,
+            norm_k,
+            heads: cfg.num_heads,
+            head_dim: hd,
+        })
+    }
+
+    /// `norm_img2`: the modulated, normed image stream (from the `shift_msa2/scale_msa2` chunks).
+    /// Returns the image-only attention output `[B, img_seq, inner]` (before the `gate_msa2` gate).
+    fn forward(&self, norm_img2: &Tensor) -> Result<Tensor> {
+        let (h, hd) = (self.heads, self.head_dim);
+        let q = to_heads(&self.to_q.forward(norm_img2)?, h, hd, self.norm_q.as_ref())?;
+        let k = to_heads(&self.to_k.forward(norm_img2)?, h, hd, self.norm_k.as_ref())?;
+        let v = to_heads(&self.to_v.forward(norm_img2)?, h, hd, None)?;
+        let o = attention(&q, &k, &v, hd)?; // [B, img_seq, inner]
+        self.to_out.forward(&o)
+    }
+}
+
 /// GELU feed-forward (diffusers `FeedForward` with `gelu` activation): `proj -> gelu -> out`.
 struct FeedForward {
     proj: Linear,
@@ -369,21 +421,30 @@ impl FeedForward {
 /// One SD3.5 joint (double-stream) block. The image stream is always a full AdaLN-Zero block; the
 /// text stream is full unless `context_pre_only` (the final block), where it only emits scale/shift
 /// for its norm and has no attention output projection / ff_context.
+///
+/// **MMDiT-X dual-attention blocks** (the diffusers `dual_attention_layers`, SD3.5 Medium blocks
+/// 0..=12) additionally carry [`attn2`](SelfAttention) — a second, image-only self-attention. Their
+/// `norm1` is a 9-chunk `SD35AdaLayerNormZeroX` (the usual 6 + `shift_msa2/scale_msa2/gate_msa2`),
+/// and the block adds `gate_msa2 · attn2(modulate(LN(img), shift2, scale2))` to the image stream
+/// *before* the joint-attn + mlp residuals (diffusers adds it right after computing the norms).
 struct JointBlock {
     norm1: AdaLayerNormZero,
     norm1_context: AdaLayerNormZero,
     attn: JointAttention,
+    /// The MMDiT-X second (image-only) attention; `Some` only on `dual_attention_layers` blocks.
+    attn2: Option<SelfAttention>,
     ff: FeedForward,
     ff_context: Option<FeedForward>,
     context_pre_only: bool,
 }
 
 impl JointBlock {
-    fn new(cfg: &Sd3Config, context_pre_only: bool, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Sd3Config, context_pre_only: bool, dual: bool, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.inner_dim;
         let ff_hidden = cfg.ff_hidden();
-        // Image norm: 6 chunks (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp).
-        let norm1 = AdaLayerNormZero::new(inner, 6, vb.pp("norm1"))?;
+        // Image norm: 6 chunks normally; 9 on a dual (MMDiT-X) block — the extra 3 are
+        // shift_msa2/scale_msa2/gate_msa2 for the `attn2` path (diffusers `SD35AdaLayerNormZeroX`).
+        let norm1 = AdaLayerNormZero::new(inner, if dual { 9 } else { 6 }, vb.pp("norm1"))?;
         // Context norm: 6 chunks normally; 2 (scale, shift) when context_pre_only.
         let norm1_context = AdaLayerNormZero::new(
             inner,
@@ -391,6 +452,12 @@ impl JointBlock {
             vb.pp("norm1_context"),
         )?;
         let attn = JointAttention::new(cfg, context_pre_only, vb.pp("attn"))?;
+        // The second image-only attention lives at `attn2.*` on dual blocks only.
+        let attn2 = if dual {
+            Some(SelfAttention::new(cfg, vb.pp("attn2"))?)
+        } else {
+            None
+        };
         let ff = FeedForward::new(inner, ff_hidden, vb.pp("ff"))?;
         let ff_context = if context_pre_only {
             None
@@ -401,6 +468,7 @@ impl JointBlock {
             norm1,
             norm1_context,
             attn,
+            attn2,
             ff,
             ff_context,
             context_pre_only,
@@ -408,13 +476,16 @@ impl JointBlock {
     }
 
     /// `(image, text, temb)` → updated `(image, text)`. For the final (`context_pre_only`) block the
-    /// returned `text` is unchanged (only `image` matters downstream).
+    /// returned `text` is unchanged (only `image` matters downstream). On a dual (MMDiT-X) block the
+    /// image-only `attn2` residual is added before the joint-attn residual.
     fn forward(&self, img: &Tensor, txt: &Tensor, temb: &Tensor) -> Result<(Tensor, Tensor)> {
-        // Image AdaLN-Zero: 6 chunks.
+        // Image AdaLN-Zero: 6 chunks (standard) or 9 (dual / MMDiT-X). The first 6 are always
+        // shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp.
         let im = self.norm1.forward(temb)?;
         let (shift_msa, scale_msa, gate_msa) = (&im[0], &im[1], &im[2]);
         let (shift_mlp, scale_mlp, gate_mlp) = (&im[3], &im[4], &im[5]);
-        let norm_img = modulate(&layer_norm(img)?, scale_msa, shift_msa)?;
+        let ln_img = layer_norm(img)?;
+        let norm_img = modulate(&ln_img, scale_msa, shift_msa)?;
 
         // Context norm.
         let cm = self.norm1_context.forward(temb)?;
@@ -427,8 +498,19 @@ impl JointBlock {
 
         let (img_attn, txt_attn) = self.attn.forward(&norm_img, &norm_txt)?;
 
+        // MMDiT-X dual attention: a second, image-only self-attention. diffusers modulates the SAME
+        // LayerNorm output with the (shift_msa2, scale_msa2) chunks, runs `attn2`, gates by
+        // `gate_msa2`, and adds it to the image stream *before* the joint-attn residual.
+        let mut img = img.clone();
+        if let Some(attn2) = &self.attn2 {
+            let (shift_msa2, scale_msa2, gate_msa2) = (&im[6], &im[7], &im[8]);
+            let norm_img2 = modulate(&ln_img, scale_msa2, shift_msa2)?;
+            let img_attn2 = attn2.forward(&norm_img2)?;
+            img = gated(&img, gate_msa2, &img_attn2)?;
+        }
+
         // Image stream residual + ff.
-        let mut img = gated(img, gate_msa, &img_attn)?;
+        let mut img = gated(&img, gate_msa, &img_attn)?;
         let norm_img2 = modulate(&layer_norm(&img)?, scale_mlp, shift_mlp)?;
         let img_ff = self.ff.forward(&norm_img2)?;
         img = gated(&img, gate_mlp, &img_ff)?;
@@ -500,9 +582,12 @@ impl Sd3Transformer {
         for i in 0..cfg.num_layers {
             // The LAST block is context_pre_only when the config flags it (SD3.5 default).
             let pre_only = cfg.context_pre_only_last && i == cfg.num_layers - 1;
+            // MMDiT-X: the early `dual_attention_layers` blocks carry the image-only `attn2`.
+            let dual = cfg.is_dual_block(i);
             blocks.push(JointBlock::new(
                 cfg,
                 pre_only,
+                dual,
                 vb.pp("transformer_blocks").pp(i),
             )?);
         }
@@ -592,6 +677,16 @@ mod tests {
             t5_seq_len: 8,
             t5_dim: 4096,
             timestep_channels: 16,
+            dual_attention_layers: Vec::new(),
+        }
+    }
+
+    /// A tiny MMDiT-X (Medium-shaped) config: like [`tiny_cfg`] but with the FIRST block flagged as a
+    /// dual-attention (`attn2`) block, so the dual path is exercised.
+    fn tiny_dual_cfg() -> Sd3Config {
+        Sd3Config {
+            dual_attention_layers: vec![0],
+            ..tiny_cfg()
         }
     }
 
@@ -736,7 +831,7 @@ mod tests {
         let cfg = tiny_cfg();
         let vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-        let block = JointBlock::new(&cfg, true, vb.pp("transformer_blocks").pp(0)).unwrap();
+        let block = JointBlock::new(&cfg, true, false, vb.pp("transformer_blocks").pp(0)).unwrap();
         assert!(block.context_pre_only);
         assert!(block.ff_context.is_none());
         assert!(block.attn.to_add_out.is_none());
@@ -759,5 +854,115 @@ mod tests {
             same < 1e-6,
             "context_pre_only block must leave text unchanged"
         );
+    }
+
+    // ---- MMDiT-X dual-attention (sc-7878) -------------------------------------------------------
+
+    /// A dual (MMDiT-X) block's `norm1` is a 9-chunk `SD35AdaLayerNormZeroX`: the usual 6
+    /// (shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp) PLUS shift_msa2, scale_msa2,
+    /// gate_msa2 for the `attn2` path. A standard block's `norm1` is 6 chunks.
+    #[test]
+    fn dual_block_norm1_emits_nine_chunks() {
+        let dev = Device::Cpu;
+        let cfg = tiny_dual_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+
+        let dual = JointBlock::new(&cfg, false, true, vb.pp("dual")).unwrap();
+        assert_eq!(dual.norm1.n_chunks, 9, "dual norm1 must emit 9 chunks");
+        assert!(dual.attn2.is_some(), "dual block must carry attn2");
+
+        let std = JointBlock::new(&cfg, false, false, vb.pp("std")).unwrap();
+        assert_eq!(std.norm1.n_chunks, 6, "standard norm1 must emit 6 chunks");
+        assert!(std.attn2.is_none(), "standard block must NOT carry attn2");
+
+        // The chunks really are produced in the documented order/width.
+        let temb = Tensor::randn(0f32, 1f32, (1, cfg.inner_dim), &dev).unwrap();
+        let chunks = dual.norm1.forward(&temb).unwrap();
+        assert_eq!(chunks.len(), 9);
+        for c in &chunks {
+            assert_eq!(c.dims(), &[1, 1, cfg.inner_dim]);
+        }
+    }
+
+    /// **The dual `attn2` path is NOT a no-op.** Build one dual block, run its forward (which adds the
+    /// `gate_msa2 · attn2(...)` residual), then DROP its `attn2` (set to `None`) and run the same
+    /// inputs again. The only behavioural difference between the two runs is the `attn2` residual, so
+    /// a differing output proves the dual path actually executes and contributes (a vacuous/zero
+    /// attn2 would leave the output unchanged). The norm1 9-chunk linear is identical across both
+    /// runs (the extra `shift/scale/gate_msa2` chunks are only consumed when `attn2` is present).
+    #[test]
+    fn dual_attention_path_changes_output() {
+        let dev = Device::Cpu;
+        let cfg = tiny_dual_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+
+        // Dual block (9-chunk norm1 + attn2).
+        let mut block =
+            JointBlock::new(&cfg, false, true, vb.pp("transformer_blocks").pp(0)).unwrap();
+        assert!(block.attn2.is_some());
+
+        let img = Tensor::randn(0f32, 1f32, (1, 4, cfg.inner_dim), &dev).unwrap();
+        let txt = Tensor::randn(0f32, 1f32, (1, 6, cfg.inner_dim), &dev).unwrap();
+        let temb = Tensor::randn(0f32, 1f32, (1, cfg.inner_dim), &dev).unwrap();
+
+        // With attn2 active.
+        let (img_dual, _) = block.forward(&img, &txt, &temb).unwrap();
+        // Drop attn2 and re-run with identical weights/inputs — the ONLY difference is the missing
+        // image-only attention residual.
+        block.attn2 = None;
+        let (img_no_attn2, _) = block.forward(&img, &txt, &temb).unwrap();
+
+        let diff = (img_dual - img_no_attn2)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff > 1e-5,
+            "dual attn2 path must change the image stream (diff={diff}); it is a no-op?"
+        );
+    }
+
+    /// A small MMDiT-X (Medium-shaped) transformer with dual blocks runs end-to-end and produces a
+    /// velocity with the latent's shape and non-vacuous magnitude.
+    #[test]
+    fn tiny_mmdit_x_forward_produces_latent_shape() {
+        let dev = Device::Cpu;
+        // 3 blocks, the first two dual (MMDiT-X), the last standard — exercises both code paths and
+        // the dual/standard boundary like Medium's 13-dual / 11-standard split.
+        let cfg = Sd3Config {
+            dual_attention_layers: vec![0, 1],
+            ..tiny_cfg()
+        };
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let model = Sd3Transformer::new(&cfg, vb).unwrap();
+        // The dual flag really propagated to the blocks.
+        assert!(model.blocks[0].attn2.is_some());
+        assert!(model.blocks[1].attn2.is_some());
+        assert!(model.blocks[2].attn2.is_none());
+
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 8, 8), &dev).unwrap();
+        let ctx_seq = cfg.context_seq_len();
+        let context =
+            Tensor::randn(0f32, 1f32, (1, ctx_seq, cfg.joint_attention_dim), &dev).unwrap();
+        let pooled = Tensor::randn(0f32, 1f32, (1, cfg.pooled_dim), &dev).unwrap();
+        let t = Tensor::full(0.5f32, 1, &dev).unwrap();
+
+        let v = model.forward(&latent, &context, &pooled, &t).unwrap();
+        assert_eq!(v.dims(), latent.dims());
+        let max = v
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(max > 0.0, "MMDiT-X velocity is vacuously zero?");
     }
 }
