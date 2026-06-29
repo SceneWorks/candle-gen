@@ -22,7 +22,8 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    self, AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, Progress,
+    WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -94,6 +95,27 @@ fn main() -> Result<()> {
             other => return Err(format!("--quant must be q4 or q8 (got {other})").into()),
         };
         println!("[smoke] DiT quant = {q}");
+    }
+    // Optional LoRA/LoKr adapter merge (sc-8498). `--lora <path>` for a kohya/diffusers LoRA,
+    // `--lokr <path>` for a LoKr, with `--lora-scale <f>` (default 1.0). Folded into the MMDiT dense
+    // weights at first component load, before the optional quantize.
+    let adapter_scale: f32 = arg(&args, "--lora-scale")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
+    if let Some(p) = arg(&args, "--lora") {
+        spec = spec.with_adapters(vec![AdapterSpec::new(
+            PathBuf::from(&p),
+            adapter_scale,
+            AdapterKind::Lora,
+        )]);
+        println!("[smoke] LoRA = {p} (scale {adapter_scale})");
+    } else if let Some(p) = arg(&args, "--lokr") {
+        spec = spec.with_adapters(vec![AdapterSpec::new(
+            PathBuf::from(&p),
+            adapter_scale,
+            AdapterKind::Lokr,
+        )]);
+        println!("[smoke] LoKr = {p} (scale {adapter_scale})");
     }
     let gen = gen_core::registry::load(model_id, &spec)?;
     println!(

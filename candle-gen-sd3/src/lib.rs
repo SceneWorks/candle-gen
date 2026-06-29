@@ -26,6 +26,7 @@
 //! modulation apply order (`x·(1+scale)+shift`, with the correct chunk split) is the documented bug
 //! magnet; see [`transformer`].
 
+pub mod adapters;
 pub mod clip_tokenizer;
 pub mod conditioning;
 pub mod config;
@@ -44,8 +45,8 @@ use std::sync::Mutex;
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, WeightsSource,
+    self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
+    Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 
 use pipeline::{Components, Pipeline};
@@ -78,6 +79,9 @@ pub struct Sd3Generator {
     /// Optional DiT quantization (`Q4`/`Q8`) applied at first component load (sc-7879). `None` ⇒
     /// dense bf16. The text encoders + VAE stay dense regardless.
     quant: Option<Quant>,
+    /// LoRA/LoKr adapters to fold into the MMDiT dense weights at first component load (sc-8498),
+    /// **before** the optional quantize so the two compose. Empty ⇒ the stock unadapted build.
+    adapters: Vec<AdapterSpec>,
     /// Cached components. `Mutex` because `Generator` is shared and `generate` takes `&self`; the lock
     /// is held only to read/populate the cache, never across the denoise.
     components: Mutex<Option<Components>>,
@@ -149,6 +153,7 @@ impl Generator for Sd3Generator {
             self.dtype,
             self.variant,
             self.quant,
+            self.adapters.clone(),
         );
         let components = self.components(&pipe)?;
         let images = pipe.render(req, &components, on_progress)?;
@@ -201,9 +206,11 @@ pub fn descriptor_for(variant: Variant) -> ModelDescriptor {
             // txt2img only for now (img2img / control land later); empty list ⇒ shared
             // `validate_request` rejects any conditioning.
             conditioning: vec![],
-            // LoRA/LoKr not wired yet (a later story); refuse rather than silently drop.
-            supports_lora: false,
-            supports_lokr: false,
+            // sc-8498: LoRA/LoKr fold into the MMDiT dense weights at load (merge-not-residual,
+            // before the optional Q4/Q8 quantize). The kohya `lora_sd3` fused-QKV surface + diffusers/
+            // PEFT/bare keys are mapped by `crate::adapters`.
+            supports_lora: true,
+            supports_lokr: true,
             samplers: candle_gen::curated_sampler_names(),
             schedulers: candle_gen::curated_scheduler_names(),
             supported_guidance_methods: vec![],
@@ -267,11 +274,10 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
             "candle {id} does not support control / IP-adapter overlays (txt2img only)"
         )));
     }
-    if !spec.adapters.is_empty() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle {id} does not support LoRA/LoKr adapters yet"
-        )));
-    }
+    // sc-8498: LoRA/LoKr adapters are now accepted — they fold into the MMDiT dense weights at first
+    // component load (`crate::adapters`), before the optional quantize. Loading is lazy, so the merge
+    // (and any resolution errors) surface on the first `generate`, not here.
+    let adapters = spec.adapters.clone();
     // SD3.5 is a bf16 model; the device is the backend selected at compile time.
     let device = candle_gen::default_device()?;
     Ok(Box::new(Sd3Generator {
@@ -281,6 +287,7 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
         dtype: DType::BF16,
         variant,
         quant,
+        adapters,
         components: Mutex::new(None),
     }))
 }
@@ -319,7 +326,9 @@ mod tests {
         assert!(d.capabilities.supports_negative_prompt);
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.conditioning.is_empty());
-        assert!(!d.capabilities.supports_lora);
+        // sc-8498: LoRA/LoKr are wired (merge-not-residual at load).
+        assert!(d.capabilities.supports_lora);
+        assert!(d.capabilities.supports_lokr);
         // sc-7879: the MMDiT folds to Q4/Q8 at load (TE+VAE stay dense).
         assert_eq!(
             d.capabilities.supported_quants,
@@ -469,11 +478,18 @@ mod tests {
             "Q4 quant load must be accepted (sc-7879)"
         );
 
+        // sc-8498: a LoRA spec is now ACCEPTED — loading is lazy, so the (nonexistent) adapter file
+        // is not read here; the merge surfaces on the first `generate`.
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
-        let Err(e) = load(&lora) else {
-            panic!("lora load must be refused")
+        assert!(load(&lora).is_ok(), "LoRA spec must be accepted (sc-8498)");
+
+        // Control / IP-adapter overlays remain refused (txt2img only).
+        let control = LoadSpec::new(WeightsSource::Dir("/snap".into()))
+            .with_control(WeightsSource::Dir("/ctrl".into()));
+        let Err(e) = load(&control) else {
+            panic!("control overlay must be refused")
         };
         assert!(matches!(e, gen_core::Error::Unsupported(_)), "got: {e:?}");
     }

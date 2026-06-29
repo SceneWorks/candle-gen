@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{self, GenerationRequest, Image, Progress, Quant};
+use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress, Quant};
 use candle_gen::{CandleError, Result};
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
@@ -144,6 +144,9 @@ pub(crate) struct Pipeline {
     /// Optional MMDiT quantization applied right after the (dense) transformer weights load
     /// (sc-7879). `None` ⇒ dense bf16; the TE + VAE stay dense regardless.
     quant: Option<Quant>,
+    /// LoRA/LoKr adapters folded into the MMDiT dense weights at load (sc-8498), **before** the
+    /// optional quantize. Empty ⇒ the stock unadapted (mmaped) build.
+    adapters: Vec<AdapterSpec>,
 }
 
 /// The loaded SD3.5 components, `Arc`-shared so the generator can cache them across `generate` calls.
@@ -164,6 +167,7 @@ impl Pipeline {
         dtype: DType,
         variant: Variant,
         quant: Option<Quant>,
+        adapters: Vec<AdapterSpec>,
     ) -> Self {
         Self {
             root: root.to_path_buf(),
@@ -172,6 +176,7 @@ impl Pipeline {
             variant,
             cfg: variant.config(),
             quant,
+            adapters,
         }
     }
 
@@ -180,24 +185,7 @@ impl Pipeline {
     pub(crate) fn load_components(&self) -> Result<Components> {
         let encoders =
             Sd3TextEncoders::load(&self.root, self.cfg.t5_seq_len, &self.device, self.dtype)?;
-        let transformer = match self.quant {
-            // sc-8504 CPU-stage path: build the dense MMDiT on a **CPU** VarBuilder, then
-            // `quantize_onto` the compute device — the quantized projections land directly on the GPU
-            // (the dense projection weight never touches it) and the dense-kept leaves migrate
-            // alongside. This drops the in-place dense-build transient (sc-7879 built dense on-device
-            // then folded in place, so dense + quantized briefly coexisted on the GPU). The resulting
-            // Q4_0/Q8_0 blocks are bit-identical to the in-place path (the quantizer routes through the
-            // CPU either way). The TE + VAE stay dense bf16.
-            Some(q) => {
-                let cpu = Device::Cpu;
-                let mut transformer =
-                    Sd3Transformer::new(&self.cfg, self.component_vb_on("transformer", &cpu)?)?;
-                transformer.quantize_onto(q, &self.device)?;
-                transformer
-            }
-            // Dense bf16: load straight onto the compute device, unchanged.
-            None => Sd3Transformer::new(&self.cfg, self.component_vb("transformer")?)?,
-        };
+        let transformer = self.load_transformer()?;
         let vae = load_vae(self.component_vb("vae")?)?;
         Ok(Components {
             encoders: Arc::new(Mutex::new(encoders)),
@@ -206,16 +194,64 @@ impl Pipeline {
         })
     }
 
-    /// Build a [`VarBuilder`] over every `.safetensors` in the snapshot component subdir `sub`, on the
-    /// pipeline's compute device.
-    fn component_vb(&self, sub: &str) -> Result<VarBuilder<'static>> {
-        self.component_vb_on(sub, &self.device)
+    /// Build the MMDiT, folding any LoRA/LoKr adapters into the dense weights at the safetensors-key
+    /// level **before** the optional Q4/Q8 quantize (sc-8498) so adapters + quantization compose.
+    ///
+    /// * **No adapters** — the stock path: mmap the `transformer/` snapshot into a `VarBuilder`
+    ///   (dense bf16) or, for quant, the sc-8504 CPU-stage build + `quantize_onto`.
+    /// * **Adapters** — read the `transformer/` `.safetensors` into a CPU tensor map, fold the deltas
+    ///   in (`crate::adapters`, f32 math), and build the DiT from a `VarBuilder::from_tensors` over the
+    ///   merged map: dense ⇒ built straight onto the compute device; quant ⇒ built on a CPU VarBuilder
+    ///   then `quantize_onto` the GPU (the merged dense weight quantizes, never lands on the GPU).
+    fn load_transformer(&self) -> Result<Sd3Transformer> {
+        if self.adapters.is_empty() {
+            return match self.quant {
+                // sc-8504 CPU-stage path: build the dense MMDiT on a **CPU** VarBuilder, then
+                // `quantize_onto` the compute device. The TE + VAE stay dense bf16.
+                Some(q) => {
+                    let cpu = Device::Cpu;
+                    let mut transformer =
+                        Sd3Transformer::new(&self.cfg, self.component_vb_on("transformer", &cpu)?)?;
+                    transformer.quantize_onto(q, &self.device)?;
+                    Ok(transformer)
+                }
+                // Dense bf16: load straight onto the compute device, unchanged.
+                None => Ok(Sd3Transformer::new(
+                    &self.cfg,
+                    self.component_vb("transformer")?,
+                )?),
+            };
+        }
+
+        // Adapter path: read → merge (CPU, f32 deltas) → build from the merged map.
+        let files = self.component_files("transformer")?;
+        let (tensors, report) =
+            crate::adapters::merged_transformer_tensors(&files, &self.adapters)?;
+        eprintln!(
+            "sc-8498 sd3 adapter merge: {} base weight(s) updated, {} key(s) out of surface \
+             ({} adapter file[s])",
+            report.merged,
+            report.skipped_keys,
+            self.adapters.len()
+        );
+        match self.quant {
+            Some(q) => {
+                let cpu = Device::Cpu;
+                let vb = VarBuilder::from_tensors(tensors, self.dtype, &cpu);
+                let mut transformer = Sd3Transformer::new(&self.cfg, vb)?;
+                transformer.quantize_onto(q, &self.device)?;
+                Ok(transformer)
+            }
+            None => {
+                let vb = VarBuilder::from_tensors(tensors, self.dtype, &self.device);
+                Ok(Sd3Transformer::new(&self.cfg, vb)?)
+            }
+        }
     }
 
-    /// [`Self::component_vb`] but on an explicit `device` — the sc-8504 CPU-stage quant path builds the
-    /// dense MMDiT on the CPU (system RAM) before quantizing each projection onto the GPU, so the dense
-    /// projection weights never land on the GPU.
-    fn component_vb_on(&self, sub: &str, device: &Device) -> Result<VarBuilder<'static>> {
+    /// The sorted list of `.safetensors` files in the snapshot component subdir `sub` (the merge reads
+    /// the `transformer/` shards directly into a tensor map).
+    fn component_files(&self, sub: &str) -> Result<Vec<PathBuf>> {
         let dir = self.root.join(sub);
         if !dir.is_dir() {
             return Err(CandleError::Msg(format!(
@@ -235,6 +271,20 @@ impl Pipeline {
                 dir.display()
             )));
         }
+        Ok(files)
+    }
+
+    /// Build a [`VarBuilder`] over every `.safetensors` in the snapshot component subdir `sub`, on the
+    /// pipeline's compute device.
+    fn component_vb(&self, sub: &str) -> Result<VarBuilder<'static>> {
+        self.component_vb_on(sub, &self.device)
+    }
+
+    /// [`Self::component_vb`] but on an explicit `device` — the sc-8504 CPU-stage quant path builds the
+    /// dense MMDiT on the CPU (system RAM) before quantizing each projection onto the GPU, so the dense
+    /// projection weights never land on the GPU.
+    fn component_vb_on(&self, sub: &str, device: &Device) -> Result<VarBuilder<'static>> {
+        let files = self.component_files(sub)?;
         // SAFETY: mmap of read-only weight files; standard candle loading path.
         Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, self.dtype, device)? })
     }
@@ -805,6 +855,7 @@ mod tests {
                 DType::BF16,
                 Variant::Large,
                 quant,
+                Vec::new(),
             );
             let comps = pipe.load_components().expect("load real components");
             // Touch the transformer so the allocation is live, then sample the device's used memory.
