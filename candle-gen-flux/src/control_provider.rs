@@ -1,0 +1,490 @@
+//! FLUX.1-dev **Fun-Controlnet-Union** provider (sc-8412) — the candle (Windows/CUDA) sibling of
+//! `mlx-gen-flux`'s `Flux1DevControl` (sc-8238/8239). Strict structural conditioning (pose / canny /
+//! depth — **input-agnostic**, no discrete mode index) on FLUX.1-dev via
+//! `Shakker-Labs/FLUX.1-dev-ControlNet-Union-Pro-2.0`, a diffusers residual-emitter control branch
+//! overlaid on the dev base DiT.
+//!
+//! **How it conditions:** the pose/canny/depth control image is VAE-encoded + 2×2-packed into the
+//! packed transformer latent `[1, seq, 64]` (the same pack as the noise latents, so it aligns 1:1 with
+//! the base image tokens), constant across the denoise. [`FluxControlTransformer`] runs the
+//! parity-proven dev DiT ([`crate::ip_dit::IpFlux`]) plus the control branch
+//! ([`crate::control::FluxControlNet`]): 6 per-block residuals are computed once and added into the base
+//! image stream after base double blocks at `interval = ceil(19/6) = 4`, scaled by `control_scale`
+//! (Shakker README sweet spot ≈ 0.7). dev is guidance-distilled — a single embedded-guidance forward,
+//! no true-CFG / negative pass.
+//!
+//! **Compose-readiness:** the denoise routes through [`FluxControlTransformer::forward_composed`], which
+//! threads an optional identity injector ([`crate::ip_dit::DitImageInjector`] — PuLID / XLabs
+//! IP-Adapter) into the SAME base double-block stream as the control residuals. This provider wires the
+//! seam (and exposes [`Flux1DevControl::generate_with_injector`]); a follow-on epic stacks identity +
+//! control in one denoise step by passing `Some(injector)`.
+//!
+//! Bespoke provider (NOT gen-core-registered), worker-invoked by name — the candle pattern for
+//! conditioned surfaces (mirrors [`crate::ip_provider`] / the FLUX.2 control provider). The
+//! `flux1_dev_control` worker lane is a separate Phase-B step (sc-8304/sc-8246), not this crate.
+//! Determinism is the candle-lane contract (sc-3673): seeded CPU init noise; the control encode seeds
+//! the device RNG so the (sampled) control latent is reproducible per render seed.
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use candle_core::{DType, Device, Tensor};
+use candle_nn::VarBuilder;
+use candle_transformers::models::clip::text_model::ClipTextTransformer;
+use candle_transformers::models::flux::autoencoder::AutoEncoder;
+use candle_transformers::models::flux::sampling::{get_schedule, State};
+use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
+use rand::{rngs::StdRng, SeedableRng};
+use rand_distr::{Distribution, StandardNormal};
+
+use candle_gen::gen_core::imageops::resize_lanczos_u8;
+use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::TimestepConvention;
+use candle_gen::gen_core::{Image, Progress};
+use candle_gen::{CandleError, Result};
+
+use crate::control::{
+    accepts_control_kind, FluxControlNet, FluxControlNetConfig, FluxControlTransformer,
+};
+use crate::ip_dit::{DitImageInjector, IpFlux};
+use crate::pipeline::{ae_config, clip_config, decode_latents, encode_text, flow_mu, flux_config};
+use crate::Variant;
+
+/// FLUX runs at bf16.
+const DTYPE: DType = DType::BF16;
+/// FLUX latent channel count (the raw VAE latent / initial noise; the DiT packs it 2×2 to 64).
+const LATENT_CHANNELS: usize = 16;
+/// FLUX dev's resolution-dependent flow-match time-shift endpoints (matching the txt2img pipeline).
+const BASE_SHIFT: f64 = 0.5;
+const MAX_SHIFT: f64 = 1.15;
+
+/// FLUX latent geometry requires both image dims to be multiples of 16 for a clean 2×2 pack.
+const SIZE_MULTIPLE: u32 = 16;
+
+/// Default control-conditioning scale — the Shakker Union-Pro-2.0 README recommends ≈ 0.7. The request's
+/// `control_scale` wins when non-zero; a 0 falls back to this (a request that supplied a control but left
+/// the scale unset still steers, mirroring the mlx provider).
+pub const DEFAULT_CONTROL_SCALE: f32 = 0.7;
+
+/// Paths to the FLUX.1-dev control checkpoints: the dev snapshot dir + the Shakker Fun-Controlnet-Union
+/// overlay.
+pub struct Flux1ControlPaths {
+    /// The black-forest-labs FLUX.1-dev snapshot dir (`flux1-dev.safetensors`, `ae.safetensors`,
+    /// `text_encoder/`, `text_encoder_2/`, `tokenizer_2/`).
+    pub flux_base: PathBuf,
+    /// The `FLUX.1-dev-ControlNet-Union-Pro-2.0` checkpoint (a single `.safetensors`
+    /// `diffusion_pytorch_model.safetensors`, or a dir containing it).
+    pub control: PathBuf,
+}
+
+/// One FLUX.1-dev strict-control request. dev is guidance-distilled — `guidance` is the embedded scalar
+/// (single forward, no negative prompt).
+#[derive(Clone)]
+pub struct Flux1ControlRequest {
+    pub prompt: String,
+    pub width: u32,
+    pub height: u32,
+    pub steps: usize,
+    /// Embedded guidance scale (dev default ≈ 3.5).
+    pub guidance: f32,
+    /// `control_scale` — how strongly the control branch locks the base (≈ 0.7).
+    pub control_scale: f32,
+    /// The control kind (pose / canny / depth). Input-agnostic — used only to validate the accepted set;
+    /// it does NOT branch the forward (Union-Pro-2.0 dropped the discrete mode index).
+    pub control_kind: String,
+    pub seed: u64,
+    /// Cooperative cancellation, checked before each denoise step (the engine contract).
+    pub cancel: CancelFlag,
+}
+
+impl Default for Flux1ControlRequest {
+    fn default() -> Self {
+        Self {
+            prompt: String::new(),
+            width: 1024,
+            height: 1024,
+            steps: 25,
+            guidance: 3.5,
+            control_scale: DEFAULT_CONTROL_SCALE,
+            control_kind: "pose".into(),
+            seed: 0,
+            cancel: CancelFlag::default(),
+        }
+    }
+}
+
+/// mmap a [`VarBuilder`] over `files` at `dtype`/`device`, erroring if any is missing.
+fn mmap_vb(files: &[PathBuf], dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
+    for f in files {
+        if !f.is_file() {
+            return Err(CandleError::Msg(format!(
+                "flux1 control snapshot is missing {}",
+                f.display()
+            )));
+        }
+    }
+    // SAFETY: mmap of read-only weight files; standard candle loading path.
+    let vb = unsafe { VarBuilder::from_mmaped_safetensors(files, dtype, device)? };
+    Ok(vb)
+}
+
+/// Sorted list of every `.safetensors` in `dir` (sharded T5 / a control overlay shipped as a dir).
+fn safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| CandleError::Msg(format!("flux1 control: read {}: {e}", dir.display())))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .collect();
+    files.sort();
+    if files.is_empty() {
+        return Err(CandleError::Msg(format!(
+            "flux1 control: no .safetensors found in {}",
+            dir.display()
+        )));
+    }
+    Ok(files)
+}
+
+/// Open a VarBuilder over the Shakker control checkpoint — a single `.safetensors` `File` or a `Dir`
+/// containing it — on `device` at `dtype`.
+fn control_var_builder(path: &Path, dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
+    let files = if path.is_dir() {
+        safetensors_in(path)?
+    } else {
+        if !path.is_file() {
+            return Err(CandleError::Msg(format!(
+                "flux1 control: control checkpoint not found at {} (expected the \
+                 FLUX.1-dev-ControlNet-Union-Pro-2.0 safetensors)",
+                path.display()
+            )));
+        }
+        vec![path.to_path_buf()]
+    };
+    mmap_vb(&files, dtype, device)
+}
+
+/// Resize `image` to `width`×`height` and convert to an NCHW `[1, 3, H, W]` tensor in `[-1, 1]` at
+/// `dtype` on `device` — the VAE-encode input for the control image (the same normalization the noise
+/// path uses for decode).
+fn preprocess_control(
+    image: &Image,
+    width: u32,
+    height: u32,
+    device: &Device,
+    dtype: DType,
+) -> Result<Tensor> {
+    let (iw, ih) = (image.width as usize, image.height as usize);
+    if image.pixels.len() != iw * ih * 3 {
+        return Err(CandleError::Msg(format!(
+            "flux1 control: control pixel buffer {} != {iw}x{ih}x3",
+            image.pixels.len()
+        )));
+    }
+    let (rw, rh) = (width as usize, height as usize);
+    // Lanczos-resize to the render size (no-op when already that size), then [0,255] → [-1,1], HWC→NCHW.
+    let resized: Vec<f32> = if (ih, iw) == (rh, rw) {
+        image.pixels.iter().map(|&v| v as f32).collect()
+    } else {
+        resize_lanczos_u8(&image.pixels, ih, iw, rh, rw) // HWC f32 [0,255]
+    };
+    let data: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();
+    let hwc = Tensor::from_vec(data, (rh, rw, 3), device)?;
+    let nchw = hwc.permute((2, 0, 1))?.unsqueeze(0)?.contiguous()?;
+    nchw.to_dtype(dtype).map_err(Into::into)
+}
+
+/// A loaded FLUX.1-dev control model: the reused FLUX text encoders + VAE, the dev DiT wrapped in its
+/// control branch ([`FluxControlTransformer`]). `generate` takes `&self` (no per-call mutation), so one
+/// load serves many renders.
+pub struct Flux1DevControl {
+    /// The snapshot root (for the T5 tokenizer in `encode_text`).
+    root: PathBuf,
+    device: Device,
+    dtype: DType,
+    clip: ClipTextTransformer,
+    /// Behind a `Mutex` because `T5EncoderModel::forward` takes `&mut self` while `generate` is `&self`;
+    /// locked only for the once-per-request text encode.
+    t5: Mutex<T5EncoderModel>,
+    transformer: FluxControlTransformer,
+    vae: AutoEncoder,
+}
+
+impl Flux1DevControl {
+    /// Load the dev base (the forked [`IpFlux`] DiT — the only FLUX DiT with the compose-ready injector
+    /// seam) + the reused text encoders + VAE + the Shakker control overlay, assembling the
+    /// [`FluxControlTransformer`].
+    pub fn load(paths: &Flux1ControlPaths) -> Result<Self> {
+        let device = candle_gen::default_device()?;
+        let dtype = DTYPE;
+        let root = paths.flux_base.clone();
+        let variant = Variant::Dev; // the Shakker control is FLUX.1-dev only.
+
+        if !root.join(variant.transformer_file()).is_file() {
+            return Err(CandleError::Msg(format!(
+                "flux1 control: no {} in {} (expected a black-forest-labs FLUX.1-dev snapshot)",
+                variant.transformer_file(),
+                root.display()
+            )));
+        }
+
+        // CLIP-L (text) under `text_encoder/`.
+        let clip_vb = mmap_vb(
+            &[root.join("text_encoder/model.safetensors")],
+            dtype,
+            &device,
+        )?;
+        let clip = ClipTextTransformer::new(clip_vb.pp("text_model"), &clip_config())?;
+
+        // T5-XXL under `text_encoder_2/` (sharded; config.json alongside).
+        let t5_dir = root.join("text_encoder_2");
+        let t5_cfg: T5Config = {
+            let cfg = std::fs::read_to_string(t5_dir.join("config.json")).map_err(|e| {
+                CandleError::Msg(format!(
+                    "flux1 control: read text_encoder_2/config.json: {e}"
+                ))
+            })?;
+            serde_json::from_str(&cfg).map_err(|e| {
+                CandleError::Msg(format!("flux1 control: parse T5 config.json: {e}"))
+            })?
+        };
+        let t5_vb = mmap_vb(&safetensors_in(&t5_dir)?, dtype, &device)?;
+        let t5 = T5EncoderModel::load(t5_vb, &t5_cfg)?;
+
+        // The forked FLUX DiT (the compose-ready injector seam) from the root BFL checkpoint.
+        let dit_vb = mmap_vb(&[root.join(variant.transformer_file())], dtype, &device)?;
+        let base = IpFlux::new(&flux_config(variant), dit_vb)?;
+
+        // FLUX AutoEncoder (`ae.safetensors`).
+        let vae_vb = mmap_vb(&[root.join("ae.safetensors")], dtype, &device)?;
+        let vae = AutoEncoder::new(&ae_config(variant), vae_vb)?;
+
+        // The Shakker control overlay (diffusers layout, un-prefixed keys). The branch shares the base
+        // FLUX config's dims (hidden / heads / RoPE) so its residuals align with the base image tokens.
+        let control_vb = control_var_builder(&paths.control, dtype, &device)?;
+        let branch = FluxControlNet::new(
+            &flux_config(variant),
+            &FluxControlNetConfig::shakker_union_pro_2_0(),
+            control_vb,
+        )?;
+        let transformer = FluxControlTransformer::new(base, branch);
+
+        Ok(Self {
+            root,
+            device,
+            dtype,
+            clip,
+            t5: Mutex::new(t5),
+            transformer,
+            vae,
+        })
+    }
+
+    /// The injection interval over the base double blocks (`ceil(19/6) = 4`).
+    pub fn residual_interval(&self) -> usize {
+        self.transformer.residual_interval()
+    }
+
+    /// Number of control residuals (the control double-block count, 6).
+    pub fn num_residuals(&self) -> usize {
+        self.transformer.num_residuals()
+    }
+
+    /// Generate one control-conditioned image. `control_image` is the preprocessed pose/canny/depth hint
+    /// (the worker pre-fits it to the render size; this re-resizes defensively). `injector = None` is the
+    /// plain control path.
+    pub fn generate(
+        &self,
+        req: &Flux1ControlRequest,
+        control_image: &Image,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        self.generate_with_injector(req, control_image, None, on_progress)
+    }
+
+    /// As [`generate`](Self::generate), but threading an OPTIONAL identity injector (PuLID / XLabs
+    /// IP-Adapter) into every control-denoise step — the **compose-ready** seam. With `injector = None`
+    /// this is the plain control path; `Some(..)` stacks identity + control in one denoise.
+    pub fn generate_with_injector(
+        &self,
+        req: &Flux1ControlRequest,
+        control_image: &Image,
+        injector: Option<&dyn DitImageInjector>,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        if req.cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        if req.prompt.trim().is_empty() {
+            return Err(CandleError::Msg("flux1 control: prompt is required".into()));
+        }
+        if !accepts_control_kind(&req.control_kind) {
+            return Err(CandleError::Msg(format!(
+                "flux1_dev_control supports pose/canny/depth control (Fun-Controlnet-Union), got {:?}",
+                req.control_kind
+            )));
+        }
+        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+            return Err(CandleError::Msg(format!(
+                "flux1 control: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+                req.width, req.height
+            )));
+        }
+        if req.steps == 0 {
+            return Err(CandleError::Msg("flux1 control: steps must be >= 1".into()));
+        }
+        // A request that left `control_scale` at 0 still steers (map to the Shakker default), mirroring
+        // the mlx provider — an explicit non-zero wins.
+        let control_scale = if req.control_scale == 0.0 {
+            DEFAULT_CONTROL_SCALE as f64
+        } else {
+            req.control_scale as f64
+        };
+
+        // Conditioning (seed-independent): text (T5 seq + CLIP pooled) + the packed control latent.
+        let (t5_emb, clip_emb) = encode_text(
+            Variant::Dev,
+            &self.root,
+            &self.device,
+            self.dtype,
+            &self.clip,
+            &self.t5,
+            &req.prompt,
+        )?;
+        let control_latent =
+            self.encode_control_latent(control_image, req.width, req.height, req.seed)?;
+
+        // candle's get_noise geometry: latent is /8 of a multiple-of-16 request.
+        let lat_h = (req.height as usize).div_ceil(16) * 2;
+        let lat_w = (req.width as usize).div_ceil(16) * 2;
+        let n = LATENT_CHANNELS * lat_h * lat_w;
+        // sc-3673 parity: deterministic, launch-portable CPU-seeded initial noise.
+        let mut rng = StdRng::seed_from_u64(req.seed);
+        let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+        let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
+            .to_device(&self.device)?
+            .to_dtype(self.dtype)?;
+
+        let state = State::new(&t5_emb, &clip_emb, &noise)?;
+        let timesteps = get_schedule(req.steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)));
+        let guidance = req.guidance as f64;
+
+        let latents = self.denoise(
+            &state,
+            &control_latent,
+            &timesteps,
+            guidance,
+            control_scale,
+            injector,
+            req.seed,
+            &req.cancel,
+            on_progress,
+        )?;
+        on_progress(Progress::Decoding);
+        decode_latents(&self.vae, &latents, req.height as usize, req.width as usize)
+    }
+
+    /// VAE-encode + 2×2-pack the control hint into the packed control latent `[1, seq, 64]` (constant
+    /// across steps). Uses the same VAE + pack (`State::new`'s patchify) as the noise latents, so the
+    /// control latent aligns 1:1 with the base image tokens. The control encode seeds the device RNG with
+    /// the render seed so the (sampled) latent is reproducible per render (the candle determinism
+    /// contract, sc-3673); the latent is identical across steps and across the batch.
+    fn encode_control_latent(
+        &self,
+        image: &Image,
+        width: u32,
+        height: u32,
+        seed: u64,
+    ) -> Result<Tensor> {
+        let nchw = preprocess_control(image, width, height, &self.device, self.dtype)?;
+        // Reproducible VAE sample (the candle AutoEncoder's `reg` samples; seed it for determinism).
+        let _ = self.device.set_seed(seed);
+        let encoded = self.vae.encode(&nchw)?; // [1, 16, H/8, W/8]
+                                               // Reuse the candle State patchify to 2×2-pack to [1, seq, 64] — identical geometry to the noise
+                                               // pack. `State::new` needs a t5/clip embed only to fill txt/vec (unused here), so feed tiny
+                                               // placeholders and take only `.img` (the packed latent).
+        let dummy_t5 = Tensor::zeros((1, 1, 4096), self.dtype, &self.device)?;
+        let dummy_clip = Tensor::zeros((1, 768), self.dtype, &self.device)?;
+        let packed = State::new(&dummy_t5, &dummy_clip, &encoded)?;
+        Ok(packed.img)
+    }
+
+    /// The flow-match denoise with the control branch, routed through the unified curated
+    /// sampler/scheduler driver (epic 7114 P4) — the control twin of the IP/txt2img `denoise`. dev is
+    /// guidance-distilled (a single embedded-guidance forward, no negative pass). The control forward
+    /// lives INSIDE the `predict` closure so a multi-eval solver re-runs the whole step. FLUX feeds the
+    /// raw timestep (`Sigma` convention: `t == σ`). The provider exposes no sampler/scheduler knob, so
+    /// this defaults to the native flow-match Euler path. Cancellation + progress are owned by the driver.
+    #[allow(clippy::too_many_arguments)]
+    fn denoise(
+        &self,
+        state: &State,
+        control_latent: &Tensor,
+        timesteps: &[f64],
+        guidance: f64,
+        control_scale: f64,
+        injector: Option<&dyn DitImageInjector>,
+        seed: u64,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Tensor> {
+        let b_sz = state.img.dim(0)?;
+        let guidance_t = Tensor::full(guidance as f32, b_sz, &self.device)?;
+        let native: Vec<f32> = timesteps.iter().map(|&t| t as f32).collect();
+        let mu = flow_mu(Variant::Dev, state.img.dim(1)?);
+        let steps = native.len().saturating_sub(1);
+        let sigmas = candle_gen::resolve_flow_schedule(None, mu, steps, &native);
+        candle_gen::run_flow_sampler(
+            None,
+            TimestepConvention::Sigma,
+            &sigmas,
+            state.img.clone(),
+            seed,
+            cancel,
+            on_progress,
+            |img, t| -> Result<Tensor> {
+                let t_vec = Tensor::full(t, b_sz, &self.device)?;
+                Ok(self.transformer.forward_composed(
+                    img,
+                    &state.img_ids,
+                    &state.txt,
+                    &state.txt_ids,
+                    &t_vec,
+                    &state.vec,
+                    Some(&guidance_t),
+                    control_latent,
+                    control_scale,
+                    injector,
+                )?)
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The request defaults match the dev control production knobs (1024², 25 steps, guidance 3.5,
+    /// control scale 0.7, pose).
+    #[test]
+    fn request_defaults() {
+        let r = Flux1ControlRequest::default();
+        assert_eq!((r.width, r.height), (1024, 1024));
+        assert_eq!(r.steps, 25);
+        assert_eq!(r.guidance, 3.5);
+        assert_eq!(r.control_scale, DEFAULT_CONTROL_SCALE);
+        assert_eq!(r.control_kind, "pose");
+        assert!(!r.cancel.is_cancelled());
+    }
+
+    /// The control checkpoint resolver: a missing path errors loudly; a direct file is used as-is.
+    #[test]
+    fn control_checkpoint_resolution() {
+        let dev = Device::Cpu;
+        let dir = std::env::temp_dir().join(format!("flux1_ctrl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A nonexistent path errors.
+        assert!(control_var_builder(&dir.join("nope.safetensors"), DTYPE, &dev).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

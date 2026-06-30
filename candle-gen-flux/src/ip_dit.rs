@@ -52,7 +52,7 @@ fn layer_norm(dim: usize, vb: VarBuilder) -> Result<LayerNorm> {
     Ok(LayerNorm::new_no_bias(ws, 1e-6))
 }
 
-fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+pub(crate) fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
     let dim = q.dim(D::Minus1)?;
     let scale_factor = 1.0 / (dim as f64).sqrt();
     let mut batch_dims = q.dims().to_vec();
@@ -89,7 +89,7 @@ fn rope(pos: &Tensor, dim: usize, theta: usize) -> Result<Tensor> {
     out.reshape((b, n, d, 2, 2))
 }
 
-fn apply_rope(x: &Tensor, freq_cis: &Tensor) -> Result<Tensor> {
+pub(crate) fn apply_rope(x: &Tensor, freq_cis: &Tensor) -> Result<Tensor> {
     let dims = x.dims();
     let (b_sz, n_head, seq_len, n_embd) = x.dims4()?;
     let x = x.reshape((b_sz, n_head, seq_len, n_embd / 2, 2))?;
@@ -100,14 +100,14 @@ fn apply_rope(x: &Tensor, freq_cis: &Tensor) -> Result<Tensor> {
     (fr0.broadcast_mul(&x0)? + fr1.broadcast_mul(&x1)?)?.reshape(dims.to_vec())
 }
 
-fn attention(q: &Tensor, k: &Tensor, v: &Tensor, pe: &Tensor) -> Result<Tensor> {
+pub(crate) fn attention(q: &Tensor, k: &Tensor, v: &Tensor, pe: &Tensor) -> Result<Tensor> {
     let q = apply_rope(q, pe)?.contiguous()?;
     let k = apply_rope(k, pe)?.contiguous()?;
     let x = scaled_dot_product_attention(&q, &k, v)?;
     x.transpose(1, 2)?.flatten_from(2)
 }
 
-fn timestep_embedding(t: &Tensor, dim: usize, dtype: DType) -> Result<Tensor> {
+pub(crate) fn timestep_embedding(t: &Tensor, dim: usize, dtype: DType) -> Result<Tensor> {
     const TIME_FACTOR: f64 = 1000.;
     const MAX_PERIOD: f64 = 10000.;
     if dim % 2 == 1 {
@@ -127,7 +127,7 @@ fn timestep_embedding(t: &Tensor, dim: usize, dtype: DType) -> Result<Tensor> {
 }
 
 #[derive(Debug, Clone)]
-struct EmbedNd {
+pub(crate) struct EmbedNd {
     #[allow(unused)]
     dim: usize,
     theta: usize,
@@ -135,7 +135,7 @@ struct EmbedNd {
 }
 
 impl EmbedNd {
-    fn new(dim: usize, theta: usize, axes_dim: Vec<usize>) -> Self {
+    pub(crate) fn new(dim: usize, theta: usize, axes_dim: Vec<usize>) -> Self {
         Self {
             dim,
             theta,
@@ -713,4 +713,119 @@ impl IpFlux {
         let img = joint.i((.., txt_len..))?;
         self.final_layer.forward(&img, &vec_)
     }
+
+    /// As [`forward_injected`], but ALSO threading the Fun-Controlnet-Union per-double-block residuals
+    /// (sc-8412) — the Shakker `FLUX.1-dev-ControlNet-Union-Pro-2.0` path. `control = (residuals,
+    /// scale)` is the (already-computed, pre-injection) control-branch output: one residual per control
+    /// double block, added to the base **image** stream after base double block `i` at the diffusers
+    /// interval `ceil(num_double_blocks / num_residuals)`, scaled by `scale`. With `control = None` this
+    /// is byte-identical to [`forward_injected`] (and so, with `injector = None` too, to the plain
+    /// [`forward`](Self::forward)).
+    ///
+    /// **Compose-ready** (the candle twin of the mlx `forward_control` seam): the per-block `injector`
+    /// (PuLID / XLabs IP-Adapter) is consulted at the SAME points as in [`forward_injected`], so a
+    /// future epic can stack identity + control in one denoise (`injector = Some(..)` AND
+    /// `control = Some(..)`). The control residual is added AFTER the injector's `after_double` residual,
+    /// matching diffusers' FLUX ControlNet order (the controlnet sample is added to the post-block
+    /// hidden state).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_control(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+        injector: Option<&dyn DitImageInjector>,
+        control: Option<(&[Tensor], f64)>,
+    ) -> Result<Tensor> {
+        if txt.rank() != 3 {
+            candle_core::bail!("unexpected shape for txt {:?}", txt.shape())
+        }
+        if img.rank() != 3 {
+            candle_core::bail!("unexpected shape for img {:?}", img.shape())
+        }
+        let dtype = img.dtype();
+        let pe = {
+            let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
+            ids.apply(&self.pe_embedder)?
+        };
+        let mut txt = txt.apply(&self.txt_in)?;
+        let mut img = img.apply(&self.img_in)?;
+        let vec_ = timestep_embedding(timesteps, 256, dtype)?.apply(&self.time_in)?;
+        let vec_ = match (self.guidance_in.as_ref(), guidance) {
+            (Some(g_in), Some(guidance)) => {
+                (vec_ + timestep_embedding(guidance, 256, dtype)?.apply(g_in))?
+            }
+            _ => vec_,
+        };
+        let vec_ = (vec_ + y.apply(&self.vector_in))?;
+
+        // ControlNet residual injection interval (diffusers `FluxTransformer2DModel`):
+        // `interval = ceil(num_double_blocks / num_control_residuals)`, and after base double block `i`
+        // we add `controlnet_block_samples[i / interval]` (scaled). The Shakker Union-Pro-2.0 ships 6
+        // control double blocks → interval `ceil(19/6) = 4`. An empty residual slice is treated as "no
+        // control". The residuals are pre-scaled once before the 19-block loop rather than per block.
+        let control = control.filter(|(res, _)| !res.is_empty());
+        let scaled_control = match control {
+            Some((res, scale)) => {
+                let interval = control_residual_interval(self.double_blocks.len(), res.len());
+                let scaled = res
+                    .iter()
+                    .map(|r| r.to_dtype(dtype)? * scale)
+                    .collect::<Result<Vec<_>>>()?;
+                Some((scaled, interval))
+            }
+            None => None,
+        };
+
+        for (i, block) in self.double_blocks.iter().enumerate() {
+            (img, txt) = block.forward(&img, &txt, &vec_, &pe, None)?;
+            // Identity injector (PuLID / IP-Adapter) first — composes with control below.
+            if let Some(inj) = injector {
+                if let Some(r) = inj.after_double(i, &img)? {
+                    img = (&img + r.to_dtype(img.dtype())?)?;
+                }
+            }
+            // Fun-Controlnet-Union residual, added AFTER the identity injector so the two compose:
+            // `img = img + controlnet_block_samples[i / interval]·scale`.
+            if let Some((res, interval)) = &scaled_control {
+                let idx = (i / interval).min(res.len() - 1);
+                img = (&img + &res[idx])?;
+            }
+        }
+
+        // Single blocks operate on the joint `cat(txt, img)`. The Shakker Union-Pro-2.0 checkpoint has
+        // 0 control SINGLE blocks (diffusers `controlnet_single_block_samples = None`), so only the
+        // identity injector seam is consulted here, unchanged from `forward_injected`.
+        let txt_len = txt.dim(1)?;
+        let mut joint = Tensor::cat(&[&txt, &img], 1)?;
+        for (i, block) in self.single_blocks.iter().enumerate() {
+            joint = block.forward(&joint, &vec_, &pe)?;
+            if let Some(inj) = injector {
+                if inj.injects_after_single(i) {
+                    let seq = joint.dim(1)?;
+                    let img_part = joint.narrow(1, txt_len, seq - txt_len)?;
+                    if let Some(r) = inj.after_single(i, &img_part)? {
+                        let added = (img_part + r.to_dtype(joint.dtype())?)?;
+                        let txt_part = joint.narrow(1, 0, txt_len)?;
+                        joint = Tensor::cat(&[&txt_part, &added], 1)?;
+                    }
+                }
+            }
+        }
+        let img = joint.i((.., txt_len..))?;
+        self.final_layer.forward(&img, &vec_)
+    }
+}
+
+/// ControlNet residual injection interval (diffusers `FluxTransformer2DModel`):
+/// `interval = ceil(num_double_blocks / num_residuals)`. After base double block `i` the controlnet
+/// residual `controlnet_block_samples[i / interval]` is added. For FLUX.1 (19 double blocks) and the
+/// Shakker Union-Pro-2.0 (6 control residuals) this is `ceil(19/6) = 4` (sc-8412). `num_residuals = 0`
+/// would never reach here (the caller filters an empty residual slice), so it is clamped to 1.
+pub(crate) fn control_residual_interval(num_double_blocks: usize, num_residuals: usize) -> usize {
+    num_double_blocks.div_ceil(num_residuals.max(1))
 }

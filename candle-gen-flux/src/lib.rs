@@ -39,6 +39,20 @@ pub mod ip_image_encoder;
 pub mod ip_provider;
 pub use ip_provider::{IpAdapterFlux, IpAdapterFluxPaths, IpAdapterFluxRequest, DEFAULT_IP_SCALE};
 
+// FLUX.1-dev Fun-Controlnet-Union (sc-8412) — strict structural conditioning (pose/canny/depth,
+// input-agnostic) via `Shakker-Labs/FLUX.1-dev-ControlNet-Union-Pro-2.0`. `control` is the diffusers
+// residual-emitter control branch (a 6-block partial copy of the dev MMDiT) + the
+// `FluxControlTransformer` that injects its 6 residuals into the BFL base double stream at interval
+// ceil(19/6)=4; `control_provider` composes it with the reused FLUX text encoders / VAE into the
+// bespoke control stream the worker drives by name (NOT gen-core-registered — the `flux1_*` descriptors
+// stay txt2img-only; the `flux1_dev_control` worker lane is Phase-B, sc-8304/sc-8246).
+pub mod control;
+pub mod control_provider;
+pub use control::{FluxControlNet, FluxControlNetConfig, FluxControlTransformer};
+pub use control_provider::{
+    Flux1ControlPaths, Flux1ControlRequest, Flux1DevControl, DEFAULT_CONTROL_SCALE,
+};
+
 // The vendored FLUX DiT + its post-block image-stream injector seam, re-exported for the PuLID-FLUX
 // provider (`candle-gen-pulid`, sc-5492), which composes the FLUX backbone with the EVA-CLIP tower +
 // IDFormer + the 20 PerceiverAttentionCA modules driven through [`DitImageInjector`]. `Config` is the
