@@ -55,7 +55,7 @@ use candle_gen::train::checkpoint::file_stem;
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
 use candle_gen::train::flow_match::{self, validate_flow_match_request, velocity_loss};
 use candle_gen::train::gradient_checkpoint::checkpointed_backward;
-use candle_gen::train::lora::LoraSet;
+use candle_gen::train::lora::{LoraHost, LoraSet};
 use candle_gen::train::optim::{accumulate_grads, TrainOptimizer};
 use candle_gen::train::schedule::schedule_updates;
 use candle_gen::{CandleError, Result};
@@ -599,6 +599,15 @@ impl WanMoeTrainer {
             if cfg.sample_every > 0 && step % cfg.sample_every == 0 {
                 if let Some(state) = sample_state.as_ref() {
                     let total = state.prompts.len() as u32;
+                    // Freeze BOTH experts' adapters to detached snapshots so the preview denoise runs
+                    // graph-free (the factor `Var`s are otherwise tracked → the forward's activations are
+                    // retained → OOM at full resolution). Restored right after so training keeps its grads.
+                    for ex in experts.iter_mut() {
+                        let _ = ex.dit.visit_lora_mut(&mut |ll| {
+                            ll.freeze_adapter();
+                            Ok(())
+                        });
+                    }
                     for (i, prompt) in state.prompts.iter().enumerate() {
                         if req.cancel.is_cancelled() {
                             break;
@@ -618,6 +627,12 @@ impl WanMoeTrainer {
                                 i + 1
                             ),
                         }
+                    }
+                    for ex in experts.iter_mut() {
+                        let _ = ex.dit.visit_lora_mut(&mut |ll| {
+                            ll.thaw_adapter();
+                            Ok(())
+                        });
                     }
                 }
             }

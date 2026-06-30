@@ -116,6 +116,10 @@ pub struct LoraLinear {
     out_features: usize,
     path: String,
     adapter: Option<Adapter>,
+    /// While a preview render is in flight ([`freeze_adapter`](Self::freeze_adapter)), the live
+    /// `Var`-backed adapter is parked here and `adapter` holds a detached snapshot, so the inference
+    /// forward builds no autograd graph. [`thaw_adapter`](Self::thaw_adapter) restores it.
+    frozen: Option<Adapter>,
 }
 
 impl LoraLinear {
@@ -133,6 +137,7 @@ impl LoraLinear {
             out_features,
             path,
             adapter: None,
+            frozen: None,
         }
     }
 
@@ -174,6 +179,62 @@ impl LoraLinear {
             in_f: self.in_features,
             scale,
         });
+    }
+
+    /// Park the live `Var`-backed adapter and install a **detached snapshot** in its place, so an
+    /// inference forward (a preview render, sc-8650) builds NO autograd graph — the snapshot's factors
+    /// are non-variable, so candle frees each layer's activations instead of retaining them for a
+    /// backward that never comes. Without this the full-resolution preview OOMs (it retains a whole
+    /// training-style graph of the 28-step denoise). Idempotent; pair with [`thaw_adapter`](Self::thaw_adapter).
+    pub fn freeze_adapter(&mut self) {
+        if self.frozen.is_none() {
+            if let Some(original) = self.adapter.take() {
+                self.adapter = Some(original.detached());
+                self.frozen = Some(original);
+            }
+        }
+    }
+
+    /// Restore the live `Var`-backed adapter parked by [`freeze_adapter`](Self::freeze_adapter) so
+    /// training resumes tracking gradients. Idempotent (no-op if not frozen).
+    pub fn thaw_adapter(&mut self) {
+        if let Some(original) = self.frozen.take() {
+            self.adapter = Some(original);
+        }
+    }
+}
+
+impl Adapter {
+    /// A graph-free copy: every `Var`-backed factor replaced by a [`Tensor::detach`]ed (non-variable)
+    /// tensor sharing the same storage. A forward through it reads the current factor values but builds
+    /// no autograd graph (sc-8650 preview rendering).
+    fn detached(&self) -> Adapter {
+        match self {
+            Adapter::Lora { down, up, scale } => Adapter::Lora {
+                down: down.detach(),
+                up: up.detach(),
+                scale: *scale,
+            },
+            Adapter::Lokr {
+                w1,
+                w2,
+                out_f,
+                in_f,
+                scale,
+            } => Adapter::Lokr {
+                w1: w1.detach(),
+                w2: match w2 {
+                    LokrW2::Full(w) => LokrW2::Full(w.detach()),
+                    LokrW2::LowRank { a, b } => LokrW2::LowRank {
+                        a: a.detach(),
+                        b: b.detach(),
+                    },
+                },
+                out_f: *out_f,
+                in_f: *in_f,
+                scale: *scale,
+            },
+        }
     }
 }
 

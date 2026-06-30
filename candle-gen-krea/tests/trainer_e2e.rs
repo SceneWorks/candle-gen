@@ -299,6 +299,64 @@ fn krea_lora_gradient_checkpointing() {
     );
 }
 
+/// sc-8650 regression: preview rendering at **production resolution** (1024², gradient-checkpoint, 28
+/// sample-steps) must NOT OOM. The render runs **graph-free** — the driver freezes the adapter `Var`s to
+/// detached snapshots for the denoise, so it uses inference-level memory (the same path 24 GB cards run).
+/// Before that fix this OOM'd: the live `Var`s made the multi-step denoise retain a whole training-style
+/// graph, so every full-res preview was best-effort-skipped (0 emitted). The 64px `*_emits_preview_samples`
+/// smoke never accumulated enough graph to surface it — this guards the real production path.
+#[test]
+#[ignore = "needs real Krea-2-Raw weights + a GPU; run with --features cuda --release --ignored"]
+fn krea_preview_full_resolution_no_oom() {
+    if snapshot().is_none() {
+        eprintln!("skipping: set KREA_RAW_DIR (or KREA_TURBO_DIR)");
+        return;
+    }
+    let tmp = std::env::temp_dir().join("krea_preview_1024");
+    let items = make_dataset(&tmp);
+    candle_gen_krea::force_link();
+    let mut trainer = gen_core::load_trainer(
+        "krea_2_raw",
+        &LoadSpec::new(WeightsSource::Dir(snapshot().unwrap())),
+    )
+    .expect("krea_2_raw trainer registered");
+    // Production-shaped: 1024² with gradient checkpointing (the 12B DiT forces it), 28 sample-steps.
+    let mut cfg = config(NetworkType::Lora, 2, true);
+    cfg.resolution = 1024;
+    cfg.sample_every = 2;
+    cfg.sample_steps = 28;
+    cfg.sample_guidance_scale = 3.5;
+    cfg.sample_prompts = vec![
+        "a portrait photo".to_string(),
+        "a landscape photo".to_string(),
+    ];
+    let req = TrainingRequest {
+        items,
+        config: cfg,
+        output_dir: tmp.join("out"),
+        file_name: "krea_1024.safetensors".to_string(),
+        trigger_words: vec![],
+        cancel: CancelFlag::new(),
+    };
+    let mut samples = 0u32;
+    trainer
+        .train(&req, &mut |p| {
+            if let TrainingProgress::Sample { image, .. } = p {
+                assert_eq!(
+                    image.pixels.len(),
+                    (image.width * image.height * 3) as usize,
+                    "RGB8 row-major"
+                );
+                samples += 1;
+            }
+        })
+        .expect("training runs");
+    assert_eq!(
+        samples, 2,
+        "expected 2 full-resolution (1024²) previews without OOM (1 cadence × 2 prompts), got {samples}"
+    );
+}
+
 /// sc-8650: with a sample cadence set, the trainer renders preview images from the **in-progress
 /// adapter** and emits them as [`TrainingProgress::Sample`] — each a valid, non-empty RGB8 bitmap. This
 /// is the candle twin of the MLX sc-5637 `*_emits_preview_samples` smokes.

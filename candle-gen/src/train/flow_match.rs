@@ -573,6 +573,13 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         if cfg.sample_every > 0 && step % cfg.sample_every == 0 {
             if let Some(state) = sample_plan.state.as_ref() {
                 let total = sample_plan.prompts.len() as u32;
+                // Freeze the adapters to detached snapshots so the multi-step preview denoise runs
+                // graph-free (the factor `Var`s are otherwise tracked, retaining the whole forward's
+                // activations → OOM at full resolution). Restored right after so training keeps its grads.
+                let _ = dit.visit_lora_mut(&mut |ll| {
+                    ll.freeze_adapter();
+                    Ok(())
+                });
                 for (index, prompt) in sample_plan.prompts.iter().enumerate() {
                     if req.cancel.is_cancelled() {
                         break;
@@ -594,6 +601,10 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
                         ),
                     }
                 }
+                let _ = dit.visit_lora_mut(&mut |ll| {
+                    ll.thaw_adapter();
+                    Ok(())
+                });
             }
         }
 

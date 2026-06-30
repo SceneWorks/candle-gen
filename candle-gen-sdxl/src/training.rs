@@ -55,8 +55,8 @@ use candle_gen::train::checkpoint::{checkpoint_filename, file_stem};
 use candle_gen::train::dataset::{bucket_resolution, load_image_tensor};
 use candle_gen::train::gradient_checkpoint::{checkpointed_backward, Segment};
 use candle_gen::train::lora::{
-    build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraSet,
-    SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
+    build_lokr_targets, build_lora_targets, save_lokr, save_lora_peft, AdapterKind, LoraHost,
+    LoraSet, SDXL_ATTN_TARGETS, SDXL_PEFT_PREFIX,
 };
 use candle_gen::train::optim::{accumulate_grads, clip_grad_norm, scale_grads, TrainOptimizer};
 use candle_gen::train::schedule::{lr_multiplier, schedule_updates};
@@ -729,6 +729,13 @@ impl SdxlTrainer {
             if cfg.sample_every > 0 && step % cfg.sample_every == 0 {
                 if let Some(preview) = &preview {
                     let total_previews = preview.prompts.len() as u32;
+                    // Freeze adapters to detached snapshots so the preview denoise runs graph-free (the
+                    // factor `Var`s are otherwise tracked → the forward's activations are retained →
+                    // OOM at full resolution). Restored right after so training keeps its grads.
+                    let _ = unet.visit_lora_mut(&mut |ll| {
+                        ll.freeze_adapter();
+                        Ok(())
+                    });
                     for (i, prompt) in preview.prompts.iter().enumerate() {
                         let seed = candle_gen::train::flow_match::sample_seed(cfg.seed, step, i);
                         match render_one_preview(
@@ -756,6 +763,10 @@ impl SdxlTrainer {
                             ),
                         }
                     }
+                    let _ = unet.visit_lora_mut(&mut |ll| {
+                        ll.thaw_adapter();
+                        Ok(())
+                    });
                 }
             }
 
