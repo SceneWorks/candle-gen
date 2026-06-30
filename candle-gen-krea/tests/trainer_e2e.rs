@@ -360,7 +360,10 @@ fn krea_trainer_emits_preview_samples() {
         samples.len()
     );
     for (step, index, total, prompt, img) in &samples {
-        assert!(*step == 2 || *step == 4, "preview at a cadence step, got {step}");
+        assert!(
+            *step == 2 || *step == 4,
+            "preview at a cadence step, got {step}"
+        );
         assert_eq!(*total, 2, "two prompts per cadence");
         assert!((1..=2).contains(index), "1-based prompt index, got {index}");
         assert!(img.width > 0 && img.height > 0, "non-empty preview dims");
