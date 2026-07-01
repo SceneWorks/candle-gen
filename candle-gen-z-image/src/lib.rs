@@ -55,6 +55,12 @@ pub mod edit;
 #[cfg(test)]
 mod edit_validate;
 
+// Base (non-Turbo) `z_image` img2img/`Reference` real-weight GPU validation (sc-8646) — env-driven,
+// `#[ignore]`d integration test driving the REGISTERED base generator through a `Conditioning::Reference`
+// (strength ablation + the strength-1.0 source round-trip + prompt divergence).
+#[cfg(test)]
+mod base_img2img_validate;
+
 pub use adapters::{merge_adapters, MergeReport};
 // Base (non-Turbo) `z_image` generator (sc-8414). Its `descriptor`/`load`/`MODEL_ID` share the names
 // of the Turbo model's free functions below, so reach them through the `base` module path (consumers

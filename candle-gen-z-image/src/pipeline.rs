@@ -46,9 +46,10 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
+use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
-use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress};
+use candle_gen::gen_core::{self, AdapterSpec, Conditioning, GenerationRequest, Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
 use candle_transformers::models::z_image::sampling::postprocess_image;
@@ -60,7 +61,7 @@ use candle_transformers::models::z_image::text_encoder::{TextEncoderConfig, ZIma
 use candle_transformers::models::z_image::transformer::{
     Config as DitConfig, ZImageTransformer2DModel,
 };
-use candle_transformers::models::z_image::vae::{AutoEncoderKL, VaeConfig};
+use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder, VaeConfig};
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 
@@ -116,6 +117,49 @@ pub(crate) const TOKENIZER_MAX_LEN: usize = 512;
 /// pure function so the law is unit-testable without a GPU.
 pub(crate) fn image_seed(base_seed: u64, index: u32) -> u64 {
     base_seed.wrapping_add(index as u64)
+}
+
+/// The VAE **encoder** runs f32 (the encode path's dtype, matching [`crate::edit`]); its distribution
+/// mean is cast to the compute dtype (bf16) for the img2img init latent. Only the base img2img /
+/// `Reference` path (sc-8646) builds/uses an encoder — txt2img never touches it.
+const ENC_DTYPE: DType = DType::F32;
+
+/// img2img start step — the Z-Image "structure-preservation" convention (the fork's `init_time_step`,
+/// mirrored from `mlx-gen`'s shared `img2img::init_time_step`): for a reference with `strength` in
+/// `(0, 1]`, `max(1, floor(num_steps · strength))`; otherwise `0` (pure txt2img, no reference blend).
+/// **Higher strength → later start → fewer denoise steps → output stays CLOSER to the reference** — the
+/// inverse of the SDXL knob, matched here so the strength knob behaves identically on the Mac (MLX) and
+/// Windows (candle) base lanes. `floor` because Python `int(steps · strength)` truncates toward zero for
+/// `s ≥ 0`. Pure function so the cross-backend-parity law is unit-testable without a GPU.
+pub(crate) fn init_time_step(num_steps: usize, strength: Option<f32>) -> usize {
+    match strength {
+        Some(s) if s > 0.0 => {
+            let s = s.clamp(0.0, 1.0);
+            ((num_steps as f32 * s) as usize).max(1)
+        }
+        _ => 0,
+    }
+}
+
+/// Resolve the single img2img init image + its effective strength from the request's conditioning
+/// (sc-8646), mirroring `mlx-gen-z-image::pipeline::resolve_reference`. A per-reference `strength`
+/// overrides `req.strength`. The base Z-Image conditions on exactly one init image, so more than one
+/// [`Conditioning::Reference`] is an error (multi-image would be `MultiReference`, unadvertised here);
+/// non-`Reference` conditioning kinds are already rejected by the capability floor in `validate`.
+pub(crate) fn resolve_reference(req: &GenerationRequest) -> Result<Option<(&Image, Option<f32>)>> {
+    let mut reference = None;
+    for c in &req.conditioning {
+        if let Conditioning::Reference { image, strength } = c {
+            if reference.is_some() {
+                return Err(CandleError::Msg(
+                    "z_image: multiple reference images are not supported (single img2img init only)"
+                        .into(),
+                ));
+            }
+            reference = Some((image, strength.or(req.strength)));
+        }
+    }
+    Ok(reference)
 }
 
 /// The **base** (non-Turbo) Z-Image flow-match scheduler config: `shift = 6.0`,
@@ -248,6 +292,39 @@ impl Pipeline {
         }
         crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
         Ok(VarBuilder::from_tensors(tensors, self.dtype, &self.device))
+    }
+
+    /// Build the standalone f32 VAE **encoder** for the base img2img / `Reference` path (sc-8646). The
+    /// decode `AutoEncoderKL` holds an encoder too, but (a) it is private and (b) its `encode` samples
+    /// the diagonal-gaussian via the *device* RNG (not launch-portable — breaks sc-3673), so — exactly
+    /// like [`crate::edit`] and [`crate::control`] — the raw `Encoder` is run here to take the
+    /// distribution **mean** deterministically. Only built on the first img2img request (cached by the
+    /// generator), so the txt2img / Turbo path never pays for it.
+    pub(crate) fn load_vae_encoder(&self) -> Result<VaeEncoder> {
+        let files = self.component_files("vae")?;
+        // SAFETY: mmap of read-only weight files; standard candle loading path.
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, ENC_DTYPE, &self.device)? };
+        Ok(VaeEncoder::new(&VaeConfig::z_image(), vb.pp("encoder"))?)
+    }
+
+    /// VAE-encode `source` (LANCZOS-resized to the render size, normalized to `[-1, 1]` NCHW) to the
+    /// deterministic clean init latent `(1, 16, H/8, W/8)` at the compute dtype (bf16): the distribution
+    /// **mean** (not a sampled draw), mapped to latent space as `(mean − shift) · scale` — the same
+    /// deterministic encode [`crate::edit::ZImageEdit::encode_source`] uses. `encoder` is the f32 encoder
+    /// from [`load_vae_encoder`](Self::load_vae_encoder).
+    pub(crate) fn encode_reference(
+        &self,
+        encoder: &VaeEncoder,
+        source: &Image,
+        width: u32,
+        height: u32,
+    ) -> Result<Tensor> {
+        let vae_cfg = VaeConfig::z_image();
+        let img = preprocess_source(source, width, height, &self.device)?; // f32 (1,3,H,W) [-1,1]
+        let moments = img.apply(encoder)?; // (1, 32, H/8, W/8) — [mean | logvar]
+        let mean = moments.chunk(2, 1)?[0].clone(); // (1, 16, H/8, W/8)
+        let latents = ((mean - vae_cfg.shift_factor)? * vae_cfg.scaling_factor)?;
+        Ok(latents.to_dtype(self.dtype)?)
     }
 
     /// Prompt → `cap_feats` `(seq, 2560)` at the compute dtype. Tokenizes with the Qwen chat
@@ -411,10 +488,20 @@ impl Pipeline {
     ///   forward (Turbo-equivalent cost). The uncond branch encodes the negative prompt (empty string
     ///   when unset — the unconditional embedding).
     /// - **Default 50 steps** when `req.steps` is unset ([`BASE_DEFAULT_STEPS`]).
+    ///
+    /// **img2img / `Reference` (sc-8646).** When `clean` is `Some` (the caller VAE-encoded a reference
+    /// image via [`encode_reference`](Self::encode_reference)) and `start_step > 0`, each image blends
+    /// the pre-encoded clean latent with the seeded noise at `σ_start` (the flow-match interpolation
+    /// `x_t = (1 − σ)·clean + σ·noise`) and denoises the **reduced** `start_step..` tail of the σ
+    /// schedule — real CFG applies to the img2img tail exactly as to txt2img. `start_step == 0` (`clean`
+    /// is `None`) is pure txt2img: `x_t = noise`, full schedule — byte-identical to the pre-sc-8646 path.
+    /// Mirrors `mlx-gen-z-image::model_base` + `pipeline::render_batch`.
     pub(crate) fn render_base(
         &self,
         req: &GenerationRequest,
         components: &Components,
+        clean: Option<&Tensor>,
+        start_step: usize,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
@@ -467,14 +554,32 @@ impl Pipeline {
                 &native,
             );
 
+            // img2img / `Reference` (sc-8646): blend the pre-encoded clean latent with the seeded noise
+            // at `σ_start = sigmas[start]` and denoise the reduced `start..` schedule tail. `start` is
+            // clamped to the schedule because a curated scheduler may return a length ≠ `steps + 1`.
+            // For txt2img (`clean` is `None`, `start_step == 0`) this is `x_t = noise` over the full
+            // schedule — byte-identical to the pre-sc-8646 path. Mirrors `render_batch`'s
+            // `add_noise_by_interpolation` (`x_t = (1 − σ)·clean + σ·noise`).
+            let start = start_step.min(sigmas.len().saturating_sub(1));
+            let x_t = match clean {
+                Some(clean) => {
+                    let sigma_start = sigmas[start] as f64;
+                    (clean.affine(1.0 - sigma_start, 0.0)? + noise.affine(sigma_start, 0.0)?)?
+                }
+                None => noise,
+            };
+            let run_sigmas = &sigmas[start..];
+
             // `prepare_inputs` pads cap_feats to SEQ_MULTI_OF (+ attention mask) for both the cond and
-            // (when CFG is on) the uncond branch, and adds the singleton frame axis to the latents.
-            let prepared = prepare_inputs(&noise, std::slice::from_ref(&cap), &self.device)?;
+            // (when CFG is on) the uncond branch, and adds the singleton frame axis to the latents. The
+            // uncond branch only uses cap_feats/cap_mask (its `latents` are discarded), so passing `x_t`
+            // there is fine.
+            let prepared = prepare_inputs(&x_t, std::slice::from_ref(&cap), &self.device)?;
             let cap_feats = prepared.cap_feats;
             let cap_mask = prepared.cap_mask;
             let uncond = match neg_cap.as_ref() {
                 Some(neg) => {
-                    let p = prepare_inputs(&noise, std::slice::from_ref(neg), &self.device)?;
+                    let p = prepare_inputs(&x_t, std::slice::from_ref(neg), &self.device)?;
                     Some((p.cap_feats, p.cap_mask))
                 }
                 None => None,
@@ -483,7 +588,7 @@ impl Pipeline {
             let latents = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
                 TimestepConvention::OneMinusSigma,
-                &sigmas,
+                run_sigmas,
                 prepared.latents,
                 seed,
                 &req.cancel,
@@ -540,6 +645,36 @@ impl Pipeline {
             pixels,
         })
     }
+}
+
+/// An RGB8 img2img reference → `[1, 3, H, W]` f32 in `[-1, 1]` (the VAE encoder's input range),
+/// LANCZOS-resized to the render `width × height` (the worker pre-fits, but resizing here keeps the
+/// base provider robust to an off-size reference — the same normalization [`crate::edit`] uses,
+/// sc-8646). A no-op resize when already at the render size.
+fn preprocess_source(image: &Image, width: u32, height: u32, device: &Device) -> Result<Tensor> {
+    let (iw, ih) = (image.width as usize, image.height as usize);
+    if image.pixels.len() != iw * ih * 3 {
+        return Err(CandleError::Msg(format!(
+            "z_image img2img: reference buffer {} != {iw}x{ih}x3",
+            image.pixels.len()
+        )));
+    }
+    let (rw, rh) = (width as usize, height as usize);
+    let resized: Vec<f32> = if (ih, iw) == (rh, rw) {
+        image.pixels.iter().map(|&p| p as f32).collect()
+    } else {
+        resize_lanczos_u8(&image.pixels, ih, iw, rh, rw) // HWC f32 [0,255]
+    };
+    // [0,255] → [-1,1], HWC → CHW.
+    let mut data = vec![0f32; 3 * rh * rw];
+    for y in 0..rh {
+        for x in 0..rw {
+            for c in 0..3 {
+                data[c * rh * rw + y * rw + x] = resized[(y * rw + x) * 3 + c] / 127.5 - 1.0;
+            }
+        }
+    }
+    Ok(Tensor::from_vec(data, (1, 3, rh, rw), device)?.to_dtype(ENC_DTYPE)?)
 }
 
 #[cfg(test)]
@@ -669,5 +804,117 @@ mod tests {
                 1.0 - s.sigmas[i]
             );
         }
+    }
+
+    /// The base img2img start-step law (sc-8646, the fork's `init_time_step` over `Option<f32>`):
+    /// `max(1, floor(steps·strength))` for a strength in `(0, 1]`, else `0` (pure txt2img). Higher
+    /// strength → later start → fewer denoise steps (Z-Image structure preservation). Pure, no GPU —
+    /// the cross-backend-parity contract with `mlx-gen`'s shared `img2img::init_time_step`.
+    #[test]
+    fn init_time_step_is_the_fork_convention() {
+        // None / non-positive strength ⇒ pure txt2img (start 0, reference ignored).
+        assert_eq!(init_time_step(50, None), 0);
+        assert_eq!(init_time_step(50, Some(0.0)), 0);
+        assert_eq!(init_time_step(50, Some(-1.0)), 0);
+        // floor(steps·strength), min 1.
+        assert_eq!(init_time_step(50, Some(0.6)), 30); // floor(30.0)
+        assert_eq!(init_time_step(50, Some(0.01)), 1); // floor(0.5)=0 → max(1,0)=1
+        assert_eq!(init_time_step(4, Some(0.6)), 2); // floor(2.4)
+        assert_eq!(init_time_step(50, Some(1.0)), 50); // == steps ⇒ empty loop, source round-trip
+        assert_eq!(init_time_step(50, Some(2.0)), 50); // clamped above 1
+                                                       // Monotone: higher strength ⇒ later (or equal) start.
+        let starts: Vec<usize> = [0.1, 0.3, 0.5, 0.7, 0.9]
+            .iter()
+            .map(|&s| init_time_step(50, Some(s)))
+            .collect();
+        assert!(starts.windows(2).all(|w| w[0] <= w[1]), "{starts:?}");
+    }
+
+    /// `resolve_reference` pulls the single img2img init image + its effective strength from the
+    /// request's conditioning (sc-8646): the per-reference strength wins over `req.strength`, a bare
+    /// `Reference` falls back to `req.strength`, no `Reference` is `None`, and >1 `Reference` errors.
+    /// Pure, no GPU.
+    #[test]
+    fn resolve_reference_picks_single_ref_and_strength() {
+        use candle_gen::gen_core::{Conditioning, Image};
+        let img = || Image {
+            width: 8,
+            height: 8,
+            pixels: vec![0u8; 8 * 8 * 3],
+        };
+
+        // No conditioning ⇒ txt2img.
+        let none = GenerationRequest::default();
+        assert!(resolve_reference(&none).unwrap().is_none());
+
+        // Per-reference strength wins over req.strength.
+        let per_ref = GenerationRequest {
+            strength: Some(0.2),
+            conditioning: vec![Conditioning::Reference {
+                image: img(),
+                strength: Some(0.75),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(resolve_reference(&per_ref).unwrap().unwrap().1, Some(0.75));
+
+        // A bare Reference falls back to req.strength.
+        let fallback = GenerationRequest {
+            strength: Some(0.3),
+            conditioning: vec![Conditioning::Reference {
+                image: img(),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(resolve_reference(&fallback).unwrap().unwrap().1, Some(0.3));
+
+        // More than one Reference is an error (single img2img init only).
+        let two = GenerationRequest {
+            conditioning: vec![
+                Conditioning::Reference {
+                    image: img(),
+                    strength: None,
+                },
+                Conditioning::Reference {
+                    image: img(),
+                    strength: None,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(resolve_reference(&two).is_err());
+    }
+
+    /// The img2img blend + reduced-schedule indices the base render loop reads (sc-8646), asserted on
+    /// the static shift=6.0 σ table. At start `k`: the loop runs the `sigmas[k..]` tail (so
+    /// `steps − k + 1` σ nodes / `steps − k` steps), σ_start = sigmas[k] ∈ (0,1) for interior `k`, and
+    /// the flow-match interpolation `x_t = (1−σ)·clean + σ·noise` seeds the loop. Max strength (k=steps)
+    /// ⇒ σ_start = 0 ⇒ x_t = clean and a single-node (0-step) tail: the source VAE round-trip. GPU-free.
+    #[test]
+    fn img2img_reduced_schedule_indices() {
+        let steps = 50usize;
+        let mut s = FlowMatchEulerDiscreteScheduler::new(base_scheduler_config());
+        s.set_timesteps(steps, None);
+        let sigmas: Vec<f32> = s.sigmas.iter().map(|&x| x as f32).collect();
+        assert_eq!(sigmas.len(), steps + 1);
+
+        // Default strength 0.6 → start 30; the tail runs sigmas[30..] (21 nodes, 20 steps).
+        let start = init_time_step(steps, Some(0.6));
+        assert_eq!(start, 30);
+        let tail = &sigmas[start..];
+        assert_eq!(tail.len(), steps - start + 1);
+        assert!(
+            tail[0] > 0.0 && tail[0] < 1.0,
+            "σ_start in (0,1): {}",
+            tail[0]
+        );
+        assert!(tail[tail.len() - 1].abs() < 1e-6, "tail ends at 0");
+
+        // Max strength → start == steps → single-node tail (0 steps), σ_start == 0 ⇒ x_t == clean.
+        let full = init_time_step(steps, Some(1.0));
+        assert_eq!(full, steps);
+        assert_eq!(sigmas[full..].len(), 1);
+        assert!(sigmas[full].abs() < 1e-6);
     }
 }

@@ -24,15 +24,16 @@
 //! additive.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Progress, WeightsSource,
+    self, AdapterSpec, Capabilities, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, Modality, ModelDescriptor, Progress, WeightsSource,
 };
+use candle_transformers::models::z_image::vae::Encoder as VaeEncoder;
 
-use crate::pipeline::{Components, Pipeline};
+use crate::pipeline::{self, Components, Pipeline, BASE_DEFAULT_STEPS};
 use crate::{accel_attn_enabled, SIZE_MULTIPLE};
 
 /// Registry id for the **base** Z-Image (non-Turbo). Matches the SceneWorks catalog `z_image` entry
@@ -56,6 +57,11 @@ pub struct ZImageBaseGenerator {
     /// Cached components + the accel-attn flag they were built with. `Mutex` because `Generator` is
     /// shared and `generate` takes `&self`; the lock is held only to read/populate the cache.
     components: Mutex<Option<(bool, Components)>>,
+    /// Lazily-built, cached f32 VAE encoder for the img2img / `Reference` path (sc-8646). Built on the
+    /// **first img2img request only** — a pure txt2img workload never populates it, so the txt2img cost
+    /// is unchanged. Accel-independent (the encoder has no attention-dispatch toggle), so a single
+    /// cached instance serves every request.
+    vae_encoder: Mutex<Option<Arc<VaeEncoder>>>,
 }
 
 impl ZImageBaseGenerator {
@@ -75,6 +81,22 @@ impl ZImageBaseGenerator {
         let comps = pipe.load_components(accel)?;
         *guard = Some((accel, comps.clone()));
         Ok(comps)
+    }
+
+    /// Get the cached f32 VAE encoder for the img2img / `Reference` path (sc-8646), building it on a
+    /// miss. Only ever called when a request carries a `Reference` at a strength that yields a non-empty
+    /// denoise (`start_step > 0`), so a txt2img-only workload never builds it.
+    fn vae_encoder(&self, pipe: &Pipeline) -> gen_core::Result<Arc<VaeEncoder>> {
+        let mut guard = self
+            .vae_encoder
+            .lock()
+            .expect("z-image base vae-encoder cache mutex poisoned");
+        if let Some(enc) = guard.as_ref() {
+            return Ok(enc.clone());
+        }
+        let enc = Arc::new(pipe.load_vae_encoder()?);
+        *guard = Some(enc.clone());
+        Ok(enc)
     }
 }
 
@@ -116,7 +138,27 @@ impl Generator for ZImageBaseGenerator {
         self.validate(req)?;
         let pipe = Pipeline::load(&self.root, &self.device, self.dtype, &self.adapters);
         let components = self.components(&pipe)?;
-        let images = pipe.render_base(req, &components, on_progress)?;
+
+        // img2img / `Reference` (sc-8646): resolve the single reference + its effective strength, and —
+        // when the strength yields a non-empty structure-preserving denoise (`start_step > 0`) —
+        // VAE-encode it to the clean init latent. `resolve_reference` errors on >1 reference; the
+        // capability floor in `validate` already rejects any non-`Reference` conditioning. Mirrors
+        // `mlx-gen-z-image::model_base::generate_impl`.
+        let reference = pipeline::resolve_reference(req)?;
+        let steps = req.steps.map(|s| s as usize).unwrap_or(BASE_DEFAULT_STEPS);
+        let start_step = match &reference {
+            Some((_, strength)) => pipeline::init_time_step(steps, *strength),
+            None => 0,
+        };
+        let clean = if start_step > 0 {
+            let (image, _) = reference.expect("start_step > 0 implies a reference");
+            let encoder = self.vae_encoder(&pipe)?;
+            Some(pipe.encode_reference(&encoder, image, req.width, req.height)?)
+        } else {
+            None
+        };
+
+        let images = pipe.render_base(req, &components, clean.as_ref(), start_step, on_progress)?;
         Ok(GenerationOutput::Images(images))
     }
 }
@@ -137,13 +179,12 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: true,
-            // txt2img only in this slice (sc-8414): `render_base` does not consume a Reference image,
-            // so the descriptor advertises NO conditioning rather than silently dropping one (the
-            // false-capability trap the Turbo crate documents). The mlx base provider DOES expose
-            // img2img `Reference`; wiring it on the candle base path is a follow-up. An empty list
-            // means the shared `validate_request` rejects any conditioning and the worker keeps those
-            // shapes on the Python path.
-            conditioning: vec![],
+            // img2img: `render_base` VAE-encodes a single `Reference` image → partial-noise init at the
+            // requested strength → real-CFG denoise of the reduced schedule tail (sc-8646, the candle
+            // sibling of `mlx-gen-z-image::model_base`'s `Reference` route). ControlNet is a separate
+            // variant (Fun-ControlNet, [`crate::control`]); multi-image would be `MultiReference` — both
+            // unadvertised here, so the capability floor keeps those shapes on the Python path.
+            conditioning: vec![ConditioningKind::Reference],
             // LoRA/LoKr merge into the dense DiT at load (sc-5166), shared with Turbo.
             supports_lora: true,
             supports_lokr: true,
@@ -203,6 +244,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         dtype: DType::BF16,
         adapters: spec.adapters.clone(),
         components: Mutex::new(None),
+        vae_encoder: Mutex::new(None),
     }))
 }
 
@@ -245,6 +287,9 @@ mod tests {
             d.capabilities.schedulers,
             candle_gen::curated_scheduler_names()
         );
+        // img2img / `Reference` is advertised (sc-8646) — the candle base path now VAE-encodes a
+        // reference and denoises the reduced schedule tail, matching the mlx base provider.
+        assert!(d.capabilities.accepts(ConditioningKind::Reference));
     }
 
     /// The base differs from Turbo where it must (CFG support, distinct id) and agrees on the shared
@@ -267,9 +312,10 @@ mod tests {
     }
 
     /// A txt2img request with guidance + a negative prompt passes base validation (the Turbo descriptor
-    /// rejects them); unsupported shapes are still rejected clearly. Uses the lazy generator (no GPU).
+    /// rejects them), and an img2img `Reference` request passes too (sc-8646); unsupported shapes are
+    /// still rejected clearly. Uses the lazy generator (no GPU).
     #[test]
-    fn validate_accepts_cfg_and_rejects_unsupported() {
+    fn validate_accepts_cfg_and_reference_and_rejects_unsupported() {
         let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
         let g = registry::load("z_image", &spec).unwrap();
 
@@ -283,6 +329,17 @@ mod tests {
             g.validate(&ok).is_ok(),
             "base accepts guidance + negative prompt"
         );
+
+        // img2img: a single `Reference` is now an accepted conditioning (sc-8646).
+        let img2img = GenerationRequest {
+            prompt: "a rusty robot holding a lit candle".into(),
+            conditioning: vec![Conditioning::Reference {
+                image: Image::default(),
+                strength: Some(0.6),
+            }],
+            ..Default::default()
+        };
+        assert!(g.validate(&img2img).is_ok(), "base accepts a Reference");
 
         for bad in [
             // empty prompt
@@ -299,20 +356,19 @@ mod tests {
                 steps: Some(0),
                 ..Default::default()
             },
-            // any conditioning — txt2img-only slice advertises none (img2img is a follow-up)
+            // an unadvertised conditioning kind (control) is still rejected — only `Reference` is wired.
             GenerationRequest {
                 prompt: "x".into(),
-                conditioning: vec![Conditioning::Reference {
+                conditioning: vec![Conditioning::Depth {
                     image: Image::default(),
-                    strength: None,
                 }],
                 ..Default::default()
             },
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
-        // Sanity: img2img Reference is a kind the candle base slice does not advertise.
-        assert!(!descriptor()
+        // Sanity: img2img Reference IS a kind the candle base slice now advertises.
+        assert!(descriptor()
             .capabilities
             .accepts(ConditioningKind::Reference));
     }
