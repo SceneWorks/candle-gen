@@ -385,7 +385,10 @@ fn real_aitoolkit_lokr_merges_full_surface() {
         let (w2o, w2i) = (dims.w2_out.unwrap(), dims.w2_in.unwrap());
         let (out_f, in_f) = (w1r * w2o, w1c * w2i);
         let key = format!("{}.weight", resolve_native_module(module));
-        base.insert(key, Tensor::zeros((out_f, in_f), DType::BF16, &dev).unwrap());
+        base.insert(
+            key,
+            Tensor::zeros((out_f, in_f), DType::BF16, &dev).unwrap(),
+        );
     }
     let n = base.len();
     eprintln!("[krea ai-toolkit LoKr] modules={n}");
