@@ -6,9 +6,15 @@
 //!   krea_2_turbo D:\models\Krea-2-Turbo "a red apple on a wooden table" 1024 1024 0 42 out.png
 //! ```
 //! Arg order: <model_id> <snapshot_dir> <prompt> [width] [height] [steps(0=default)] [seed] [out.png]
+//!            [adapter.safetensors] [adapter_scale]
+//!
+//! When an `[adapter.safetensors]` path is given it is loaded as an `AdapterKind::Lora` spec (the way
+//! the worker classifies a no-`networkType` file) and merged at first generate — exercising the
+//! sc-8776 LoKr-sniff / widened-surface path end-to-end.
 
 use candle_gen::gen_core::{
-    registry, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    registry, AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, Progress,
+    WeightsSource,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,8 +38,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(8)
         .cloned()
         .unwrap_or_else(|| "krea_render.png".into());
+    let adapter = a.get(9).cloned();
+    let adapter_scale: f32 = a.get(10).and_then(|s| s.parse().ok()).unwrap_or(1.0);
 
-    let spec = LoadSpec::new(WeightsSource::Dir(snapshot.into()));
+    let mut spec = LoadSpec::new(WeightsSource::Dir(snapshot.into()));
+    if let Some(path) = adapter {
+        eprintln!("adapter: {path} (Lora-classified, scale {adapter_scale})");
+        spec.adapters = vec![AdapterSpec::new(
+            path.into(),
+            adapter_scale,
+            AdapterKind::Lora,
+        )];
+    }
     let gen = registry::load(&model, &spec)?;
 
     let req = GenerationRequest {

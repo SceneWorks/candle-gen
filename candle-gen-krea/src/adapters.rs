@@ -14,11 +14,17 @@
 //! round-trips exactly.
 //!
 //! **Merge at the safetensors-key level.** The DiT reads its `transformer/` keys 1:1, so `{path}.weight`
-//! is a valid base key for every Linear an adapter targets — the single-stream blocks' attention
-//! projections (`to_q`/`to_k`/`to_v`/`to_out.0`, the [`KREA_ATTN_TARGETS`] surface). The Krea trainer
-//! writes **bare dotted** PEFT keys (`save_lora_peft(set, "", …)` — no `base_model.model.unet.` prefix);
-//! on read we also tolerate the common community prefixes ([`PEFT_PREFIXES`]) and a kohya
-//! `lora_transformer_<flat>` flattening resolved against the base key set.
+//! is a valid base key for every Linear an adapter targets. The candle `krea_2_raw` trainer's own
+//! default surface is the single-stream blocks' attention projections
+//! (`to_q`/`to_k`/`to_v`/`to_out.0`, [`crate::train_dit::KREA_ATTN_TARGETS`]), but the *merge* surface is
+//! wider — the full set of adaptable Linears MLX's host exposes (attention incl. `to_gate` + the SwiGLU
+//! FFN `ff.<gate|up|down>`, across the single-stream `transformer_blocks` **and** the `text_fusion`
+//! blocks, [`merge_surface_keys`]) — so an ai-toolkit LoKr that adapts gate + FFN folds in fully
+//! (sc-8776). The Krea trainer writes **bare dotted** PEFT keys (`save_lora_peft(set, "", …)` — no
+//! `base_model.model.unet.` prefix); on read we also tolerate the common community prefixes
+//! ([`PEFT_PREFIXES`]), the ai-toolkit native `diffusion_model.blocks…`/`wq`/`mlp` naming
+//! ([`normalize_native_krea_path`]), and a kohya `lora_transformer_<flat>` flattening resolved against
+//! the base key set.
 //!
 //! **Family-match policy:** a `family: krea_2` adapter (`baseModel: krea_2_raw`) applies on
 //! `krea_2_turbo` — there is **no base-model gating** here (the Lens / Z-Image precedent; base-model
@@ -26,8 +32,8 @@
 //! factors the file carries.
 //!
 //! Out-of-surface keys are **counted and surfaced** in [`MergeReport`], never silently dropped:
-//! text-encoder LoRAs (this is a DiT-only merge) and conv-shaped (4-D) factors (the trainer adapts the
-//! Linear attention projections only).
+//! text-encoder LoRAs (this is a DiT-only merge) and conv-shaped (4-D) factors (the merge folds only
+//! into the 2-D Linear projections).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -39,7 +45,6 @@ use candle_gen::{CandleError, Result};
 
 use crate::config::Krea2Config;
 use crate::loader::Weights;
-use crate::train_dit::KREA_ATTN_TARGETS;
 
 /// PEFT key prefixes tolerated on read, longest-first. The candle Krea trainer writes **bare** dotted
 /// paths (no prefix), but community adapters and `peft.save_pretrained()` wrap the DiT under one of
@@ -188,6 +193,18 @@ fn classify_lora_key(key: &str, table: &BTreeMap<String, String>) -> Option<(Str
     None
 }
 
+/// Resolve a LoKr module *stem* (the key with its `.lokr_*` / `.alpha` suffix already removed) to a
+/// DiT dotted path: a kohya `lora_transformer_<flat>` stem via `table`, else PEFT/bare/native resolved
+/// through the prefix strip + ai-toolkit rename. Shared by the factor and `.alpha` classifiers so a
+/// per-target `.alpha` groups under the same path as its factors.
+fn resolve_lokr_module(stem: &str, table: &BTreeMap<String, String>) -> Option<String> {
+    if let Some(flat) = stem.strip_prefix(KOHYA_PREFIX) {
+        table.get(flat).cloned()
+    } else {
+        Some(normalize_native_krea_path(strip_peft_prefix(stem)))
+    }
+}
+
 /// Map one LoKr factor key to `(dit_dotted_path, factor_name)`, or `None` if out of surface.
 fn classify_lokr_key(
     key: &str,
@@ -196,14 +213,19 @@ fn classify_lokr_key(
     for suf in LOKR_SUFFIXES {
         if let Some(stem) = key.strip_suffix(suf) {
             let factor = &suf[1..]; // drop the leading '.'
-            return if let Some(flat) = stem.strip_prefix(KOHYA_PREFIX) {
-                table.get(flat).map(|d| (d.clone(), factor))
-            } else {
-                Some((normalize_native_krea_path(strip_peft_prefix(stem)), factor))
-            };
+            return resolve_lokr_module(stem, table).map(|d| (d, factor));
         }
     }
     None
+}
+
+/// `true` if any tensor key is a LoKr factor (`*.lokr_w…`), regardless of `networkType` metadata —
+/// how a **third-party** LyCORIS LoKr (ai-toolkit / kohya / lycoris-lib) is recognized (those files
+/// ship the Kronecker factors but not the peft `networkType=lokr` stamp). Mirrors MLX `is_lokr_keys`.
+fn has_lokr_keys(af: &AdapterFile) -> bool {
+    af.tensors
+        .keys()
+        .any(|k| LOKR_SUFFIXES.iter().any(|s| k.ends_with(s)))
 }
 
 fn read_scalar(t: &Tensor) -> Result<f32> {
@@ -288,8 +310,36 @@ fn merge_lora_file(
     Ok(())
 }
 
-/// Merge one LoKr file into `base` at `scale`: `rank`/`alpha` from file metadata (alpha defaults to
-/// rank), per-module factors grouped, `δ = (alpha/rank)·kron(w1,w2)·scale` reconstructed and merged.
+/// One module's grouped LoKr factors plus its optional per-target `.alpha` scalar (the ai-toolkit /
+/// lycoris layout — vs SceneWorks' peft LoKr which stamps one file-level `rank`/`alpha`).
+#[derive(Default)]
+struct LokrGroup {
+    factors: BTreeMap<&'static str, Tensor>,
+    alpha: Option<f32>,
+}
+
+impl LokrGroup {
+    /// The LyCORIS factorization rank (`lora_dim`) derived from whichever factor is decomposed —
+    /// `lokr_w1_a` is `[out_l, dim]` (dim = trailing), else `lokr_w2_a` is `[out_k, dim]`. `None` when
+    /// **both** legs are full matrices: lycoris then forces `alpha = lora_dim` ⇒ scale 1 (ai-toolkit
+    /// `LokrModule.__init__`: `if use_w1 and use_w2: alpha = lora_dim`). Mirrors MLX `ThirdPartyLokr`.
+    fn rank(&self) -> Option<f32> {
+        if let Some(a) = self.factors.get("lokr_w1_a") {
+            return Some(a.dims()[1] as f32);
+        }
+        self.factors.get("lokr_w2_a").map(|a| a.dims()[1] as f32)
+    }
+}
+
+/// Merge one LoKr file into `base` at `scale`, `δ = (alpha/rank)·kron(w1,w2)·scale` per module.
+///
+/// Two `(alpha, rank)` sources, matching MLX's split (`parse_lokr` vs `parse_lokr_thirdparty`):
+/// SceneWorks' / candle-trainer **peft** LoKr stamps one file-level `rank`/`alpha` (alpha defaults to
+/// rank) applied to every target — preferred when present so a candle-trained adapter round-trips.
+/// A **third-party** LyCORIS file (ai-toolkit / lycoris) stamps neither and instead carries a
+/// per-target `.alpha` tensor; then rank/alpha/scale are derived **per module** ([`LokrGroup`]):
+/// rank from a decomposed factor's inner dim, alpha from the `.alpha` tensor, and the both-full case
+/// (`rank() == None`) forced to scale 1 — the ai-toolkit convention (sc-8776).
 fn merge_lokr_file(
     base: &mut HashMap<String, Tensor>,
     af: &AdapterFile,
@@ -297,28 +347,34 @@ fn merge_lokr_file(
     table: &BTreeMap<String, String>,
     report: &mut MergeReport,
 ) -> Result<()> {
-    let rank = af
-        .meta
-        .get("rank")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(1.0);
-    let alpha = af
-        .meta
-        .get("alpha")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(rank);
+    let file_rank = af.meta.get("rank").and_then(|s| s.parse::<f32>().ok());
+    let file_alpha = af.meta.get("alpha").and_then(|s| s.parse::<f32>().ok());
+    let has_file_meta = file_rank.is_some() || file_alpha.is_some();
 
-    let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
+    let mut grouped: BTreeMap<String, LokrGroup> = BTreeMap::new();
     for (key, t) in &af.tensors {
+        // Per-target `.alpha` scalar (ai-toolkit / lycoris) — group under the same DiT path as its
+        // factors so it can inform that module's scale.
+        if let Some(stem) = key.strip_suffix(".alpha") {
+            match resolve_lokr_module(stem, table) {
+                Some(path) => grouped.entry(path).or_default().alpha = Some(read_scalar(t)?),
+                None => report.skipped_keys += 1,
+            }
+            continue;
+        }
         match classify_lokr_key(key, table) {
             Some((path, factor)) => {
-                grouped.entry(path).or_default().insert(factor, t.clone());
+                grouped
+                    .entry(path)
+                    .or_default()
+                    .factors
+                    .insert(factor, t.clone());
             }
             None => report.skipped_keys += 1,
         }
     }
 
-    for (path, f) in grouped {
+    for (path, g) in grouped {
         let base_key = format!("{path}.weight");
         let Some(w) = base.get(&base_key) else {
             report.skipped_keys += 1;
@@ -328,14 +384,30 @@ fn merge_lokr_file(
             report.skipped_keys += 1; // conv LoKr — out of surface
             continue;
         }
+        // A group with only an `.alpha` (its factors targeted a non-routable module) can't be
+        // reconstructed — surface it rather than erroring on the missing `w1` leg.
+        if !g.factors.contains_key("lokr_w1") && !g.factors.contains_key("lokr_w1_a") {
+            report.skipped_keys += 1;
+            continue;
+        }
         let (out_f, in_f) = (w.dims()[0], w.dims()[1]);
+        // File-level peft metadata (candle-trainer) applied uniformly; else lycoris per-target.
+        let (alpha, rank) = if has_file_meta {
+            let rank = file_rank.unwrap_or(1.0);
+            (file_alpha.unwrap_or(rank), rank)
+        } else {
+            match g.rank() {
+                Some(r) => (g.alpha.unwrap_or(r), r),
+                None => (1.0, 1.0), // both factors full ⇒ lycoris scale 1
+            }
+        };
         let delta = reconstruct_lokr_delta(
-            f.get("lokr_w1"),
-            f.get("lokr_w1_a"),
-            f.get("lokr_w1_b"),
-            f.get("lokr_w2"),
-            f.get("lokr_w2_a"),
-            f.get("lokr_w2_b"),
+            g.factors.get("lokr_w1"),
+            g.factors.get("lokr_w1_a"),
+            g.factors.get("lokr_w1_b"),
+            g.factors.get("lokr_w2"),
+            g.factors.get("lokr_w2_a"),
+            g.factors.get("lokr_w2_b"),
             alpha,
             rank,
             scale,
@@ -377,33 +449,60 @@ pub fn merge_adapters(
                         spec.path.display()
                     )));
                 }
-                merge_lora_file(map, &af, spec.scale, &table, &mut report)?;
+                // A third-party LyCORIS LoKr (ai-toolkit / lycoris, sc-8776) carries `lokr_*` keys but
+                // NO `networkType` stamp, so `classify_adapter` can't know to set kind=Lokr — sniff the
+                // keys and route to the LoKr merge, mirroring MLX's `is_lokr_keys` autoprefix branch.
+                if has_lokr_keys(&af) {
+                    merge_lokr_file(map, &af, spec.scale, &table, &mut report)?;
+                } else {
+                    merge_lora_file(map, &af, spec.scale, &table, &mut report)?;
+                }
             }
         }
     }
     if report.merged == 0 {
         return Err(CandleError::Msg(format!(
             "krea: no adapter target modules matched across {} file(s) — expected bare/PEFT \
-             `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` with networkType=lokr (LoKr) \
-             over the DiT attention projections (transformer_blocks.<i>.attn.<to_q|to_k|to_v|to_out.0>). \
-             Conv-layer / text-encoder adapters are out of surface",
+             `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` (LoKr — declared \
+             networkType=lokr OR sniffed by key) over the DiT attention (to_q|to_k|to_v|to_gate|\
+             to_out.0) and SwiGLU FFN (ff.gate|ff.up|ff.down) projections across the single-stream \
+             transformer_blocks and text_fusion blocks. Conv-layer / text-encoder adapters are out \
+             of surface",
             specs.len()
         )));
     }
     Ok(report)
 }
 
-/// The dense base-weight keys the merge targets: each single-stream block's attention projections
-/// (`transformer_blocks.<i>.attn.<to_q|to_k|to_v|to_out.0>.weight`) — the [`KREA_ATTN_TARGETS`] surface
-/// the `krea_2_raw` trainer adapts. Preloading exactly these (rather than the whole 12B model) bounds
-/// the merge's transient host memory to the ~112 attention matrices, while still letting every trained
-/// target resolve.
-fn attention_surface_keys(cfg: &Krea2Config) -> Vec<String> {
-    let mut keys = Vec::with_capacity(cfg.num_layers * KREA_ATTN_TARGETS.len());
-    for i in 0..cfg.num_layers {
-        for target in KREA_ATTN_TARGETS {
-            keys.push(format!("transformer_blocks.{i}.attn.{target}.weight"));
+/// The dense base-weight keys the merge targets: every adaptable Linear the merge surface can fold a
+/// delta into — per block, the attention projections (`attn.<to_q|to_k|to_v|to_gate|to_out.0>`) and
+/// the SwiGLU FFN (`ff.<gate|up|down>`), across the single-stream `transformer_blocks` **and** the
+/// `text_fusion` `layerwise_blocks` / `refiner_blocks`. This is the full 256-Linear surface MLX's Krea
+/// [`AdaptableHost`] exposes (sc-8776); the candle `krea_2_raw` trainer's own default is a subset
+/// ([`crate::train_dit::KREA_ATTN_TARGETS`], the 112 attention matrices), but an ai-toolkit LoKr adapts `to_gate` + the
+/// FFN too, so preloading only the attention subset would silently skip half its targets. Preloading
+/// exactly this surface (rather than the whole 12B model — norms, embedders, modulation stay out)
+/// bounds the merge's transient host memory while letting every trained target resolve; a key absent
+/// from a given build (e.g. a 1-block test snapshot) is skipped by [`merge_into_weights`]'s
+/// `w.contains` guard.
+fn merge_surface_keys(cfg: &Krea2Config) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut block = |prefix: &str| {
+        for target in ["to_q", "to_k", "to_v", "to_gate", "to_out.0"] {
+            keys.push(format!("{prefix}.attn.{target}.weight"));
         }
+        for target in ["gate", "up", "down"] {
+            keys.push(format!("{prefix}.ff.{target}.weight"));
+        }
+    };
+    for i in 0..cfg.num_layers {
+        block(&format!("transformer_blocks.{i}"));
+    }
+    for i in 0..cfg.num_layerwise_text_blocks {
+        block(&format!("text_fusion.layerwise_blocks.{i}"));
+    }
+    for i in 0..cfg.num_refiner_text_blocks {
+        block(&format!("text_fusion.refiner_blocks.{i}"));
     }
     keys
 }
@@ -423,7 +522,7 @@ pub fn merge_into_weights(
         return Ok(MergeReport::default());
     }
     let mut map: HashMap<String, Tensor> = HashMap::new();
-    for key in attention_surface_keys(cfg) {
+    for key in merge_surface_keys(cfg) {
         if w.contains(&key) {
             map.insert(key.clone(), w.get_cpu(&key)?);
         }
@@ -436,6 +535,7 @@ pub fn merge_into_weights(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::train_dit::KREA_ATTN_TARGETS;
     use candle_gen::candle_core::safetensors::save as save_tensors;
 
     /// A tiny stand-in for the base DiT tensor map: two attention Linears + one conv (4-D) weight.
@@ -708,6 +808,176 @@ mod tests {
         )
         .unwrap();
         assert!(max_abs(&(merged - expected).unwrap()) < 1e-2);
+    }
+
+    /// The keystone sc-8776 round-trip: an **ostris ai-toolkit** LoKr — **no** `networkType` metadata,
+    /// per-target `.alpha` tensors, full `lokr_w1`/`lokr_w2` factors, native `diffusion_model.blocks…`
+    /// / `wq` / `mlp` naming across the attention (incl. `gate`) + SwiGLU FFN of a single-stream **and**
+    /// a text_fusion block — is written to disk, read back through the public [`merge_adapters`] with
+    /// the worker's `AdapterKind::Lora` classification, and folds in **every** target with
+    /// `skipped_keys == 0`. Because both Kronecker legs are full, the lycoris scale is 1, so the huge
+    /// sentinel `.alpha` (~1e10, as real ai-toolkit files ship) is correctly ignored.
+    #[test]
+    fn merge_adapters_sniffs_full_surface_aitoolkit_lokr() {
+        let dev = Device::Cpu;
+
+        // Base surface: one single-stream block (5 attn incl to_gate + 3 ff) + one text_fusion attn.
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        let base_zero = |m: &mut HashMap<String, Tensor>, k: String| {
+            m.insert(k, Tensor::zeros((4, 4), DType::BF16, &dev).unwrap());
+        };
+        for t in ["to_q", "to_k", "to_v", "to_gate", "to_out.0"] {
+            base_zero(&mut map, format!("transformer_blocks.0.attn.{t}.weight"));
+        }
+        for t in ["gate", "up", "down"] {
+            base_zero(&mut map, format!("transformer_blocks.0.ff.{t}.weight"));
+        }
+        base_zero(
+            &mut map,
+            "text_fusion.layerwise_blocks.0.attn.to_q.weight".into(),
+        );
+
+        // ai-toolkit native LoKr: full 2×2 ⊗ 2×2 = 4×4 delta, a sentinel per-target `.alpha`.
+        let w1 = t2(&[1.0, 2.0, 3.0, 4.0], 2, 2);
+        let w2 = t2(&[1.0, 0.0, 0.0, 1.0], 2, 2);
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        let add = |t: &mut HashMap<String, Tensor>, module: &str| {
+            t.insert(format!("{module}.lokr_w1"), w1.clone());
+            t.insert(format!("{module}.lokr_w2"), w2.clone());
+            t.insert(
+                format!("{module}.alpha"),
+                Tensor::from_vec(vec![9.999e9f32], (1,), &dev).unwrap(),
+            );
+        };
+        for t in ["wq", "wk", "wv", "gate", "wo"] {
+            add(&mut tensors, &format!("diffusion_model.blocks.0.attn.{t}"));
+        }
+        for t in ["gate", "up", "down"] {
+            add(&mut tensors, &format!("diffusion_model.blocks.0.mlp.{t}"));
+        }
+        add(
+            &mut tensors,
+            "diffusion_model.txtfusion.layerwise_blocks.0.attn.wq",
+        );
+
+        let file = std::env::temp_dir().join(format!(
+            "krea_aitoolkit_lokr_{}.safetensors",
+            std::process::id()
+        ));
+        save_tensors(&tensors, &file).unwrap();
+
+        // Classified `Lora` by the worker (no networkType); the sniff must route it to the LoKr merge.
+        let report = merge_adapters(
+            &mut map,
+            &[AdapterSpec::new(file.clone(), 1.0, AdapterKind::Lora)],
+        );
+        std::fs::remove_file(&file).ok();
+        let report = report.unwrap();
+
+        // All 9 targets merged (5 attn + 3 ff + 1 text_fusion), nothing skipped.
+        assert_eq!(
+            report.merged, 9,
+            "every attn/gate/ffn/text_fusion target must merge"
+        );
+        assert_eq!(
+            report.skipped_keys, 0,
+            "no ai-toolkit target should be skipped"
+        );
+
+        // Both-full ⇒ scale 1: merged to_q (zero base) is exactly kron(w1,w2), NOT scaled by ~1e10.
+        let merged = map
+            .get("transformer_blocks.0.attn.to_q.weight")
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        let expected = reconstruct_lokr_delta(
+            Some(&w1),
+            None,
+            None,
+            Some(&w2),
+            None,
+            None,
+            1.0,
+            1.0,
+            1.0,
+            (4, 4),
+        )
+        .unwrap();
+        assert!(
+            max_abs(&(&merged - &expected).unwrap()) < 1e-4,
+            "both-full LoKr must fold at scale 1 (sentinel alpha ignored)"
+        );
+        assert!(max_abs(&merged) > 0.0, "the delta must be non-trivial");
+    }
+
+    /// sc-8776: with **no** file-level `rank`/`alpha` metadata, a **decomposed** LoKr leg
+    /// (`lokr_w2_a`/`lokr_w2_b`) honors the per-target `.alpha` tensor — scale `alpha/rank` where
+    /// `rank` is the decomposed inner dim — mirroring MLX `ThirdPartyLokr` / ai-toolkit
+    /// (`scale = alpha / lora_dim`). Uses a rank-0 `.alpha` scalar, as real ai-toolkit files ship.
+    #[test]
+    fn merge_lokr_honors_per_target_alpha_when_decomposed() {
+        let dev = Device::Cpu;
+        let mut map = base_map(); // has transformer_blocks.0.attn.to_q [4,4]
+        let path = "transformer_blocks.0.attn.to_q";
+        let w1 = t2(&[1.0, 0.0, 0.0, 1.0], 2, 2); // full
+        let w2a = t2(&[1.0, 0.0, 0.0, 1.0], 2, 2); // [out_k=2, rank=2]
+        let w2b = t2(&[0.5, 1.0, 1.5, 2.0], 2, 2); // [rank=2, in_n=2]
+        let af = AdapterFile {
+            tensors: HashMap::from([
+                (format!("{path}.lokr_w1"), w1.clone()),
+                (format!("{path}.lokr_w2_a"), w2a.clone()),
+                (format!("{path}.lokr_w2_b"), w2b.clone()),
+                (
+                    format!("{path}.alpha"),
+                    Tensor::from_vec(vec![8.0f32], (), &dev).unwrap(), // rank-0 scalar
+                ),
+            ]),
+            meta: HashMap::new(), // no networkType / rank / alpha
+        };
+        let table = build_kohya_table(&map);
+        let mut report = MergeReport::default();
+        merge_lokr_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
+        assert_eq!(report.merged, 1);
+        assert_eq!(report.skipped_keys, 0);
+
+        let merged = map
+            .get(&format!("{path}.weight"))
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        // rank = w2_a.dims[1] = 2, alpha = 8 ⇒ scale 4.
+        let expected = reconstruct_lokr_delta(
+            Some(&w1),
+            None,
+            None,
+            None,
+            Some(&w2a),
+            Some(&w2b),
+            8.0,
+            2.0,
+            1.0,
+            (4, 4),
+        )
+        .unwrap();
+        assert!(max_abs(&(&merged - &expected).unwrap()) < 1e-4);
+        // The old alpha=rank default (scale 1) would diverge by a factor of 4.
+        let buggy = reconstruct_lokr_delta(
+            Some(&w1),
+            None,
+            None,
+            None,
+            Some(&w2a),
+            Some(&w2b),
+            2.0,
+            2.0,
+            1.0,
+            (4, 4),
+        )
+        .unwrap();
+        assert!(
+            max_abs(&(&merged - &buggy).unwrap()) > 1e-3,
+            "per-target alpha must differ from the alpha=rank default"
+        );
     }
 
     /// A non-empty spec list that matches nothing is a loud error (not a silent unadapted render).
