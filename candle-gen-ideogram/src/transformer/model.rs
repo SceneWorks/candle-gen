@@ -7,13 +7,13 @@
 //! block by full (segment-masked) attention + interleaved 3D MRoPE.
 
 use candle_gen::candle_core::{DType, Result, Tensor, D};
-use candle_gen::candle_nn::{Embedding, Linear, Module};
 
 use super::block::Ideogram4Block;
 use super::mrope::Ideogram4MRoPE;
 use super::rmsnorm;
 use crate::config::Ideogram4DitConfig;
-use crate::loader::{linear, Weights};
+use crate::loader::{embedding_detect, linear_detect, Weights};
+use crate::quant::{QEmbedding, QLinear};
 
 /// Token role constants (upstream `ideogram4.constants`).
 const OUTPUT_IMAGE_INDICATOR: i64 = 2;
@@ -24,17 +24,17 @@ const COND_NORM_EPS: f64 = 1e-6;
 const FINAL_NORM_EPS: f64 = 1e-6;
 
 pub struct Ideogram4Transformer {
-    input_proj: Linear,
+    input_proj: QLinear,
     llm_cond_norm: Tensor,
-    llm_cond_proj: Linear,
-    t_mlp_in: Linear,
-    t_mlp_out: Linear,
-    adaln_proj: Linear,
-    embed_image_indicator: Embedding,
+    llm_cond_proj: QLinear,
+    t_mlp_in: QLinear,
+    t_mlp_out: QLinear,
+    adaln_proj: QLinear,
+    embed_image_indicator: QEmbedding,
     rotary_emb: Ideogram4MRoPE,
     layers: Vec<Ideogram4Block>,
-    final_adaln: Linear,
-    final_linear: Linear,
+    final_adaln: QLinear,
+    final_linear: QLinear,
     /// Sinusoidal frequencies for the `t` embedding (`[1, emb_dim/2]`, f32).
     t_freqs: Tensor,
     dtype: DType,
@@ -61,16 +61,15 @@ impl Ideogram4Transformer {
         let t_freqs: Vec<f32> = (0..half).map(|d| (-lf * d as f32).exp()).collect();
         let t_freqs = Tensor::from_vec(t_freqs, (1, half), w.device())?;
 
-        let ind_w = w.get("embed_image_indicator.weight")?;
-        let embed_image_indicator = Embedding::new(ind_w, cfg.emb_dim);
+        let embed_image_indicator = embedding_detect(w, "embed_image_indicator")?;
 
         Ok(Self {
-            input_proj: linear(w, "input_proj", true)?,
+            input_proj: linear_detect(w, "input_proj", true)?,
             llm_cond_norm: w.get("llm_cond_norm.weight")?,
-            llm_cond_proj: linear(w, "llm_cond_proj", true)?,
-            t_mlp_in: linear(w, "t_embedding.mlp_in", true)?,
-            t_mlp_out: linear(w, "t_embedding.mlp_out", true)?,
-            adaln_proj: linear(w, "adaln_proj", true)?,
+            llm_cond_proj: linear_detect(w, "llm_cond_proj", true)?,
+            t_mlp_in: linear_detect(w, "t_embedding.mlp_in", true)?,
+            t_mlp_out: linear_detect(w, "t_embedding.mlp_out", true)?,
+            adaln_proj: linear_detect(w, "adaln_proj", true)?,
             embed_image_indicator,
             rotary_emb: Ideogram4MRoPE::new(
                 head_dim,
@@ -79,8 +78,8 @@ impl Ideogram4Transformer {
                 w.device(),
             )?,
             layers,
-            final_adaln: linear(w, "final_layer.adaln_modulation", true)?,
-            final_linear: linear(w, "final_layer.linear", true)?,
+            final_adaln: linear_detect(w, "final_layer.adaln_modulation", true)?,
+            final_linear: linear_detect(w, "final_layer.linear", true)?,
             t_freqs,
             dtype: w.dtype(),
         })

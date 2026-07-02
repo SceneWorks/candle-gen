@@ -20,9 +20,9 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{
-    embedding, linear_no_bias, ops::softmax_last_dim, rms_norm, rotary_emb::rope, Embedding,
-    Linear, Module, RmsNorm, VarBuilder,
+    ops::softmax_last_dim, rms_norm, rotary_emb::rope, Module, RmsNorm, VarBuilder,
 };
+use candle_gen::quant::{embedding, lin, QEmbedding, QLinear};
 
 use crate::config::Ideogram4TextEncoderConfig;
 
@@ -61,10 +61,10 @@ impl Rotary {
 }
 
 struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: QLinear,
+    k_proj: QLinear,
+    v_proj: QLinear,
+    o_proj: QLinear,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
     n_heads: usize,
@@ -77,10 +77,10 @@ impl Attention {
         let h = cfg.hidden_size;
         let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
         Ok(Self {
-            q_proj: linear_no_bias(h, nh * hd, vb.pp("q_proj"))?,
-            k_proj: linear_no_bias(h, nkv * hd, vb.pp("k_proj"))?,
-            v_proj: linear_no_bias(h, nkv * hd, vb.pp("v_proj"))?,
-            o_proj: linear_no_bias(nh * hd, h, vb.pp("o_proj"))?,
+            q_proj: lin(&vb, "q_proj", h, nh * hd, false)?,
+            k_proj: lin(&vb, "k_proj", h, nkv * hd, false)?,
+            v_proj: lin(&vb, "v_proj", h, nkv * hd, false)?,
+            o_proj: lin(&vb, "o_proj", nh * hd, h, false)?,
             q_norm: rms_norm(hd, cfg.rms_norm_eps, vb.pp("q_norm"))?,
             k_norm: rms_norm(hd, cfg.rms_norm_eps, vb.pp("k_norm"))?,
             n_heads: nh,
@@ -128,18 +128,18 @@ fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
 }
 
 struct Mlp {
-    gate: Linear,
-    up: Linear,
-    down: Linear,
+    gate: QLinear,
+    up: QLinear,
+    down: QLinear,
 }
 
 impl Mlp {
     fn new(cfg: &Ideogram4TextEncoderConfig, vb: VarBuilder) -> Result<Self> {
         let (h, i) = (cfg.hidden_size, cfg.intermediate_size);
         Ok(Self {
-            gate: linear_no_bias(h, i, vb.pp("gate_proj"))?,
-            up: linear_no_bias(h, i, vb.pp("up_proj"))?,
-            down: linear_no_bias(i, h, vb.pp("down_proj"))?,
+            gate: lin(&vb, "gate_proj", h, i, false)?,
+            up: lin(&vb, "up_proj", h, i, false)?,
+            down: lin(&vb, "down_proj", i, h, false)?,
         })
     }
 
@@ -181,7 +181,7 @@ impl DecoderLayer {
 
 /// The Ideogram 4 Qwen3-VL text-path prompt-embeds encoder.
 pub struct Ideogram4TextEncoder {
-    embed_tokens: Embedding,
+    embed_tokens: QEmbedding,
     layers: Vec<DecoderLayer>,
     rotary: Rotary,
     /// Layer indices whose OUTPUTS are captured (`captured[i] = layer_i(hidden)`).
@@ -200,7 +200,7 @@ impl Ideogram4TextEncoder {
         vb: VarBuilder,
     ) -> Result<Self> {
         let model = vb.pp("language_model");
-        let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, model.pp("embed_tokens"))?;
+        let embed_tokens = embedding(&model, "embed_tokens", cfg.vocab_size, cfg.hidden_size)?;
         let max_layer = *out_layers.iter().max().unwrap_or(&0);
         let mut layers = Vec::with_capacity(max_layer + 1);
         let vb_layers = model.pp("layers");

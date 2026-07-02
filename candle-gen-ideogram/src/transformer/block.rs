@@ -5,18 +5,18 @@
 
 use candle_gen::candle_core::{Result, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
-use candle_gen::candle_nn::{Linear, Module};
 
 use super::rmsnorm;
-use crate::loader::{linear, Weights};
+use crate::loader::{linear_detect, Weights};
+use crate::quant::QLinear;
 
 /// Per-head q/k RMSNorm eps (upstream `Ideogram4Attention`, hardcoded 1e-5).
 const ATTN_QK_EPS: f64 = 1e-5;
 
 // ── Attention ────────────────────────────────────────────────────────────────────────────
 pub struct Ideogram4Attention {
-    qkv: Linear,
-    o: Linear,
+    qkv: QLinear,
+    o: QLinear,
     norm_q: Tensor,
     norm_k: Tensor,
     num_heads: usize,
@@ -26,8 +26,8 @@ pub struct Ideogram4Attention {
 impl Ideogram4Attention {
     pub fn load(w: &Weights, prefix: &str, num_heads: usize, head_dim: usize) -> Result<Self> {
         Ok(Self {
-            qkv: linear(w, &format!("{prefix}.qkv"), false)?,
-            o: linear(w, &format!("{prefix}.o"), false)?,
+            qkv: linear_detect(w, &format!("{prefix}.qkv"), false)?,
+            o: linear_detect(w, &format!("{prefix}.o"), false)?,
             norm_q: w.get(&format!("{prefix}.norm_q.weight"))?,
             norm_k: w.get(&format!("{prefix}.norm_k.weight"))?,
             num_heads,
@@ -81,17 +81,17 @@ fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
 
 // ── SwiGLU MLP ───────────────────────────────────────────────────────────────────────────
 pub struct Ideogram4Mlp {
-    w1: Linear,
-    w2: Linear,
-    w3: Linear,
+    w1: QLinear,
+    w2: QLinear,
+    w3: QLinear,
 }
 
 impl Ideogram4Mlp {
     pub fn load(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
-            w1: linear(w, &format!("{prefix}.w1"), false)?,
-            w2: linear(w, &format!("{prefix}.w2"), false)?,
-            w3: linear(w, &format!("{prefix}.w3"), false)?,
+            w1: linear_detect(w, &format!("{prefix}.w1"), false)?,
+            w2: linear_detect(w, &format!("{prefix}.w2"), false)?,
+            w3: linear_detect(w, &format!("{prefix}.w3"), false)?,
         })
     }
 
@@ -109,7 +109,7 @@ pub struct Ideogram4Block {
     attention_norm2: Tensor,
     ffn_norm1: Tensor,
     ffn_norm2: Tensor,
-    adaln_modulation: Linear,
+    adaln_modulation: QLinear,
     eps: f64,
 }
 
@@ -133,7 +133,7 @@ impl Ideogram4Block {
             attention_norm2: w.get(&format!("{prefix}.attention_norm2.weight"))?,
             ffn_norm1: w.get(&format!("{prefix}.ffn_norm1.weight"))?,
             ffn_norm2: w.get(&format!("{prefix}.ffn_norm2.weight"))?,
-            adaln_modulation: linear(w, &format!("{prefix}.adaln_modulation"), true)?,
+            adaln_modulation: linear_detect(w, &format!("{prefix}.adaln_modulation"), true)?,
             eps: norm_eps,
         })
     }
