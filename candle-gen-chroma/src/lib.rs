@@ -25,6 +25,7 @@
 mod beta;
 mod config;
 mod pipeline;
+mod quant;
 mod rope;
 mod text;
 mod transformer;

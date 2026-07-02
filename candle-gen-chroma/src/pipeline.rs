@@ -76,12 +76,21 @@ impl Pipeline {
 
     /// Load the four heavy components from the Chroma diffusers snapshot (`tokenizer/` vendored,
     /// `text_encoder/` T5, `transformer/` DiT, `vae/` AutoencoderKL), all at f32.
+    ///
+    /// The DiT loads through the shared packed-detect seam (sc-9409): a pre-quantized MLX-packed tier
+    /// (`SceneWorks/chroma1-*-mlx` q4/q8, whose `transformer/config.json` carries a `quantization`
+    /// block) loads straight from the packed parts (no dense bf16 staging); a dense diffusers snapshot
+    /// takes the plain path unchanged. The **T5-XXL encoder and VAE ship dense bf16 in every tier** (the
+    /// convert job quantizes only the transformer), so their loaders are unchanged. The packed
+    /// `group_size` is read from the transformer `config.json` (default 64 when absent — never a silent
+    /// dense read of the u32 codes).
     pub(crate) fn load_components(&self) -> Result<Components> {
         let cfg = ChromaTransformerConfig::default();
         let tokenizer = text::load_tokenizer()?;
         let t5 = text::load_t5(&self.root, &self.device)?;
-        let transformer =
-            ChromaTransformer::new(cfg, self.f32_vb(&self.root.join("transformer"))?)?;
+        let dit_dir = self.root.join("transformer");
+        let gs = self.transformer_group_size(&dit_dir);
+        let transformer = ChromaTransformer::new_gs(cfg, self.f32_vb(&dit_dir)?, gs)?;
         let vae = Vae::new(self.f32_vb(&self.root.join("vae"))?)?;
         Ok(Components {
             tokenizer: Arc::new(tokenizer),
@@ -90,6 +99,21 @@ impl Pipeline {
             vae: Arc::new(vae),
             cfg,
         })
+    }
+
+    /// The MLX packed `group_size` for the DiT, read from `transformer/config.json`'s `quantization`
+    /// block (a packed tier). Absent/dense ⇒ the shared default 64 ([`candle_gen::quant::PackedConfig`]
+    /// already resolves a missing `group_size` to 64, so a packed tier with only `bits` still loads
+    /// packed rather than silently reading its u32 codes dense). The per-tensor `.scales` detect in
+    /// [`crate::quant::QLinear::linear_detect_gs`] is what actually routes each projection dense vs
+    /// packed — this only supplies the group size the packed branch repacks at.
+    fn transformer_group_size(&self, dit_dir: &Path) -> usize {
+        std::fs::read_to_string(dit_dir.join("config.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
+            .map(|pc| pc.group_size as usize)
+            .unwrap_or(candle_gen::quant::MLX_GROUP_SIZE)
     }
 
     /// mmap an f32 [`VarBuilder`] over every `.safetensors` in `dir` (the DiT + VAE ship sharded).
@@ -306,6 +330,56 @@ fn pack(x: &Tensor) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `transformer_group_size` reads the packed `transformer/config.json`'s `quantization.group_size`
+    /// (the sc-9409 packed tier), defaults to the shared 64 for a `bits`-only or a dense config, and
+    /// never returns a *non*-value that would silently read u32 codes dense. Writes small JSONs — no
+    /// weights, GPU-free.
+    #[test]
+    fn transformer_group_size_reads_quantization_block() {
+        let tmp = std::env::temp_dir().join(format!("sc9409_gs_pipe_{}", std::process::id()));
+        let dir = tmp.join("transformer");
+        std::fs::create_dir_all(&dir).ok();
+        let pipe = Pipeline::load(ChromaVariant::Base, &tmp, &Device::Cpu);
+
+        // A real Chroma packed tier: bits 4, group 64.
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{ "num_layers": 19, "quantization": { "bits": 4, "group_size": 64 } }"#,
+        )
+        .unwrap();
+        assert_eq!(pipe.transformer_group_size(&dir), 64);
+
+        // A non-64 packed tier (the sc-9410 group-32 shape) is threaded verbatim.
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{ "quantization": { "bits": 4, "group_size": 32 } }"#,
+        )
+        .unwrap();
+        assert_eq!(pipe.transformer_group_size(&dir), 32);
+
+        // `bits`-only (no group_size) ⇒ the shared default 64 (PackedConfig resolves it), NOT a dense
+        // read of the packed codes.
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{ "quantization": { "bits": 8 } }"#,
+        )
+        .unwrap();
+        assert_eq!(pipe.transformer_group_size(&dir), 64);
+
+        // A dense snapshot (no `quantization`) ⇒ default 64 (inert — the per-tensor detect takes the
+        // dense path regardless).
+        std::fs::write(dir.join("config.json"), r#"{ "num_layers": 19 }"#).unwrap();
+        assert_eq!(pipe.transformer_group_size(&dir), 64);
+
+        // Absent config ⇒ default 64 (no panic).
+        assert_eq!(
+            pipe.transformer_group_size(&tmp.join("missing")),
+            candle_gen::quant::MLX_GROUP_SIZE
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 
     /// HD's static shift moves the interior sigmas but keeps a descending 1→0 schedule of length N+1.
     #[test]

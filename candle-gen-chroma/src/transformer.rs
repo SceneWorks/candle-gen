@@ -17,16 +17,19 @@
 //! all-ones. The cross-backend f32 floor (~1e-3) absorbs the one-extra-pad-token nuance. Matching the
 //! candle FLUX slice's "T5 unmasked" choice.
 //!
-//! LoRA/LoKr adapters and Q4/Q8 quantization are NOT wired in this slice (rejected at load), so all
-//! the `Adaptable*`/`quantize` machinery the mlx provider carries is dropped — every projection is a
-//! plain `candle_nn::Linear` (with bias, as the diffusers checkpoint stores).
+//! LoRA/LoKr adapters and *on-the-fly* Q4/Q8 quantization of a dense tier are NOT wired in this slice
+//! (rejected at load), so the `Adaptable*`/`quantize` machinery the mlx provider carries is dropped.
+//! **Pre-quantized MLX-packed tiers ARE loaded, though** (sc-9409, `SceneWorks/chroma1-*-mlx` q4/q8):
+//! every projection is a [`crate::quant::QLinear`] built via `linear_detect_gs`, which packed-detects
+//! the MLX `.scales` sibling and loads straight from the packed parts (no dense staging), or falls back
+//! to the plain dense biased load (dense tier, unchanged) — see [`crate::quant`]. The T5-XXL encoder
+//! and VAE ship dense in every tier, so only the DiT threads through the packed seam.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
-use candle_gen::candle_nn::{
-    linear, ops::softmax_last_dim, rms_norm, Linear, Module, RmsNorm, VarBuilder,
-};
+use candle_gen::candle_nn::{ops::softmax_last_dim, rms_norm, Module, RmsNorm, VarBuilder};
 
 use crate::config::ChromaTransformerConfig;
+use crate::quant::QLinear;
 use crate::rope::RopeTable;
 
 /// AdaLayerNorm LayerNorm epsilon (all pruned norms + `norm_out`, `elementwise_affine=False`).
@@ -167,16 +170,16 @@ fn attention_budgeted(
 /// gelu-tanh feed-forward `lin2(gelu(lin1(x)))` (diffusers FLUX `FeedForward`, `net.0.proj` /
 /// `net.2`, `mlp_ratio = 4`).
 struct FeedForward {
-    lin1: Linear,
-    lin2: Linear,
+    lin1: QLinear,
+    lin2: QLinear,
 }
 
 impl FeedForward {
-    fn new(inner: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(inner: usize, vb: VarBuilder, gs: usize) -> Result<Self> {
         let hidden = 4 * inner;
         Ok(Self {
-            lin1: linear(inner, hidden, vb.pp("net").pp("0").pp("proj"))?,
-            lin2: linear(hidden, inner, vb.pp("net").pp("2"))?,
+            lin1: QLinear::linear_detect_gs(inner, hidden, &vb, "net.0.proj", true, gs)?,
+            lin2: QLinear::linear_detect_gs(hidden, inner, &vb, "net.2", true, gs)?,
         })
     }
 
@@ -234,33 +237,37 @@ impl TimestepTextProj {
 /// `ChromaApproximator` — `in_proj` then `n_layers` residual blocks
 /// `x = x + linear_2(silu(linear_1(rms_norm(x))))`, then `out_proj`.
 struct Approximator {
-    in_proj: Linear,
-    layers: Vec<(Linear, Linear)>,
+    in_proj: QLinear,
+    layers: Vec<(QLinear, QLinear)>,
     norms: Vec<RmsNorm>,
-    out_proj: Linear,
+    out_proj: QLinear,
 }
 
 impl Approximator {
-    fn load(vb: VarBuilder, cfg: &ChromaTransformerConfig) -> Result<Self> {
+    fn load(vb: VarBuilder, cfg: &ChromaTransformerConfig, gs: usize) -> Result<Self> {
         let vb = vb.pp("distilled_guidance_layer");
         let in_dim = cfg.approximator_num_channels; // 4·nc = 64
         let hidden = cfg.approximator_hidden_dim; // 5120
         let inner = cfg.inner_dim(); // 3072
+                                     // The Approximator ships **dense** even in the packed tiers, so these `linear_detect_gs` calls
+                                     // all take the dense arm today; routing them through packed-detect anyway (sc-9486 superset)
+                                     // keeps a single, uniform loader across the DiT and makes a future packed-Approximator tier a
+                                     // no-op change here.
         let mut layers = Vec::with_capacity(cfg.approximator_layers);
         let mut norms = Vec::with_capacity(cfg.approximator_layers);
         for i in 0..cfg.approximator_layers {
             let lvb = vb.pp("layers").pp(i);
             layers.push((
-                linear(hidden, hidden, lvb.pp("linear_1"))?,
-                linear(hidden, hidden, lvb.pp("linear_2"))?,
+                QLinear::linear_detect_gs(hidden, hidden, &lvb, "linear_1", true, gs)?,
+                QLinear::linear_detect_gs(hidden, hidden, &lvb, "linear_2", true, gs)?,
             ));
             norms.push(rms_norm(hidden, APPROX_RMS_EPS, vb.pp("norms").pp(i))?);
         }
         Ok(Self {
-            in_proj: linear(in_dim, hidden, vb.pp("in_proj"))?,
+            in_proj: QLinear::linear_detect_gs(in_dim, hidden, &vb, "in_proj", true, gs)?,
             layers,
             norms,
-            out_proj: linear(hidden, inner, vb.pp("out_proj"))?,
+            out_proj: QLinear::linear_detect_gs(hidden, inner, &vb, "out_proj", true, gs)?,
         })
     }
 
@@ -278,14 +285,14 @@ impl Approximator {
 // ============================ blocks ============================
 
 struct DoubleAttn {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
-    add_q: Linear,
-    add_k: Linear,
-    add_v: Linear,
-    to_add_out: Linear,
+    to_q: QLinear,
+    to_k: QLinear,
+    to_v: QLinear,
+    to_out: QLinear,
+    add_q: QLinear,
+    add_k: QLinear,
+    add_v: QLinear,
+    to_add_out: QLinear,
     norm_q: RmsNorm,
     norm_k: RmsNorm,
     norm_added_q: RmsNorm,
@@ -295,18 +302,23 @@ struct DoubleAttn {
 }
 
 impl DoubleAttn {
-    fn load(vb: VarBuilder, cfg: &ChromaTransformerConfig) -> Result<Self> {
+    fn load(vb: VarBuilder, cfg: &ChromaTransformerConfig, gs: usize) -> Result<Self> {
         let inner = cfg.inner_dim();
         let hd = cfg.attention_head_dim;
+        // Every Chroma DiT projection is biased; `linear_detect_gs` packed-detects the MLX `.scales`
+        // sibling (packed tier) or falls back to the dense biased load (dense tier), threading the
+        // `config.json` group size. `to_out` nests at `to_out.0` — pass the full base so the
+        // `.scales`/`.biases`/`.bias` siblings survive the key nesting (never `.pp("0")` past scales).
+        let lin = |name: &str| QLinear::linear_detect_gs(inner, inner, &vb, name, true, gs);
         Ok(Self {
-            to_q: linear(inner, inner, vb.pp("to_q"))?,
-            to_k: linear(inner, inner, vb.pp("to_k"))?,
-            to_v: linear(inner, inner, vb.pp("to_v"))?,
-            to_out: linear(inner, inner, vb.pp("to_out").pp("0"))?,
-            add_q: linear(inner, inner, vb.pp("add_q_proj"))?,
-            add_k: linear(inner, inner, vb.pp("add_k_proj"))?,
-            add_v: linear(inner, inner, vb.pp("add_v_proj"))?,
-            to_add_out: linear(inner, inner, vb.pp("to_add_out"))?,
+            to_q: lin("to_q")?,
+            to_k: lin("to_k")?,
+            to_v: lin("to_v")?,
+            to_out: lin("to_out.0")?,
+            add_q: lin("add_q_proj")?,
+            add_k: lin("add_k_proj")?,
+            add_v: lin("add_v_proj")?,
+            to_add_out: lin("to_add_out")?,
             norm_q: rms_norm(hd, QK_RMS_EPS, vb.pp("norm_q"))?,
             norm_k: rms_norm(hd, QK_RMS_EPS, vb.pp("norm_k"))?,
             norm_added_q: rms_norm(hd, QK_RMS_EPS, vb.pp("norm_added_q"))?,
@@ -363,12 +375,12 @@ struct DoubleBlock {
 }
 
 impl DoubleBlock {
-    fn load(vb: VarBuilder, cfg: &ChromaTransformerConfig) -> Result<Self> {
+    fn load(vb: VarBuilder, cfg: &ChromaTransformerConfig, gs: usize) -> Result<Self> {
         let inner = cfg.inner_dim();
         Ok(Self {
-            attn: DoubleAttn::load(vb.pp("attn"), cfg)?,
-            ff: FeedForward::new(inner, vb.pp("ff"))?,
-            ff_context: FeedForward::new(inner, vb.pp("ff_context"))?,
+            attn: DoubleAttn::load(vb.pp("attn"), cfg, gs)?,
+            ff: FeedForward::new(inner, vb.pp("ff"), gs)?,
+            ff_context: FeedForward::new(inner, vb.pp("ff_context"), gs)?,
         })
     }
 
@@ -402,9 +414,9 @@ impl DoubleBlock {
 }
 
 struct SingleAttn {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
+    to_q: QLinear,
+    to_k: QLinear,
+    to_v: QLinear,
     norm_q: RmsNorm,
     norm_k: RmsNorm,
     heads: usize,
@@ -412,13 +424,14 @@ struct SingleAttn {
 }
 
 impl SingleAttn {
-    fn load(vb: VarBuilder, cfg: &ChromaTransformerConfig) -> Result<Self> {
+    fn load(vb: VarBuilder, cfg: &ChromaTransformerConfig, gs: usize) -> Result<Self> {
         let inner = cfg.inner_dim();
         let hd = cfg.attention_head_dim;
+        let lin = |name: &str| QLinear::linear_detect_gs(inner, inner, &vb, name, true, gs);
         Ok(Self {
-            to_q: linear(inner, inner, vb.pp("to_q"))?,
-            to_k: linear(inner, inner, vb.pp("to_k"))?,
-            to_v: linear(inner, inner, vb.pp("to_v"))?,
+            to_q: lin("to_q")?,
+            to_k: lin("to_k")?,
+            to_v: lin("to_v")?,
             norm_q: rms_norm(hd, QK_RMS_EPS, vb.pp("norm_q"))?,
             norm_k: rms_norm(hd, QK_RMS_EPS, vb.pp("norm_k"))?,
             heads: cfg.num_attention_heads,
@@ -447,18 +460,25 @@ impl SingleAttn {
 
 struct SingleBlock {
     attn: SingleAttn,
-    proj_mlp: Linear,
-    proj_out: Linear,
+    proj_mlp: QLinear,
+    proj_out: QLinear,
 }
 
 impl SingleBlock {
-    fn load(vb: VarBuilder, cfg: &ChromaTransformerConfig) -> Result<Self> {
+    fn load(vb: VarBuilder, cfg: &ChromaTransformerConfig, gs: usize) -> Result<Self> {
         let inner = cfg.inner_dim();
         let mlp_hidden = 4 * inner;
         Ok(Self {
-            attn: SingleAttn::load(vb.pp("attn"), cfg)?,
-            proj_mlp: linear(inner, mlp_hidden, vb.pp("proj_mlp"))?,
-            proj_out: linear(inner + mlp_hidden, inner, vb.pp("proj_out"))?,
+            attn: SingleAttn::load(vb.pp("attn"), cfg, gs)?,
+            proj_mlp: QLinear::linear_detect_gs(inner, mlp_hidden, &vb, "proj_mlp", true, gs)?,
+            proj_out: QLinear::linear_detect_gs(
+                inner + mlp_hidden,
+                inner,
+                &vb,
+                "proj_out",
+                true,
+                gs,
+            )?,
         })
     }
 
@@ -479,35 +499,57 @@ impl SingleBlock {
 
 pub struct ChromaTransformer {
     cfg: ChromaTransformerConfig,
-    x_embedder: Linear,
-    context_embedder: Linear,
+    x_embedder: QLinear,
+    context_embedder: QLinear,
     time_text_embed: TimestepTextProj,
     approximator: Approximator,
     double_blocks: Vec<DoubleBlock>,
     single_blocks: Vec<SingleBlock>,
-    proj_out: Linear,
+    proj_out: QLinear,
 }
 
 impl ChromaTransformer {
-    /// Build from a diffusers `transformer/` VarBuilder (f32). The block counts come from the config
-    /// (the VarBuilder errors loudly on a key mismatch, so a wrong checkpoint fails at load).
-    pub fn new(cfg: ChromaTransformerConfig, vb: VarBuilder) -> Result<Self> {
+    /// Build from a diffusers `transformer/` VarBuilder (f32) at an explicit MLX `group_size` read from
+    /// the packed `transformer/config.json`'s `quantization.group_size` (sc-9409; a **dense** snapshot
+    /// passes the default 64). The block counts come from the config (the VarBuilder errors loudly on a
+    /// key mismatch, so a wrong checkpoint fails at load).
+    ///
+    /// Every packed projection is loaded via [`crate::quant::QLinear::linear_detect_gs`], which
+    /// packed-detects the `.scales` sibling (packed tier) or falls back to the dense biased load
+    /// unchanged (dense tier — and the still-dense `x_embedder`/`context_embedder`/`proj_out` +
+    /// Approximator inside a packed tier). `x_embedder`/`context_embedder`/`proj_out` are dense in every
+    /// shipped tier but route through the same detect loader for a single uniform seam.
+    pub fn new_gs(cfg: ChromaTransformerConfig, vb: VarBuilder, gs: usize) -> Result<Self> {
         let inner = cfg.inner_dim();
         let device = vb.device().clone();
         let double_blocks = (0..cfg.num_layers)
-            .map(|i| DoubleBlock::load(vb.pp("transformer_blocks").pp(i), &cfg))
+            .map(|i| DoubleBlock::load(vb.pp("transformer_blocks").pp(i), &cfg, gs))
             .collect::<Result<Vec<_>>>()?;
         let single_blocks = (0..cfg.num_single_layers)
-            .map(|i| SingleBlock::load(vb.pp("single_transformer_blocks").pp(i), &cfg))
+            .map(|i| SingleBlock::load(vb.pp("single_transformer_blocks").pp(i), &cfg, gs))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            x_embedder: linear(cfg.in_channels, inner, vb.pp("x_embedder"))?,
-            context_embedder: linear(cfg.joint_attention_dim, inner, vb.pp("context_embedder"))?,
+            x_embedder: QLinear::linear_detect_gs(
+                cfg.in_channels,
+                inner,
+                &vb,
+                "x_embedder",
+                true,
+                gs,
+            )?,
+            context_embedder: QLinear::linear_detect_gs(
+                cfg.joint_attention_dim,
+                inner,
+                &vb,
+                "context_embedder",
+                true,
+                gs,
+            )?,
             time_text_embed: TimestepTextProj::new(&cfg, &device)?,
-            approximator: Approximator::load(vb.clone(), &cfg)?,
+            approximator: Approximator::load(vb.clone(), &cfg, gs)?,
             double_blocks,
             single_blocks,
-            proj_out: linear(inner, cfg.in_channels, vb.pp("proj_out"))?,
+            proj_out: QLinear::linear_detect_gs(inner, cfg.in_channels, &vb, "proj_out", true, gs)?,
             cfg,
         })
     }
