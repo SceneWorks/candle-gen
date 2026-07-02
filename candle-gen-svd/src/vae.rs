@@ -48,10 +48,10 @@ impl GroupNormW {
         let dims = x.dims().to_vec();
         let (b, c) = (dims[0], dims[1]);
         let spatial: usize = dims[2..].iter().product();
-        // Normalize in f32 even when the module runs fp16 (the UNet's dtype on CUDA): an fp16 variance
-        // over `(C/G)·H·W` elements loses precision (catastrophic cancellation), matching how torch /
-        // diffusers GroupNorm upcasts its statistics. The affine (weight/bias) then runs in the input
-        // dtype.
+        // Normalize in f32 even when the module runs at a lower precision (fp16/bf16 via `SVD_FORCE_*`;
+        // the default is f32): an fp16 variance over `(C/G)·H·W` elements loses precision (catastrophic
+        // cancellation), matching how torch / diffusers GroupNorm upcasts its statistics. The affine
+        // (weight/bias) then runs in the input dtype.
         let xr = x
             .reshape((b, self.groups, (c / self.groups) * spatial))?
             .to_dtype(DType::F32)?;

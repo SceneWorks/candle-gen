@@ -14,8 +14,11 @@
 //! `conditioning_fps` / `decode_chunk_size` / `frames` / `steps` / the CFG ceiling come from the
 //! request; `req.fps` is the decoupled output/playback cadence.
 //!
-//! **Dtypes:** the UNet + image encoder run **fp16** (SVD's production dtype); the VAE always stays
-//! **f32** (`force_upcast=True`). `backend = "candle"`, `mac_only = false`.
+//! **Dtypes:** every component defaults to **f32** — the VAE always (`force_upcast=True`), and the
+//! UNet + image encoder too, because fp16 overflows to NaN in the deep spatio-temporal UNet and bf16's
+//! coarse mantissa collapses the wide-σ EDM denoise (see [`Components::load`] for the full rationale).
+//! The experimental fp16/bf16 paths are reachable only via the `SVD_FORCE_F16` / `SVD_FORCE_BF16` env
+//! vars (the sc-5493 GPU follow-up). `backend = "candle"`, `mac_only = false`.
 
 pub mod config;
 pub mod conv3d;
@@ -65,9 +68,10 @@ struct Components {
 }
 
 impl Components {
-    /// Load every component from a checkpoint snapshot dir (`vae/` + `unet/` + `image_encoder/`). The
-    /// UNet + image encoder run **fp16** on CUDA (SVD's production dtype) / **f32** on CPU; the VAE
-    /// always stays f32 (`force_upcast=True`).
+    /// Load every component from a checkpoint snapshot dir (`vae/` + `unet/` + `image_encoder/`). Every
+    /// component defaults to **f32** (the VAE always does, `force_upcast=True`; the UNet + image encoder
+    /// too — see the rationale below). The experimental fp16/bf16 paths are opt-in via `SVD_FORCE_F16` /
+    /// `SVD_FORCE_BF16`.
     fn load(root: &Path, device: &Device) -> CResult<Self> {
         // The UNet + image encoder run **f32** (the VAE always does). SVD ships an fp16 checkpoint, but
         // the candle GPU dtype story is a tradeoff this provider can't yet square at fp16: fp16's narrow
