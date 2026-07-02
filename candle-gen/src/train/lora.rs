@@ -160,6 +160,14 @@ impl LoraLinear {
         self.adapter.is_some()
     }
 
+    /// Whether the live `Var`-backed adapter is currently parked behind a detached preview snapshot
+    /// ([`freeze_adapter`](Self::freeze_adapter)). `false` once [`thaw_adapter`](Self::thaw_adapter)
+    /// has restored it — i.e. the adapter is back in its gradient-tracking (training) state. Lets the
+    /// harness assert the freeze/thaw restore invariant around preview rendering (F-035, sc-9019).
+    pub fn is_frozen(&self) -> bool {
+        self.frozen.is_some()
+    }
+
     /// Install a LoRA residual. `down`/`up` are expected to be `Var`-backed (storage-sharing) f32
     /// tensors of shape `[rank, in]` / `[out, rank]`; `scale = alpha / rank`.
     pub fn install_lora(&mut self, down: Tensor, up: Tensor, scale: f64) {

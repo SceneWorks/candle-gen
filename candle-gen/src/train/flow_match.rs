@@ -590,35 +590,47 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
                 // Freeze the adapters to detached snapshots so the multi-step preview denoise runs
                 // graph-free (the factor `Var`s are otherwise tracked, retaining the whole forward's
                 // activations → OOM at full resolution). Restored right after so training keeps its grads.
-                let _ = dit.visit_lora_mut(&mut |ll| {
+                //
+                // Don't swallow the freeze/thaw visitor results (F-035, sc-9019): a `LoraHost` that fails
+                // mid-walk must surface, not silently leave adapters detached (their grads would go `None`
+                // — the same silent-grad failure class the fused-ops rule guards against). The invariant is
+                // that the adapters are back in their training grad state after the preview even on the
+                // freeze/render-error path, so THAW ALWAYS RUNS and is propagated; a freeze error is only
+                // surfaced after the restore, and a per-prompt render error is already logged+skipped below.
+                let freeze = dit.visit_lora_mut(&mut |ll| {
                     ll.freeze_adapter();
                     Ok(())
                 });
-                for (index, prompt) in sample_plan.prompts.iter().enumerate() {
-                    if req.cancel.is_cancelled() {
-                        break;
-                    }
-                    let seed = sample_seed(cfg.seed, step, index);
-                    match model.render_sample(&dit, state, index, cfg, seed) {
-                        Ok(image) => on_progress(TrainingProgress::Sample {
-                            step,
-                            index: index as u32 + 1,
-                            total,
-                            prompt: prompt.clone(),
-                            image,
-                        }),
-                        Err(e) => eprintln!(
-                            "[sc-8650] {}: preview sample failed at step {step} (prompt {}): {e} \
-                             — skipping this preview, training continues",
-                            T::LABEL,
-                            index + 1
-                        ),
+                if freeze.is_ok() {
+                    for (index, prompt) in sample_plan.prompts.iter().enumerate() {
+                        if req.cancel.is_cancelled() {
+                            break;
+                        }
+                        let seed = sample_seed(cfg.seed, step, index);
+                        match model.render_sample(&dit, state, index, cfg, seed) {
+                            Ok(image) => on_progress(TrainingProgress::Sample {
+                                step,
+                                index: index as u32 + 1,
+                                total,
+                                prompt: prompt.clone(),
+                                image,
+                            }),
+                            Err(e) => eprintln!(
+                                "[sc-8650] {}: preview sample failed at step {step} (prompt {}): {e} \
+                                 — skipping this preview, training continues",
+                                T::LABEL,
+                                index + 1
+                            ),
+                        }
                     }
                 }
-                let _ = dit.visit_lora_mut(&mut |ll| {
+                // Always thaw (even if freeze failed partway, or a render errored) so training never
+                // resumes with detached adapters; propagate a thaw failure. Then surface any freeze error.
+                dit.visit_lora_mut(&mut |ll| {
                     ll.thaw_adapter();
                     Ok(())
-                });
+                })?;
+                freeze?;
             }
         }
 
@@ -671,6 +683,7 @@ mod tests {
     use crate::train::lora::{LoraHost, LoraLinear};
     use candle_nn::Linear;
     use std::cell::Cell;
+    use std::rc::Rc;
 
     /// `sample_unit_timestep` is deterministic in its seed, lands in `[1e-3, 1−1e-3]`, and the bias
     /// tilts shift the mass the documented way (`low` ⇒ smaller t than neutral than `high`, on
@@ -1050,5 +1063,225 @@ mod tests {
             CandleError::Msg(m) => assert!(m.contains("no usable dataset items"), "got {m}"),
             other => panic!("expected Msg, got {other:?}"),
         }
+    }
+
+    // --- F-035 (sc-9019): the freeze/thaw adapter visitor around preview rendering must NOT swallow its
+    //     `Result`, and the adapters must be restored to their training grad state after a preview even
+    //     when the render errors (so training never resumes with detached, silently-grad-`None` adapters).
+
+    /// A preview-enabled mock DiT. Its `visit_lora_mut` toggles the real `LoraLinear` freeze/thaw AND
+    /// records, into shared cells, (a) the adapter's `is_frozen()` after each visit pass — so a test can
+    /// assert the final (post-thaw) grad state — and (b) a per-pass injectable failure so a test can force
+    /// the thaw visitor to error and confirm the driver surfaces it instead of swallowing it with `let _`.
+    struct PreviewDit {
+        lin: LoraLinear,
+        /// `is_frozen()` observed after the most recent visit pass (freeze or thaw).
+        frozen_after: Rc<Cell<bool>>,
+        /// Number of `visit_lora_mut` passes so far (freeze = odd, thaw = even within a cadence).
+        passes: Rc<Cell<u32>>,
+        /// If `Some(n)`, the `n`-th visit pass (1-based) returns `Err` before touching the adapter.
+        fail_on_pass: Option<u32>,
+    }
+    impl LoraHost for PreviewDit {
+        fn visit_lora_mut(
+            &mut self,
+            f: &mut dyn FnMut(&mut LoraLinear) -> Result<()>,
+        ) -> Result<()> {
+            let pass = self.passes.get() + 1;
+            self.passes.set(pass);
+            if self.fail_on_pass == Some(pass) {
+                return Err(CandleError::Msg("injected visitor failure".into()));
+            }
+            let r = f(&mut self.lin);
+            self.frozen_after.set(self.lin.is_frozen());
+            r
+        }
+    }
+
+    struct PreviewTrainer {
+        device: Device,
+        frozen_after: Rc<Cell<bool>>,
+        passes: Rc<Cell<u32>>,
+        fail_on_pass: Option<u32>,
+        /// Whether `render_sample` should error (to exercise the render-error → still-thaw path).
+        render_errors: bool,
+    }
+    impl FlowMatchTrainer for PreviewTrainer {
+        type Dit = PreviewDit;
+        type Cached = ();
+        type Aux = ();
+        // A present sample state (`Some(())`) turns the preview path on for this run.
+        type SampleState = ();
+        const LABEL: &'static str = "preview mock trainer";
+
+        fn device(&self) -> &Device {
+            &self.device
+        }
+        fn default_targets(&self) -> &'static [&'static str] {
+            &["to_q"]
+        }
+        fn cache(
+            &self,
+            _req: &TrainingRequest,
+            _device: &Device,
+            _on_progress: &mut dyn FnMut(TrainingProgress),
+        ) -> Result<(Vec<()>, (), SamplePlan<()>)> {
+            // One prompt + a present state ⇒ the driver runs the freeze → render → thaw preview block.
+            Ok((
+                vec![()],
+                (),
+                SamplePlan {
+                    prompts: vec!["a preview".into()],
+                    state: Some(()),
+                },
+            ))
+        }
+        fn build_dit(&self, _req: &TrainingRequest, device: &Device) -> Result<PreviewDit> {
+            let w = Tensor::zeros((4, 4), DType::F32, device)?;
+            Ok(PreviewDit {
+                lin: LoraLinear::from_linear(Linear::new(w, None), 4, 4, "to_q".into()),
+                frozen_after: self.frozen_after.clone(),
+                passes: self.passes.clone(),
+                fail_on_pass: self.fail_on_pass,
+            })
+        }
+        fn micro_step(
+            &self,
+            _dit: &PreviewDit,
+            vars: &[Var],
+            _cached: &(),
+            _aux: &(),
+            _cfg: &TrainingConfig,
+            _step: u32,
+            _device: &Device,
+        ) -> Result<(f32, GradStore)> {
+            let mut loss = vars[0].as_tensor().sqr()?.sum_all()?;
+            for v in &vars[1..] {
+                loss = (loss + v.as_tensor().sqr()?.sum_all()?)?;
+            }
+            let val = loss.to_scalar::<f32>()?;
+            let grads = loss.backward()?;
+            Ok((val, grads))
+        }
+        fn render_sample(
+            &self,
+            _dit: &PreviewDit,
+            _state: &(),
+            _index: usize,
+            _cfg: &TrainingConfig,
+            _seed: u64,
+        ) -> Result<Image> {
+            if self.render_errors {
+                Err(CandleError::Msg("injected render failure".into()))
+            } else {
+                Ok(Image {
+                    width: 1,
+                    height: 1,
+                    pixels: vec![0, 0, 0],
+                })
+            }
+        }
+    }
+
+    fn preview_request(steps: u32, sample_every: u32) -> TrainingRequest {
+        let config = TrainingConfig {
+            steps,
+            gradient_accumulation: 1,
+            save_every: 0,
+            sample_every,
+            sample_prompts: vec!["a preview".into()],
+            ..TrainingConfig::default()
+        };
+        TrainingRequest {
+            items: vec![TrainingItem {
+                image_path: "/img0.png".into(),
+                caption: "x".into(),
+            }],
+            config,
+            output_dir: std::env::temp_dir().join("candle_flow_match_preview_test"),
+            file_name: "a.safetensors".into(),
+            trigger_words: vec![],
+            cancel: CancelFlag::new(),
+        }
+    }
+
+    /// After a preview whose render ERRORS, the thaw pass still runs, so the adapter is restored to its
+    /// gradient-tracking (training) state — `is_frozen()` is `false`. Guards the invariant that a failed
+    /// render never leaves training with detached, silently-grad-`None` adapters (F-035, sc-9019).
+    #[test]
+    fn preview_thaw_restores_grad_state_even_when_render_errors() {
+        let frozen_after = Rc::new(Cell::new(false));
+        let passes = Rc::new(Cell::new(0));
+        let model = PreviewTrainer {
+            device: Device::Cpu,
+            frozen_after: frozen_after.clone(),
+            passes: passes.clone(),
+            fail_on_pass: None,
+            render_errors: true, // render fails; the thaw must still run
+        };
+        // steps=2, sample_every=1 → the preview block runs each step (freeze + thaw = 2 passes/cadence).
+        let req = preview_request(2, 1);
+        let out = run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        assert_eq!(out.steps, 2);
+        assert!(
+            passes.get() >= 2,
+            "the freeze + thaw visitor passes must have run, got {}",
+            passes.get()
+        );
+        assert!(
+            !frozen_after.get(),
+            "adapters must be thawed (grad state restored) after a preview even when the render errors"
+        );
+    }
+
+    /// A thaw-pass visitor failure is PROPAGATED, not swallowed with `let _`: the driver returns the
+    /// error rather than silently resuming training with detached adapters (F-035, sc-9019).
+    #[test]
+    fn preview_thaw_visitor_error_is_propagated() {
+        let frozen_after = Rc::new(Cell::new(false));
+        let passes = Rc::new(Cell::new(0));
+        let model = PreviewTrainer {
+            device: Device::Cpu,
+            frozen_after,
+            passes,
+            // Pass 1 = freeze (ok), pass 2 = thaw (fail) within the first cadence.
+            fail_on_pass: Some(2),
+            render_errors: false,
+        };
+        let req = preview_request(1, 1);
+        let err = run_flow_match_training(&model, &req, &mut |_| {}).unwrap_err();
+        match err {
+            CandleError::Msg(m) => {
+                assert!(m.contains("injected visitor failure"), "got {m}")
+            }
+            other => panic!("expected the thaw visitor error to propagate, got {other:?}"),
+        }
+    }
+
+    /// A freeze-pass visitor failure is PROPAGATED too — and because the thaw still runs on that path, the
+    /// adapter is never left frozen (F-035, sc-9019).
+    #[test]
+    fn preview_freeze_visitor_error_is_propagated_and_thaws() {
+        let frozen_after = Rc::new(Cell::new(false));
+        let passes = Rc::new(Cell::new(0));
+        let model = PreviewTrainer {
+            device: Device::Cpu,
+            frozen_after: frozen_after.clone(),
+            passes,
+            fail_on_pass: Some(1), // pass 1 = freeze fails
+            render_errors: false,
+        };
+        let req = preview_request(1, 1);
+        let err = run_flow_match_training(&model, &req, &mut |_| {}).unwrap_err();
+        match err {
+            CandleError::Msg(m) => {
+                assert!(m.contains("injected visitor failure"), "got {m}")
+            }
+            other => panic!("expected the freeze visitor error to propagate, got {other:?}"),
+        }
+        assert!(
+            !frozen_after.get(),
+            "the thaw pass must still run after a freeze failure so no adapter is left frozen"
+        );
     }
 }
