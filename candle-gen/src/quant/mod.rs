@@ -170,10 +170,16 @@ impl QLinear {
 pub enum QEmbedding {
     Dense(Embedding),
     Quantized {
-        /// The GGUF-quantized `[vocab, hidden]` table; dequantized to the activation dtype per
-        /// forward, then index-selected.
+        /// The GGUF-quantized `[vocab, hidden]` table; dequantized to `out_dtype` per forward, then
+        /// index-selected.
         table: QTensor,
         hidden_size: usize,
+        /// The dtype the dequantized table is cast to before index-select — the dense embedding
+        /// table's dtype (i.e. `vb.dtype()`). Mirrors how [`QLinear::forward`] casts its dequantized
+        /// weight to the activation dtype, so a packed bf16 text-encoder embedding yields bf16 rows
+        /// exactly as the dense path would (dtype parity). Defaults to `F32` (the `QTensor`'s natural
+        /// dequant dtype) for [`Self::from_packed`] callers that don't specify one.
+        out_dtype: DType,
     },
 }
 
@@ -185,29 +191,49 @@ impl QEmbedding {
 
     /// Build a `Quantized` embedding directly from an MLX packed triple on `device` (Q4 lossless
     /// repack / Q8 re-quant, as [`QLinear::from_packed`]). The `[vocab, hidden]` table's `hidden`
-    /// (the last dim, the group axis) is `scales.cols · group_size`.
+    /// (the last dim, the group axis) is `scales.cols · group_size`. The forward dequantizes to
+    /// `F32` (the `QTensor`'s natural dtype); use [`Self::from_packed_dtype`] to match a non-f32
+    /// dense-path output dtype (dtype parity).
     pub fn from_packed(
         wq: &Tensor,
         scales: &Tensor,
         biases: &Tensor,
         device: &Device,
     ) -> Result<Self> {
+        Self::from_packed_dtype(wq, scales, biases, device, DType::F32)
+    }
+
+    /// As [`Self::from_packed`], but the forward dequantizes to `out_dtype` (the dense-path table
+    /// dtype, `vb.dtype()`) — so a packed bf16 embedding yields bf16 rows exactly as the dense path
+    /// would, mirroring [`QLinear::forward`]'s activation-dtype cast.
+    pub fn from_packed_dtype(
+        wq: &Tensor,
+        scales: &Tensor,
+        biases: &Tensor,
+        device: &Device,
+        out_dtype: DType,
+    ) -> Result<Self> {
         let table = repack_packed_weight(wq, scales, biases, device)?;
         let hidden = table.shape().dims()[1];
         Ok(Self::Quantized {
             table,
             hidden_size: hidden,
+            out_dtype,
         })
     }
 
     /// Index-select the embedding rows for `indexes`. Dense delegates to `candle_nn::Embedding`;
-    /// quantized dequantizes the table to a natural float dtype (f32) once, then index-selects — the
-    /// same shape contract as the dense forward.
+    /// quantized dequantizes the table and casts it to `out_dtype` (the dense-path table dtype) once,
+    /// then index-selects — the same shape *and* dtype contract as the dense forward.
     pub fn forward(&self, indexes: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(e) => e.forward(indexes),
-            Self::Quantized { table, hidden_size } => {
-                let w = table.dequantize(indexes.device())?;
+            Self::Quantized {
+                table,
+                hidden_size,
+                out_dtype,
+            } => {
+                let w = table.dequantize(indexes.device())?.to_dtype(*out_dtype)?;
                 Embedding::new(w, *hidden_size).forward(indexes)
             }
         }
@@ -289,7 +315,9 @@ pub fn embedding(vb: &VarBuilder, base: &str, vocab: usize, hidden: usize) -> Re
         let wq = vb.get_unchecked_dtype(&format!("{base}.weight"), DType::U32)?;
         let scales = vb.get_unchecked_dtype(&scales_key, DType::F32)?;
         let biases = vb.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?;
-        return QEmbedding::from_packed(&wq, &scales, &biases, &device);
+        // Dequantize the table to the dense-path table dtype (`vb.dtype()`), so a packed bf16
+        // text-encoder embedding yields bf16 rows exactly as the dense path would (dtype parity).
+        return QEmbedding::from_packed_dtype(&wq, &scales, &biases, &device, vb.dtype());
     }
     QEmbedding::embedding(vocab, hidden, vb.pp(base))
 }
@@ -395,6 +423,58 @@ mod tests {
         let (p, d) = (packed.forward(&idx)?, dense.forward(&idx)?);
         let dev_max = (p.sub(&d)?).abs()?.max_all()?.to_scalar::<f32>()?;
         assert_eq!(dev_max, 0.0, "packed embedding deviates from dense grid");
+        Ok(())
+    }
+
+    /// The packed `QEmbedding` forward output dtype matches the dense embedding path's — a bf16
+    /// dense table yields bf16 rows, so the packed path (loaded with the same `vb.dtype()`) must too.
+    /// The dense path here goes through the same VarBuilder-detect loader (`embedding`), so it holds
+    /// the `[base].weight` in the vb's bf16 dtype exactly as a real bf16 text-encoder would.
+    #[test]
+    fn packed_qembedding_forward_dtype_matches_dense() -> Result<()> {
+        let dev = Device::Cpu;
+        let (vocab, hidden) = (32, 128);
+        let (wq, s, b, grid) = q4_fixture(vocab, hidden);
+
+        // A packed table and a dense table, both written to safetensors and loaded through the
+        // `embedding` detect-loader at bf16 vb dtype — the dense table is the reference dtype path.
+        let mut map: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
+        map.insert("emb.weight".into(), wq);
+        map.insert("emb.scales".into(), s);
+        map.insert("emb.biases".into(), b);
+        map.insert(
+            "dense.weight".into(),
+            Tensor::from_vec(grid, (vocab, hidden), &dev)?,
+        );
+
+        let tmp = std::env::temp_dir().join(format!(
+            "sc9086_emb_dtype_{}.safetensors",
+            std::process::id()
+        ));
+        candle_core::safetensors::save(&map, &tmp)?;
+        // SAFETY: we just wrote this file and nothing else touches it during the test.
+        let st = unsafe { MmapedSafetensors::new(&tmp)? };
+        let vb = VarBuilder::from_backend(Box::new(st), DType::BF16, dev.clone());
+
+        let packed = embedding(&vb, "emb", vocab, hidden)?;
+        assert!(
+            packed.is_quantized(),
+            "`.scales` present ⇒ packed embedding"
+        );
+        let dense = embedding(&vb, "dense", vocab, hidden)?;
+        assert!(!dense.is_quantized(), "no `.scales` ⇒ dense embedding");
+
+        let idx = Tensor::from_vec(vec![0u32, 5, 31, 12, 5], (5,), &dev)?;
+        let p = packed.forward(&idx)?;
+        let d = dense.forward(&idx)?;
+        assert_eq!(d.dtype(), DType::BF16, "dense bf16 embedding yields bf16");
+        assert_eq!(
+            p.dtype(),
+            d.dtype(),
+            "packed embedding forward dtype must match the dense path (dtype parity)"
+        );
+
+        std::fs::remove_file(&tmp).ok();
         Ok(())
     }
 
@@ -513,8 +593,11 @@ mod tests {
     /// block's outlier sits on a **zero-weight** channel (carries no signal — the reference is built
     /// purely from its block-mates): the dequant path tracks the f32 reference, the raw int8 path
     /// collapses to ~0. A revert to `QMatMul::forward` inside `QLinear::forward` fails the `> 0.99`
-    /// assert. We build the packed `QLinear` from a synthetic MLX Q4 triple, so this exercises the
-    /// **packed-load** forward specifically. Skips on CPU (the int8 MMVQ/MMQ path is CUDA-only).
+    /// assert. This exercises the shared **dequant-on-forward** compute path in `QLinear::forward` —
+    /// the byte-identical path a packed `Q4_1` load and a load-time `Q4_0` quantize both feed (the
+    /// weight is dequantized to a dense matmul; the int8 activation fast path stays off), so a
+    /// `Q4_0` `QLinear` built via the load-time `quantize` covers the packed forward too. Skips on
+    /// CPU (the int8 MMVQ/MMQ path is CUDA-only).
     #[test]
     fn q4_packed_forward_survives_outlier_activations() -> Result<()> {
         use candle_core::quantized::QMatMul;
@@ -554,8 +637,9 @@ mod tests {
         let x = Tensor::from_vec(x, (m, in_dim), &dev)?;
         let reference = x.matmul(&w.t()?)?; // f32 dense ground truth on `dev`
 
-        // Production packed-load path: a Q4 `QLinear` (dequant-on-forward — the same compute path
-        // `from_packed` produces; the load-time `quantize` is the shortest way to a real QTensor here).
+        // Dequant-on-forward path: a Q4 `QLinear` built via the load-time `quantize` — the shortest
+        // way to a real QTensor, and the byte-identical `QLinear::forward` compute path a packed
+        // `from_packed` load also feeds (both dequant the weight to a dense matmul).
         let qt = QTensor::quantize_onto(&w_cpu, GgmlDType::Q4_0, &dev)?;
         let mut lin = QLinear::Dense(Linear::new(w, None));
         lin.quantize(Quant::Q4)?;
