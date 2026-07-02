@@ -106,7 +106,46 @@ PKG="${1:-candle-gen}"
 # marker in ANSI codes so the `(*)$` strip misses it and a deduped node looks "distinct" — a false
 # skew). The ESC-strip sed is a portable backstop (works on BSD + GNU sed).
 esc=$(printf '\033')
-cargo tree -p "$PKG" --target all --color never --prefix none 2>/dev/null \
+
+# sc-9022 (F-038): run `cargo tree` on its own and capture stdout, stderr, and exit code
+# SEPARATELY. Previously this was `cargo tree … 2>/dev/null | sed | … | evaluate`, which discarded
+# cargo's stderr AND let the pipeline's exit status come from `evaluate` (the last stage). So a
+# genuine RESOLUTION failure (network/fetch, auth, a bad or unknown pin, unknown package) produced
+# zero matching lines, and `evaluate` mis-reported "${CRATE} was not found in the build graph" — the
+# WRONG diagnosis, sending developers to hunt for pin skew when cargo could not resolve the graph at
+# all. Now a nonzero `cargo tree` exit is surfaced with cargo's own stderr and a distinct message,
+# and only successful output is fed into the skew verdict.
+#
+# NOTE on `set -e`: a failing command substitution in a plain assignment (`var=$(cmd)`) DOES abort
+# under `set -euo pipefail` when the script runs from a file, so we can't just read `$?` afterwards
+# — the script would exit first with cargo's raw code and NONE of the diagnostics below. We disable
+# errexit only for the capture, record the exit code, then restore it.
+tree_err_file=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/gen-core-skew-cargo.$$")
+set +e
+tree_out=$(cargo tree -p "$PKG" --target all --color never --prefix none 2>"$tree_err_file")
+tree_rc=$?
+set -e
+tree_err=$(cat "$tree_err_file" 2>/dev/null)
+rm -f "$tree_err_file"
+
+if [ "$tree_rc" -ne 0 ]; then
+  {
+    echo "ERROR (sc-4482 / sc-9022): 'cargo tree -p ${PKG} --target all' FAILED (exit ${tree_rc})."
+    echo "This is a dependency RESOLUTION failure (network/fetch, auth, a bad/unknown pin, unknown"
+    echo "package), NOT a version skew and NOT a missing ${CRATE}. Fix the resolution error below"
+    echo "before the skew gate can run. cargo's own diagnostics:"
+    echo "---- cargo tree stderr ----"
+    if [ -n "$tree_err" ]; then
+      printf '%s\n' "$tree_err"
+    else
+      echo "(cargo produced no stderr output)"
+    fi
+    echo "---------------------------"
+  } >&2
+  exit "$tree_rc"
+fi
+
+printf '%s\n' "$tree_out" \
   | sed "s/${esc}\\[[0-9;]*m//g" \
   | sed 's/ (\*)$//' \
   | grep -E "^${CRATE} v" \
