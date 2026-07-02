@@ -180,12 +180,40 @@ fn load_transformer(
 }
 
 /// `transformer/config.json` `zero_cond_t` (Edit-2511 = true; the original Edit / 2509 omit it).
-fn read_zero_cond_t(root: &Path) -> bool {
-    std::fs::read_to_string(root.join("transformer/config.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("zero_cond_t").and_then(|b| b.as_bool()))
-        .unwrap_or(false)
+///
+/// A genuinely-absent `transformer/config.json` (the original Edit / 2509 snapshots don't gate on it)
+/// or an absent `zero_cond_t` key defaults to `false`. But a *present-but-corrupt* config — I/O error,
+/// malformed JSON, or a `zero_cond_t` of the wrong type — errors loudly rather than silently switching
+/// an Edit-2511 render to the 2509 single-timestep modulation on a damaged snapshot (sc-9010 / F-073).
+fn read_zero_cond_t(root: &Path) -> Result<bool> {
+    let path = root.join("transformer/config.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        // Absent config ⇒ documented default (2509 / original Edit).
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(CandleError::Msg(format!(
+                "qwen edit: read {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        CandleError::Msg(format!(
+            "qwen edit: parse {} (corrupt snapshot?): {e}",
+            path.display()
+        ))
+    })?;
+    match v.get("zero_cond_t") {
+        // Key absent ⇒ documented default.
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(b) => b.as_bool().ok_or_else(|| {
+            CandleError::Msg(format!(
+                "qwen edit: `zero_cond_t` in {} must be a bool, got {b}",
+                path.display()
+            ))
+        }),
+    }
 }
 
 /// Locate the assembled HF `tokenizer.json` (sc-6294). The original `Qwen-Image-Edit` ships it under
@@ -244,7 +272,7 @@ impl QwenEdit {
         .map_err(|e| CandleError::Msg(format!("qwen edit: load tokenizer: {e}")))?;
 
         Ok(Self {
-            zero_cond_t: read_zero_cond_t(root),
+            zero_cond_t: read_zero_cond_t(root)?,
             device,
             te_cfg,
             vl_encoder,
@@ -450,10 +478,73 @@ mod tests {
         assert!(!r.cancel.is_cancelled());
     }
 
+    fn zero_cond_t_tmp(name: &str) -> PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "qwen_edit_zct_{name}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("transformer")).unwrap();
+        tmp
+    }
+
     #[test]
-    fn zero_cond_t_defaults_false_when_absent() {
-        // A nonexistent config → false (the original Qwen-Image-Edit / 2509 path).
-        assert!(!read_zero_cond_t(Path::new("/nonexistent")));
+    fn zero_cond_t_defaults_false_when_config_absent() {
+        // A nonexistent config (dir/file) → false, the original Qwen-Image-Edit / 2509 path.
+        assert!(!read_zero_cond_t(Path::new("/nonexistent")).unwrap());
+    }
+
+    #[test]
+    fn zero_cond_t_defaults_false_when_key_absent() {
+        // Config present but the key genuinely absent (a valid 2509 config.json) → documented default.
+        let tmp = zero_cond_t_tmp("keyabsent");
+        std::fs::write(
+            tmp.join("transformer/config.json"),
+            br#"{"num_layers": 60}"#,
+        )
+        .unwrap();
+        assert!(!read_zero_cond_t(&tmp).unwrap());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn zero_cond_t_reads_present_value() {
+        // Edit-2511 config with the key set true → true.
+        let tmp = zero_cond_t_tmp("present");
+        std::fs::write(
+            tmp.join("transformer/config.json"),
+            br#"{"zero_cond_t": true}"#,
+        )
+        .unwrap();
+        assert!(read_zero_cond_t(&tmp).unwrap());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn zero_cond_t_errors_on_corrupt_json() {
+        // A present-but-malformed config (partial download) must error, NOT silently downgrade to 2509.
+        let tmp = zero_cond_t_tmp("corrupt");
+        std::fs::write(tmp.join("transformer/config.json"), b"{ this is not json").unwrap();
+        assert!(read_zero_cond_t(&tmp).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn zero_cond_t_errors_on_wrong_type() {
+        // `zero_cond_t` present but the wrong type → error naming the field, not a silent false.
+        let tmp = zero_cond_t_tmp("wrongtype");
+        std::fs::write(
+            tmp.join("transformer/config.json"),
+            br#"{"zero_cond_t": "yes"}"#,
+        )
+        .unwrap();
+        let err = read_zero_cond_t(&tmp).unwrap_err().to_string();
+        assert!(
+            err.contains("zero_cond_t"),
+            "error should name the field: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

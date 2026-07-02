@@ -96,12 +96,12 @@ impl Krea2Config {
             .map_err(|e| CandleError::Msg(format!("krea: parse {}: {e}", path.display())))?;
         let mut cfg = Self::from_json(&v)?;
         // `patch_size` lives in the pipeline manifest, not the transformer config; read it if present.
-        let idx = root.join("model_index.json");
-        if let Ok(t) = std::fs::read_to_string(&idx) {
-            if let Ok(mv) = serde_json::from_str::<serde_json::Value>(&t) {
-                if let Some(p) = mv.get("patch_size").and_then(serde_json::Value::as_u64) {
-                    cfg.patch_size = p as usize;
-                }
+        // A genuinely-absent `model_index.json` keeps the reference `patch_size` default; a
+        // *present-but-corrupt* manifest errors loudly rather than silently downgrading to the default
+        // on a damaged snapshot (sc-9010 / F-073).
+        if let Some(mv) = read_optional_json(&root.join("model_index.json"), "krea")? {
+            if let Some(p) = mv.get("patch_size").and_then(serde_json::Value::as_u64) {
+                cfg.patch_size = p as usize;
             }
         }
         cfg.validate()?;
@@ -191,6 +191,31 @@ impl Krea2Config {
     }
 }
 
+/// Read an **optional** JSON manifest, distinguishing "genuinely absent" (→ `Ok(None)`, use the
+/// documented default) from "present but corrupt" (→ `Err`, name the file). A missing file is a
+/// legitimate snapshot shape; an I/O error or malformed JSON on a file that *is* present signals a
+/// damaged/partial download that must surface rather than silently downgrade behavior (sc-9010 /
+/// F-073).
+pub(crate) fn read_optional_json(path: &Path, who: &str) -> Result<Option<serde_json::Value>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(CandleError::Msg(format!(
+                "{who}: read {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    let v = serde_json::from_str(&text).map_err(|e| {
+        CandleError::Msg(format!(
+            "{who}: parse {} (corrupt snapshot?): {e}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(v))
+}
+
 fn read_triple(v: Option<&serde_json::Value>, dflt: [usize; 3]) -> [usize; 3] {
     match v.and_then(serde_json::Value::as_array) {
         Some(a) if a.len() == 3 => {
@@ -263,5 +288,64 @@ mod tests {
         let mut c = Krea2Config::turbo();
         c.num_kv_heads = 7; // 48 not divisible by 7
         assert!(c.validate().is_err());
+    }
+
+    fn snapshot_tmp(name: &str) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "krea_cfg_{name}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("transformer")).unwrap();
+        // A valid published transformer/config.json.
+        std::fs::write(
+            tmp.join("transformer").join("config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "attention_head_dim": 128,
+                "axes_dims_rope": [32, 48, 48],
+                "num_attention_heads": 48,
+                "num_key_value_heads": 12
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        tmp
+    }
+
+    #[test]
+    fn from_snapshot_defaults_patch_size_when_model_index_absent() {
+        // No model_index.json at all → keep the reference patch_size default.
+        let tmp = snapshot_tmp("idx_absent");
+        let c = Krea2Config::from_snapshot(&tmp).unwrap();
+        assert_eq!(c.patch_size, Krea2Config::turbo().patch_size);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn from_snapshot_reads_present_patch_size() {
+        let tmp = snapshot_tmp("idx_present");
+        std::fs::write(tmp.join("model_index.json"), br#"{"patch_size": 4}"#).unwrap();
+        let c = Krea2Config::from_snapshot(&tmp).unwrap();
+        assert_eq!(c.patch_size, 4);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn from_snapshot_errors_on_corrupt_model_index() {
+        // model_index.json is present but malformed (partial download) → error, NOT silent default.
+        let tmp = snapshot_tmp("idx_corrupt");
+        std::fs::write(tmp.join("model_index.json"), b"{ not json").unwrap();
+        assert!(Krea2Config::from_snapshot(&tmp).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_optional_json_absent_is_none() {
+        assert!(
+            read_optional_json(Path::new("/nonexistent/model_index.json"), "krea")
+                .unwrap()
+                .is_none()
+        );
     }
 }
