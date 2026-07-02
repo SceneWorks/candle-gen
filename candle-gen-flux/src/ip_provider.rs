@@ -19,13 +19,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
 use candle_transformers::models::clip::text_model::ClipTextTransformer;
 use candle_transformers::models::flux::autoencoder::AutoEncoder;
 use candle_transformers::models::flux::sampling::{get_schedule, State};
-use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
-use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
+use candle_transformers::models::t5::T5EncoderModel;
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
@@ -33,12 +30,15 @@ use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_gen_sdxl::weights::Weights;
 
+use crate::flux1_load;
 use crate::ip_adapter::{FluxIpAdapter, FluxIpInjector};
 use crate::ip_dit::IpFlux;
 use crate::ip_image_encoder::FluxIpImageEncoder;
-use crate::pipeline::{ae_config, clip_config, decode_latents, encode_text, flow_mu, flux_config};
+use crate::pipeline::{decode_latents, encode_text, flow_mu, flux_config};
 use crate::Variant;
 
+/// The provider-specific error label for the shared [`crate::flux1_load`] diagnostics.
+const LABEL: &str = "flux ip-adapter";
 /// FLUX runs at bf16.
 const DTYPE: DType = DType::BF16;
 /// FLUX latent channel count (the raw VAE latent / initial noise; the DiT packs it 2×2 to 64).
@@ -132,24 +132,6 @@ fn detect_variant(flux_base: &Path) -> Result<Variant> {
     }
 }
 
-/// mmap a [`VarBuilder`] over `files` at `dtype`/`device`, erroring if any is missing.
-fn mmap_vb(files: &[PathBuf], dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
-    for f in files {
-        if !f.is_file() {
-            return Err(CandleError::Msg(format!(
-                "flux ip-adapter snapshot is missing {}",
-                f.display()
-            )));
-        }
-    }
-    candle_gen::mmap_var_builder(files, dtype, device)
-}
-
-/// Sorted list of every `.safetensors` in `dir` (sharded T5 checkpoints). Errors if none are found.
-fn safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
-    candle_gen::sorted_safetensors(dir, "flux ip-adapter")
-}
-
 /// The loaded FLUX IP-Adapter model: the reused FLUX text encoders + VAE, the forked IP DiT, the XLabs
 /// adapter, and the CLIP ViT-L image encoder.
 pub struct IpAdapterFlux {
@@ -177,36 +159,16 @@ impl IpAdapterFlux {
         let root = paths.flux_base.clone();
         let variant = detect_variant(&root)?;
 
-        // CLIP-L (text) under `text_encoder/`.
-        let clip_vb = mmap_vb(
-            &[root.join("text_encoder/model.safetensors")],
-            dtype,
-            &device,
-        )?;
-        let clip = ClipTextTransformer::new(clip_vb.pp("text_model"), &clip_config())?;
+        // CLIP-L + T5-XXL text encoders (shared FLUX.1 backbone load, sc-9003).
+        let (clip, t5) = flux1_load::text_encoders(&root, dtype, &device, LABEL)?;
 
-        // T5-XXL under `text_encoder_2/` (sharded; config.json alongside).
-        let t5_dir = root.join("text_encoder_2");
-        let t5_cfg: T5Config = {
-            let cfg = std::fs::read_to_string(t5_dir.join("config.json")).map_err(|e| {
-                CandleError::Msg(format!(
-                    "flux ip-adapter: read text_encoder_2/config.json: {e}"
-                ))
-            })?;
-            serde_json::from_str(&cfg).map_err(|e| {
-                CandleError::Msg(format!("flux ip-adapter: parse T5 config.json: {e}"))
-            })?
-        };
-        let t5_vb = mmap_vb(&safetensors_in(&t5_dir)?, dtype, &device)?;
-        let t5 = T5EncoderModel::load(t5_vb, &t5_cfg)?;
-
-        // The forked FLUX DiT (the IP seam) from the root BFL checkpoint.
-        let dit_vb = mmap_vb(&[root.join(variant.transformer_file())], dtype, &device)?;
+        // The forked FLUX DiT (the IP seam) from the root BFL checkpoint — the genuine per-provider drift
+        // (IpFlux, not the stock Flux), so the wrapper choice stays here over the shared mmap.
+        let dit_vb = flux1_load::dit_vb(&root, variant, dtype, &device, LABEL)?;
         let transformer = IpFlux::new(&flux_config(variant), dit_vb)?;
 
         // FLUX AutoEncoder (`ae.safetensors`).
-        let vae_vb = mmap_vb(&[root.join("ae.safetensors")], dtype, &device)?;
-        let vae = AutoEncoder::new(&ae_config(variant), vae_vb)?;
+        let (vae, _vae_vb) = flux1_load::vae(&root, variant, dtype, &device, LABEL)?;
 
         // XLabs adapter weights (`ip_adapter.safetensors`).
         let ipa = Weights::from_file(&paths.ip_adapter, &device, dtype).map_err(|e| {
@@ -276,16 +238,18 @@ impl IpAdapterFlux {
         let tokens = self.adapter.tokens(&embeds)?;
         let injector = FluxIpInjector::new(&self.adapter, tokens, req.ip_adapter_scale as f64);
 
-        // candle's get_noise geometry: latent is /8 of a multiple-of-16 request.
+        // candle's get_noise geometry: latent is /8 of a multiple-of-16 request. sc-3673 parity:
+        // deterministic, launch-portable CPU-seeded initial noise (shared FLUX.1 helper, sc-9003).
         let lat_h = (req.height as usize).div_ceil(16) * 2;
         let lat_w = (req.width as usize).div_ceil(16) * 2;
-        let n = LATENT_CHANNELS * lat_h * lat_w;
-        // sc-3673 parity: deterministic, launch-portable CPU-seeded initial noise.
-        let mut rng = StdRng::seed_from_u64(req.seed);
-        let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
-        let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
-            .to_device(&self.device)?
-            .to_dtype(self.dtype)?;
+        let noise = flux1_load::seeded_noise(
+            req.seed,
+            LATENT_CHANNELS,
+            lat_h,
+            lat_w,
+            &self.device,
+            self.dtype,
+        )?;
 
         let state = State::new(&t5_emb, &clip_emb, &noise)?;
         let timesteps = if self.variant.is_dev() {

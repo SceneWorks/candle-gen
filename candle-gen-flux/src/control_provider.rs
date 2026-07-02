@@ -35,9 +35,7 @@ use candle_nn::VarBuilder;
 use candle_transformers::models::clip::text_model::ClipTextTransformer;
 use candle_transformers::models::flux::autoencoder::{AutoEncoder, DiagonalGaussian, Encoder};
 use candle_transformers::models::flux::sampling::{get_schedule, State};
-use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
-use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
+use candle_transformers::models::t5::T5EncoderModel;
 
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::runtime::CancelFlag;
@@ -48,10 +46,13 @@ use candle_gen::{CandleError, Result};
 use crate::control::{
     accepts_control_kind, FluxControlNet, FluxControlNetConfig, FluxControlTransformer,
 };
+use crate::flux1_load;
 use crate::ip_dit::{DitImageInjector, IpFlux};
-use crate::pipeline::{ae_config, clip_config, decode_latents, encode_text, flow_mu, flux_config};
+use crate::pipeline::{ae_config, decode_latents, encode_text, flow_mu, flux_config};
 use crate::Variant;
 
+/// The provider-specific error label for the shared [`crate::flux1_load`] diagnostics.
+const LABEL: &str = "flux1 control";
 /// FLUX runs at bf16.
 const DTYPE: DType = DType::BF16;
 /// FLUX latent channel count (the raw VAE latent / initial noise; the DiT packs it 2×2 to 64).
@@ -117,24 +118,6 @@ impl Default for Flux1ControlRequest {
             cancel: CancelFlag::default(),
         }
     }
-}
-
-/// mmap a [`VarBuilder`] over `files` at `dtype`/`device`, erroring if any is missing.
-fn mmap_vb(files: &[PathBuf], dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
-    for f in files {
-        if !f.is_file() {
-            return Err(CandleError::Msg(format!(
-                "flux1 control snapshot is missing {}",
-                f.display()
-            )));
-        }
-    }
-    candle_gen::mmap_var_builder(files, dtype, device)
-}
-
-/// Sorted list of every `.safetensors` in `dir` (sharded T5 / a control overlay shipped as a dir).
-fn safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
-    candle_gen::sorted_safetensors(dir, "flux1 control")
 }
 
 /// Open a VarBuilder over the Shakker control checkpoint — a single `.safetensors` `File` or a `Dir`
@@ -233,38 +216,19 @@ impl Flux1DevControl {
             )));
         }
 
-        // CLIP-L (text) under `text_encoder/`.
-        let clip_vb = mmap_vb(
-            &[root.join("text_encoder/model.safetensors")],
-            dtype,
-            &device,
-        )?;
-        let clip = ClipTextTransformer::new(clip_vb.pp("text_model"), &clip_config())?;
+        // CLIP-L + T5-XXL text encoders (shared FLUX.1 backbone load, sc-9003).
+        let (clip, t5) = flux1_load::text_encoders(&root, dtype, &device, LABEL)?;
 
-        // T5-XXL under `text_encoder_2/` (sharded; config.json alongside).
-        let t5_dir = root.join("text_encoder_2");
-        let t5_cfg: T5Config = {
-            let cfg = std::fs::read_to_string(t5_dir.join("config.json")).map_err(|e| {
-                CandleError::Msg(format!(
-                    "flux1 control: read text_encoder_2/config.json: {e}"
-                ))
-            })?;
-            serde_json::from_str(&cfg).map_err(|e| {
-                CandleError::Msg(format!("flux1 control: parse T5 config.json: {e}"))
-            })?
-        };
-        let t5_vb = mmap_vb(&safetensors_in(&t5_dir)?, dtype, &device)?;
-        let t5 = T5EncoderModel::load(t5_vb, &t5_cfg)?;
-
-        // The forked FLUX DiT (the compose-ready injector seam) from the root BFL checkpoint.
-        let dit_vb = mmap_vb(&[root.join(variant.transformer_file())], dtype, &device)?;
+        // The forked FLUX DiT (the compose-ready injector seam) from the root BFL checkpoint — the genuine
+        // per-provider drift (IpFlux base, not the stock Flux), so the wrapper choice stays here.
+        let dit_vb = flux1_load::dit_vb(&root, variant, dtype, &device, LABEL)?;
         let base = IpFlux::new(&flux_config(variant), dit_vb)?;
 
         // FLUX AutoEncoder (`ae.safetensors`) for decode, plus a separate posterior-MEAN encoder over the
-        // same weights for the deterministic control encode (sc-8988).
+        // same weights for the deterministic control encode (sc-8988). The shared loader hands back the
+        // VAE plus its VarBuilder so the mean-encoder reuses the same mmap (the per-provider drift here).
         let ae_cfg = ae_config(variant);
-        let vae_vb = mmap_vb(&[root.join("ae.safetensors")], dtype, &device)?;
-        let vae = AutoEncoder::new(&ae_cfg, vae_vb.clone())?;
+        let (vae, vae_vb) = flux1_load::vae(&root, variant, dtype, &device, LABEL)?;
         let control_encoder = MeanVaeEncoder {
             encoder: Encoder::new(&ae_cfg, vae_vb.pp("encoder"))?,
             shift_factor: ae_cfg.shift_factor,
@@ -365,16 +329,18 @@ impl Flux1DevControl {
         )?;
         let control_latent = self.encode_control_latent(control_image, req.width, req.height)?;
 
-        // candle's get_noise geometry: latent is /8 of a multiple-of-16 request.
+        // candle's get_noise geometry: latent is /8 of a multiple-of-16 request. sc-3673 parity:
+        // deterministic, launch-portable CPU-seeded initial noise (shared FLUX.1 helper, sc-9003).
         let lat_h = (req.height as usize).div_ceil(16) * 2;
         let lat_w = (req.width as usize).div_ceil(16) * 2;
-        let n = LATENT_CHANNELS * lat_h * lat_w;
-        // sc-3673 parity: deterministic, launch-portable CPU-seeded initial noise.
-        let mut rng = StdRng::seed_from_u64(req.seed);
-        let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
-        let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
-            .to_device(&self.device)?
-            .to_dtype(self.dtype)?;
+        let noise = flux1_load::seeded_noise(
+            req.seed,
+            LATENT_CHANNELS,
+            lat_h,
+            lat_w,
+            &self.device,
+            self.dtype,
+        )?;
 
         let state = State::new(&t5_emb, &clip_emb, &noise)?;
         let timesteps = get_schedule(req.steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)));
@@ -524,6 +490,8 @@ mod tests {
 
     use candle_nn::VarMap;
     use candle_transformers::models::flux::autoencoder::Config as AeCfg;
+    use rand::{rngs::StdRng, SeedableRng};
+    use rand_distr::{Distribution, StandardNormal};
 
     /// A tiny FLUX AE config (real BFL shift/scale, `ch = 32` — the AE's `group_norm(32, ·)` floor).
     fn tiny_ae_cfg() -> AeCfg {

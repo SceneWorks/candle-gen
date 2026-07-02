@@ -634,6 +634,12 @@ impl IpFlux {
 
     /// The upstream FLUX `forward`, plus the optional XLabs IP injector threaded into every double
     /// block. `ip = None` is byte-identical to candle-transformers `Flux::forward`.
+    ///
+    /// A thin wrapper over the shared [`forward_core`](Self::forward_core): the XLabs IP seam is the
+    /// mid-block one (threaded into `block.forward`), so this engages ONLY `ip` — no post-block
+    /// [`DitImageInjector`] and no control residuals. Byte-identical to the pre-consolidation body: with
+    /// `injector = None` / `control = None` every post-block `if let Some(..)` is skipped and the loop
+    /// reduces to the exact upstream sequence.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -646,39 +652,9 @@ impl IpFlux {
         guidance: Option<&Tensor>,
         ip: Option<&FluxIpInjector>,
     ) -> Result<Tensor> {
-        if txt.rank() != 3 {
-            candle_core::bail!("unexpected shape for txt {:?}", txt.shape())
-        }
-        if img.rank() != 3 {
-            candle_core::bail!("unexpected shape for img {:?}", img.shape())
-        }
-        let dtype = img.dtype();
-        let pe = {
-            let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
-            ids.apply(&self.pe_embedder)?
-        };
-        let mut txt = txt.apply(&self.txt_in)?;
-        let mut img = img.apply(&self.img_in)?;
-        let vec_ = timestep_embedding(timesteps, 256, dtype)?.apply(&self.time_in)?;
-        let vec_ = match (self.guidance_in.as_ref(), guidance) {
-            (Some(g_in), Some(guidance)) => {
-                (vec_ + timestep_embedding(guidance, 256, dtype)?.apply(g_in))?
-            }
-            _ => vec_,
-        };
-        let vec_ = (vec_ + y.apply(&self.vector_in))?;
-
-        // Double blocks — the XLabs IP injector is consulted inside each (image-query seam).
-        for (i, block) in self.double_blocks.iter().enumerate() {
-            (img, txt) = block.forward(&img, &txt, &vec_, &pe, ip.map(|inj| (inj, i)))?
-        }
-        // Single blocks (no IP injection — XLabs only adapts the double stream).
-        let mut img = Tensor::cat(&[&txt, &img], 1)?;
-        for block in self.single_blocks.iter() {
-            img = block.forward(&img, &vec_, &pe)?;
-        }
-        let img = img.i((.., txt.dim(1)?..))?;
-        self.final_layer.forward(&img, &vec_)
+        self.forward_core(
+            img, img_ids, txt, txt_ids, timesteps, y, guidance, ip, None, None,
+        )
     }
 
     /// The upstream FLUX `forward`, plus an optional **post-block** image-stream residual injector —
@@ -690,6 +666,9 @@ impl IpFlux {
     /// blocks it opts into (the image-token tail of `joint = cat(txt, img)`), matching the reference
     /// `flux/model.py` PuLID injection points (every 2nd double, every 4th single). The XLabs IP seam is
     /// NOT engaged here (`ip = None` into the blocks) — PuLID uses only the post-block residuals.
+    ///
+    /// A thin wrapper over [`forward_core`](Self::forward_core) engaging only the post-block `injector`
+    /// (`ip = None`, `control = None`).
     #[allow(clippy::too_many_arguments)]
     pub fn forward_injected(
         &self,
@@ -702,58 +681,9 @@ impl IpFlux {
         guidance: Option<&Tensor>,
         injector: Option<&dyn DitImageInjector>,
     ) -> Result<Tensor> {
-        if txt.rank() != 3 {
-            candle_core::bail!("unexpected shape for txt {:?}", txt.shape())
-        }
-        if img.rank() != 3 {
-            candle_core::bail!("unexpected shape for img {:?}", img.shape())
-        }
-        let dtype = img.dtype();
-        let pe = {
-            let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
-            ids.apply(&self.pe_embedder)?
-        };
-        let mut txt = txt.apply(&self.txt_in)?;
-        let mut img = img.apply(&self.img_in)?;
-        let vec_ = timestep_embedding(timesteps, 256, dtype)?.apply(&self.time_in)?;
-        let vec_ = match (self.guidance_in.as_ref(), guidance) {
-            (Some(g_in), Some(guidance)) => {
-                (vec_ + timestep_embedding(guidance, 256, dtype)?.apply(g_in))?
-            }
-            _ => vec_,
-        };
-        let vec_ = (vec_ + y.apply(&self.vector_in))?;
-
-        // Double blocks (no IP seam) — the post-block PuLID residual is consulted on the image stream.
-        for (i, block) in self.double_blocks.iter().enumerate() {
-            (img, txt) = block.forward(&img, &txt, &vec_, &pe, None)?;
-            if let Some(inj) = injector {
-                if let Some(r) = inj.after_double(i, &img)? {
-                    img = (&img + r.to_dtype(img.dtype())?)?;
-                }
-            }
-        }
-
-        // Single blocks operate on the joint `cat(txt, img)`; the PuLID residual is added to the
-        // image-token tail (and written back) after the blocks it opts into.
-        let txt_len = txt.dim(1)?;
-        let mut joint = Tensor::cat(&[&txt, &img], 1)?;
-        for (i, block) in self.single_blocks.iter().enumerate() {
-            joint = block.forward(&joint, &vec_, &pe)?;
-            if let Some(inj) = injector {
-                if inj.injects_after_single(i) {
-                    let seq = joint.dim(1)?;
-                    let img_part = joint.narrow(1, txt_len, seq - txt_len)?;
-                    if let Some(r) = inj.after_single(i, &img_part)? {
-                        let added = (img_part + r.to_dtype(joint.dtype())?)?;
-                        let txt_part = joint.narrow(1, 0, txt_len)?;
-                        joint = Tensor::cat(&[&txt_part, &added], 1)?;
-                    }
-                }
-            }
-        }
-        let img = joint.i((.., txt_len..))?;
-        self.final_layer.forward(&img, &vec_)
+        self.forward_core(
+            img, img_ids, txt, txt_ids, timesteps, y, guidance, None, injector, None,
+        )
     }
 
     /// As [`forward_injected`], but ALSO threading the Fun-Controlnet-Union per-double-block residuals
@@ -770,6 +700,9 @@ impl IpFlux {
     /// `control = Some(..)`). The control residual is added AFTER the injector's `after_double` residual,
     /// matching diffusers' FLUX ControlNet order (the controlnet sample is added to the post-block
     /// hidden state).
+    ///
+    /// A thin wrapper over [`forward_core`](Self::forward_core) engaging the post-block `injector` and
+    /// `control` (the XLabs mid-block `ip` seam is `None` here).
     #[allow(clippy::too_many_arguments)]
     pub fn forward_control(
         &self,
@@ -780,6 +713,42 @@ impl IpFlux {
         timesteps: &Tensor,
         y: &Tensor,
         guidance: Option<&Tensor>,
+        injector: Option<&dyn DitImageInjector>,
+        control: Option<(&[Tensor], f64)>,
+    ) -> Result<Tensor> {
+        self.forward_core(
+            img, img_ids, txt, txt_ids, timesteps, y, guidance, None, injector, control,
+        )
+    }
+
+    /// The single shared FLUX DiT forward body backing [`forward`], [`forward_injected`], and
+    /// [`forward_control`] (sc-9003 / F-023 — the three used to triplicate this ~60-line body, letting
+    /// the parity-critical preamble and block loop drift independently). It threads all three orthogonal
+    /// seams as explicit parameters; each public entry point engages exactly the seam(s) it owns and
+    /// leaves the rest `None`, so every arm stays byte-identical to its pre-consolidation body:
+    ///
+    /// - `ip` — the XLabs IP-Adapter **mid-block** seam (the decoupled-cross-attn residual computed from
+    ///   the captured pre-RoPE image query INSIDE each double block). Only [`forward`] engages it.
+    /// - `injector` — the generic **post-block** [`DitImageInjector`] seam (PuLID id cross-attn):
+    ///   `after_double` on the image stream and `after_single` on the image-token tail of the joint
+    ///   stream. [`forward_injected`] and [`forward_control`] engage it.
+    /// - `control` — the Fun-Controlnet-Union per-double-block residuals `(residuals, scale)`, pre-scaled
+    ///   once and added after the injector residual at the diffusers interval. Only [`forward_control`]
+    ///   engages it.
+    ///
+    /// With `ip = None`, `injector = None`, `control = None` this is the verbatim upstream
+    /// candle-transformers `Flux::forward`.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_core(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        y: &Tensor,
+        guidance: Option<&Tensor>,
+        ip: Option<&FluxIpInjector>,
         injector: Option<&dyn DitImageInjector>,
         control: Option<(&[Tensor], f64)>,
     ) -> Result<Tensor> {
@@ -823,8 +792,12 @@ impl IpFlux {
             None => None,
         };
 
+        // Double blocks: the XLabs IP seam is consulted INSIDE each block (`ip`, the image-query seam);
+        // the post-block `injector` residual and then the control residual are added to the image stream
+        // afterwards. Each seam is inert when its argument is `None`, so a single-seam caller reduces to
+        // exactly its former body.
         for (i, block) in self.double_blocks.iter().enumerate() {
-            (img, txt) = block.forward(&img, &txt, &vec_, &pe, None)?;
+            (img, txt) = block.forward(&img, &txt, &vec_, &pe, ip.map(|inj| (inj, i)))?;
             // Identity injector (PuLID / IP-Adapter) first — composes with control below.
             if let Some(inj) = injector {
                 if let Some(r) = inj.after_double(i, &img)? {
@@ -839,9 +812,11 @@ impl IpFlux {
             }
         }
 
-        // Single blocks operate on the joint `cat(txt, img)`. The Shakker Union-Pro-2.0 checkpoint has
-        // 0 control SINGLE blocks (diffusers `controlnet_single_block_samples = None`), so only the
-        // identity injector seam is consulted here, unchanged from `forward_injected`.
+        // Single blocks operate on the joint `cat(txt, img)`; XLabs adapts only the double stream, so the
+        // IP seam is never engaged here. The post-block `injector` residual is added to the image-token
+        // tail (and written back) after the blocks it opts into. The Shakker Union-Pro-2.0 checkpoint has
+        // 0 control SINGLE blocks (diffusers `controlnet_single_block_samples = None`), so control is not
+        // consulted here.
         let txt_len = txt.dim(1)?;
         let mut joint = Tensor::cat(&[&txt, &img], 1)?;
         for (i, block) in self.single_blocks.iter().enumerate() {
@@ -876,6 +851,7 @@ pub(crate) fn control_residual_interval(num_double_blocks: usize, num_residuals:
 mod tests {
     use super::*;
     use candle_core::Device;
+    use candle_nn::VarMap;
 
     fn assert_close(a: &Tensor, b: &Tensor) {
         assert_eq!(a.dims(), b.dims());
@@ -911,5 +887,149 @@ mod tests {
         let single = sdpa_budgeted(&q, &kx, &vx, usize::MAX).unwrap();
         let chunked = sdpa_budgeted(&q, &kx, &vx, 1).unwrap();
         assert_close(&single, &chunked);
+    }
+
+    /// A tiny FLUX DiT config (real hyperparameter *shape*, minimal depth) for a CPU-only forward parity
+    /// test — small enough to run every gate, large enough to exercise the double + single block loops
+    /// and the final layer.
+    fn tiny_cfg() -> Config {
+        Config {
+            in_channels: 64,
+            vec_in_dim: 768,
+            context_in_dim: 4096,
+            hidden_size: 32,
+            mlp_ratio: 2.0,
+            num_heads: 2,
+            depth: 3,
+            depth_single_blocks: 4,
+            axes_dim: vec![4, 6, 6],
+            theta: 10_000,
+            qkv_bias: true,
+            guidance_embed: true,
+        }
+    }
+
+    /// Build a tiny random-weight [`IpFlux`] on CPU. VarMap zero-init is randomized so the forward is a
+    /// non-degenerate function (a zero DiT would make the wrapper-vs-wrapper parity vacuous).
+    fn tiny_ipflux(dev: &Device) -> IpFlux {
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, dev);
+        let model = IpFlux::new(&cfg, vb).expect("tiny IpFlux");
+        // Randomize every parameter (deterministic seed) — otherwise every weight is 0 and the forward
+        // collapses to a constant, hiding any drift between the wrappers.
+        let mut seed = 9003u64;
+        for var in vm.data().lock().unwrap().values() {
+            let n = var.shape().elem_count();
+            let data: Vec<f32> = (0..n)
+                .map(|_| {
+                    // xorshift64* — a self-contained deterministic PRNG, no rand dep needed here.
+                    seed ^= seed >> 12;
+                    seed ^= seed << 25;
+                    seed ^= seed >> 27;
+                    let u =
+                        (seed.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64;
+                    ((u as f32) - 0.5) * 0.1
+                })
+                .collect();
+            let t = Tensor::from_vec(data, var.shape(), dev).expect("randomize");
+            var.set(&t).expect("set var");
+        }
+        model
+    }
+
+    /// The FLUX DiT `img`/`img_ids`/`txt`/`txt_ids`/`timesteps`/`y` inputs for a tiny 2×2-token image and
+    /// a 3-token text sequence — the geometry `State::new` produces, at the tiny config's channel counts.
+    fn tiny_inputs(dev: &Device, cfg: &Config) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor) {
+        let (img_seq, txt_seq) = (4usize, 3usize);
+        let fill = |shape: (usize, usize, usize), scale: f32| {
+            let n = shape.0 * shape.1 * shape.2;
+            let data: Vec<f32> = (0..n).map(|i| ((i as f32 * 0.31).sin()) * scale).collect();
+            Tensor::from_vec(data, shape, dev).unwrap()
+        };
+        let img = fill((1, img_seq, cfg.in_channels), 1.0);
+        let txt = fill((1, txt_seq, cfg.context_in_dim), 1.0);
+        // Position ids are 3-axis (axes_dim.len() == 3), integer-valued floats.
+        let ids = |seq: usize| {
+            let data: Vec<f32> = (0..seq * 3).map(|i| (i % 5) as f32).collect();
+            Tensor::from_vec(data, (1, seq, 3), dev).unwrap()
+        };
+        let img_ids = ids(img_seq);
+        let txt_ids = ids(txt_seq);
+        let timesteps = Tensor::from_vec(vec![0.7f32], (1,), dev).unwrap();
+        let y = fill((1, 1, cfg.vec_in_dim), 1.0).squeeze(1).unwrap(); // (1, vec_in_dim)
+        (img, img_ids, txt, txt_ids, timesteps, y)
+    }
+
+    /// sc-9003 / F-023: the three public forwards were consolidated onto one `forward_core`. Each is a
+    /// thin wrapper engaging only its own seam, so with every optional injector `None` all three must be
+    /// byte-identical — the documented invariant (`forward_control(.., None) ≡ forward_injected(.., None)
+    /// ≡ forward(.., None)`). This locks that the consolidation didn't perturb the shared body.
+    #[test]
+    fn wrappers_agree_when_all_injectors_none() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let model = tiny_ipflux(&dev);
+        let (img, img_ids, txt, txt_ids, timesteps, y) = tiny_inputs(&dev, &cfg);
+        let g = Tensor::from_vec(vec![3.5f32], (1,), &dev).unwrap();
+
+        let base = model
+            .forward(
+                &img,
+                &img_ids,
+                &txt,
+                &txt_ids,
+                &timesteps,
+                &y,
+                Some(&g),
+                None,
+            )
+            .expect("forward");
+        let injected = model
+            .forward_injected(
+                &img,
+                &img_ids,
+                &txt,
+                &txt_ids,
+                &timesteps,
+                &y,
+                Some(&g),
+                None,
+            )
+            .expect("forward_injected");
+        let control = model
+            .forward_control(
+                &img,
+                &img_ids,
+                &txt,
+                &txt_ids,
+                &timesteps,
+                &y,
+                Some(&g),
+                None,
+                None,
+            )
+            .expect("forward_control");
+
+        // All three engage no seam ⇒ identical to the plain FLUX path, and to each other.
+        assert_close(&base, &injected);
+        assert_close(&base, &control);
+
+        // An empty control residual slice is also "no control" — must match the None arm.
+        let empty: Vec<Tensor> = Vec::new();
+        let control_empty = model
+            .forward_control(
+                &img,
+                &img_ids,
+                &txt,
+                &txt_ids,
+                &timesteps,
+                &y,
+                Some(&g),
+                None,
+                Some((&empty, 0.7)),
+            )
+            .expect("forward_control empty residuals");
+        assert_close(&base, &control_empty);
     }
 }

@@ -73,10 +73,8 @@ use candle_transformers::models::flux::autoencoder::{AutoEncoder, Config as AeCo
 use candle_transformers::models::flux::model::{Config as FluxConfig, Flux};
 use candle_transformers::models::flux::sampling::{get_schedule, unpack, State};
 use candle_transformers::models::flux::WithForward;
-use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
+use candle_transformers::models::t5::T5EncoderModel;
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, VaeConfig};
-use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 use tokenizers::Tokenizer;
 
 use crate::packed_dit::PackedFluxDit;
@@ -180,32 +178,25 @@ impl Pipeline {
 
     /// The dense BFL-layout path (sc-3694, unchanged): CLIP-L from `text_encoder/`, T5-XXL from
     /// `text_encoder_2/`, the DiT from the root `flux1-*.safetensors` and the VAE from `ae.safetensors`.
+    /// The text-encoder / DiT-mmap / VAE loads now come from the shared FLUX.1 backbone loader
+    /// (sc-9003 / F-023) — the CLIP `text_model.` prefix, the T5 config parse, and the noise geometry no
+    /// longer drift across the three FLUX.1 providers. This path builds the **stock**
+    /// `candle-transformers` `Flux` DiT (the per-provider drift: the providers build the forked `IpFlux`).
     fn load_stock_components(&self) -> Result<Components> {
-        // CLIP-L (openai/clip-vit-large-patch14 layout) under the diffusers `text_encoder/` subdir;
-        // the candle transformer pools under the `text_model.` prefix. Config is fixed for FLUX.
-        let clip_vb = self.mmap_vb(&[self.root.join("text_encoder/model.safetensors")])?;
-        let clip = ClipTextTransformer::new(clip_vb.pp("text_model"), &clip_config())?;
-
-        // T5-XXL under `text_encoder_2/` (sharded; config.json alongside).
-        let t5_dir = self.root.join("text_encoder_2");
-        let t5_cfg: T5Config = {
-            let cfg = std::fs::read_to_string(t5_dir.join("config.json")).map_err(|e| {
-                CandleError::Msg(format!("flux: read text_encoder_2/config.json: {e}"))
-            })?;
-            serde_json::from_str(&cfg)
-                .map_err(|e| CandleError::Msg(format!("flux: parse T5 config.json: {e}")))?
-        };
-        let t5_vb = self.mmap_vb(&self.safetensors_in(&t5_dir)?)?;
-        let t5 = T5EncoderModel::load(t5_vb, &t5_cfg)?;
+        // CLIP-L + T5-XXL text encoders (shared FLUX.1 backbone load).
+        let (clip, t5) =
+            crate::flux1_load::text_encoders(&self.root, self.dtype, &self.device, "flux")?;
 
         // FLUX DiT (original BFL checkpoint) at the snapshot root; config differs only by the
-        // guidance embedding (dev embeds the guidance scale, schnell does not).
-        let dit_vb = self.mmap_vb(&[self.root.join(self.variant.transformer_file())])?;
+        // guidance embedding (dev embeds the guidance scale, schnell does not). The stock `Flux` over the
+        // shared DiT mmap.
+        let dit_vb =
+            crate::flux1_load::dit_vb(&self.root, self.variant, self.dtype, &self.device, "flux")?;
         let transformer = Flux::new(&flux_config(self.variant), dit_vb)?;
 
         // FLUX AutoEncoder (`ae.safetensors`) at the root.
-        let vae_vb = self.mmap_vb(&[self.root.join("ae.safetensors")])?;
-        let vae = AutoEncoder::new(&ae_config(self.variant), vae_vb)?;
+        let (vae, _vae_vb) =
+            crate::flux1_load::vae(&self.root, self.variant, self.dtype, &self.device, "flux")?;
 
         Ok(Components::Stock {
             clip: Arc::new(clip),
@@ -335,20 +326,6 @@ impl Pipeline {
         Ok(VarBuilder::from_tensors(tensors, self.dtype, &self.device))
     }
 
-    /// mmap a [`VarBuilder`] over `files` at this pipeline's dtype/device, erroring if any is missing.
-    fn mmap_vb(&self, files: &[PathBuf]) -> Result<VarBuilder<'static>> {
-        for f in files {
-            if !f.is_file() {
-                return Err(CandleError::Msg(format!(
-                    "flux snapshot is missing {} (expected a black-forest-labs FLUX.1 snapshot at {})",
-                    f.display(),
-                    self.root.display()
-                )));
-            }
-        }
-        candle_gen::mmap_var_builder(files, self.dtype, &self.device)
-    }
-
     /// Sorted list of every `.safetensors` in `dir` (sharded T5 checkpoints ship as
     /// `model-0000n-of-0000m.safetensors`). Errors if none are found.
     fn safetensors_in(&self, dir: &Path) -> Result<Vec<PathBuf>> {
@@ -453,14 +430,16 @@ impl Pipeline {
             let seed = image_seed(base_seed, index);
 
             // sc-3673 parity — deterministic, launch-portable initial noise in candle's get_noise
-            // shape (1, 16, h/8, w/8): N(0,1) from a fixed-algorithm CPU RNG seeded by `seed`, built
-            // on CPU then moved to the device.
-            let n = LATENT_CHANNELS * lat_h * lat_w;
-            let mut rng = StdRng::seed_from_u64(seed);
-            let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
-            let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
-                .to_device(&self.device)?
-                .to_dtype(self.dtype)?;
+            // shape (1, 16, h/8, w/8): N(0,1) from a fixed-algorithm CPU RNG seeded by `seed` (shared
+            // FLUX.1 helper, sc-9003).
+            let noise = crate::flux1_load::seeded_noise(
+                seed,
+                LATENT_CHANNELS,
+                lat_h,
+                lat_w,
+                &self.device,
+                self.dtype,
+            )?;
 
             // Pack noise + build the conditioning state (img/img_ids/txt/txt_ids/vec) exactly as the
             // candle reference — shared by both tiers. The packed token count drives dev's

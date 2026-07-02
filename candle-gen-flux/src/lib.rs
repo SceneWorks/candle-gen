@@ -28,6 +28,13 @@
 
 mod pipeline;
 
+// Shared FLUX.1 component-loading stack (sc-9003 / F-023): the CLIP-L + T5-XXL text encoders, the DiT
+// checkpoint mmap, the AutoEncoder VAE, and the CPU-seeded initial noise — the block the three FLUX.1
+// providers (txt2img / IP-Adapter / control) used to copy-paste. One home over `candle_gen::loader`
+// (F-019), parameterized only by the provider's error `label`; the genuine drift (which DiT wrapper is
+// built, the mean-encoder mirror) stays with each caller.
+mod flux1_load;
+
 // Packed-tier (MLX diffusers-layout q4/q8) load path (sc-9407, sc-9089 umbrella). `quant` is the thin
 // per-crate dense-or-packed enum delegating to the shared `candle_gen::quant` packed-load module
 // (sc-9086); `packed_dit`/`packed_te` are minimal vendored diffusers-layout FLUX.1 DiT + CLIP-L/T5-XXL
