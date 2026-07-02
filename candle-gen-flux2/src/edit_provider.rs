@@ -113,11 +113,10 @@ impl Flux2Edit {
         let device = candle_gen::default_device()?;
         let pipe = Pipeline::load(variant, quant, &paths.root, &device);
         // Packed MLX tier → build directly on the GPU from the packed parts (sc-9087, no ~105 GB dense
-        // CPU staging); dense tier → the legacy CPU-stage → quantize-onto-GPU path. Shared with txt2img.
-        let (te, transformer) = pipe.load_quantizable(
-            |cfg, vb| Ok(Qwen3TextEncoder::new(cfg, vb)?),
-            |cfg, vb| Ok(Flux2Transformer::new(cfg, vb)?),
-        )?;
+        // CPU staging); dense tier → the legacy CPU-stage → quantize-onto-GPU path. Shared TE+DiT loader
+        // with txt2img / control (F-024, sc-9004). The VAE *with encoder* (the reference encode) is the
+        // per-site addition.
+        let (te, transformer) = pipe.load_te_and_dit()?;
         let vae = Flux2Vae::new_with_encoder(pipe.component_vb("vae")?)?;
         Ok(Self {
             pipe,

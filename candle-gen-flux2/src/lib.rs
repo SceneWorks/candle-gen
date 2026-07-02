@@ -147,12 +147,31 @@ impl Pipeline {
             .is_some()
     }
 
+    /// Load the base **Mistral/Qwen3 TE + `Flux2Transformer` DiT** pair — the exact quantizable stack
+    /// shared by every entry point (txt2img [`Self::load_components`], `Flux2Edit::load_variant`,
+    /// `Flux2Control::load`). This is the single home for the "which builders + which tier/staging
+    /// strategy" decision (F-024, sc-9004): it fixes the default builders (`Qwen3TextEncoder::new` /
+    /// `Flux2Transformer::new`) and delegates the packed-vs-dense-vs-quant routing to
+    /// [`Self::load_quantizable`]. Callers layer their extra components on top (the edit/control VAE
+    /// *with encoder*, the control-branch overlay) — those are the genuine per-site differences and stay
+    /// at the call site; only the copy-pasted TE+DiT loader moves here.
+    ///
+    /// A staging-strategy change (e.g. pre-quantized snapshot consumption) now lives in one place. Use
+    /// [`Self::load_quantizable`] directly only if a future caller needs non-default module builders.
+    pub(crate) fn load_te_and_dit(&self) -> CResult<(Qwen3TextEncoder, Flux2Transformer)> {
+        self.load_quantizable(
+            |cfg, vb| Ok(Qwen3TextEncoder::new(cfg, vb)?),
+            |cfg, vb| Ok(Flux2Transformer::new(cfg, vb)?),
+        )
+    }
+
     /// Load the TE + DiT, routing each through the **packed** path (build straight from an MLX-packed
     /// tier on the GPU — sc-9087, no ~105 GB dense CPU staging) or the legacy **dense** path (stage
     /// dense in system RAM, then quantize each projection onto the GPU) per [`Self::component_is_packed`]
     /// and `self.quant`. Shared by txt2img, `Flux2Edit::load_dev`, and `Flux2Control` (they load the same
-    /// quantizable pair; the callers add the VAE / control overlay). `mk_te` / `mk_dit` build the module
-    /// from a component VarBuilder (`Qwen3TextEncoder::new` / `Flux2Transformer::new`).
+    /// quantizable pair; the callers add the VAE / control overlay) via [`Self::load_te_and_dit`], which
+    /// fixes the default builders. `mk_te` / `mk_dit` build the module from a component VarBuilder
+    /// (`Qwen3TextEncoder::new` / `Flux2Transformer::new`).
     pub(crate) fn load_quantizable(
         &self,
         mk_te: impl Fn(&Flux2Config, VarBuilder) -> CResult<Qwen3TextEncoder>,
@@ -205,10 +224,7 @@ impl Pipeline {
     }
 
     fn load_components(&self) -> CResult<Components> {
-        let (te, transformer) = self.load_quantizable(
-            |cfg, vb| Ok(Qwen3TextEncoder::new(cfg, vb)?),
-            |cfg, vb| Ok(Flux2Transformer::new(cfg, vb)?),
-        )?;
+        let (te, transformer) = self.load_te_and_dit()?;
         let vae = Flux2Vae::new(self.component_vb("vae")?)?;
         Ok(Components {
             te: Arc::new(te),
@@ -734,6 +750,126 @@ mod tests {
         assert!(!pipe.component_is_packed("vae"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The shared quantizable-loader's three device/dtype-selection regimes (the F-024 de-dup home,
+    /// sc-9004). `load_one_quantizable` is the single body behind `load_te_and_dit` (and thus behind
+    /// txt2img, edit, and control): the same routing decision every entry point makes. Exercised on CPU
+    /// with a stub module that records the device its VarBuilder was built on:
+    /// - **no quant** → build on the configured device (`self.device`), no staging.
+    /// - **dense tier + quant** → stage dense on the CPU, then quantize onto `self.device`.
+    /// - **packed tier + quant** → build directly on `self.device` (no dense CPU staging, sc-9087).
+    ///
+    /// The dtype passed to the builder is always `self.dtype` (f32) regardless of regime — the loaded
+    /// weights + dtype/device stay byte-identical per site (the invariant the de-dup must preserve).
+    #[test]
+    fn load_one_quantizable_selects_device_per_tier() {
+        use candle_gen::candle_core::safetensors;
+        use std::collections::HashMap;
+
+        /// Records the device + dtype its VarBuilder was constructed on, and whether the post-build
+        /// `quantize` hook ran (the CPU-stage → quantize-onto-GPU / packed handoff).
+        struct Probe {
+            device: Device,
+            dtype: DType,
+            quantized: std::cell::Cell<bool>,
+        }
+
+        let dir = std::env::temp_dir().join(format!("sc9004_loader_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A one-tensor safetensors shard so `component_vb_on` mmaps successfully for either component.
+        let write_shard = |sub: &str, packed: bool| {
+            let comp = dir.join(sub);
+            std::fs::create_dir_all(&comp).unwrap();
+            let mut map = HashMap::new();
+            map.insert(
+                "w".to_string(),
+                Tensor::zeros((2, 2), DType::F32, &Device::Cpu).unwrap(),
+            );
+            safetensors::save(&map, comp.join("model.safetensors")).unwrap();
+            if packed {
+                std::fs::write(
+                    comp.join("config.json"),
+                    r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+                )
+                .unwrap();
+            }
+        };
+
+        // The build closure just records what the loader handed it; the quantize closure records that it
+        // ran and on which device (the CPU-stage → quantize-onto-GPU handoff).
+        let build = |vb: VarBuilder| -> CResult<Probe> {
+            Ok(Probe {
+                device: vb.device().clone(),
+                dtype: vb.dtype(),
+                quantized: std::cell::Cell::new(false),
+            })
+        };
+        let quantize = |m: &mut Probe, _q: Quant, _d: &Device| -> CResult<()> {
+            m.quantized.set(true);
+            Ok(())
+        };
+
+        // no quant → configured device, no staging call.
+        write_shard("text_encoder", false);
+        let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &dir, &Device::Cpu);
+        let p = pipe
+            .load_one_quantizable("text_encoder", build, quantize)
+            .unwrap();
+        assert!(matches!(p.device, Device::Cpu));
+        assert_eq!(p.dtype, DType::F32);
+        assert!(!p.quantized.get(), "no-quant path must not quantize");
+
+        // dense tier + quant → the builder sees the CPU (staging), then quantize runs onto the device.
+        let dense = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu);
+        let p = dense
+            .load_one_quantizable("text_encoder", build, quantize)
+            .unwrap();
+        assert!(
+            matches!(p.device, Device::Cpu),
+            "dense-tier build stages on CPU"
+        );
+        assert!(
+            p.quantized.get(),
+            "dense-tier + quant must quantize onto the device"
+        );
+
+        // packed tier + quant → the builder sees the configured device directly (no dense staging).
+        write_shard("transformer", true);
+        let packed = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu);
+        let p = packed
+            .load_one_quantizable("transformer", build, quantize)
+            .unwrap();
+        assert!(
+            matches!(p.device, Device::Cpu),
+            "packed-tier build lands on the configured device (no CPU staging step)"
+        );
+        assert!(
+            p.quantized.get(),
+            "packed-tier still runs the (no-op on projections) quantize to carry dense leaves"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `load_te_and_dit` is a thin delegation to `load_quantizable` with the default TE+DiT builders —
+    /// the single home the three entry points (txt2img/edit/control) now share (F-024, sc-9004). It
+    /// surfaces the underlying loader error (here: a snapshot missing the `text_encoder/` component)
+    /// unchanged, confirming the delegation is wired without needing real 32B weights.
+    #[test]
+    fn load_te_and_dit_surfaces_missing_component() {
+        let dir = std::env::temp_dir().join(format!("sc9004_missing_{}", std::process::id()));
+        // No component dirs written → the shared loader must error on the missing text_encoder/.
+        let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &dir, &Device::Cpu);
+        let err = pipe
+            .load_te_and_dit()
+            .err()
+            .expect("missing components")
+            .to_string();
+        assert!(
+            err.contains("text_encoder"),
+            "delegation surfaces the loader's missing-component error, got: {err}"
+        );
     }
 
     #[test]

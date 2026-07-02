@@ -31,7 +31,7 @@ use candle_gen::{CandleError, Result};
 use crate::config::{Flux2Variant, DEFAULT_GUIDANCE_DEV, DEFAULT_STEPS_DEV, SIZE_MULTIPLE};
 use crate::edit_provider::preprocess_ref;
 use crate::text_encoder::Qwen3TextEncoder;
-use crate::transformer::{Flux2ControlBranch, Flux2ControlTransformer, Flux2Transformer};
+use crate::transformer::{Flux2ControlBranch, Flux2ControlTransformer};
 use crate::vae::Flux2Vae;
 use crate::{pipeline, to_image, Pipeline};
 
@@ -102,11 +102,9 @@ impl Flux2Control {
 
         // Base DiT + Mistral TE. Packed MLX tier → build directly on the GPU from the packed parts
         // (sc-9087, no ~105 GB dense CPU staging); dense tier → stage dense in CPU RAM and quantize each
-        // projection onto the GPU. Shared with txt2img / edit.
-        let (te, base) = pipe.load_quantizable(
-            |cfg, vb| Ok(Qwen3TextEncoder::new(cfg, vb)?),
-            |cfg, vb| Ok(Flux2Transformer::new(cfg, vb)?),
-        )?;
+        // projection onto the GPU. Shared TE+DiT loader with txt2img / edit (F-024, sc-9004); the control
+        // branch overlay below (`Flux2ControlBranch` → `Flux2ControlTransformer`) is the per-site addition.
+        let (te, base) = pipe.load_te_and_dit()?;
 
         // The control overlay is small (~8 GB bf16) and fits on the GPU; load it dense on-device and
         // quantize in place (the 260-ch `control_img_in` stays dense — 260 ∤ 32).
