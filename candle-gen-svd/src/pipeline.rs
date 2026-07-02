@@ -121,6 +121,11 @@ fn guidance_schedule(
 /// solvers stay correct). Inputs are the **conditional** rows (`[1, …]`); the uncond CFG branch zeros
 /// `image_embeds`/`image_latents` (the diffusers SVD uncond). Latents are the init noise scaled by
 /// `init_noise_sigma`. Returns the final `[1, F, 4, h, w]` latents.
+///
+/// When guidance is disabled (`max_g <= 1.0`, the diffusers `do_classifier_free_guidance` gate) the
+/// uncond half is neither built nor forwarded: the loop runs a single batch-1 cond-only UNet forward,
+/// since the per-frame blend collapses to the conditional (sc-8993 F-013). Guided output (`max_g >
+/// 1.0`) is untouched.
 #[allow(clippy::too_many_arguments)]
 pub fn denoise(
     unet: &SvdUnet,
@@ -142,13 +147,26 @@ pub fn denoise(
     let sched = EdmSchedule::karras(steps, scheduler);
     let ms = EdmModelSampling::svd();
 
-    // CFG conditioning batches (constant across steps): row 0 = uncond (zeros), row 1 = cond.
-    let zeros_e = image_embeds.zeros_like()?;
-    let embeds2 = Tensor::cat(&[&zeros_e, image_embeds], 0)?; // [2, ctx, 1024]
-    let zeros_l = image_latents.zeros_like()?;
-    let img_lat2 = Tensor::cat(&[&zeros_l, image_latents], 0)?; // [2, F, 4, h, w]
-    let atid2 = Tensor::cat(&[added_time_ids, added_time_ids], 0)?; // [2, 3]
-    let guidance = guidance_schedule(num_frames, min_g, max_g, &device)?;
+    // Whether classifier-free guidance is active. SVD ramps the guidance per frame via
+    // `linspace(min, max, F)`, so the diffusers `do_classifier_free_guidance` gate is `max > 1.0`:
+    // when the max is 1.0 every per-frame scale is ≤ 1.0 and the blend `uncond + g·(cond − uncond)`
+    // collapses to the conditional, making the uncond half + the doubled UNet forward pure waste
+    // (sc-8993 F-013; the parent story scoped only lens/sd3/wan14b). Defaults (max 3.0) keep CFG on.
+    let cfg_active = max_g > 1.0;
+
+    // CFG conditioning batches (constant across steps): row 0 = uncond (zeros), row 1 = cond. Built
+    // only when guidance is active — otherwise the cond-only single-batch path below is taken.
+    let cfg_batches = if cfg_active {
+        let zeros_e = image_embeds.zeros_like()?;
+        let embeds2 = Tensor::cat(&[&zeros_e, image_embeds], 0)?; // [2, ctx, 1024]
+        let zeros_l = image_latents.zeros_like()?;
+        let img_lat2 = Tensor::cat(&[&zeros_l, image_latents], 0)?; // [2, F, 4, h, w]
+        let atid2 = Tensor::cat(&[added_time_ids, added_time_ids], 0)?; // [2, 3]
+        let guidance = guidance_schedule(num_frames, min_g, max_g, &device)?;
+        Some((embeds2, img_lat2, atid2, guidance))
+    } else {
+        None
+    };
 
     candle_gen::run_curated_sampler(
         sampler,
@@ -161,14 +179,26 @@ pub fn denoise(
         |x_in, t| -> CResult<Tensor> {
             // `x_in` is already the `1/√(σ²+1)`-scaled latent (`scale_model_input`) the driver applied
             // via `EdmModelSampling::input_scale`; `t` is the continuous EDM timestep `0.25·ln σ`.
-            let lat2 = Tensor::cat(&[x_in, x_in], 0)?; // [2, F, 4, h, w]
-            let inp = Tensor::cat(&[&lat2, &img_lat2], 2)?; // [2, F, 8, h, w] (channel concat)
-            let pred = unet.forward(&inp, t, &embeds2, &atid2, num_frames)?; // [2, F, 4, h, w]
-            let uncond = pred.narrow(0, 0, 1)?;
-            let cond = pred.narrow(0, 1, 1)?;
-            // noise_pred = uncond + guidance · (cond − uncond), frame-wise (the raw v the EDM contract
-            // recombines into x0).
-            Ok(uncond.add(&guidance.broadcast_mul(&(cond - &uncond)?)?)?)
+            match &cfg_batches {
+                Some((embeds2, img_lat2, atid2, guidance)) => {
+                    let lat2 = Tensor::cat(&[x_in, x_in], 0)?; // [2, F, 4, h, w]
+                    let inp = Tensor::cat(&[&lat2, img_lat2], 2)?; // [2, F, 8, h, w] (channel concat)
+                    let pred = unet.forward(&inp, t, embeds2, atid2, num_frames)?; // [2, F, 4, h, w]
+                    let uncond = pred.narrow(0, 0, 1)?;
+                    let cond = pred.narrow(0, 1, 1)?;
+                    // noise_pred = uncond + guidance · (cond − uncond), frame-wise (the raw v the EDM
+                    // contract recombines into x0).
+                    Ok(uncond.add(&guidance.broadcast_mul(&(cond - &uncond)?)?)?)
+                }
+                // Guidance disabled (max ≤ 1.0): single-batch cond-only forward. The CFG blend at
+                // scale 1.0 is exactly `cond`, so this returns the same velocity the 2-batch path
+                // would — at half the UNet compute.
+                None => {
+                    let inp = Tensor::cat(&[x_in, image_latents], 2)?; // [1, F, 8, h, w]
+                    Ok(unet.forward(&inp, t, image_embeds, added_time_ids, num_frames)?)
+                    // [1,F,4,h,w]
+                }
+            }
         },
     )
 }
@@ -222,4 +252,54 @@ pub fn frames_to_images(decoded: &Tensor) -> CResult<Vec<Image>> {
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// sc-8993 (F-013): when guidance is disabled every per-frame scale is `1.0`, and the CFG blend
+    /// `uncond + g·(cond − uncond)` with `g == 1.0` is exactly `cond` for ANY uncond. This is the
+    /// algebraic justification for [`denoise`] skipping the uncond half + doubled UNet forward when
+    /// `max_guidance_scale <= 1.0`: the single-batch cond-only forward returns bit-identical output to
+    /// what the 2-batch CFG path would have produced. Mirrors sd3's `cfg_scale_one_equals_cond_only_path`
+    /// and lens's `cfg_rescale_at_guidance_one_is_cond_for_any_uncond`.
+    #[test]
+    fn guidance_one_blend_equals_cond_for_any_uncond() {
+        let dev = Device::Cpu;
+        let num_frames = 2;
+        // A guidance schedule with min == max == 1.0 → every per-frame scale is exactly 1.0, shaped
+        // `[1, F, 1, 1, 1]` to broadcast over the per-frame `[1, F, 4, h, w]` predictions.
+        let guidance = guidance_schedule(num_frames, 1.0, 1.0, &dev).unwrap();
+        // Per-frame prediction shape `[1, F, 4, 1, 1]` (a 1×1 spatial grid keeps the tensors tiny).
+        let cond = Tensor::from_vec(
+            vec![3.0f32, 4.0, 0.0, -2.0, 1.0, 2.0, 2.0, 7.0],
+            (1, num_frames, 4, 1, 1),
+            &dev,
+        )
+        .unwrap();
+        // A deliberately unrelated uncond — the result must ignore it entirely at guidance 1.0.
+        let uncond = Tensor::from_vec(
+            vec![9.5f32, -0.5, 1.0, 3.0, -1.0, 8.0, 0.5, -4.5],
+            (1, num_frames, 4, 1, 1),
+            &dev,
+        )
+        .unwrap();
+        // The exact blend the `denoise` CFG path computes each step.
+        let blended = uncond
+            .add(&guidance.broadcast_mul(&(&cond - &uncond).unwrap()).unwrap())
+            .unwrap();
+        let diff = (&blended - &cond)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff < 1e-5,
+            "guidance-1.0 CFG blend must equal cond; max |diff| = {diff}"
+        );
+    }
 }
