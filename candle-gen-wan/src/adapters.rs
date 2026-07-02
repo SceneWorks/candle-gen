@@ -23,7 +23,9 @@
 //! **Key conventions.** The candle trainer writes **bare** dotted PEFT/LoKr keys (no prefix). Community
 //! Wan LoRAs carry a `diffusion_model.` / `transformer.` namespace (the diffusers/sd-scripts exports) or
 //! the kohya `lora_unet_<flattened>` form; all resolve. Out-of-surface keys are counted in
-//! [`MergeReport`] and surfaced, never silently dropped.
+//! [`MergeReport`] (so a zero-match spec list hard-errors rather than silently no-op'ing), but the
+//! populated report is *discarded* at the call site — F-051 (sc-9035) ratified silent library-side
+//! merges (no per-merge stderr), matching the Z-Image/sd3/qwen-image-edit twins.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -56,7 +58,8 @@ const LOKR_SUFFIXES: [&str; 6] = [
 ];
 
 /// Outcome of merging adapter specs into one expert's tensor map: base weights updated, and keys that
-/// fell outside the merge surface (text-encoder / unresolved — surfaced, not silently dropped).
+/// fell outside the merge surface (text-encoder / unresolved). The count gates the zero-match hard-error
+/// inside [`merge_adapters`]; the caller discards the populated report (F-051 / sc-9035, no stderr).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct MergeReport {
     pub merged: usize,
@@ -482,6 +485,39 @@ mod tests {
             .to_scalar::<f32>()
             .unwrap();
         assert!(diff < 1e-4, "merged lokr weight off by {diff}");
+    }
+
+    /// sc-9027 / F-043: a partially-matching LoRA (one on-surface target + one off-surface) merges the
+    /// hit and counts the miss in [`MergeReport::skipped_keys`], so the merge machinery distinguishes a
+    /// partial match from a total miss (the latter hard-errors). The caller discards the report (F-051),
+    /// so this asserts the report contents directly from the merge, not any call-site side effect.
+    #[test]
+    fn merge_lora_partial_match_reports_skipped() {
+        let mut map = base_map();
+        let down = t2(&[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], 2, 4);
+        let up = t2(&[2.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0], 4, 2);
+        let af = AdapterFile {
+            tensors: HashMap::from([
+                // On-surface: block 0 attn1.to_q exists in `base_map`.
+                (
+                    "blocks.0.attn1.to_q.lora_A.weight".to_string(),
+                    down.clone(),
+                ),
+                ("blocks.0.attn1.to_q.lora_B.weight".to_string(), up.clone()),
+                // Off-surface: block 99 is not in the base map — the miss must be counted, not dropped.
+                ("blocks.99.attn1.to_q.lora_A.weight".to_string(), down),
+                ("blocks.99.attn1.to_q.lora_B.weight".to_string(), up),
+            ]),
+            meta: HashMap::new(),
+        };
+        let table = build_kohya_table(&map);
+        let mut report = MergeReport::default();
+        merge_lora_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
+        assert_eq!(report.merged, 1, "the on-surface target merges");
+        assert!(
+            report.skipped_keys >= 1,
+            "the off-surface target is surfaced as skipped, not silently dropped"
+        );
     }
 
     /// A non-empty spec list that matches nothing surfaces as zero-merged (the public entry then errors).

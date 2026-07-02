@@ -39,6 +39,13 @@ pub const STAGE1_SIGMAS: [f32; 9] = [
     1.0, 0.993_75, 0.987_5, 0.981_25, 0.975, 0.909_375, 0.725, 0.421_875, 0.0,
 ];
 
+/// The number of denoise steps the distilled [`STAGE1_SIGMAS`] schedule performs (`len − 1`). This is
+/// the ONLY step count the distilled model supports — the σ waypoints are baked into training, so an
+/// arbitrary `req.steps` cannot be honored by resampling without going out-of-distribution. `render`
+/// runs this many steps unconditionally; [`crate::descriptor`]'s `validate` rejects any other explicit
+/// `req.steps` rather than silently ignoring it (sc-9027 / F-043).
+pub const NATIVE_STEPS: u32 = STAGE1_SIGMAS.len() as u32 - 1;
+
 /// The LTX-2.3 video DiT (`AVTransformer3DModel`, video stack) dimensions.
 #[derive(Clone, Debug)]
 pub struct TransformerConfig {

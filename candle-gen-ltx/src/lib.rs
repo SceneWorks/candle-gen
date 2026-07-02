@@ -51,8 +51,8 @@ use candle_gen::{run_av_curated_sampler, AvLatents, CandleError, Result as CResu
 use audio_vae::AudioDecoder;
 use config::{
     compute_audio_frames, AudioVaeConfig, AvConfig, ConnectorConfig, GemmaConfig, VocoderConfig,
-    DEFAULT_FPS, DEFAULT_FRAMES, DEFAULT_HEIGHT, DEFAULT_WIDTH, MODEL_ID, STAGE1_SIGMAS,
-    TEXT_MAX_LENGTH,
+    DEFAULT_FPS, DEFAULT_FRAMES, DEFAULT_HEIGHT, DEFAULT_WIDTH, MODEL_ID, NATIVE_STEPS,
+    STAGE1_SIGMAS, TEXT_MAX_LENGTH,
 };
 use gemma::GemmaEncoder;
 use text_encoder::LtxTextEncoder;
@@ -375,6 +375,18 @@ impl Generator for LtxGenerator {
                 )));
             }
         }
+        // `req.steps` (sc-9027 / F-043): the distilled model bakes the fixed `STAGE1_SIGMAS` σ waypoints
+        // into training, so the only supported step count is `NATIVE_STEPS`. Reject any other explicit
+        // override with a clear diagnostic instead of silently running the baked schedule — a
+        // `steps: 30` request must not quietly render at 8 steps. `None` uses the distilled default.
+        if let Some(s) = req.steps {
+            if s != NATIVE_STEPS {
+                return Err(gen_core::Error::Msg(format!(
+                    "ltx: this distilled model runs a fixed {NATIVE_STEPS}-step schedule and cannot \
+                     honor steps={s}; omit `steps` (or pass {NATIVE_STEPS}) to use the baked schedule"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -392,7 +404,9 @@ impl Generator for LtxGenerator {
 }
 
 /// LTX-2.3 distilled txt2video descriptor — single-stage rectified-flow (no CFG / negative prompt;
-/// guidance is distilled in). Audio / I2V / upsampler / LoRA / quant deferred.
+/// guidance is distilled in). The denoise step count is FIXED at [`NATIVE_STEPS`] (the baked
+/// `STAGE1_SIGMAS` schedule); an explicit non-native `req.steps` is rejected in `validate` rather than
+/// silently ignored (sc-9027 / F-043). Audio / I2V / upsampler / LoRA / quant deferred.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -571,6 +585,50 @@ mod tests {
             },
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
+        }
+    }
+
+    /// sc-9027 / F-043: the distilled schedule is fixed, so `render` runs exactly `NATIVE_STEPS`
+    /// (`STAGE1_SIGMAS.len() − 1`) denoise steps and never resamples for an arbitrary `req.steps`.
+    #[test]
+    fn native_steps_matches_baked_schedule() {
+        assert_eq!(NATIVE_STEPS as usize, STAGE1_SIGMAS.len() - 1);
+        assert_eq!(NATIVE_STEPS, 8);
+    }
+
+    /// `req.steps` is no longer silently ignored: `None` (distilled default) and an explicit
+    /// `Some(NATIVE_STEPS)` are accepted; any other override is rejected with a diagnostic rather than
+    /// quietly running the baked 8-step schedule.
+    #[test]
+    fn validate_honors_or_rejects_req_steps() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let base = GenerationRequest {
+            prompt: "a cat walking across a sunny garden".into(),
+            width: 704,
+            height: 480,
+            frames: Some(49),
+            ..Default::default()
+        };
+        // Default (None) → distilled schedule.
+        assert!(g.validate(&base).is_ok());
+        // Explicit native step count is honored.
+        assert!(g
+            .validate(&GenerationRequest {
+                steps: Some(NATIVE_STEPS),
+                ..base.clone()
+            })
+            .is_ok());
+        // A non-native override (the F-043 `steps: 30` case) is rejected, not silently ignored.
+        for s in [1u32, 4, 7, 9, 30, 50] {
+            assert!(
+                g.validate(&GenerationRequest {
+                    steps: Some(s),
+                    ..base.clone()
+                })
+                .is_err(),
+                "steps={s} must be rejected"
+            );
         }
     }
 }
