@@ -342,16 +342,16 @@ fn load_text_projection(
     device: &Device,
     dtype: DType,
 ) -> CandleResult<Linear> {
-    let tensors = candle_gen::candle_core::safetensors::load(file, device)?;
-    let w = tensors
-        .get("text_projection.weight")
-        .ok_or_else(|| {
-            CandleError::Msg(format!(
-                "sd3 conditioning: text_projection.weight missing from {sub}/ checkpoint ({})",
-                file.display()
-            ))
-        })?
-        .to_dtype(dtype)?;
+    // Header-only mmap read of the single pooled-head tensor (sc-8990 / F-010): `build_clip_transformer`
+    // already read this same file for `text_model.*`, so materializing the whole CLIP checkpoint on the
+    // GPU again just to grab one weight cost ~1.7 GB of transient VRAM plus a second full disk read.
+    let w = candle_gen::load_one_tensor(
+        file,
+        "text_projection.weight",
+        dtype,
+        device,
+        &format!("sd3 conditioning ({sub}/)"),
+    )?;
     Ok(Linear::new(w, None))
 }
 

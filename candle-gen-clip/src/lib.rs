@@ -169,10 +169,22 @@ impl ClipTextEmbedder {
     pub fn from_snapshot(root: &Path) -> Result<Self> {
         let file = resolve_weights_file(root)?;
         let device = candle_gen::default_device()?;
+        // The pooled `text_projection.weight` lives in the same checkpoint the mmapped `vb` below reads
+        // for `text_model.*`. Pull just that one tensor through a header-only mmap (sc-8990 / F-010)
+        // instead of the old `Weights::from_file`, which materialized the ENTIRE CLIP checkpoint (the
+        // full vision tower included) on the device a second time just to grab this one head weight.
         let vb = candle_gen::mmap_var_builder(std::slice::from_ref(&file), DType::F32, &device)?;
         let body = ClipTextTransformer::new(vb.pp("text_model"), &clip_text_config())?;
-        let weights = Weights::from_file(&file, &device, DType::F32)?;
-        let text_projection = Linear::new(weights.require("text_projection.weight")?, None);
+        let text_projection = Linear::new(
+            candle_gen::load_one_tensor(
+                &file,
+                "text_projection.weight",
+                DType::F32,
+                &device,
+                "clip_vit_l14_text",
+            )?,
+            None,
+        );
         let tokenizer = Tokenizer::from_file(root.join("tokenizer.json"))
             .map_err(|e| CandleError::Msg(format!("clip_vit_l14_text: load tokenizer: {e}")))?;
         Ok(Self {
@@ -276,7 +288,16 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn ImageEmbedder>> {
     };
     let file = resolve_weights_file(root)?;
     let device = candle_gen::default_device()?;
-    let weights = Weights::from_file(&file, &device, DType::F32)?;
+    // The `openai/clip-vit-large-patch14` snapshot is the full `CLIPModel`, but the image embedder only
+    // needs the vision tower + its projection head — the whole `text_model.*` tower is dead weight here.
+    // Load just the needed prefixes via a header-only mmap (sc-8990 / F-010) so the unused text tower is
+    // never materialized on the device.
+    let weights = Weights::from_file_filtered(
+        &file,
+        &device,
+        DType::F32,
+        &["vision_model.", "visual_projection."],
+    )?;
     Ok(Box::new(ClipImageEmbedder::from_weights(&weights)?))
 }
 

@@ -122,6 +122,46 @@ pub fn load_path_mmap(
     mmap_var_builder(&files, dtype, device)
 }
 
+/// mmap a single `.safetensors` `file` and materialize **only** the tensor named `name`, cast to
+/// `dtype` and placed on `device`. `label` prefixes the crafted "missing tensor" error so callers keep
+/// their provider-specific diagnostics.
+///
+/// This is the header-only counterpart to [`mmap_var_builder`] for the F-010 pattern: several call
+/// sites called `candle_core::safetensors::load(file, device)` — which materializes **every** tensor of
+/// a CLIP checkpoint on the device — solely to extract one head tensor (e.g. `text_projection.weight`),
+/// costing ~1.4–1.7 GB of transient VRAM and a second full disk read. Safetensors keeps the tensor
+/// index in the file header, so an mmap lets us read a single view and load just its bytes; the peak
+/// footprint drops to that one tensor.
+///
+/// The returned tensor is **byte-identical** to `safetensors::load(file, device)?.get(name)?
+/// .to_dtype(dtype)?`: the view is loaded at its stored dtype onto `device`, then cast to `dtype`
+/// (skipping the cast when it already matches, so no redundant copy).
+pub fn load_one_tensor(
+    file: &Path,
+    name: &str,
+    dtype: DType,
+    device: &Device,
+    label: &str,
+) -> Result<candle_core::Tensor> {
+    // SAFETY: same invariant as `mmap_var_builder` — a read-only, process-owned weight file, mapped
+    // only for the duration of this call and not mutated behind the mapping.
+    let st = unsafe { candle_core::safetensors::MmapedSafetensors::new(file)? };
+    // Craft the label-prefixed missing-key message rather than surfacing candle's raw error, matching
+    // the F-019 loader style and the messages the pre-consolidation call sites produced.
+    if st.get(name).is_err() {
+        return Err(CandleError::Msg(format!(
+            "{label}: tensor `{name}` missing from {}",
+            file.display()
+        )));
+    }
+    let t = st.load(name, device)?;
+    if t.dtype() == dtype {
+        Ok(t)
+    } else {
+        Ok(t.to_dtype(dtype)?)
+    }
+}
+
 /// The one audited `unsafe` mmap surface: build a `'static` [`VarBuilder`] over the already-resolved
 /// shard `files` at `dtype`/`device`.
 ///
@@ -278,6 +318,57 @@ mod tests {
         let err = resolve_weight_files(&missing, "ctl").unwrap_err();
         assert!(
             matches!(err, CandleError::Msg(m) if m.contains("ctl") && m.contains("no .safetensors"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_one_tensor_reads_named_only_and_errors_on_missing() {
+        // A multi-tensor file: the helper must return exactly the named tensor (byte-identical to a
+        // full load + get + to_dtype) and never depend on the other tensors being materialized.
+        let dir = tmp_dir("one_tensor");
+        let file = dir.join("checkpoint.safetensors");
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "text_projection.weight".to_string(),
+            Tensor::new(&[1.0f32, 2.0, 3.0], &Device::Cpu).unwrap(),
+        );
+        map.insert(
+            "unused.big".to_string(),
+            Tensor::new(&[9.0f32, 9.0, 9.0, 9.0], &Device::Cpu).unwrap(),
+        );
+        candle_core::safetensors::save(&map, &file).unwrap();
+
+        // The named tensor comes back with its value + shape intact.
+        let t = load_one_tensor(
+            &file,
+            "text_projection.weight",
+            DType::F32,
+            &Device::Cpu,
+            "prov",
+        )
+        .unwrap();
+        assert_eq!(t.dims(), &[3]);
+        assert_eq!(t.to_vec1::<f32>().unwrap(), vec![1.0, 2.0, 3.0]);
+
+        // Byte-identical to the old full-load path.
+        let full = candle_core::safetensors::load(&file, &Device::Cpu).unwrap();
+        let reference = full
+            .get("text_projection.weight")
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap();
+        assert_eq!(
+            t.to_vec1::<f32>().unwrap(),
+            reference.to_vec1::<f32>().unwrap()
+        );
+
+        // A missing name yields the crafted, label-prefixed error (not candle's raw message).
+        let err =
+            load_one_tensor(&file, "nope.weight", DType::F32, &Device::Cpu, "prov").unwrap_err();
+        assert!(
+            matches!(err, CandleError::Msg(m) if m.contains("prov") && m.contains("nope.weight")),
+            "expected a crafted missing-tensor error"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

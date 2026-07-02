@@ -37,8 +37,8 @@ pub use candle_nn;
 // `unsafe` mmap surface (also aids F-062) and the SAFETY invariant in one place.
 pub mod loader;
 pub use loader::{
-    component_vb, load_path_mmap, load_sorted_mmap, mmap_var_builder, resolve_weight_files,
-    sorted_safetensors,
+    component_vb, load_one_tensor, load_path_mmap, load_sorted_mmap, mmap_var_builder,
+    resolve_weight_files, sorted_safetensors,
 };
 
 // Shared VRAM-budget probe (sc-9014 / F-030): the trusted-path `nvidia-smi` resolver the video-VAE
