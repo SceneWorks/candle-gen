@@ -28,6 +28,15 @@
 
 mod pipeline;
 
+// Packed-tier (MLX diffusers-layout q4/q8) load path (sc-9407, sc-9089 umbrella). `quant` is the thin
+// per-crate dense-or-packed enum delegating to the shared `candle_gen::quant` packed-load module
+// (sc-9086); `packed_dit`/`packed_te` are minimal vendored diffusers-layout FLUX.1 DiT + CLIP-L/T5-XXL
+// encoders that build every projection through it, so q4/q8 load straight from the packed parts (no
+// dense bf16 staging). The dense BFL snapshot path (stock `candle-transformers`) is unchanged.
+mod packed_dit;
+mod packed_te;
+mod quant;
+
 // XLabs FLUX IP-Adapter (sc-5872, epic 5480) — reference-image (identity) conditioning. `ip_dit` is the
 // forked FLUX DiT carrying the per-double-block decoupled-cross-attn seam (the stock candle-transformers
 // `Flux` has none); `ip_adapter` is the XLabs projector + K/V weights; `ip_image_encoder` is the pooled

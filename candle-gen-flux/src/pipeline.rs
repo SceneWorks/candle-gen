@@ -42,9 +42,20 @@
 //!   `gen_core::Image` (RGB8) — the worker owns asset writes.
 //!
 //! **First-slice surface (sc-3694), matching the SDXL/Z-Image slices:** txt2img only. img2img
-//! (mlx's `Reference`/IP-adapter), LoRA/LoKr, and Q4/Q8 quantization are NOT wired here — they are
-//! rejected loudly (the worker routes them to the Python fallback) rather than silently dropped.
+//! (mlx's `Reference`/IP-adapter) and LoRA/LoKr are NOT wired here — they are rejected loudly (the
+//! worker routes them to the Python fallback) rather than silently dropped.
+//!
+//! **Packed Q4/Q8 tiers (sc-9407, sc-9089 umbrella).** [`Pipeline::load_components`] auto-detects a
+//! pre-quantized MLX-packed **diffusers**-layout tier (`SceneWorks/flux1-schnell-mlx` q4/q8) by the
+//! `quantization` block in a component's `config.json` ([`Pipeline::component_is_packed`]) and loads the
+//! CLIP + T5 + DiT **straight from the packed parts** through the shared [`candle_gen::quant`]
+//! packed-detect (the vendored [`crate::packed_dit`] / [`crate::packed_te`] models) — no dense bf16
+//! staging. The VAE dequantizes its 8 packed mid-block attention projections to dense and feeds a stock
+//! diffusers `AutoEncoderKL`. A dense **BFL** snapshot (no `quantization` block) takes the stock path
+//! unchanged. On-the-fly quantization of a dense tier is still NOT done (only the pre-packed tier is a
+//! quantized path).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -61,10 +72,13 @@ use candle_transformers::models::flux::model::{Config as FluxConfig, Flux};
 use candle_transformers::models::flux::sampling::{get_schedule, unpack, State};
 use candle_transformers::models::flux::WithForward;
 use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
+use candle_transformers::models::z_image::vae::{AutoEncoderKL, VaeConfig};
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 use tokenizers::Tokenizer;
 
+use crate::packed_dit::PackedFluxDit;
+use crate::packed_te::{ClipConfig, PackedClipText, PackedT5Encoder, T5Config as PackedT5Config};
 use crate::Variant;
 
 /// FLUX latent channel count (the VAE's `z_channels` and the DiT's pre-pack channel count). The DiT
@@ -108,15 +122,33 @@ pub(crate) struct Pipeline {
 }
 
 /// The loaded FLUX components, `Arc`-shared so the generator can cache them across `generate` calls
-/// and cheaply clone them out for a render. The T5 encoder is behind a `Mutex` because its
-/// `forward` takes `&mut self` (relative-position-bias cache) while `Generator::generate` is `&self`;
-/// it is locked only for the once-per-request text encode, never across the denoise.
+/// and cheaply clone them out for a render. Two shapes:
+///
+/// - [`Components::Stock`] — the dense **BFL**-layout black-forest-labs snapshot: the stock
+///   `candle-transformers` CLIP / T5 / `Flux` DiT / `AutoEncoder` VAE, reading the original single-file
+///   `flux1-*.safetensors` + `ae.safetensors` (path unchanged, sc-3694).
+/// - [`Components::Packed`] — the pre-quantized **diffusers**-layout MLX tier
+///   (`SceneWorks/flux1-schnell-mlx` q4/q8): the vendored packed-detect [`PackedClipText`] /
+///   [`PackedT5Encoder`] / [`PackedFluxDit`] built straight from the packed parts (sc-9407, no dense
+///   staging), + a stock diffusers `AutoEncoderKL` fed the dequantized-to-dense VAE weights.
+///
+/// The stock T5 encoder is behind a `Mutex` because its `forward` takes `&mut self` (position-bias
+/// cache) while `Generator::generate` is `&self`; the packed T5 forward is `&self`, so no lock is
+/// needed there. Cloning an enum arm clones the inner `Arc`s (cheap).
 #[derive(Clone)]
-pub(crate) struct Components {
-    clip: Arc<ClipTextTransformer>,
-    t5: Arc<Mutex<T5EncoderModel>>,
-    transformer: Arc<Flux>,
-    vae: Arc<AutoEncoder>,
+pub(crate) enum Components {
+    Stock {
+        clip: Arc<ClipTextTransformer>,
+        t5: Arc<Mutex<T5EncoderModel>>,
+        transformer: Arc<Flux>,
+        vae: Arc<AutoEncoder>,
+    },
+    Packed {
+        clip: Arc<PackedClipText>,
+        t5: Arc<PackedT5Encoder>,
+        transformer: Arc<PackedFluxDit>,
+        vae: Arc<AutoEncoderKL>,
+    },
 }
 
 impl Pipeline {
@@ -131,10 +163,22 @@ impl Pipeline {
         }
     }
 
-    /// Load the four heavy components from the snapshot. The DiT (`flux1-*.safetensors`) and VAE
-    /// (`ae.safetensors`) come from the root BFL single-file checkpoints; CLIP-L from `text_encoder/`
-    /// and T5-XXL from `text_encoder_2/` (diffusers subdirs).
+    /// Load the four heavy components from the snapshot, auto-detecting the tier. A pre-quantized
+    /// **MLX-packed** diffusers tier (`SceneWorks/flux1-schnell-mlx` q4/q8) carries a `quantization`
+    /// block in each component's `config.json` ([`Self::component_is_packed`]) — on detection the CLIP /
+    /// T5 / DiT / VAE load **straight from the packed parts** (sc-9407, no dense bf16 staging). A dense
+    /// **BFL** snapshot (black-forest-labs `FLUX.1-schnell`, no `quantization` block) takes the stock
+    /// path unchanged (sc-3694).
     pub(crate) fn load_components(&self) -> Result<Components> {
+        if self.component_is_packed("transformer") {
+            return self.load_packed_components();
+        }
+        self.load_stock_components()
+    }
+
+    /// The dense BFL-layout path (sc-3694, unchanged): CLIP-L from `text_encoder/`, T5-XXL from
+    /// `text_encoder_2/`, the DiT from the root `flux1-*.safetensors` and the VAE from `ae.safetensors`.
+    fn load_stock_components(&self) -> Result<Components> {
         // CLIP-L (openai/clip-vit-large-patch14 layout) under the diffusers `text_encoder/` subdir;
         // the candle transformer pools under the `text_model.` prefix. Config is fixed for FLUX.
         let clip_vb = self.mmap_vb(&[self.root.join("text_encoder/model.safetensors")])?;
@@ -161,12 +205,134 @@ impl Pipeline {
         let vae_vb = self.mmap_vb(&[self.root.join("ae.safetensors")])?;
         let vae = AutoEncoder::new(&ae_config(self.variant), vae_vb)?;
 
-        Ok(Components {
+        Ok(Components::Stock {
             clip: Arc::new(clip),
             t5: Arc::new(Mutex::new(t5)),
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
         })
+    }
+
+    /// The pre-quantized MLX-packed diffusers-layout path (sc-9407): the vendored packed-detect
+    /// [`PackedClipText`] / [`PackedT5Encoder`] / [`PackedFluxDit`] load straight from the packed parts
+    /// (q4 → `Q4_1` lossless, q8 → `Q8_0` requant — no dense staging); the diffusers `AutoEncoderKL` VAE
+    /// is fed the 8 dequantized-to-dense attention projections (the rest of the VAE is already dense).
+    fn load_packed_components(&self) -> Result<Components> {
+        // CLIP-L (diffusers `text_encoder/model.safetensors`, `text_model.` prefix). Every projection +
+        // the token/position embeddings are packed; the LayerNorms stay dense.
+        let clip_vb = self.component_vb("text_encoder")?;
+        let clip = PackedClipText::new(&ClipConfig::flux(), clip_vb.pp("text_model"))?;
+
+        // T5-XXL encoder (diffusers `text_encoder_2/`, single-file in the packed tier). `shared` + every
+        // block projection + block 0's `relative_attention_bias` are packed.
+        let t5_vb = self.component_vb("text_encoder_2")?;
+        let t5 = PackedT5Encoder::new(&PackedT5Config::xxl(), t5_vb)?;
+
+        // FLUX diffusers DiT (`FluxTransformer2DModel`): 19 double + 38 single blocks, every Linear
+        // packed. The block counts come from the component `config.json` (defaulting to FLUX.1's 19/38).
+        let (num_double, num_single) = self.dit_block_counts()?;
+        let dit_vb = self.component_vb("transformer")?;
+        let transformer =
+            PackedFluxDit::new(&flux_config(self.variant), num_double, num_single, dit_vb)?;
+
+        // Diffusers `AutoEncoderKL` (identical config to z-image's VAE — 16 latent ch, [128,256,512,512],
+        // scaling 0.3611 / shift 0.1159). The 8 packed mid-block attention projections dequantize to
+        // dense; everything else is already dense bf16.
+        let vae = AutoEncoderKL::new(&flux_vae_config(), self.vae_vb_dequantized()?)?;
+
+        Ok(Components::Packed {
+            clip: Arc::new(clip),
+            t5: Arc::new(t5),
+            transformer: Arc::new(transformer),
+            vae: Arc::new(vae),
+        })
+    }
+
+    /// Whether the snapshot component `sub/` is a **pre-quantized MLX-packed tier** — its `config.json`
+    /// carries a `quantization` block ([`candle_gen::quant::PackedConfig`]) that the install-time convert
+    /// job writes. Absent/unreadable config → not packed (the dense BFL path), so a BFL snapshot (which
+    /// has no `transformer/config.json`) loads stock. Mirrors z-image/flux2's `component_is_packed`.
+    pub(crate) fn component_is_packed(&self, sub: &str) -> bool {
+        let path = self.root.join(sub).join("config.json");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
+            .is_some()
+    }
+
+    /// The DiT double / single block counts from the packed `transformer/config.json`
+    /// (`num_layers` / `num_single_layers`), defaulting to FLUX.1's 19 / 38 when absent.
+    fn dit_block_counts(&self) -> Result<(usize, usize)> {
+        let path = self.root.join("transformer").join("config.json");
+        let (mut num_double, mut num_single) = (19usize, 38usize);
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                if let Some(n) = v.get("num_layers").and_then(|x| x.as_u64()) {
+                    num_double = n as usize;
+                }
+                if let Some(n) = v.get("num_single_layers").and_then(|x| x.as_u64()) {
+                    num_single = n as usize;
+                }
+            }
+        }
+        Ok((num_double, num_single))
+    }
+
+    /// Sorted `.safetensors` in the snapshot component subdir `sub` (single-file or sharded).
+    fn component_files(&self, sub: &str) -> Result<Vec<PathBuf>> {
+        let dir = self.root.join(sub);
+        self.safetensors_in(&dir)
+    }
+
+    /// mmap a [`VarBuilder`] over every `.safetensors` in the snapshot component subdir `sub`.
+    fn component_vb(&self, sub: &str) -> Result<VarBuilder<'static>> {
+        let files = self.component_files(sub)?;
+        // SAFETY: mmap of read-only weight files; standard candle loading path.
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, self.dtype, &self.device)? };
+        Ok(vb)
+    }
+
+    /// Build a VAE [`VarBuilder`] for a packed tier by dequantizing the 8 packed mid-block attention
+    /// projections (`{encoder,decoder}.mid_block.attentions.0.{to_q,to_k,to_v,to_out.0}`) to dense and
+    /// passing every other (already-dense) tensor through unchanged — so the stock diffusers
+    /// `AutoEncoderKL` never sees a `.weight` u32/`.scales`/`.biases` triple it can't read (sc-9407, the
+    /// z-image VAE path).
+    fn vae_vb_dequantized(&self) -> Result<VarBuilder<'static>> {
+        use candle_gen::candle_core::safetensors::MmapedSafetensors;
+        let files = self.component_files("vae")?;
+        // SAFETY: mmap of read-only weight files; standard candle loading path.
+        let st = unsafe { MmapedSafetensors::multi(&files)? };
+        let src = VarBuilder::from_backend(Box::new(st), self.dtype, self.device.clone());
+
+        // SAFETY: same file set; a second mapping to enumerate keys + load the dense tensors.
+        let st2 = unsafe { MmapedSafetensors::multi(&files)? };
+        let packed_bases: std::collections::HashSet<String> = st2
+            .tensors()
+            .iter()
+            .filter_map(|(k, _)| k.strip_suffix(".scales").map(|b| b.to_string()))
+            .collect();
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        for (key, _) in st2.tensors() {
+            if key.ends_with(".scales") || key.ends_with(".biases") {
+                continue; // folded into the dequantized dense `.weight`
+            }
+            if let Some(base) = key.strip_suffix(".weight") {
+                if packed_bases.contains(base) {
+                    let dense = crate::quant::dequant_packed_to_dense(
+                        &src,
+                        base,
+                        &self.device,
+                        self.dtype,
+                    )?;
+                    tensors.insert(key.clone(), dense);
+                    continue;
+                }
+            }
+            let t = st2.load(&key, &self.device)?;
+            tensors.insert(key.clone(), t.to_dtype(self.dtype)?);
+        }
+        Ok(VarBuilder::from_tensors(tensors, self.dtype, &self.device))
     }
 
     /// mmap a [`VarBuilder`] over `files` at this pipeline's dtype/device, erroring if any is missing.
@@ -214,15 +380,57 @@ impl Pipeline {
         comps: &Components,
         prompt: &str,
     ) -> Result<(Tensor, Tensor)> {
-        encode_text(
-            self.variant,
-            &self.root,
-            &self.device,
-            self.dtype,
-            &comps.clip,
-            &comps.t5,
-            prompt,
-        )
+        match comps {
+            Components::Stock { clip, t5, .. } => encode_text(
+                self.variant,
+                &self.root,
+                &self.device,
+                self.dtype,
+                clip,
+                t5,
+                prompt,
+            ),
+            Components::Packed { clip, t5, .. } => self.encode_text_packed(clip, t5, prompt),
+        }
+    }
+
+    /// Encode `prompt` for the packed tier: the vendored [`PackedT5Encoder`] sequence + the
+    /// [`PackedClipText`] pooled vector. The tokenizers are the same two the stock path uses (T5 from
+    /// the snapshot `tokenizer_2/`, CLIP vendored), padded identically, so the only difference is which
+    /// model runs the ids — parity with `encode_text`.
+    fn encode_text_packed(
+        &self,
+        clip: &PackedClipText,
+        t5: &PackedT5Encoder,
+        prompt: &str,
+    ) -> Result<(Tensor, Tensor)> {
+        // T5 sequence — same tokenizer + padding as `encode_text`.
+        let t5_tok = Tokenizer::from_file(self.root.join("tokenizer_2/tokenizer.json"))
+            .map_err(|e| CandleError::Msg(format!("flux: load T5 tokenizer: {e}")))?;
+        let mut t5_ids: Vec<u32> = t5_tok
+            .encode(prompt, true)
+            .map_err(|e| CandleError::Msg(format!("flux: T5 tokenize: {e}")))?
+            .get_ids()
+            .to_vec();
+        t5_ids.resize(self.variant.t5_max_len(), T5_PAD_TOKEN_ID);
+        let t5_input = Tensor::new(t5_ids.as_slice(), &self.device)?.unsqueeze(0)?;
+        let t5_emb = t5.forward(&t5_input, self.dtype)?;
+
+        // CLIP pooled vector — vendored tokenizer, natural length (EOT pool).
+        const CLIP_TOKENIZER_JSON: &[u8] = include_bytes!("../assets/clip_tokenizer.json");
+        let clip_tok = Tokenizer::from_bytes(CLIP_TOKENIZER_JSON)
+            .map_err(|e| CandleError::Msg(format!("flux: load vendored CLIP tokenizer: {e}")))?;
+        let clip_ids: Vec<u32> = clip_tok
+            .encode(prompt, true)
+            .map_err(|e| CandleError::Msg(format!("flux: CLIP tokenize: {e}")))?
+            .get_ids()
+            .to_vec();
+        if clip_ids.is_empty() {
+            return Err(CandleError::Msg("flux: empty CLIP tokenization".into()));
+        }
+        let clip_input = Tensor::new(clip_ids.as_slice(), &self.device)?.unsqueeze(0)?;
+        let clip_emb = clip.forward(&clip_input)?.to_dtype(self.dtype)?;
+        Ok((t5_emb, clip_emb))
     }
 
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring
@@ -269,7 +477,8 @@ impl Pipeline {
                 .to_dtype(self.dtype)?;
 
             // Pack noise + build the conditioning state (img/img_ids/txt/txt_ids/vec) exactly as the
-            // candle reference. The packed token count drives dev's resolution-dependent time-shift.
+            // candle reference — shared by both tiers. The packed token count drives dev's
+            // resolution-dependent time-shift.
             let state = State::new(&t5_emb, &clip_emb, &noise)?;
             let timesteps = if self.variant.is_dev() {
                 get_schedule(steps, Some((state.img.dim(1)?, BASE_SHIFT, MAX_SHIFT)))
@@ -278,7 +487,7 @@ impl Pipeline {
             };
 
             let latents = self.denoise(
-                components.transformer.as_ref(),
+                components,
                 &state,
                 &timesteps,
                 guidance,
@@ -288,12 +497,15 @@ impl Pipeline {
             )?;
 
             on_progress(Progress::Decoding);
-            images.push(self.decode(
-                &components.vae,
-                &latents,
-                req.height as usize,
-                req.width as usize,
-            )?);
+            let image = match components {
+                Components::Stock { vae, .. } => {
+                    self.decode(vae, &latents, req.height as usize, req.width as usize)?
+                }
+                Components::Packed { vae, .. } => {
+                    self.decode_packed(vae, &latents, req.height as usize, req.width as usize)?
+                }
+            };
+            images.push(image);
         }
         Ok(images)
     }
@@ -311,7 +523,7 @@ impl Pipeline {
     #[allow(clippy::too_many_arguments)]
     fn denoise(
         &self,
-        model: &Flux,
+        components: &Components,
         state: &State,
         timesteps: &[f64],
         guidance: f64,
@@ -329,6 +541,13 @@ impl Pipeline {
         let steps = native.len().saturating_sub(1);
         let sigmas =
             candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
+        // Guidance is only consumed by the dev DiT; schnell's DiT ignores the tensor. The packed DiT
+        // takes the same shape (`Option<&Tensor>` — `None` for schnell, since `guidance_embed` is off).
+        let packed_guidance = if self.variant.supports_guidance() {
+            Some(&guidance_t)
+        } else {
+            None
+        };
         candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
             TimestepConvention::Sigma,
@@ -341,15 +560,27 @@ impl Pipeline {
                 // The model is fed the raw timestep (`t == σ`) as a per-batch tensor. The forward
                 // returns a `candle_core::Result`; `?` bridges it into the driver's `CandleError`.
                 let t_vec = Tensor::full(t, b_sz, dev)?;
-                Ok(model.forward(
-                    img,
-                    &state.img_ids,
-                    &state.txt,
-                    &state.txt_ids,
-                    &t_vec,
-                    &state.vec,
-                    Some(&guidance_t),
-                )?)
+                let out = match components {
+                    Components::Stock { transformer, .. } => transformer.forward(
+                        img,
+                        &state.img_ids,
+                        &state.txt,
+                        &state.txt_ids,
+                        &t_vec,
+                        &state.vec,
+                        Some(&guidance_t),
+                    )?,
+                    Components::Packed { transformer, .. } => transformer.forward(
+                        img,
+                        &state.img_ids,
+                        &state.txt,
+                        &state.txt_ids,
+                        &t_vec,
+                        &state.vec,
+                        packed_guidance,
+                    )?,
+                };
+                Ok(out)
             },
         )
     }
@@ -366,6 +597,40 @@ impl Pipeline {
     ) -> Result<Image> {
         decode_latents(vae, latents, height, width)
     }
+
+    /// Decode the packed tier's denoised latents through the diffusers `AutoEncoderKL` (which applies
+    /// `(z / scaling) + shift` inside `decode`). The latents are first unpacked from the DiT token form
+    /// `(1, h·w, 64)` back to the NCHW latent `(1, 16, H/8, W/8)` the VAE expects (the same `unpack` the
+    /// BFL path uses), then decoded to `[-1, 1]` and mapped to RGB8.
+    fn decode_packed(
+        &self,
+        vae: &AutoEncoderKL,
+        latents: &Tensor,
+        height: usize,
+        width: usize,
+    ) -> Result<Image> {
+        let latents = unpack(latents, height, width)?;
+        let decoded = vae.decode(&latents)?.to_dtype(DType::F32)?; // (1, 3, H, W) in [-1, 1]
+        let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
+        let img = img.i(0)?.to_device(&Device::Cpu)?;
+        let (c, h, w) = img.dims3()?;
+        if c != 3 {
+            return Err(CandleError::Msg(format!("expected 3 channels, got {c}")));
+        }
+        let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
+        Ok(Image {
+            width: w as u32,
+            height: h as u32,
+            pixels,
+        })
+    }
+}
+
+/// The diffusers `AutoEncoderKL` config for the FLUX packed VAE — identical to z-image's (16 latent
+/// channels, `[128, 256, 512, 512]`, layers 2, scaling 0.3611 / shift 0.1159, norm groups 32), so the
+/// shared `candle_transformers::models::z_image::vae` decoder loads the FLUX packed VAE directly.
+fn flux_vae_config() -> VaeConfig {
+    VaeConfig::z_image()
 }
 
 /// Encode `prompt` into FLUX's two conditioning tensors for `variant`: the T5 sequence `(1, L, 4096)`
@@ -490,6 +755,45 @@ pub fn ae_config(variant: Variant) -> AeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `component_is_packed` detects the `quantization` block a packed MLX tier writes into a component
+    /// `config.json` (a diffusers packed tier) but not a dense one — this is the toggle that routes
+    /// `load_components` to the packed vs stock path. GPU-free (writes/reads a small JSON file).
+    #[test]
+    fn component_is_packed_detects_quantization_block() -> Result<()> {
+        let tmp = std::env::temp_dir().join(format!("sc9407_pkg_{}", std::process::id()));
+        let packed_dir = tmp.join("transformer");
+        let dense_dir = tmp.join("vae");
+        std::fs::create_dir_all(&packed_dir).ok();
+        std::fs::create_dir_all(&dense_dir).ok();
+        std::fs::write(
+            packed_dir.join("config.json"),
+            r#"{ "num_layers": 19, "quantization": { "bits": 4, "group_size": 64 } }"#,
+        )
+        .map_err(|e| CandleError::Msg(e.to_string()))?;
+        std::fs::write(
+            dense_dir.join("config.json"),
+            r#"{ "latent_channels": 16 }"#,
+        )
+        .map_err(|e| CandleError::Msg(e.to_string()))?;
+
+        let pipe = Pipeline::load(Variant::Schnell, &tmp, &Device::Cpu, DType::F32);
+        assert!(
+            pipe.component_is_packed("transformer"),
+            "`quantization` block ⇒ packed"
+        );
+        assert!(
+            !pipe.component_is_packed("vae"),
+            "no `quantization` block ⇒ dense"
+        );
+        assert!(
+            !pipe.component_is_packed("missing"),
+            "absent component ⇒ dense (no panic)"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+        Ok(())
+    }
 
     /// Parity anchors against `mlx-gen-flux`: distilled step defaults (4 schnell / 25 dev), guidance
     /// support (dev only) + the 3.5 dev default, and the T5 max lengths (256 / 512). GPU-free.
