@@ -148,15 +148,7 @@ impl Flux2Control {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(CandleError::Msg(format!(
-                "flux2 control: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        if req.steps == 0 {
-            return Err(CandleError::Msg("flux2 control: steps must be >= 1".into()));
-        }
+        validate_request(req)?;
 
         let device = &self.pipe.device;
         let cfg = &self.pipe.cfg;
@@ -239,6 +231,27 @@ impl Flux2Control {
     }
 }
 
+/// Validate the seed-independent request knobs before any tensor work. The empty-prompt guard
+/// (sc-8987, the sc-8646 bug class) mirrors the registered txt2img `validate` and the flux1 control
+/// provider: `gen_core::TextTokenizer::tokenize("")` short-circuits to a (1, 0) encoding BEFORE the
+/// chat template runs, so an empty prompt would reach the TE as a zero-length sequence and surface
+/// as a deep tensor-shape error (or degenerate conditioning) instead of a clean validation error.
+fn validate_request(req: &Flux2ControlRequest) -> Result<()> {
+    if req.prompt.trim().is_empty() {
+        return Err(CandleError::Msg("flux2 control: prompt is required".into()));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(CandleError::Msg(format!(
+            "flux2 control: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    if req.steps == 0 {
+        return Err(CandleError::Msg("flux2 control: steps must be >= 1".into()));
+    }
+    Ok(())
+}
+
 /// Open a VarBuilder over the Fun-Controlnet-Union checkpoint — a single `.safetensors` `File` or a
 /// `Dir` containing the `.safetensors` shards — on `device` at `dtype`.
 fn control_var_builder(path: &Path, dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
@@ -279,5 +292,52 @@ mod tests {
         assert_eq!(r.guidance, DEFAULT_GUIDANCE_DEV);
         assert_eq!(r.control_scale, DEFAULT_CONTROL_SCALE);
         assert!(!r.cancel.is_cancelled());
+    }
+
+    /// The empty-prompt guard (sc-8987, sc-8646 bug class): an empty or whitespace-only prompt is a
+    /// clean validation error, never a zero-length TE sequence; a real prompt passes.
+    #[test]
+    fn validate_request_rejects_empty_prompt() {
+        let empty = Flux2ControlRequest::default();
+        let err = validate_request(&empty).unwrap_err();
+        assert!(err.to_string().contains("prompt is required"), "{err}");
+
+        let whitespace = Flux2ControlRequest {
+            prompt: " \t\n".into(),
+            ..Default::default()
+        };
+        let err = validate_request(&whitespace).unwrap_err();
+        assert!(err.to_string().contains("prompt is required"), "{err}");
+
+        let ok = Flux2ControlRequest {
+            prompt: "a dancer mid-leap".into(),
+            ..Default::default()
+        };
+        assert!(validate_request(&ok).is_ok());
+    }
+
+    /// The size/steps guards moved into `validate_request` still fire (no regression from the
+    /// sc-8987 refactor).
+    #[test]
+    fn validate_request_keeps_size_and_steps_guards() {
+        let odd = Flux2ControlRequest {
+            prompt: "a dancer".into(),
+            height: 1000,
+            ..Default::default()
+        };
+        assert!(validate_request(&odd)
+            .unwrap_err()
+            .to_string()
+            .contains("multiples"));
+
+        let zero_steps = Flux2ControlRequest {
+            prompt: "a dancer".into(),
+            steps: 0,
+            ..Default::default()
+        };
+        assert!(validate_request(&zero_steps)
+            .unwrap_err()
+            .to_string()
+            .contains("steps"));
     }
 }

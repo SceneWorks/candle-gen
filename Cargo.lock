@@ -165,7 +165,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 [[package]]
 name = "candle-core"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle?rev=65ecb58c11d2244a7e60c71bdcdb19b15b0a4343#65ecb58c11d2244a7e60c71bdcdb19b15b0a4343"
+source = "git+https://github.com/huggingface/candle?rev=c1e6756a89faefa888ea57b056394a0619925b87#c1e6756a89faefa888ea57b056394a0619925b87"
 dependencies = [
  "byteorder",
  "candle-kernels",
@@ -195,7 +195,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle?rev=65ecb58c11d2244a7e60c71bdcdb19b15b0a4343#65ecb58c11d2244a7e60c71bdcdb19b15b0a4343"
+source = "git+https://github.com/huggingface/candle?rev=c1e6756a89faefa888ea57b056394a0619925b87#c1e6756a89faefa888ea57b056394a0619925b87"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -581,7 +581,7 @@ dependencies = [
 [[package]]
 name = "candle-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/candle-llm?rev=d0ba3e66b4d53420bb0b0745a185b975822089be#d0ba3e66b4d53420bb0b0745a185b975822089be"
+source = "git+https://github.com/SceneWorks/candle-llm?rev=3d9fdf04047bf3b1fbf323ab56c919f3a03f0794#3d9fdf04047bf3b1fbf323ab56c919f3a03f0794"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -594,7 +594,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle?rev=65ecb58c11d2244a7e60c71bdcdb19b15b0a4343#65ecb58c11d2244a7e60c71bdcdb19b15b0a4343"
+source = "git+https://github.com/huggingface/candle?rev=c1e6756a89faefa888ea57b056394a0619925b87#c1e6756a89faefa888ea57b056394a0619925b87"
 dependencies = [
  "block2",
  "half",
@@ -609,7 +609,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle?rev=65ecb58c11d2244a7e60c71bdcdb19b15b0a4343#65ecb58c11d2244a7e60c71bdcdb19b15b0a4343"
+source = "git+https://github.com/huggingface/candle?rev=c1e6756a89faefa888ea57b056394a0619925b87#c1e6756a89faefa888ea57b056394a0619925b87"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -626,7 +626,7 @@ dependencies = [
 [[package]]
 name = "candle-transformers"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle?rev=65ecb58c11d2244a7e60c71bdcdb19b15b0a4343#65ecb58c11d2244a7e60c71bdcdb19b15b0a4343"
+source = "git+https://github.com/huggingface/candle?rev=c1e6756a89faefa888ea57b056394a0619925b87#c1e6756a89faefa888ea57b056394a0619925b87"
 dependencies = [
  "byteorder",
  "candle-core",
@@ -645,7 +645,7 @@ dependencies = [
 [[package]]
 name = "candle-ug"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle?rev=65ecb58c11d2244a7e60c71bdcdb19b15b0a4343#65ecb58c11d2244a7e60c71bdcdb19b15b0a4343"
+source = "git+https://github.com/huggingface/candle?rev=c1e6756a89faefa888ea57b056394a0619925b87#c1e6756a89faefa888ea57b056394a0619925b87"
 dependencies = [
  "ug",
  "ug-cuda",
@@ -1036,7 +1036,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2628,7 +2628,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3504,7 +3504,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

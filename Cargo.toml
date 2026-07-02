@@ -305,11 +305,16 @@ sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen"
 # kernel the moment candle-transformers is linked (repo-wide; SDXL + z-image both; plain candle-core
 # works). Rev 65ecb58 clears it — verified by the SDXL + Z-Image GPU conformance on RTX PRO 6000
 # (sm_120). All three crates share ONE rev so the whole tree is one candle build. Re-pin in lockstep.
-candle-core = { git = "https://github.com/huggingface/candle", rev = "65ecb58c11d2244a7e60c71bdcdb19b15b0a4343" }
-candle-nn = { git = "https://github.com/huggingface/candle", rev = "65ecb58c11d2244a7e60c71bdcdb19b15b0a4343" }
+# Bumped `65ecb58` -> `c1e6756` (2026-07-02): picks up upstream PR #3493, the use-after-free fix in
+# `as_t_slice`/`QStorage::from_data(Cow::Owned…)` that sc-9085 hit (garbage quantized weights; we
+# work around it with `Cow::Borrowed`, which stays regardless). The range is 4 commits — the fix
+# plus three Metal-only SDPA fixes; candle-kernels/ is BYTE-IDENTICAL across it, so the sc-7544
+# vendored fatbin fork below needs no re-vendor (VENDORED.md updated to record the new rev).
+candle-core = { git = "https://github.com/huggingface/candle", rev = "c1e6756a89faefa888ea57b056394a0619925b87" }
+candle-nn = { git = "https://github.com/huggingface/candle", rev = "c1e6756a89faefa888ea57b056394a0619925b87" }
 # SDXL building blocks (dual CLIP, UNet2DConditionModel, VAE, schedulers) — the candle-gen-sdxl
 # pipeline (sc-3675) reuses these, mirroring how the spike (epic 3494) built on candle-transformers.
-candle-transformers = { git = "https://github.com/huggingface/candle", rev = "65ecb58c11d2244a7e60c71bdcdb19b15b0a4343" }
+candle-transformers = { git = "https://github.com/huggingface/candle", rev = "c1e6756a89faefa888ea57b056394a0619925b87" }
 # HF tokenizers (CLIP-L + CLIP-bigG tokenizer.json) and snapshot/file resolution for SDXL weights.
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }

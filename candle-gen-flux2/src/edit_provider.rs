@@ -154,15 +154,7 @@ impl Flux2Edit {
                 "flux2 edit: at least one reference image is required".into(),
             ));
         }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
-            return Err(CandleError::Msg(format!(
-                "flux2 edit: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        if req.steps == 0 {
-            return Err(CandleError::Msg("flux2 edit: steps must be >= 1".into()));
-        }
+        validate_request(req)?;
 
         let device = &self.pipe.device;
         let cfg = &self.pipe.cfg;
@@ -309,6 +301,27 @@ impl Flux2Edit {
     }
 }
 
+/// Validate the seed-independent request knobs before any tensor work. The empty-prompt guard
+/// (sc-8987, the sc-8646 bug class) mirrors the registered txt2img `validate` and the flux1 control
+/// provider: `gen_core::TextTokenizer::tokenize("")` short-circuits to a (1, 0) encoding BEFORE the
+/// chat template runs, so an empty prompt would reach the TE as a zero-length sequence and surface
+/// as a deep tensor-shape error (or degenerate conditioning) instead of a clean validation error.
+fn validate_request(req: &Flux2EditRequest) -> Result<()> {
+    if req.prompt.trim().is_empty() {
+        return Err(CandleError::Msg("flux2 edit: prompt is required".into()));
+    }
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(CandleError::Msg(format!(
+            "flux2 edit: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    if req.steps == 0 {
+        return Err(CandleError::Msg("flux2 edit: steps must be >= 1".into()));
+    }
+    Ok(())
+}
+
 /// Lanczos-resize a reference [`Image`] (RGB8) to the render size, normalize `[0,255] → [-1,1]`, lay
 /// out as NCHW `[1, 3, H, W]` — the input [`Flux2Vae::encode_packed`] expects. Mirrors the mlx
 /// `preprocess_ref_image` (`2·x − 1`). A no-op resize when the source is already the render size.
@@ -353,6 +366,53 @@ mod tests {
         assert_eq!(r.steps, DEFAULT_STEPS as usize);
         assert_eq!(r.guidance, DEFAULT_GUIDANCE);
         assert!(!r.cancel.is_cancelled());
+    }
+
+    /// The empty-prompt guard (sc-8987, sc-8646 bug class): an empty or whitespace-only prompt is a
+    /// clean validation error, never a zero-length TE sequence; a real prompt passes.
+    #[test]
+    fn validate_request_rejects_empty_prompt() {
+        let empty = Flux2EditRequest::default();
+        let err = validate_request(&empty).unwrap_err();
+        assert!(err.to_string().contains("prompt is required"), "{err}");
+
+        let whitespace = Flux2EditRequest {
+            prompt: " \t\n".into(),
+            ..Default::default()
+        };
+        let err = validate_request(&whitespace).unwrap_err();
+        assert!(err.to_string().contains("prompt is required"), "{err}");
+
+        let ok = Flux2EditRequest {
+            prompt: "a portrait".into(),
+            ..Default::default()
+        };
+        assert!(validate_request(&ok).is_ok());
+    }
+
+    /// The size/steps guards moved into `validate_request` still fire (no regression from the
+    /// sc-8987 refactor).
+    #[test]
+    fn validate_request_keeps_size_and_steps_guards() {
+        let odd = Flux2EditRequest {
+            prompt: "a portrait".into(),
+            width: 1000,
+            ..Default::default()
+        };
+        assert!(validate_request(&odd)
+            .unwrap_err()
+            .to_string()
+            .contains("multiples"));
+
+        let zero_steps = Flux2EditRequest {
+            prompt: "a portrait".into(),
+            steps: 0,
+            ..Default::default()
+        };
+        assert!(validate_request(&zero_steps)
+            .unwrap_err()
+            .to_string()
+            .contains("steps"));
     }
 
     /// `preprocess_ref` lays a same-size RGB8 reference out as NCHW `[1,3,H,W]` in `[-1,1]`: white → 1,
