@@ -150,8 +150,8 @@ impl SinEmbed {
     fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.inner_dim();
         Ok(Self {
-            linear_1: QLinear::linear_no_bias(cfg.timestep_channels, inner, vb.pp("linear_1"))?,
-            linear_2: QLinear::linear_no_bias(inner, inner, vb.pp("linear_2"))?,
+            linear_1: QLinear::linear_detect(cfg.timestep_channels, inner, &vb, "linear_1", false)?,
+            linear_2: QLinear::linear_detect(inner, inner, &vb, "linear_2", false)?,
             channels: cfg.timestep_channels,
         })
     }
@@ -221,7 +221,7 @@ impl Modulation {
     fn new(cfg: &Flux2Config, sets: usize, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.inner_dim();
         Ok(Self {
-            linear: QLinear::linear_no_bias(inner, 3 * sets * inner, vb.pp("linear"))?,
+            linear: QLinear::linear_detect(inner, 3 * sets * inner, &vb, "linear", false)?,
             sets,
         })
     }
@@ -269,16 +269,19 @@ impl DoubleAttention {
         let inner = cfg.inner_dim();
         let hd = cfg.head_dim;
         Ok(Self {
-            to_q: QLinear::linear_no_bias(inner, inner, vb.pp("to_q"))?,
-            to_k: QLinear::linear_no_bias(inner, inner, vb.pp("to_k"))?,
-            to_v: QLinear::linear_no_bias(inner, inner, vb.pp("to_v"))?,
-            to_out: QLinear::linear_no_bias(inner, inner, vb.pp("to_out").pp("0"))?,
+            to_q: QLinear::linear_detect(inner, inner, &vb, "to_q", false)?,
+            to_k: QLinear::linear_detect(inner, inner, &vb, "to_k", false)?,
+            to_v: QLinear::linear_detect(inner, inner, &vb, "to_v", false)?,
+            // `to_out.0`: the packed `.scales`/`.biases` siblings sit under the same dotted prefix, so
+            // pass the full `to_out.0` base to `linear_detect` (never `.pp("0")` past the sibling — the
+            // sc-8670 remap trap the story flags).
+            to_out: QLinear::linear_detect(inner, inner, &vb, "to_out.0", false)?,
             norm_q: rms_norm(hd, RMS_EPS, vb.pp("norm_q"))?,
             norm_k: rms_norm(hd, RMS_EPS, vb.pp("norm_k"))?,
-            add_q: QLinear::linear_no_bias(inner, inner, vb.pp("add_q_proj"))?,
-            add_k: QLinear::linear_no_bias(inner, inner, vb.pp("add_k_proj"))?,
-            add_v: QLinear::linear_no_bias(inner, inner, vb.pp("add_v_proj"))?,
-            to_add_out: QLinear::linear_no_bias(inner, inner, vb.pp("to_add_out"))?,
+            add_q: QLinear::linear_detect(inner, inner, &vb, "add_q_proj", false)?,
+            add_k: QLinear::linear_detect(inner, inner, &vb, "add_k_proj", false)?,
+            add_v: QLinear::linear_detect(inner, inner, &vb, "add_v_proj", false)?,
+            to_add_out: QLinear::linear_detect(inner, inner, &vb, "to_add_out", false)?,
             norm_added_q: rms_norm(hd, RMS_EPS, vb.pp("norm_added_q"))?,
             norm_added_k: rms_norm(hd, RMS_EPS, vb.pp("norm_added_k"))?,
             heads: cfg.num_heads,
@@ -361,8 +364,8 @@ struct FeedForward {
 impl FeedForward {
     fn new(in_dim: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            linear_in: QLinear::linear_no_bias(in_dim, 2 * hidden, vb.pp("linear_in"))?,
-            linear_out: QLinear::linear_no_bias(hidden, in_dim, vb.pp("linear_out"))?,
+            linear_in: QLinear::linear_detect(in_dim, 2 * hidden, &vb, "linear_in", false)?,
+            linear_out: QLinear::linear_detect(hidden, in_dim, &vb, "linear_out", false)?,
         })
     }
 
@@ -453,8 +456,8 @@ impl SingleBlock {
         // The single block's projections nest under `attn.` in the diffusers checkpoint.
         let attn = vb.pp("attn");
         Ok(Self {
-            to_qkv_mlp: QLinear::linear_no_bias(inner, proj_out, attn.pp("to_qkv_mlp_proj"))?,
-            to_out: QLinear::linear_no_bias(inner + mlp_hidden, inner, attn.pp("to_out"))?,
+            to_qkv_mlp: QLinear::linear_detect(inner, proj_out, &attn, "to_qkv_mlp_proj", false)?,
+            to_out: QLinear::linear_detect(inner + mlp_hidden, inner, &attn, "to_out", false)?,
             norm_q: rms_norm(cfg.head_dim, RMS_EPS, attn.pp("norm_q"))?,
             norm_k: rms_norm(cfg.head_dim, RMS_EPS, attn.pp("norm_k"))?,
             inner,
@@ -511,7 +514,7 @@ impl NormOut {
     fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.inner_dim();
         Ok(Self {
-            linear: QLinear::linear_no_bias(inner, 2 * inner, vb.pp("linear"))?,
+            linear: QLinear::linear_detect(inner, 2 * inner, &vb, "linear", false)?,
         })
     }
 
@@ -559,11 +562,13 @@ impl Flux2Transformer {
             )?);
         }
         Ok(Self {
-            x_embedder: QLinear::linear_no_bias(cfg.in_channels, inner, vb.pp("x_embedder"))?,
-            context_embedder: QLinear::linear_no_bias(
+            x_embedder: QLinear::linear_detect(cfg.in_channels, inner, &vb, "x_embedder", false)?,
+            context_embedder: QLinear::linear_detect(
                 cfg.joint_attention_dim,
                 inner,
-                vb.pp("context_embedder"),
+                &vb,
+                "context_embedder",
+                false,
             )?,
             time_embed: TimeGuidanceEmbed::new(cfg, vb.pp("time_guidance_embed"))?,
             mod_img: Modulation::new(cfg, 2, vb.pp("double_stream_modulation_img"))?,
@@ -572,7 +577,7 @@ impl Flux2Transformer {
             double_blocks,
             single_blocks,
             norm_out: NormOut::new(cfg, vb.pp("norm_out"))?,
-            proj_out: QLinear::linear_no_bias(inner, cfg.out_channels, vb.pp("proj_out"))?,
+            proj_out: QLinear::linear_detect(inner, cfg.out_channels, &vb, "proj_out", false)?,
             pos_embed: Flux2PosEmbed::new(cfg),
             device: vb.device().clone(),
         })
@@ -759,9 +764,15 @@ impl Flux2ControlBlock {
         // The control block's attn/ff/ff_context keys match a base double block 1:1 (diffusers naming,
         // `attn.to_out.0` read natively by `DoubleBlock`); load dense, quantized in place after load.
         let base = DoubleBlock::new(cfg, vb.clone())?;
-        let after_proj = QLinear::linear(inner, inner, vb.pp("after_proj"))?;
+        let after_proj = QLinear::linear_detect(inner, inner, &vb, "after_proj", true)?;
         let before_proj = if has_before_proj {
-            Some(QLinear::linear(inner, inner, vb.pp("before_proj"))?)
+            Some(QLinear::linear_detect(
+                inner,
+                inner,
+                &vb,
+                "before_proj",
+                true,
+            )?)
         } else {
             None
         };
@@ -805,7 +816,8 @@ impl Flux2ControlBranch {
     pub fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.inner_dim();
         let places = cfg.control_layer_places();
-        let control_img_in = QLinear::linear(CONTROL_IN_DIM, inner, vb.pp("control_img_in"))?;
+        let control_img_in =
+            QLinear::linear_detect(CONTROL_IN_DIM, inner, &vb, "control_img_in", true)?;
         let mut blocks = Vec::with_capacity(places.len());
         for i in 0..places.len() {
             blocks.push(Flux2ControlBlock::new(

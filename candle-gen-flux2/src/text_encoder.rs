@@ -15,13 +15,12 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{
-    embedding, ops::softmax_last_dim, rms_norm, rotary_emb::rope, Embedding, Module, RmsNorm,
-    VarBuilder,
+    ops::softmax_last_dim, rms_norm, rotary_emb::rope, Module, RmsNorm, VarBuilder,
 };
 use candle_gen::gen_core::Quant;
 
 use crate::config::Flux2Config;
-use crate::quant::{rms_norm_to, QLinear};
+use crate::quant::{rms_norm_to, QEmbedding, QLinear};
 
 /// HF half-split RoPE table (θ over `head_dim`), built once for the max sequence length.
 struct Rotary {
@@ -95,10 +94,10 @@ impl Attention {
             (None, None)
         };
         Ok(Self {
-            q_proj: QLinear::linear_no_bias(h, nh * hd, vb.pp("q_proj"))?,
-            k_proj: QLinear::linear_no_bias(h, nkv * hd, vb.pp("k_proj"))?,
-            v_proj: QLinear::linear_no_bias(h, nkv * hd, vb.pp("v_proj"))?,
-            o_proj: QLinear::linear_no_bias(nh * hd, h, vb.pp("o_proj"))?,
+            q_proj: QLinear::linear_detect(h, nh * hd, &vb, "q_proj", false)?,
+            k_proj: QLinear::linear_detect(h, nkv * hd, &vb, "k_proj", false)?,
+            v_proj: QLinear::linear_detect(h, nkv * hd, &vb, "v_proj", false)?,
+            o_proj: QLinear::linear_detect(nh * hd, h, &vb, "o_proj", false)?,
             q_norm,
             k_norm,
             n_heads: nh,
@@ -179,9 +178,9 @@ impl Mlp {
     fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
         let (h, i) = (cfg.te_hidden_size, cfg.te_intermediate_size);
         Ok(Self {
-            gate: QLinear::linear_no_bias(h, i, vb.pp("gate_proj"))?,
-            up: QLinear::linear_no_bias(h, i, vb.pp("up_proj"))?,
-            down: QLinear::linear_no_bias(i, h, vb.pp("down_proj"))?,
+            gate: QLinear::linear_detect(h, i, &vb, "gate_proj", false)?,
+            up: QLinear::linear_detect(h, i, &vb, "up_proj", false)?,
+            down: QLinear::linear_detect(i, h, &vb, "down_proj", false)?,
         })
     }
 
@@ -243,7 +242,7 @@ impl DecoderLayer {
 
 /// The FLUX.2 decoder-LM prompt-embeds encoder (Qwen3 for klein, Mistral for dev).
 pub struct Qwen3TextEncoder {
-    embed_tokens: Embedding,
+    embed_tokens: QEmbedding,
     layers: Vec<DecoderLayer>,
     rotary: Rotary,
     out_layers: [usize; 3],
@@ -257,10 +256,11 @@ impl Qwen3TextEncoder {
     /// constructed (higher layers cannot affect the kept states).
     pub fn new(cfg: &Flux2Config, vb: VarBuilder) -> Result<Self> {
         let model = vb.pp(cfg.te_prefix);
-        let embed_tokens = embedding(
+        let embed_tokens = QEmbedding::detect(
+            &model,
+            "embed_tokens",
             cfg.te_vocab_size,
             cfg.te_hidden_size,
-            model.pp("embed_tokens"),
         )?;
         let max_run = *cfg.te_out_layers.iter().max().unwrap();
         let mut layers = Vec::with_capacity(max_run);
@@ -288,10 +288,10 @@ impl Qwen3TextEncoder {
     /// dense encoder on the CPU; afterwards the encoder runs on `device`. The token embedding stays
     /// full precision (a lookup, not a matmul) and is only moved to `device`.
     pub fn quantize(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        self.embed_tokens = Embedding::new(
-            self.embed_tokens.embeddings().to_device(device)?,
-            self.embed_tokens.hidden_size(),
-        );
+        // The token embedding stays full precision when dense (a lookup, not a matmul) and is moved to
+        // `device`; when it loaded packed (MLX tier), it already lives on `device` and `to_device` is a
+        // no-op.
+        self.embed_tokens.to_device(device)?;
         self.rotary = self.rotary.to_device(device)?;
         for layer in &mut self.layers {
             layer.quantize_onto(quant, device)?;
