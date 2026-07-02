@@ -636,7 +636,9 @@ impl T2iModel {
 
     /// Greedy/sampled understanding-path text decode from a prefilled cache. `first_logits` are the
     /// prefix's last-position logits; `t_idx` the prefix's max temporal index. Returns the generated
-    /// token ids (stop ids excluded).
+    /// token ids (stop ids excluded). `cancel`, when supplied, is checked before each decoded token
+    /// (sc-9123); a trip surfaces the typed [`CandleError::Canceled`].
+    #[allow(clippy::too_many_arguments)]
     pub fn decode_text(
         &self,
         first_logits: &[f32],
@@ -645,7 +647,8 @@ impl T2iModel {
         eos: &[i32],
         max_new_tokens: usize,
         sampler: Sampler,
-    ) -> CResult<Vec<i32>> {
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Vec<i32>> {
         self.backbone.generate(
             first_logits,
             cache,
@@ -653,6 +656,7 @@ impl T2iModel {
             eos,
             max_new_tokens,
             sampler,
+            cancel,
         )
     }
 
@@ -662,6 +666,12 @@ impl T2iModel {
     /// it2i condition prefix, then decoded to the `<|im_end|>` stop. `images` are decoded RGB
     /// `[3,H,W]` in `[0,1]` (sized to multiples of `patch·merge`); an empty slice gives a text-only
     /// question. Returns the decoded answer (special tokens stripped, trimmed).
+    ///
+    /// `cancel` is the request's cooperative cancellation handle (sc-9123, the candle sibling of
+    /// mlx-gen's F-037/sc-9093 change): threaded into the AR decode so a long VQA / understanding
+    /// rollout consumed directly by the worker is cancellable per token. Returns the typed
+    /// [`CandleError::Canceled`] on trip.
+    #[allow(clippy::too_many_arguments)]
     pub fn vqa(
         &self,
         tokenizer: &SenseNovaTokenizer,
@@ -669,6 +679,7 @@ impl T2iModel {
         images: &[Tensor],
         max_new_tokens: usize,
         sampler: Sampler,
+        cancel: Option<&CancelFlag>,
     ) -> Result<String> {
         let mut pv_parts = Vec::with_capacity(images.len());
         let mut grids = Vec::with_capacity(images.len());
@@ -709,6 +720,7 @@ impl T2iModel {
             &[tokens::IM_END],
             max_new_tokens,
             sampler,
+            cancel,
         )?;
         let u32s: Vec<u32> = toks.iter().map(|&i| i as u32).collect();
         Ok(tokenizer.decode(&u32s, true)?.trim().to_string())

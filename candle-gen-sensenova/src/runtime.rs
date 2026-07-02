@@ -17,6 +17,8 @@
 //! text decode and gen-path image generation), so only these two primitives live here.
 
 use candle_gen::candle_core::Result as CResult;
+use candle_gen::gen_core::CancelFlag;
+use candle_gen::{CandleError, Result};
 
 use crate::qwen3::{KvCache, Path, Qwen3Backbone};
 
@@ -72,6 +74,12 @@ impl Qwen3Backbone {
     /// distribution over the first generated token); `t_idx` is the prefix's max temporal index.
     /// Decoding stops at any id in `eos` (not emitted) or after `max_new_tokens`. Returns the
     /// generated token ids.
+    ///
+    /// `cancel` is the cooperative cancellation handle (sc-9123, the candle sibling of mlx-gen's
+    /// F-037/sc-9093 change): checked before each decoded token so a worker-consumed multi-minute
+    /// VQA / understanding rollout is cancellable per token, not only at its natural end. Returns
+    /// the typed [`CandleError::Canceled`] on trip so the worker can key off it.
+    #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &self,
         first_logits: &[f32],
@@ -80,12 +88,16 @@ impl Qwen3Backbone {
         eos: &[i32],
         max_new_tokens: usize,
         sampler: Sampler,
-    ) -> CResult<Vec<i32>> {
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Vec<i32>> {
         let mut rng = SplitMix64::new(sampler.seed());
         let mut logits = first_logits.to_vec();
         let mut out = Vec::new();
         let mut t = t_idx;
         for _ in 0..max_new_tokens {
+            if cancel.is_some_and(CancelFlag::is_cancelled) {
+                return Err(CandleError::Canceled);
+            }
             let next = sampler.pick(&logits, &mut rng);
             if eos.contains(&next) {
                 break;
