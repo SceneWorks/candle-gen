@@ -24,6 +24,12 @@ safetensors = "0.7"
 # `block_q4_1` stores its per-block scale/min as f16 and candle-core does not re-export `half`.
 # Same version candle-core itself resolves (Cargo.lock), so no duplicate-crate risk.
 half = "2"
+# fp8 E4M3 storage type for the cuBLASLt 8-bit GEMM wrapper (sc-9299, cuda-only): naming
+# `float8::F8E4M3` is required to clone candle's `CudaStorageSlice::F8E4M3` device buffer for the
+# raw cublasLt call. `optional` + pulled in only by the `cuda` feature so CPU/Metal builds stay lean;
+# same version candle-core resolves (Cargo.lock 0.7.0) → cargo unifies to ONE `float8` build, so the
+# `F8E4M3` we name is the SAME type candle stores.
+float8 = { version = "0.7", optional = true }
 # Parse the PEFT/diffusers `lora_adapter_metadata` JSON blob (sc-5374) in `train::lora` so the
 # inference adapter merge recovers `lora_alpha`/`r` when a file ships no per-target `.alpha` tensor.
 serde_json = { workspace = true }
@@ -38,7 +44,7 @@ default = []
 metal = ["candle-core/metal", "candle-nn/metal"]
 # NVIDIA CUDA backend (Windows target). MUST NOT be in `default` — it needs the CUDA toolkit and
 # will not build on Mac. All cuda-only code is gated behind `#[cfg(feature = "cuda")]`.
-cuda = ["candle-core/cuda", "candle-nn/cuda"]
+cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:float8"]
 # Flash-Attention kernels (Windows/CUDA only). For now this just implies `cuda`; the real fused
 # kernels need the separate `candle-flash-attn` crate, wired in a later slice on the Windows box.
 flash-attn = ["cuda"]

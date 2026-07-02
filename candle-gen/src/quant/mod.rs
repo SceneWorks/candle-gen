@@ -31,10 +31,28 @@
 
 pub mod repack;
 
+// The cuBLASLt 8-bit GEMM compute leg (sc-9299 spike, epic 9083's 8-bit pivot): fp8 E4M3 + int8
+// IGEMM matmul over cudarc's raw cublasLt sys bindings, plus the `Fp8Linear`/`Int8Linear` linear
+// layers with dynamic per-tensor activation quant. The `CublasLt` handle is cuda-only; the small
+// activation/weight quant helpers are pure candle ops and build everywhere.
+pub mod cublaslt;
+// The 8-bit linear layers own a `CublasLt` handle → cuda-only.
+#[cfg(feature = "cuda")]
+pub mod eight_bit_linear;
+
 pub use repack::{
     dequant_mlx_q4_reference, dequant_mlx_q8, f16_exact, mlx_packed_bits, repack_mlx_q4_to_q4_1,
     MLX_GROUP_SIZE,
 };
+
+#[cfg(feature = "cuda")]
+pub use cublaslt::CublasLt;
+pub use cublaslt::{
+    quantize_activation_fp8, quantize_activation_int8, quantize_weight_fp8, quantize_weight_int8,
+    QuantizedActivation, F8E4M3_MAX, I8_MAX,
+};
+#[cfg(feature = "cuda")]
+pub use eight_bit_linear::{Fp8Linear, Int8Linear};
 
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
