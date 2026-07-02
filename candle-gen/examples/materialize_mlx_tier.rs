@@ -47,8 +47,13 @@ fn convert_file(src: &Path, dst: &Path) -> Result<(usize, usize)> {
             // it to the dense weight (Q4 lossless, Q8 the accepted re-quant) — the shared module owns
             // the bit-width dispatch, so this example carries no repack logic of its own.
             let grid = match QLinear::from_packed(&wq, &scales, &biases, None, &cpu)? {
-                QLinear::Quantized { weight, .. } => weight.dequantize(&cpu)?,
-                QLinear::Dense(_) => unreachable!("from_packed always yields Quantized"),
+                QLinear::Quantized {
+                    weight: candle_gen::quant::QuantWeight::Dequant(weight),
+                    ..
+                } => weight.dequantize(&cpu)?,
+                // A packed tier is always the dequant-dense (sc-7702-safe) arm; the int8-fast/Dense arms
+                // never come out of `from_packed`.
+                _ => unreachable!("from_packed always yields a dequant-dense Quantized"),
             };
             out.insert(name.clone(), grid.to_dtype(DType::BF16)?);
             packed += 1;

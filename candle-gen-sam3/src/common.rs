@@ -10,11 +10,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use candle_gen::candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_gen::candle_core::{safetensors, DType, Device, Tensor, D};
 use candle_gen::candle_nn::ops::softmax;
 use candle_gen::candle_nn::{GroupNorm, LayerNorm, Module};
 use candle_gen::gen_core::Quant;
+use candle_gen::quant::{DenseLinear, QLinear};
 use candle_gen::{CandleError, Result};
 
 /// A loaded SAM3 weight map. Tensors are coerced to f32 on load — the parity oracle is f32 and SAM3
@@ -110,123 +110,56 @@ pub(crate) fn join(prefix: &str, leaf: &str) -> String {
     }
 }
 
-/// GGUF block size for `Q4_0`/`Q8_0` (the candle-core legacy quants). A [`Linear`] is quantized only
-/// when its contraction (`in_features`) divides this; otherwise it stays dense — the same predicate
-/// the MLX port applies (it leaves the tiny `2→256` / `4→256` / `258→256` projections dense).
-const QUANT_BLOCK: usize = 32;
-
-/// The GGUF block type a [`Quant`] level maps to — int8 → `Q8_0` (near-lossless), int4 → `Q4_0`.
-fn ggml_dtype(quant: Quant) -> GgmlDType {
-    match quant {
-        Quant::Q4 => GgmlDType::Q4_0,
-        Quant::Q8 => GgmlDType::Q8_0,
-    }
-}
-
-/// A linear over the LAST dim — **dense** (the loaded `[out, in]` weight) or **GGUF-quantized** (a
-/// `QMatMul` over `Q4_0`/`Q8_0` blocks + the full-precision bias). Applies to any `[.., in]` tensor by
-/// flattening the leading dims (robust for both the NHWC `[b,H,W,C]` projections and the
-/// `[b,nh,seq,hd]` head tensors the SAM3 modules feed it). Built dense via [`Self::load`]; folded to
-/// quantized in place by [`Self::quantize`] (sc-6246, the candle twin of the MLX `AdaptableLinear`
-/// quant path). The dense and quantized forwards are the same `x·Wᵀ + b`. `Clone` is cheap (candle
-/// tensors / `QMatMul` are `Arc`-backed) — the video model clones the dense backbone to quantize it
-/// once and share the result (F-028).
+/// A linear over the LAST dim — **dense** (the loaded `[out, in]` weight, pre-transposed to `[in, out]`
+/// at load) or **GGUF-quantized** (candle's int8 `QMatMul` over `Q4_0`/`Q8_0` blocks + the
+/// full-precision bias). Applies to any `[.., in]` tensor by flattening the leading dims (robust for
+/// both the NHWC `[b,H,W,C]` projections and the `[b,nh,seq,hd]` head tensors the SAM3 modules feed it).
+/// Built dense via [`Self::load`]; folded to quantized in place by [`Self::quantize`] (sc-6246, the
+/// candle twin of the MLX `AdaptableLinear` quant path).
+///
+/// **Thin newtype over the shared [`candle_gen::quant::QLinear`] seam (F-025 / sc-9005).** SAM3 was
+/// one of four drifted copies of the `Dense|Quantized` Linear; the seam now lives once in `candle-gen`.
+/// SAM3's load-bearing behaviors are preserved as explicit knobs: the **pre-transposed** dense layout
+/// (sc-8997/F-017), candle's **int8 `QMatMul`** matmul ([`MatmulStrategy::Int8Fast`] — SAM3's heads
+/// tolerate it; the PE vision ViT backbone that would overflow GGUF's f16 q8_1 block scale runs dense
+/// by default), the **`in_features % 32` skip** predicate (leaves the `2→256`/`4→256`/`258→256`
+/// projections dense), the **leading-dim flatten**, and **no dtype cast-back** (SAM3 runs pure f32).
+/// `Clone` is cheap (the shared seam is `Arc`-backed) — the video model clones the backbone to
+/// quantize it once and share the result (F-028).
 #[derive(Clone)]
-pub(crate) enum Linear {
-    Dense {
-        /// Pre-transposed `[in, out]`, contiguous (the per-call matmul is a plain `[lead,in]@[in,out]`).
-        weight_t: Tensor,
-        bias: Option<Tensor>,
-        out_features: usize,
-    },
-    Quantized {
-        matmul: QMatMul,
-        /// Bias kept in f32, added after the f32 `QMatMul` (`None` for bias-less projections).
-        bias: Option<Tensor>,
-        out_features: usize,
-    },
-}
+pub(crate) struct Linear(QLinear);
 
 impl Linear {
-    /// Load `{name}.weight` (+ optional `{name}.bias`) as a dense projection.
+    /// Load `{name}.weight` (+ optional `{name}.bias`) as a dense projection, pre-transposed to
+    /// `[in, out]` (sc-8997/F-017) — the SAM3 dense layout the shared seam's [`DenseLinear::Transposed`]
+    /// arm carries.
     pub fn load(w: &Weights, name: &str) -> Result<Self> {
         let weight = w.require(&format!("{name}.weight"))?; // [out, in]
-        let out_features = weight.dim(0)?;
-        Ok(Self::Dense {
+        Ok(Self(QLinear::from_dense(DenseLinear::Transposed {
             weight_t: weight.t()?.contiguous()?,
             bias: w.get(&format!("{name}.bias")),
-            out_features,
-        })
+        })))
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let dims = x.dims().to_vec();
-        let in_features = *dims.last().expect("linear input has rank >= 1");
-        let lead: usize = dims[..dims.len() - 1].iter().product();
-        let x2 = x.reshape((lead, in_features))?;
-        let (mut y, out_features, bias) = match self {
-            Self::Dense {
-                weight_t,
-                bias,
-                out_features,
-            } => (x2.matmul(weight_t)?, *out_features, bias), // [lead, out]
-            Self::Quantized {
-                matmul,
-                bias,
-                out_features,
-            } => {
-                // `QMatMul` needs a contiguous f32 activation (CPU + the CUDA dmmv fallback). NOTE:
-                // off-Mac SAM3 runs DENSE by default (the worker leaves `SCENEWORKS_SAM3_QUANT` unset).
-                // This is NOT a candle/Blackwell bug: candle's GGUF `QMatMul` is correct on sm_120
-                // (Q8/Q4 over f32/f16/bf16 all verified; seedvr2's DiT quantizes near-losslessly on the
-                // same box). SAM3's PE vision ViT backbone is what breaks when quantized — its massive
-                // activations overflow GGUF's f16 q8_1 block scale (amax/127 -> inf -> NaN), on ANY
-                // device (sc-6361). The heads quantize fine; dense is bit-exact and fits, so quant buys
-                // ~nothing here.
-                let xf = x2.to_dtype(DType::F32)?.contiguous()?;
-                (matmul.forward(&xf)?, *out_features, bias)
-            }
-        };
-        if let Some(b) = bias {
-            y = y.broadcast_add(b)?;
-        }
-        let mut out_shape = dims;
-        *out_shape.last_mut().unwrap() = out_features;
-        Ok(y.reshape(out_shape)?)
+        Ok(self.0.forward(x)?)
     }
 
     /// Fold a dense projection to `Q4_0`/`Q8_0` in place **iff** `in_features % 32 == 0` (else it stays
-    /// dense — the reference predicate). The weight is quantized on the CPU and placed back on its
-    /// original device via `QTensor::quantize_onto`; the bias is promoted to f32. Idempotent (a no-op
-    /// on an already-quantized linear).
+    /// dense — the reference predicate). Uses candle's int8 `QMatMul` forward, flattens the leading
+    /// dims, and does **not** cast back (SAM3 is pure f32) — the shared seam's int8-fast fold with
+    /// SAM3's exact knobs. The weight is quantized on the CPU and placed back on its original device;
+    /// the bias is promoted to f32. Idempotent.
+    ///
+    /// NOTE: off-Mac SAM3 runs DENSE by default (the worker leaves `SCENEWORKS_SAM3_QUANT` unset). This
+    /// is NOT a candle/Blackwell bug: candle's GGUF `QMatMul` is correct on sm_120 (seedvr2's DiT
+    /// quantizes near-losslessly on the same box). SAM3's PE vision ViT backbone is what breaks when
+    /// quantized — its massive activations overflow GGUF's f16 q8_1 block scale (amax/127 → inf → NaN),
+    /// on ANY device (sc-6361). The heads quantize fine; dense is bit-exact and fits, so quant buys
+    /// ~nothing here.
     pub fn quantize(&mut self, quant: Quant) -> Result<()> {
-        if let Self::Dense {
-            weight_t,
-            bias,
-            out_features,
-        } = self
-        {
-            let in_features = weight_t.dim(0)?;
-            if !in_features.is_multiple_of(QUANT_BLOCK) {
-                return Ok(());
-            }
-            let device = weight_t.device().clone();
-            // recover the torch-native `[out, in]` weight (we store the transpose), quantize on CPU.
-            let w_cpu = weight_t
-                .t()?
-                .contiguous()?
-                .to_device(&Device::Cpu)?
-                .to_dtype(DType::F32)?;
-            let qtensor = QTensor::quantize_onto(&w_cpu, ggml_dtype(quant), &device)?;
-            let matmul = QMatMul::from_qtensor(qtensor)?;
-            let bias = bias.clone();
-            let out_features = *out_features;
-            *self = Self::Quantized {
-                matmul,
-                bias,
-                out_features,
-            };
-        }
+        // skip_indivisible = true (the `% 32` predicate), flatten_leading = true, cast_back = false.
+        self.0.quantize_int8_fast(quant, true, true, false)?;
         Ok(())
     }
 }
@@ -362,11 +295,10 @@ mod tests {
     }
 
     fn dense(w: &Tensor, b: Option<&Tensor>) -> Linear {
-        Linear::Dense {
+        Linear(QLinear::from_dense(DenseLinear::Transposed {
             weight_t: w.t().unwrap().contiguous().unwrap(),
             bias: b.cloned(),
-            out_features: w.dim(0).unwrap(),
-        }
+        }))
     }
 
     /// A `[64, 32]` projection (in=32 = one Q4_0/Q8_0 block per row) quantizes and forwards
@@ -380,7 +312,12 @@ mod tests {
         let x = Tensor::randn(0f32, 1f32, (4, 32), &dev).unwrap();
         let dense_out = lin.forward(&x).unwrap();
         lin.quantize(quant).unwrap();
-        assert!(matches!(lin, Linear::Quantized { .. }), "must be quantized");
+        assert!(lin.0.is_quantized(), "must be quantized");
+        assert_eq!(
+            lin.0.matmul_strategy(),
+            Some(candle_gen::quant::MatmulStrategy::Int8Fast),
+            "SAM3 uses candle's int8 QMatMul forward"
+        );
         let q_out = lin.forward(&x).unwrap();
         let cos = cosine(&dense_out, &q_out);
         assert!(cos > min_cos, "{quant:?} cosine {cos:.5} ≤ {min_cos}");
@@ -484,12 +421,12 @@ mod tests {
         let odd = Tensor::randn(0f32, 1f32, (64, 20), &dev).unwrap();
         let mut lin = dense(&odd, None);
         lin.quantize(Quant::Q8).unwrap();
-        assert!(matches!(lin, Linear::Dense { .. }), "in=20 stays dense");
+        assert!(!lin.0.is_quantized(), "in=20 stays dense");
 
         let w = Tensor::randn(0f32, 1f32, (64, 32), &dev).unwrap();
         let mut q = dense(&w, None);
         q.quantize(Quant::Q8).unwrap();
         q.quantize(Quant::Q8).unwrap(); // idempotent, must not error
-        assert!(matches!(q, Linear::Quantized { .. }));
+        assert!(q.0.is_quantized());
     }
 }

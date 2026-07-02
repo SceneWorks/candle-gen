@@ -273,13 +273,16 @@ pub fn linear_detect_dense(
     let device = vb.device().clone();
     let dtype = vb.dtype();
     let q = shared::lin(vb, base, in_dim, out_dim, bias)?;
+    // The shared packed load is a `Quantized` projection whose weight is the dequant-dense
+    // `QuantWeight::Dequant` arm (a packed tier is sc-7702-safe by construction; F-025 / sc-9005).
     let shared::QLinear::Quantized {
-        weight,
+        weight: shared::QuantWeight::Dequant(weight),
         bias: qbias,
+        ..
     } = q
     else {
-        // `shared::lin` returns `Quantized` whenever `.scales` is present (checked above), so this is
-        // unreachable; fall back to a dense read rather than panicking if the shared contract changes.
+        // `shared::lin` returns `Quantized`/`Dequant` whenever `.scales` is present (checked above), so
+        // this is unreachable; fall back to a dense read rather than panicking if the contract changes.
         let sub = vb.pp(base);
         return if bias {
             candle_gen::candle_nn::linear(in_dim, out_dim, sub)

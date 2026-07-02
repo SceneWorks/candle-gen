@@ -10,13 +10,12 @@
 //! Each `Linear` is dense (the loaded bf16/f32 weight) or GGUF-quantized (`Q4_0`/`Q8_0`); the
 //! `quantize` cascade ([`crate::quant`], sc-5927) folds every DiT Linear in place after load.
 
-use candle_gen::candle_core::quantized::{QMatMul, QTensor};
-use candle_gen::candle_core::{DType, Device, Module, Result, Tensor};
+use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::gen_core::Quant;
+use candle_gen::quant::{DenseLinear, QLinear};
 
 use crate::config::DitConfig;
 use crate::nn;
-use crate::quant;
 use crate::weights::Weights;
 
 type CResult<T> = candle_gen::Result<T>;
@@ -30,101 +29,39 @@ type CResult<T> = candle_gen::Result<T>;
 /// [`Self::quantize`] folds it in place. The quantized forward runs the GGUF `QMatMul` in f32 — the
 /// CPU and CUDA dmmv paths both need an f32 activation — and casts back to the input dtype, so the
 /// surrounding DiT keeps flowing bf16 exactly as the dense path does.
-enum Linear {
-    Dense {
-        /// Pre-transposed `[in, out]`, contiguous — the per-forward matmul is a plain `[lead,in]@[in,out]`
-        /// with no transpose/copy (sc-8997/F-017). [`Self::quantize`] transposes it back to `[out,in]`
-        /// once to fold the GGUF blocks.
-        wt: Tensor,
-        b: Option<Tensor>,
-    },
-    Quant {
-        matmul: QMatMul,
-        /// Bias kept in f32 (added after the f32 `QMatMul`); `None` for the bias-less projections.
-        b: Option<Tensor>,
-        in_dim: usize,
-        out_dim: usize,
-    },
-}
+///
+/// **Thin newtype over the shared [`candle_gen::quant::QLinear`] seam (F-025 / sc-9005).** SeedVR2 was
+/// one of four drifted copies of the `Dense|Quantized` Linear; the seam now lives once in `candle-gen`.
+/// SeedVR2's load-bearing behaviors are preserved as explicit knobs: the **pre-transposed** dense
+/// layout (sc-8997/F-017), candle's **int8 `QMatMul`** forward ([`MatmulStrategy::Int8Fast`]), the
+/// **`in_features % 32` skip** predicate (leaves `vid_in.proj` in=132 dense), the **leading-dim
+/// flatten**, and the **cast-back** to the input dtype (the DiT flows bf16).
+struct Linear(QLinear);
 impl Linear {
     fn load(w: &Weights, prefix: &str, bias: bool) -> CResult<Self> {
         let weight = w.require(&format!("{prefix}.weight"))?; // [out, in]
-        Ok(Self::Dense {
-            wt: nn::transpose_weight(weight)?, // [in, out], once at load (sc-8997/F-017)
-            b: if bias {
+        Ok(Self(QLinear::from_dense(DenseLinear::Transposed {
+            weight_t: nn::transpose_weight(weight)?, // [in, out], once at load (sc-8997/F-017)
+            bias: if bias {
                 Some(w.require(&format!("{prefix}.bias"))?.clone())
             } else {
                 None
             },
-        })
+        })))
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Dense { wt, b } => nn::linear(x, wt, b.as_ref()),
-            Self::Quant {
-                matmul,
-                b,
-                in_dim,
-                out_dim,
-            } => {
-                let in_dtype = x.dtype();
-                let dims = x.dims().to_vec();
-                let lead: usize = dims[..dims.len() - 1].iter().product();
-                // QMatMul (CPU + CUDA dmmv fallback) needs a contiguous f32 activation; flatten the
-                // leading dims into one 2-D GEMM (mirrors `nn::linear`) and reshape back.
-                let xf = x
-                    .to_dtype(DType::F32)?
-                    .reshape((lead, *in_dim))?
-                    .contiguous()?;
-                let y = matmul.forward(&xf)?; // (lead, out_dim)
-                let mut out_shape = dims[..dims.len() - 1].to_vec();
-                out_shape.push(*out_dim);
-                let y = y.reshape(out_shape)?;
-                let y = match b {
-                    Some(b) => y.broadcast_add(b)?,
-                    None => y,
-                };
-                y.to_dtype(in_dtype)
-            }
-        }
+        self.0.forward(x)
     }
 
     /// Fold a dense `[out,in]` weight to `Q4_0`/`Q8_0` in place (sc-5927). No-op when already
     /// quantized or when `in_features` is not a multiple of the GGUF block (`vid_in.proj`, in=132,
-    /// stays dense — the reference predicate). The weight is quantized on the CPU and placed back on
-    /// its original device (`QTensor::quantize_onto`); the bias is promoted to f32 for the post-matmul
-    /// add. The dense copy is dropped, so the steady-state footprint is the quantized one.
+    /// stays dense — the reference predicate). Uses candle's int8 `QMatMul` forward, flattens the
+    /// leading dims, and casts back to the input dtype (the shared seam's int8-fast fold with SeedVR2's
+    /// exact knobs). The weight is quantized on the CPU and placed back on its original device; the bias
+    /// is promoted to f32 for the post-matmul add.
     fn quantize(&mut self, quant: Quant) -> CResult<()> {
-        let Self::Dense { wt, b } = self else {
-            return Ok(());
-        };
-        // `wt` is the pre-transposed `[in, out]` weight (sc-8997/F-017); transpose back once here to
-        // recover the `[out, in]` layout GGUF quantization expects. This runs at most once per Linear
-        // (the quant cascade folds each Dense in place), not per forward.
-        let in_dim = wt.dim(0)?;
-        let out_dim = wt.dim(1)?;
-        if !in_dim.is_multiple_of(quant::QUANT_BLOCK) {
-            return Ok(());
-        }
-        let device = wt.device().clone();
-        // recover the torch-native `[out, in]` weight (we store the transpose), quantize on CPU.
-        let w_cpu = wt
-            .t()?
-            .contiguous()?
-            .to_device(&Device::Cpu)?
-            .to_dtype(DType::F32)?;
-        let qtensor = QTensor::quantize_onto(&w_cpu, quant::ggml_dtype(quant), &device)?;
-        let matmul = QMatMul::from_qtensor(qtensor)?;
-        let b = match b {
-            Some(b) => Some(b.to_dtype(DType::F32)?),
-            None => None,
-        };
-        *self = Self::Quant {
-            matmul,
-            b,
-            in_dim,
-            out_dim,
-        };
+        // skip_indivisible = true (the `% 32` predicate), flatten_leading = true, cast_back = true.
+        self.0.quantize_int8_fast(quant, true, true, true)?;
         Ok(())
     }
 }
@@ -1108,16 +1045,21 @@ mod quant_tests {
         let (in_dim, out_dim) = (64usize, 96usize); // in=64 = two Q4_0/Q8_0 blocks per row
         let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
         let b = Tensor::randn(0f32, 1f32, out_dim, &dev).unwrap();
-        let mut lin = Linear::Dense {
-            wt: nn::transpose_weight(&w).unwrap(),
-            b: Some(b),
-        };
+        let mut lin = Linear(QLinear::from_dense(DenseLinear::Transposed {
+            weight_t: nn::transpose_weight(&w).unwrap(),
+            bias: Some(b),
+        }));
         // a 3-D activation (B,S,in) exercises the leading-dim flatten in the quant forward.
         let x = Tensor::randn(0f32, 1f32, (2usize, 5usize, in_dim), &dev).unwrap();
         let dense = lin.forward(&x).unwrap();
 
         lin.quantize(quant).unwrap();
-        assert!(matches!(lin, Linear::Quant { .. }), "must be quantized");
+        assert!(lin.0.is_quantized(), "must be quantized");
+        assert_eq!(
+            lin.0.matmul_strategy(),
+            Some(candle_gen::quant::MatmulStrategy::Int8Fast),
+            "SeedVR2 uses candle's int8 QMatMul forward"
+        );
         let q = lin.forward(&x).unwrap();
         assert_eq!(
             q.dims(),
@@ -1145,13 +1087,13 @@ mod quant_tests {
     fn quantize_skips_indivisible_in_features() {
         let dev = Device::Cpu;
         let w = Tensor::randn(0f32, 1f32, (64usize, 132usize), &dev).unwrap();
-        let mut lin = Linear::Dense {
-            wt: nn::transpose_weight(&w).unwrap(),
-            b: None,
-        };
+        let mut lin = Linear(QLinear::from_dense(DenseLinear::Transposed {
+            weight_t: nn::transpose_weight(&w).unwrap(),
+            bias: None,
+        }));
         lin.quantize(Quant::Q8).unwrap();
         assert!(
-            matches!(lin, Linear::Dense { .. }),
+            !lin.0.is_quantized(),
             "in=132 must stay dense (132 % 32 ≠ 0)"
         );
     }
@@ -1162,13 +1104,13 @@ mod quant_tests {
     fn quantize_is_idempotent() {
         let dev = Device::Cpu;
         let w = Tensor::randn(0f32, 1f32, (64usize, 32usize), &dev).unwrap();
-        let mut lin = Linear::Dense {
-            wt: nn::transpose_weight(&w).unwrap(),
-            b: None,
-        };
+        let mut lin = Linear(QLinear::from_dense(DenseLinear::Transposed {
+            weight_t: nn::transpose_weight(&w).unwrap(),
+            bias: None,
+        }));
         lin.quantize(Quant::Q8).unwrap();
         lin.quantize(Quant::Q8).unwrap(); // no-op, must not error
-        assert!(matches!(lin, Linear::Quant { b: None, .. }));
+        assert!(lin.0.is_quantized());
     }
 
     /// sc-9039: the block pre-norms now reuse a single `ones` weight cached at load rather than

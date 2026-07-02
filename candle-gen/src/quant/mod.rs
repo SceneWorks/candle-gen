@@ -59,7 +59,7 @@ pub use cublaslt::{
 #[cfg(feature = "cuda")]
 pub use eight_bit_linear::{Fp8Linear, Int8Linear};
 
-use candle_core::quantized::{GgmlDType, QTensor};
+use candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::{Embedding, Linear, Module, VarBuilder};
 use gen_core::Quant;
@@ -74,6 +74,12 @@ pub fn ggml_dtype(quant: Quant) -> GgmlDType {
         Quant::Q8 => GgmlDType::Q8_0,
     }
 }
+
+/// GGUF block size for `Q4_0`/`Q8_0` (the candle-core legacy quants). A [`QLinear`] folded with the
+/// SAM3/SeedVR2 skip predicate is quantized only when its contraction (`in_features`) divides this;
+/// otherwise it stays dense — the reference predicate that leaves e.g. SeedVR2's `vid_in.proj` (in=132)
+/// and SAM3's `2→256`/`4→256`/`258→256` projections full-precision.
+pub const QUANT_BLOCK: usize = 32;
 
 /// A component's `quantization` manifest block — the candle twin of `mlx_gen_flux2::config::Flux2Quant`
 /// (generalized out of the dormant per-crate `Flux2Quant`, sc-9086). An install-time convert job
@@ -112,39 +118,203 @@ impl PackedConfig {
     }
 }
 
-/// A `Linear` projection that is **dense** (the loaded bf16/f32 weight) or **GGUF-quantized** (a
-/// `QTensor` weight + full-precision bias, dequantized to a dense matmul each forward — sc-7702).
-/// Built either dense (`Self::linear*`) or straight from MLX-packed parts (`Self::from_packed*`);
-/// [`Self::quantize`] folds a dense one to `Q4_0`/`Q8_0` in place and is a no-op on an already-packed
-/// one. Every arm computes `x·Wᵀ + b`.
+/// How a [`QLinear::Quantized`] arm computes its matmul — the **load-bearing** knob unified out of the
+/// four per-crate seams (F-025 / sc-9005). Both strategies compute `x·Wᵀ + b` over the *same* GGUF
+/// `QTensor` weight; they differ only in whether the activation stays full-precision.
+///
+/// - [`Self::DequantDense`] — dequantize the weight to the activation dtype and run a *dense* matmul,
+///   keeping the activation full-precision. **The sc-7702 fix.** candle's int8 `QMatMul` fast path
+///   (`fast_mmvq`/`fast_mmq`) quantizes the *activation* to per-32-element `q8_1`, so a single outlier
+///   text feature (gpt-oss ±10⁴) sets a block's int8 scale and zeros the co-located channels → a Q4
+///   denoise diverges to NaN (a solid-black render). Dequant-to-dense keeps uniform Q4 coherent. The
+///   Lens DiT (sc-5117) and every packed-tier load use this.
+/// - [`Self::Int8Fast`] — route the (f32) activation through candle's `QMatMul::forward`, which takes
+///   the int8 fast path on CUDA for `batch > 8`. Faster, but corrupts under the outlier activations
+///   [`Self::DequantDense`] guards against — safe **only** where the activations are known well-scaled
+///   (FLUX.2's f32 DiT/TE, SAM3's heads, SeedVR2's DiT — all GPU-validated near-lossless). A model
+///   with outlier activations on an `Int8Fast` seam reproduces the sc-7702 failure; that is exactly the
+///   drift F-025 makes explicit rather than leaving four identically-named types silently disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatmulStrategy {
+    /// Dequantize the weight to a dense matmul (sc-7702-safe; the default).
+    DequantDense,
+    /// candle's int8 `QMatMul::forward` fast path (activation-quant; unsafe under outliers).
+    Int8Fast,
+}
+
+/// A dense `[out, in]` projection stored in one of two equivalent layouts — the second **load-bearing**
+/// drift unified out of the four seams (F-025). Both forward to `x·Wᵀ + b`; they differ in weight
+/// storage and the per-forward GEMM shape, which must stay byte-identical to each site's prior code.
+///
+/// - [`Self::Linear`] — a `candle_nn::Linear` holding the `[out, in]` weight (Lens / FLUX.2). The
+///   forward is `candle_nn::Linear::forward` (a `broadcast_matmul` for rank > 2 inputs).
+/// - [`Self::Transposed`] — the weight **pre-transposed** to a contiguous `[in, out]` at load
+///   (SAM3 / SeedVR2, sc-8997/F-017: re-transposing per forward materialized a fresh copy of the whole
+///   weight every call). The forward flattens all leading dims into one 2-D GEMM `[lead,in]@[in,out]`
+///   and reshapes back — candle's `matmul` rejects the non-contiguous broadcasted rhs a high-rank input
+///   otherwise produces, and the flattened GEMM is faster.
+#[derive(Clone)]
+pub enum DenseLinear {
+    Linear(Linear),
+    Transposed {
+        /// Pre-transposed `[in, out]`, contiguous.
+        weight_t: Tensor,
+        bias: Option<Tensor>,
+    },
+}
+
+impl DenseLinear {
+    /// The recovered torch-native `[out, in]` weight and its `[out]` bias — used by the quantize fold
+    /// (which needs the `[out, in]` layout GGUF quantization expects) and shape queries. For
+    /// [`Self::Transposed`] this transposes `weight_t` back once (not per forward).
+    fn out_in_weight_bias(&self) -> Result<(Tensor, Option<Tensor>)> {
+        match self {
+            Self::Linear(l) => Ok((l.weight().clone(), l.bias().cloned())),
+            Self::Transposed { weight_t, bias } => Ok((weight_t.t()?.contiguous()?, bias.clone())),
+        }
+    }
+
+    /// `in_features` (the contraction / last-dim) — the axis the quantize-skip predicate tests.
+    fn in_features(&self) -> Result<usize> {
+        match self {
+            Self::Linear(l) => l.weight().dim(1),
+            Self::Transposed { weight_t, .. } => weight_t.dim(0),
+        }
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Linear(l) => l.forward(x),
+            Self::Transposed { weight_t, bias } => {
+                let (in_dim, out_dim) = (weight_t.dim(0)?, weight_t.dim(1)?);
+                let dims = x.dims().to_vec();
+                let lead: usize = dims[..dims.len() - 1].iter().product();
+                let y = x.contiguous()?.reshape((lead, in_dim))?.matmul(weight_t)?;
+                let mut out_shape = dims[..dims.len() - 1].to_vec();
+                out_shape.push(out_dim);
+                let y = y.reshape(out_shape)?;
+                match bias {
+                    Some(b) => y.broadcast_add(b),
+                    None => Ok(y),
+                }
+            }
+        }
+    }
+}
+
+/// The stored quantized weight. `QTensor` is not `Clone` and `QMatMul::from_qtensor` consumes it, so
+/// the two [`MatmulStrategy`] arms keep the weight in the shape each forward needs, built once at fold
+/// time: [`Self::Dequant`] holds the `QTensor` behind an `Arc` (dequantized to a dense matmul per
+/// forward — the sc-7702 path); [`Self::Matmul`] holds the resident `QMatMul` (candle's int8 fast path,
+/// itself `Arc`-backed). Both wrap the same GGUF blocks; only the forward compute differs. The `Arc`
+/// makes [`QLinear`] `Clone` (SAM3's video model shares one quantized backbone across two heads, F-028).
+#[derive(Clone)]
+pub enum QuantWeight {
+    /// The GGUF `QTensor` (dequantized to the activation dtype per forward). [`MatmulStrategy::DequantDense`].
+    Dequant(std::sync::Arc<QTensor>),
+    /// The resident `QMatMul` over the same GGUF blocks. [`MatmulStrategy::Int8Fast`].
+    Matmul(QMatMul),
+}
+
+impl QuantWeight {
+    /// The GGUF block type of the stored weight — used by tests to assert the packed `Q4_1` / folded
+    /// `Q4_0`/`Q8_0` container survived the unification.
+    pub fn dtype(&self) -> GgmlDType {
+        match self {
+            Self::Dequant(w) => w.dtype(),
+            Self::Matmul(m) => match m {
+                QMatMul::QTensor(w) => w.dtype(),
+                // Dense/TensorF16 fallbacks never occur here (we always build from a QTensor).
+                _ => GgmlDType::F32,
+            },
+        }
+    }
+}
+
+/// How the quantized forward flattens the activation and casts back — the two remaining per-site
+/// forward-shape drifts (F-025), kept explicit so each site stays byte-identical. Only consulted for
+/// [`MatmulStrategy::Int8Fast`] (the dequant-dense path routes through `candle_nn::Linear`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuantForward {
+    /// Flatten all leading dims into one 2-D GEMM and reshape back to `[.., out_dim]` (SAM3 / SeedVR2),
+    /// rather than feeding the raw activation to `QMatMul` (FLUX.2, whose activation is already 2-D).
+    pub flatten_leading: bool,
+    /// Cast the output back to the input dtype after the (f32) matmul + bias. SAM3 runs pure f32 so it
+    /// skips the cast (`false`); FLUX.2 / SeedVR2 flow bf16 through the DiT and cast back (`true`).
+    pub cast_back: bool,
+}
+
+/// A `Linear` projection that is **dense** or **GGUF-quantized** — the ONE shared seam every
+/// quant-capable candle provider crate builds on (F-025 / sc-9005, consolidating the four drifted
+/// copies in `candle-gen-flux2` / `candle-gen-lens` / `candle-gen-sam3` / `candle-gen-seedvr2`). The
+/// quantized weight is a GGUF `QTensor` (`Q4_1` from a packed tier, or `Q4_0`/`Q8_0` from a load-time
+/// fold); its two **load-bearing** behaviors — the matmul [`MatmulStrategy`] (dequant-dense vs int8
+/// fast, the sc-7702 knob) and the dense weight [`DenseLinear`] layout — are explicit so no site's
+/// numerics change. Built dense (`Self::linear*`), packed (`Self::from_packed*` / [`lin`]), or
+/// packed-detected ([`Self::linear_detect`]); [`Self::quantize`] / [`Self::quantize_onto`] fold a dense
+/// one and are a no-op on an already-quantized one. Every arm computes `x·Wᵀ + b`. `Clone` is cheap
+/// (candle tensors, `QMatMul`, and the `Arc<QTensor>` dequant weight are all `Arc`-backed) — SAM3's
+/// video model clones a once-quantized backbone to share it across two heads (F-028).
+#[derive(Clone)]
 pub enum QLinear {
-    Dense(Linear),
+    Dense(DenseLinear),
     Quantized {
         /// The GGUF-quantized weight (`Q4_1` from a packed tier, or `Q4_0`/`Q8_0` from a load-time
-        /// quantize); dequantized to the activation dtype per forward.
-        weight: QTensor,
+        /// quantize), stored in the form its [`MatmulStrategy`] needs ([`QuantWeight`]).
+        weight: QuantWeight,
         /// The bias kept full-precision (`None` for bias-less projections).
         bias: Option<Tensor>,
+        /// Per-site forward flatten / dtype-cast behavior (only consulted for [`MatmulStrategy::Int8Fast`]).
+        fwd: QuantForward,
     },
 }
 
 impl QLinear {
     /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`).
     pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        Ok(Self::Dense(candle_nn::linear(in_dim, out_dim, vb)?))
+        Ok(Self::Dense(DenseLinear::Linear(candle_nn::linear(
+            in_dim, out_dim, vb,
+        )?)))
     }
 
     /// A bias-less dense `[out, in]` projection from `vb` (`{prefix}.weight`).
     pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        Ok(Self::Dense(candle_nn::linear_no_bias(in_dim, out_dim, vb)?))
+        Ok(Self::Dense(DenseLinear::Linear(candle_nn::linear_no_bias(
+            in_dim, out_dim, vb,
+        )?)))
+    }
+
+    /// A dense projection wrapping an already-built [`DenseLinear`] — the entry point for the
+    /// pre-transposed `[in, out]` layout (SAM3 / SeedVR2, sc-8997/F-017) and for tests.
+    pub fn from_dense(dense: DenseLinear) -> Self {
+        Self::Dense(dense)
+    }
+
+    /// **Packed-detecting** `[out, in]` loader: if `{base}.scales` is present in `vb` (a pre-quantized
+    /// MLX tier), build a packed [`Self::Quantized`] straight from the packed parts on `vb`'s device via
+    /// the shared [`lin`] — **no dense weight is materialized**. Otherwise the **dense** path is taken
+    /// unchanged (`{base}.weight` [+ `{base}.bias`]), to be optionally folded later by
+    /// [`Self::quantize`]. `base` is the full dotted key prefix (e.g. `attn.to_out.0`), so the
+    /// `.scales`/`.biases` siblings survive any `to_out.0`-style key nesting — build the base string
+    /// first, then detect (never `.pp()` past the scales sibling). Used by Lens / FLUX.2, whose packed
+    /// forward is [`MatmulStrategy::DequantDense`] (the sc-7702 fix).
+    pub fn linear_detect(
+        in_dim: usize,
+        out_dim: usize,
+        vb: &VarBuilder,
+        base: &str,
+        bias: bool,
+    ) -> Result<Self> {
+        lin(vb, base, in_dim, out_dim, bias)
     }
 
     /// Build a `Quantized` projection directly from an MLX packed triple (`wq` u32 codes + `scales` +
     /// `biases`) on `device` at the default group size 64 — Q4 via the lossless `Q4_1` repack, Q8 via
-    /// dequant → `Q8_0` re-quant (bit-width inferred from the shapes). `bias` is the optional dense
-    /// `{base}.bias`, kept full-precision. No dense weight is ever materialized on the Q4 path (the
-    /// whole point: the packed footprint lands on `device` directly). See [`Self::from_packed_gs`] for a
-    /// non-64 group tier (boogu packs at 32).
+    /// dequant → `Q8_0` re-quant (bit-width inferred from the shapes). Uses [`MatmulStrategy::DequantDense`]
+    /// (the sc-7702-safe forward every packed tier needs). `bias` is the optional dense `{base}.bias`,
+    /// kept full-precision. No dense weight is ever materialized on the Q4 path (the whole point: the
+    /// packed footprint lands on `device` directly). See [`Self::from_packed_gs`] for a non-64 group
+    /// tier (boogu packs at 32).
     pub fn from_packed(
         wq: &Tensor,
         scales: &Tensor,
@@ -168,17 +338,28 @@ impl QLinear {
         device: &Device,
     ) -> Result<Self> {
         let weight = repack_packed_weight(wq, scales, biases, group_size, device)?;
-        Ok(Self::Quantized { weight, bias })
+        Ok(Self::Quantized {
+            weight: QuantWeight::Dequant(std::sync::Arc::new(weight)),
+            bias,
+            fwd: QuantForward {
+                flatten_leading: false,
+                cast_back: true,
+            },
+        })
     }
 
-    /// `x·Wᵀ + b`. Both arms run a **dense** matmul: `Dense` delegates to `candle_nn::Linear`;
-    /// `Quantized` dequantizes its weight (and bias) to the activation dtype and delegates likewise.
-    /// Dequantizing to a dense matmul — rather than candle's int8 `QMatMul` fast path — is the
-    /// sc-7702 fix (see the module docs).
+    /// `x·Wᵀ + b`. `Dense` delegates to its [`DenseLinear`] layout. `Quantized` runs its
+    /// [`MatmulStrategy`]: `DequantDense` dequantizes the weight (and bias) to the activation dtype and
+    /// runs a dense matmul (sc-7702); `Int8Fast` casts the activation to f32 and routes it through
+    /// candle's `QMatMul::forward` (with per-site leading-dim flatten / dtype cast-back).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(l) => l.forward(x),
-            Self::Quantized { weight, bias } => {
+            Self::Quantized {
+                weight: QuantWeight::Dequant(weight),
+                bias,
+                ..
+            } => {
                 let in_dtype = x.dtype();
                 let w = weight.dequantize(x.device())?.to_dtype(in_dtype)?;
                 let bias = match bias {
@@ -187,29 +368,194 @@ impl QLinear {
                 };
                 Linear::new(w, bias).forward(x)
             }
+            Self::Quantized {
+                weight: QuantWeight::Matmul(matmul),
+                bias,
+                fwd,
+            } => {
+                let in_dtype = x.dtype();
+                let (mut y, out_shape) = if fwd.flatten_leading {
+                    let dims = x.dims().to_vec();
+                    let in_features = *dims.last().expect("linear input has rank >= 1");
+                    let lead: usize = dims[..dims.len() - 1].iter().product();
+                    let xf = x
+                        .reshape((lead, in_features))?
+                        .to_dtype(DType::F32)?
+                        .contiguous()?;
+                    let y2 = matmul.forward(&xf)?; // [lead, out]
+                    let out_features = y2.dim(1)?;
+                    let mut out_shape = dims;
+                    *out_shape.last_mut().unwrap() = out_features;
+                    (y2, Some(out_shape))
+                } else {
+                    let xf = x.to_dtype(DType::F32)?.contiguous()?;
+                    (matmul.forward(&xf)?, None)
+                };
+                if let Some(shape) = out_shape {
+                    y = y.reshape(shape)?;
+                }
+                if let Some(b) = bias {
+                    y = y.broadcast_add(b)?;
+                }
+                if fwd.cast_back {
+                    y = y.to_dtype(in_dtype)?;
+                }
+                Ok(y)
+            }
         }
     }
 
-    /// Fold a **dense** projection to `Q4_0`/`Q8_0` in place — **idempotent**: a no-op when already
-    /// `Quantized` (whether from a load-time quantize or a packed-tier load), so a loader can
-    /// packed-detect *and* keep an unconditional post-load `quantize` pass. The weight is quantized on
+    /// Fold a **dense** projection to `Q4_0`/`Q8_0` in place on its current device — **idempotent**: a
+    /// no-op when already `Quantized` (from a load-time quantize or a packed-tier load), so a loader can
+    /// packed-detect *and* keep an unconditional post-load `quantize` pass. Uses
+    /// [`MatmulStrategy::DequantDense`] (the sc-7702-safe path; Lens's fold). The weight is quantized on
     /// the CPU and placed back on its original device via `QTensor::quantize_onto`; the bias stays
-    /// full-precision.
+    /// full-precision. See [`Self::quantize_int8_fast`] for the int8-fast fold (FLUX.2 / SAM3 / SeedVR2)
+    /// and [`Self::quantize_onto`] to land the fold on an explicit device.
     pub fn quantize(&mut self, quant: Quant) -> Result<()> {
-        let Self::Dense(l) = self else {
+        self.fold(
+            quant,
+            None,
+            MatmulStrategy::DequantDense,
+            QuantForward {
+                flatten_leading: false,
+                cast_back: true,
+            },
+            false,
+        )
+    }
+
+    /// As [`Self::quantize`] but lands the folded `QTensor` on an explicit `device` (FLUX.2's
+    /// CPU-stage-then-quantize-onto-GPU path, sc-7460) and uses the [`MatmulStrategy::Int8Fast`] forward
+    /// (FLUX.2's f32 DiT/TE, GPU-validated). Idempotent on an already-quantized projection.
+    pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.fold(
+            quant,
+            Some(device.clone()),
+            MatmulStrategy::Int8Fast,
+            QuantForward {
+                flatten_leading: false,
+                cast_back: true,
+            },
+            false,
+        )
+    }
+
+    /// Fold to [`MatmulStrategy::Int8Fast`] in place on the current device, **skipping** any projection
+    /// whose `in_features` is not a multiple of the 32-wide GGUF block (SAM3 / SeedVR2's reference
+    /// predicate — it leaves e.g. SeedVR2's `vid_in.proj` in=132 and SAM3's `2→256`/`4→256`/`258→256`
+    /// projections dense). `flatten_leading` / `cast_back` capture the site's forward shape (SAM3:
+    /// flatten, no cast-back — pure f32; SeedVR2: flatten + cast-back — bf16 DiT). Idempotent.
+    pub fn quantize_int8_fast(
+        &mut self,
+        quant: Quant,
+        skip_indivisible: bool,
+        flatten_leading: bool,
+        cast_back: bool,
+    ) -> Result<()> {
+        self.fold(
+            quant,
+            None,
+            MatmulStrategy::Int8Fast,
+            QuantForward {
+                flatten_leading,
+                cast_back,
+            },
+            skip_indivisible,
+        )
+    }
+
+    /// The shared dense→quantized fold behind [`Self::quantize`] / [`Self::quantize_onto`] /
+    /// [`Self::quantize_int8_fast`]. `onto` picks the target device (`None` = the weight's current
+    /// device); `skip_indivisible` leaves an `in_features % 32 != 0` projection dense (the SAM3/SeedVR2
+    /// predicate). No-op when already `Quantized`.
+    fn fold(
+        &mut self,
+        quant: Quant,
+        onto: Option<Device>,
+        strategy: MatmulStrategy,
+        fwd: QuantForward,
+        skip_indivisible: bool,
+    ) -> Result<()> {
+        let Self::Dense(dense) = self else {
             return Ok(());
         };
-        let device = l.weight().device().clone();
-        let w_cpu = l.weight().to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let weight = QTensor::quantize_onto(&w_cpu, ggml_dtype(quant), &device)?;
-        let bias = l.bias().cloned();
-        *self = Self::Quantized { weight, bias };
+        if skip_indivisible && !dense.in_features()?.is_multiple_of(QUANT_BLOCK) {
+            return Ok(());
+        }
+        let (w_out_in, bias) = dense.out_in_weight_bias()?;
+        let device = onto.unwrap_or(w_out_in.device().clone());
+        let w_cpu = w_out_in.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        let qtensor = QTensor::quantize_onto(&w_cpu, ggml_dtype(quant), &device)?;
+        let weight = match strategy {
+            MatmulStrategy::DequantDense => QuantWeight::Dequant(std::sync::Arc::new(qtensor)),
+            MatmulStrategy::Int8Fast => QuantWeight::Matmul(QMatMul::from_qtensor(qtensor)?),
+        };
+        // The bias follows the weight's device and is promoted to f32 for the post-matmul add.
+        let bias = match bias {
+            Some(b) => Some(b.to_device(&device)?.to_dtype(DType::F32)?),
+            None => None,
+        };
+        *self = Self::Quantized { weight, bias, fwd };
+        Ok(())
+    }
+
+    /// Move a still-**dense** projection (weight + optional bias) to `device`, in place. A no-op when
+    /// already quantized (that weight already lives on its device). Used by the CPU-staged quant path
+    /// for the leaves it must keep dense — e.g. FLUX.2's control branch `control_img_in` (260
+    /// in-features is not a multiple of the block 32, so it can't quantize) (sc-7460).
+    pub fn to_device(&mut self, device: &Device) -> Result<()> {
+        if let Self::Dense(dense) = self {
+            match dense {
+                DenseLinear::Linear(l) => {
+                    let w = l.weight().to_device(device)?;
+                    let b = match l.bias() {
+                        Some(b) => Some(b.to_device(device)?),
+                        None => None,
+                    };
+                    *dense = DenseLinear::Linear(Linear::new(w, b));
+                }
+                DenseLinear::Transposed { weight_t, bias } => {
+                    let w = weight_t.to_device(device)?;
+                    let b = match bias {
+                        Some(b) => Some(b.to_device(device)?),
+                        None => None,
+                    };
+                    *dense = DenseLinear::Transposed {
+                        weight_t: w,
+                        bias: b,
+                    };
+                }
+            }
+        }
         Ok(())
     }
 
     /// Whether this projection loaded (or was folded) to a quantized weight.
     pub fn is_quantized(&self) -> bool {
         matches!(self, Self::Quantized { .. })
+    }
+
+    /// The [`MatmulStrategy`] of a quantized projection (`None` when dense) — used by tests to assert a
+    /// site kept its intended (dequant-dense vs int8-fast) forward after the F-025 unification.
+    pub fn matmul_strategy(&self) -> Option<MatmulStrategy> {
+        match self {
+            Self::Quantized {
+                weight: QuantWeight::Dequant(_),
+                ..
+            } => Some(MatmulStrategy::DequantDense),
+            Self::Quantized {
+                weight: QuantWeight::Matmul(_),
+                ..
+            } => Some(MatmulStrategy::Int8Fast),
+            Self::Dense(_) => None,
+        }
+    }
+}
+
+impl Module for QLinear {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        QLinear::forward(self, x)
     }
 }
 
@@ -494,10 +840,10 @@ mod tests {
 
         let packed = QLinear::from_packed(&wq, &s, &b, None, &dev)?;
         assert!(packed.is_quantized());
-        let dense = QLinear::Dense(Linear::new(
+        let dense = QLinear::Dense(DenseLinear::Linear(Linear::new(
             Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
             None,
-        ));
+        )));
 
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let cos = cosine(&packed.forward(&x)?, &dense.forward(&x)?);
@@ -620,7 +966,7 @@ mod tests {
     fn quantize_dense_then_idempotent() -> Result<()> {
         let dev = Device::Cpu;
         let w = Tensor::randn(0f32, 1f32, (64, 32), &dev)?;
-        let mut lin = QLinear::Dense(Linear::new(w, None));
+        let mut lin = QLinear::Dense(DenseLinear::Linear(Linear::new(w, None)));
         lin.quantize(Quant::Q8)?;
         assert!(lin.is_quantized());
         lin.quantize(Quant::Q8)?; // no-op, must not error
@@ -774,7 +1120,7 @@ mod tests {
         // way to a real QTensor, and the byte-identical `QLinear::forward` compute path a packed
         // `from_packed` load also feeds (both dequant the weight to a dense matmul).
         let qt = QTensor::quantize_onto(&w_cpu, GgmlDType::Q4_0, &dev)?;
-        let mut lin = QLinear::Dense(Linear::new(w, None));
+        let mut lin = QLinear::Dense(DenseLinear::Linear(Linear::new(w, None)));
         lin.quantize(Quant::Q4)?;
         let dequant = lin.forward(&x)?;
 
@@ -793,6 +1139,159 @@ mod tests {
             dq > q8 + 0.05,
             "vacuous test: the raw int8 path ({q8:.4}) did not degrade vs dequant ({dq:.4})"
         );
+        Ok(())
+    }
+
+    // ---- F-025 / sc-9005 unified-seam drifts --------------------------------------------------
+
+    /// A dense [`DenseLinear::Linear`] forward equals a plain `candle_nn::Linear` exactly (the Lens /
+    /// FLUX.2 dense layout is a pass-through).
+    #[test]
+    fn dense_linear_layout_equals_plain_linear() -> Result<()> {
+        let dev = Device::Cpu;
+        let (in_dim, out_dim) = (32, 64);
+        let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?;
+        let b = Tensor::randn(0f32, 1f32, out_dim, &dev)?;
+        let plain = Linear::new(w.clone(), Some(b.clone()));
+        let ql = QLinear::Dense(DenseLinear::Linear(plain.clone()));
+
+        let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+        let dev_max = (ql.forward(&x)?.sub(&plain.forward(&x)?)?)
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert_eq!(dev_max, 0.0, "Dense(Linear) must equal plain Linear");
+        Ok(())
+    }
+
+    /// A pre-transposed [`DenseLinear::Transposed`] forward (SAM3 / SeedVR2 layout) equals the
+    /// `[out,in]` `candle_nn::Linear` result over a rank-3 activation — the flatten-GEMM path is
+    /// numerically the same `x·Wᵀ + b`.
+    #[test]
+    fn dense_transposed_layout_matches_linear_on_nd() -> Result<()> {
+        let dev = Device::Cpu;
+        let (in_dim, out_dim) = (32, 48);
+        let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?; // [out, in]
+        let b = Tensor::randn(0f32, 1f32, out_dim, &dev)?;
+        let transposed = QLinear::from_dense(DenseLinear::Transposed {
+            weight_t: w.t()?.contiguous()?,
+            bias: Some(b.clone()),
+        });
+        let plain = Linear::new(w, Some(b));
+
+        // rank-3 activation (the SeedVR2/SAM3 case that goes through the leading-dim flatten).
+        let x = Tensor::randn(0f32, 1f32, (2usize, 5usize, in_dim), &dev)?;
+        let got = transposed.forward(&x)?;
+        let want = plain.forward(&x)?;
+        assert_eq!(got.dims(), want.dims());
+        let cos = cosine(&got, &want);
+        assert!(cos > 0.99999, "transposed vs linear cosine {cos:.6}");
+        Ok(())
+    }
+
+    /// The int8-fast fold builds a [`QuantWeight::Matmul`] (candle's `QMatMul` path), quantizes/forwards
+    /// near-losslessly at Q8, and reports [`MatmulStrategy::Int8Fast`] — the FLUX.2 / SAM3 / SeedVR2
+    /// strategy, kept distinct from the dequant-dense (Lens) path.
+    #[test]
+    fn int8_fast_fold_quantizes_and_reports_strategy() -> Result<()> {
+        let dev = Device::Cpu;
+        let (in_dim, out_dim) = (32, 64);
+        let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?;
+        let b = Tensor::randn(0f32, 1f32, out_dim, &dev)?;
+        let mut lin = QLinear::Dense(DenseLinear::Linear(Linear::new(w, Some(b))));
+        let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+        let dense = lin.forward(&x)?;
+
+        lin.quantize_int8_fast(Quant::Q8, false, false, true)?;
+        assert_eq!(lin.matmul_strategy(), Some(MatmulStrategy::Int8Fast));
+        assert!(matches!(
+            lin,
+            QLinear::Quantized {
+                weight: QuantWeight::Matmul(_),
+                ..
+            }
+        ));
+        let q = lin.forward(&x)?;
+        assert_eq!(q.dims(), dense.dims());
+        let cos = cosine(&dense, &q);
+        assert!(cos > 0.999, "int8-fast Q8 cosine {cos:.5}");
+        Ok(())
+    }
+
+    /// `quantize` (the Lens fold) yields the [`MatmulStrategy::DequantDense`] (sc-7702-safe) path.
+    #[test]
+    fn dequant_dense_fold_reports_strategy() -> Result<()> {
+        let dev = Device::Cpu;
+        let w = Tensor::randn(0f32, 1f32, (64, 32), &dev)?;
+        let mut lin = QLinear::Dense(DenseLinear::Linear(Linear::new(w, None)));
+        lin.quantize(Quant::Q4)?;
+        assert_eq!(lin.matmul_strategy(), Some(MatmulStrategy::DequantDense));
+        Ok(())
+    }
+
+    /// The SAM3/SeedVR2 skip predicate: an `in_features` not a multiple of 32 stays dense; a divisible
+    /// one folds. Idempotent (a second fold is a no-op).
+    #[test]
+    fn int8_fast_skip_predicate_and_idempotent() -> Result<()> {
+        let dev = Device::Cpu;
+        // in=20, not a multiple of 32 → stays dense under the skip predicate.
+        let odd = Tensor::randn(0f32, 1f32, (64, 20), &dev)?;
+        let mut lin = QLinear::from_dense(DenseLinear::Transposed {
+            weight_t: odd.t()?.contiguous()?,
+            bias: None,
+        });
+        lin.quantize_int8_fast(Quant::Q8, true, true, false)?;
+        assert!(matches!(lin, QLinear::Dense(_)), "in=20 must stay dense");
+
+        // in=32 → folds; a second call is a no-op.
+        let w = Tensor::randn(0f32, 1f32, (64, 32), &dev)?;
+        let mut lin = QLinear::from_dense(DenseLinear::Transposed {
+            weight_t: w.t()?.contiguous()?,
+            bias: None,
+        });
+        lin.quantize_int8_fast(Quant::Q8, true, true, false)?;
+        assert!(lin.is_quantized(), "in=32 must fold");
+        lin.quantize_int8_fast(Quant::Q8, true, true, false)?; // idempotent
+        assert_eq!(lin.matmul_strategy(), Some(MatmulStrategy::Int8Fast));
+        Ok(())
+    }
+
+    /// `quantize_onto` lands the folded weight on an explicit device (here the CPU) with the int8-fast
+    /// strategy and an f32-promoted bias — FLUX.2's CPU-stage → quantize-onto path.
+    #[test]
+    fn quantize_onto_explicit_device_int8_fast() -> Result<()> {
+        let dev = Device::Cpu;
+        let w = Tensor::randn(0f32, 1f32, (64, 32), &dev)?;
+        let b = Tensor::randn(0f32, 1f32, 64, &dev)?;
+        let mut lin = QLinear::Dense(DenseLinear::Linear(Linear::new(w, Some(b))));
+        lin.quantize_onto(Quant::Q8, &dev)?;
+        assert_eq!(lin.matmul_strategy(), Some(MatmulStrategy::Int8Fast));
+        match &lin {
+            QLinear::Quantized { bias: Some(b), .. } => {
+                assert_eq!(b.dtype(), DType::F32, "bias promoted to f32")
+            }
+            _ => panic!("expected quantized with bias"),
+        }
+        // Idempotent.
+        lin.quantize_onto(Quant::Q8, &dev)?;
+        assert!(lin.is_quantized());
+        Ok(())
+    }
+
+    /// `to_device` moves a dense `Transposed` projection and is a no-op on a quantized one.
+    #[test]
+    fn to_device_moves_dense_only() -> Result<()> {
+        let dev = Device::Cpu;
+        let w = Tensor::randn(0f32, 1f32, (64, 32), &dev)?;
+        let mut lin = QLinear::from_dense(DenseLinear::Transposed {
+            weight_t: w.t()?.contiguous()?,
+            bias: None,
+        });
+        lin.to_device(&dev)?; // dense: rebuilds in place
+        assert!(matches!(lin, QLinear::Dense(_)));
+        lin.quantize(Quant::Q8)?;
+        lin.to_device(&dev)?; // quantized: no-op, must not error
+        assert!(lin.is_quantized());
         Ok(())
     }
 }

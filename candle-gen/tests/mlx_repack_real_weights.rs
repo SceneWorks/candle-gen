@@ -210,7 +210,7 @@ fn q8_requant_error_study() -> Result<()> {
 #[ignore = "needs the hosted z-image q4 tier on disk (SC9085_Q4 env)"]
 fn shared_qlinear_packed_load_matches_grid_on_real_tier() -> Result<()> {
     use candle_gen::candle_nn::{Linear, VarBuilder};
-    use candle_gen::quant::{dequant_mlx_q4_reference, lin, QLinear};
+    use candle_gen::quant::{dequant_mlx_q4_reference, lin, DenseLinear, QLinear};
 
     let q4_path = std::env::var("SC9085_Q4").expect("SC9085_Q4 not set");
     // SAFETY: immutable HF-cache blob.
@@ -240,7 +240,7 @@ fn shared_qlinear_packed_load_matches_grid_on_real_tier() -> Result<()> {
 
             // Reference: a dense linear over the exact MLX grid the pack represents.
             let grid = dequant_mlx_q4_reference(&wq, &scales, &biases)?.to_device(dev)?;
-            let dense = QLinear::Dense(Linear::new(grid, None));
+            let dense = QLinear::Dense(DenseLinear::Linear(Linear::new(grid, None)));
 
             let x = Tensor::randn(0f32, 1f32, (2, in_dim), dev)?;
             let got = ql.forward(&x)?;
