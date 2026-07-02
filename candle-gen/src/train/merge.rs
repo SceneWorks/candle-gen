@@ -96,10 +96,43 @@ impl AdapterFile {
     }
 }
 
+/// The hard ceiling on an adapter `.safetensors` size, enforced before [`read_adapter`] buffers the
+/// whole file into memory (F-078 / sc-9058). LoRA / LoKr / LoHa adapters are the tiny delta factors of
+/// a model — real ones run MBs to low single-digit GBs even for a full-rank fold of a 32B DiT; nothing
+/// legitimate approaches this. The cap turns a corrupt or malicious multi-tens-of-GB "adapter" (which
+/// candle's loader would otherwise `std::fs::read` in full, driving the process OOM) into a clean,
+/// descriptive `Err` naming the path, the cap, and the actual size — rejected on a cheap `fs::metadata`
+/// stat, before a single byte is allocated. 8 GiB leaves generous headroom above any real adapter while
+/// staying well under the memory a buffered read would demand for a hostile file. Base weights are
+/// mmap'd, not buffered, so they are (correctly) unaffected by this.
+pub const MAX_ADAPTER_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 /// Read an adapter `.safetensors` once: tensors via candle's loader (CPU, native dtype), metadata via
 /// the safetensors header reader (candle's `load` drops the header `__metadata__`, which LoKr's
 /// `rank`/`alpha` live in).
+///
+/// The file is buffered whole (unlike the mmap'd base-weight paths), so its on-disk size is checked
+/// against [`MAX_ADAPTER_BYTES`] *before* the allocation (F-078 / sc-9058): an over-cap file is a clean
+/// `Err` naming the path, cap, and actual size, never an unbounded `std::fs::read` that could OOM the
+/// process. Normal-sized adapters are unaffected — the byte-for-byte load path below is unchanged.
 pub fn read_adapter(path: &Path) -> Result<AdapterFile> {
+    read_adapter_capped(path, MAX_ADAPTER_BYTES)
+}
+
+/// [`read_adapter`] with an explicit byte cap — the shared body; `read_adapter` passes
+/// [`MAX_ADAPTER_BYTES`]. Factored out so the guard can be exercised with a tiny cap in tests without
+/// crafting a multi-GB file (the fully-in-memory buffer read is exactly why the cap exists).
+fn read_adapter_capped(path: &Path, max_bytes: u64) -> Result<AdapterFile> {
+    let size = std::fs::metadata(path)
+        .map_err(|e| CandleError::Msg(format!("stat adapter {}: {e}", path.display())))?
+        .len();
+    if size > max_bytes {
+        return Err(CandleError::Msg(format!(
+            "adapter {} is {size} bytes, exceeding the {max_bytes}-byte cap; \
+             refusing to buffer it into memory",
+            path.display(),
+        )));
+    }
     let bytes = std::fs::read(path)
         .map_err(|e| CandleError::Msg(format!("read adapter {}: {e}", path.display())))?;
     let tensors = cst::load_buffer(&bytes, &Device::Cpu)?;
@@ -664,6 +697,75 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(decomposed.lycoris_scale(), 2.0);
+    }
+
+    /// A unique per-process temp path so parallel test binaries don't collide.
+    fn tmp_adapter(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "candle_gen_merge_{tag}_{}_{:?}.safetensors",
+            std::process::id(),
+            std::thread::current().id(),
+        ))
+    }
+
+    /// Write a tiny well-formed `.safetensors` (one small tensor) to `path`.
+    fn write_tiny_adapter(path: &Path) {
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        m.insert("m.lora_down.weight".to_string(), t2(&[1.0, 2.0], 1, 2));
+        cst::save(&m, path).unwrap();
+    }
+
+    /// A normal-sized adapter loads its tensors under the size cap (F-078 / sc-9058): the guard is a
+    /// no-op for legitimate files — same bytes, same tensor map.
+    #[test]
+    fn read_adapter_loads_normal_file_under_cap() {
+        let path = tmp_adapter("normal");
+        write_tiny_adapter(&path);
+        // Real entry (8 GiB cap) and an explicit small-but-sufficient cap both load identically.
+        let af = read_adapter(&path).unwrap();
+        assert!(af.tensors.contains_key("m.lora_down.weight"));
+        let capped = read_adapter_capped(&path, MAX_ADAPTER_BYTES).unwrap();
+        assert_eq!(capped.tensors.len(), af.tensors.len());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// An over-cap adapter is a clean, descriptive `Err` — not an OOM, not a panic — naming the path,
+    /// the cap, and the actual size, BEFORE the file is buffered into memory (F-078 / sc-9058). Uses a
+    /// tiny (1-byte) cap against a small real file so no GBs are allocated.
+    #[test]
+    fn read_adapter_over_cap_errs_cleanly() {
+        let path = tmp_adapter("overcap");
+        write_tiny_adapter(&path);
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size > 1, "fixture must exceed the 1-byte test cap");
+        let err = match read_adapter_capped(&path, 1) {
+            Ok(_) => panic!("over-cap adapter must be rejected, not loaded"),
+            Err(e) => e.to_string(),
+        };
+        std::fs::remove_file(&path).ok();
+        assert!(err.contains("adapter"), "message names the subject: {err}");
+        assert!(
+            err.contains(&size.to_string()),
+            "message names the actual size ({size}): {err}"
+        );
+        assert!(err.contains("cap"), "message names the cap: {err}");
+        assert!(
+            err.contains(&path.display().to_string())
+                || err.contains(path.file_name().unwrap().to_str().unwrap()),
+            "message names the path: {err}"
+        );
+    }
+
+    /// A missing adapter path is a clean stat `Err`, not a panic (the cap check stats first).
+    #[test]
+    fn read_adapter_missing_path_errs() {
+        let path = tmp_adapter("does_not_exist_xyz");
+        std::fs::remove_file(&path).ok();
+        let err = match read_adapter(&path) {
+            Ok(_) => panic!("missing adapter must error"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("stat adapter"), "got: {err}");
     }
 
     /// The shared zero-match error carries the family tag, hint, and file count.
