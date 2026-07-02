@@ -33,12 +33,14 @@
 //! DiT device.
 //!
 //! **Text encoder & VAE.** This seam is the **DiT** only. The gpt-oss text encoder ([`crate::text_encoder`])
-//! has its own MXFP4 fused-expert quant path (sc-5111) and is not touched here; the Flux.2 VAE stays
+//! currently loads its experts from the dense MXFP4 `SceneWorks/Lens` diffusers snapshot and transcodes
+//! them via its own fused-expert quant path (sc-5111); it is not touched here, and the Flux.2 VAE stays
 //! f32. Note the hosted `SceneWorks/lens-mlx` tier packs its `text_encoder/` experts in a *3-D* MLX
 //! affine format (`model.layers.*.mlp.experts.{gate_up_proj,down_proj}` + `.scales`/`.biases`), which is
-//! **not** the 2-D `Linear` shape the shared loaders consume — a packed-tier encoder loader is tracked
-//! separately (sc-9089 umbrella), so the DiT here loads packed while the encoder loads from the dense
-//! `SceneWorks/Lens` snapshot's MXFP4 experts.
+//! **not** the 2-D `Linear` shape the shared loaders consume — so a dedicated packed 3-D fused-expert
+//! encoder loader (which would let the encoder read the packed `lens-mlx` experts directly, matching the
+//! DiT's packed tier) is deferred and tracked in Shortcut story **sc-9457**. Until it lands, the DiT here
+//! loads packed while the encoder still loads from the dense `SceneWorks/Lens` snapshot's MXFP4 experts.
 
 use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
 use candle_gen::candle_core::{DType, Device, Result, Tensor};

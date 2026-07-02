@@ -21,8 +21,9 @@
 //! triple (`{base}.weight` u32 + `.scales` + `.biases`) — the DiT then loads **straight from the packed
 //! parts** (no dense bf16 staging, no load-then-quantize pass; `LensTransformer::quantize` no-ops over
 //! the already-packed weights). With `--quant q4` the gpt-oss MXFP4 encoder still transcodes to Q4 as
-//! before (the packed-encoder tier is a separate story — the encoder here loads its MXFP4 experts from
-//! the assembled snapshot). A coherent render proves the packed DiT denoises end-to-end on sm_120.
+//! before — the encoder here loads its MXFP4 experts from the dense `SceneWorks/Lens` snapshot (sc-5111);
+//! a dedicated packed 3-D fused-expert encoder loader (end-to-end packed lens-mlx tier) is deferred and
+//! tracked in Shortcut story **sc-9457**. A coherent render proves the packed DiT denoises end-to-end on sm_120.
 
 use std::path::PathBuf;
 
