@@ -6,8 +6,10 @@
 //! DiT's packed tokens and this 16-ch latent and is handled by `flux::sampling::unpack` in the
 //! pipeline). The only deltas vs. the flux2 decoder this is adapted from are `LATENT_CHANNELS 32→16`
 //! and the diffusers `z/scaling + shift` un-scale (FLUX `scaling_factor = 0.3611`,
-//! `shift_factor = 0.1159`), folded into [`Vae::decode`] (pipeline-unscale + `post_quant_conv` +
-//! decoder, exactly as candle's `flux::autoencoder` does).
+//! `shift_factor = 0.1159`), folded into [`Vae::decode`] (pipeline-unscale + optional
+//! `post_quant_conv` + decoder). The real Chroma/FLUX.1 16-ch VAE ships **no** `post_quant_conv`
+//! (matching the mlx parity reference `mlx_gen_flux::load_vae`), so it is loaded/applied only when a
+//! snapshot happens to carry one — see [`Vae`].
 //!
 //! The decoder tree is the diffusers layout: `conv_in → mid(resnet, attn, resnet) → 4 up_blocks
 //! (3 resnets each, upsampler on all but the last) → groupnorm/silu → conv_out`. GroupNorm eps 1e-6,
@@ -164,7 +166,14 @@ impl UpBlock {
 /// The Chroma/FLUX 16-channel AutoencoderKL — decode-only (txt2img). Build from a `vae/` VarBuilder
 /// (diffusers AutoencoderKL keys, f32).
 pub struct Vae {
-    post_quant_conv: Conv2d,
+    /// The `post_quant_conv` 1×1 conv, **when the snapshot ships one**. The real Chroma VAE
+    /// (`lodestones/Chroma1-*`, mirrored verbatim into the `SceneWorks/chroma1-*-mlx` tiers) is a FLUX.1
+    /// 16-ch AutoencoderKL that carries **no** `post_quant_conv` — matching the mlx parity reference
+    /// (`mlx_gen_flux::load_vae`), whose decode never applies one. It is loaded (and applied) only if
+    /// present, so a snapshot that does ship it stays byte-exact and one that omits it decodes directly
+    /// from the un-scaled latent (sc-9409: unblocks the real Chroma render, which previously errored on
+    /// the missing `post_quant_conv.weight` key).
+    post_quant_conv: Option<Conv2d>,
     conv_in: Conv2d,
     mid_resnet0: Resnet,
     mid_attn: MidAttention,
@@ -176,7 +185,16 @@ pub struct Vae {
 
 impl Vae {
     pub fn new(vb: VarBuilder) -> Result<Self> {
-        let post_quant_conv = conv1x1(LATENT_CHANNELS, LATENT_CHANNELS, vb.pp("post_quant_conv"))?;
+        // Optional: the real Chroma/FLUX.1 16-ch VAE ships no `post_quant_conv` (see the field docs).
+        let post_quant_conv = if vb.contains_tensor("post_quant_conv.weight") {
+            Some(conv1x1(
+                LATENT_CHANNELS,
+                LATENT_CHANNELS,
+                vb.pp("post_quant_conv"),
+            )?)
+        } else {
+            None
+        };
         let dec = vb.pp("decoder");
         let top = *BLOCK_OUT.last().unwrap(); // 512
         let conv_in = conv3x3(LATENT_CHANNELS, top, dec.pp("conv_in"))?;
@@ -227,7 +245,12 @@ impl Vae {
     /// into the VAE decode (`post_quant_conv → decoder`), matching candle's `flux::autoencoder`.
     pub fn decode(&self, latents: &Tensor) -> Result<Tensor> {
         let z = ((latents.to_dtype(DType::F32)? / SCALING_FACTOR)? + SHIFT_FACTOR)?;
-        let z = self.post_quant_conv.forward(&z)?;
+        // `post_quant_conv` only when the snapshot ships it (the real Chroma VAE omits it — the mlx
+        // parity reference likewise never applies one).
+        let z = match &self.post_quant_conv {
+            Some(pqc) => pqc.forward(&z)?,
+            None => z,
+        };
         let mut h = self.conv_in.forward(&z)?;
         h = self.mid_resnet0.forward(&h)?;
         h = self.mid_attn.forward(&h)?;
