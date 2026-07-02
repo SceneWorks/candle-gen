@@ -12,7 +12,7 @@ use std::f64::consts::PI;
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 
-use crate::config::{TransformerConfig, SPATIAL_SCALE, TEMPORAL_SCALE};
+use crate::config::{SPATIAL_SCALE, TEMPORAL_SCALE};
 
 /// Build the f32 position grid `[1, 3, T, 2]` (last axis `[start, end]`) for a latent `(frames,
 /// h, w)` token grid, C-major over `(frame, height, width)`. Frame axis: `(t+e)·TEMPORAL_SCALE`,
@@ -50,78 +50,6 @@ pub fn create_position_grid(
         }
     }
     Tensor::from_vec(data, (1, 3, num_patches, 2), device)
-}
-
-/// Precompute the SPLIT RoPE `(cos, sin)` tables, each f32 `[1, num_heads, T, head_dim/2]`.
-///
-/// * `positions` — the f32 grid `[1, 3, T, 2]` from [`create_position_grid`].
-/// * `dim` — the **inner dim** (`heads · head_dim`, 4096 for video).
-/// * `theta` — base frequency (10000).
-/// * `max_pos` — per-axis maxima `[20, 2048, 2048]`.
-pub fn precompute_split_freqs(
-    positions: &Tensor,
-    dim: usize,
-    theta: f64,
-    max_pos: &[i32; 3],
-    num_heads: usize,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
-    let (_b, n_pos_dims, seq, _two) = positions.dims4()?;
-    assert_eq!(n_pos_dims, 3, "video split-rope expects 3 position axes");
-    let pos = positions.flatten_all()?.to_vec1::<f32>()?;
-    // C-order index into (1, 3, T, 2): ((d)*T + t)*2 + e.
-    let idx = |d: usize, t: usize, e: usize| (d * seq + t) * 2 + e;
-
-    let n_elem = 2 * n_pos_dims; // 6
-    let num_indices = (dim / n_elem).max(1); // 682
-    let step = if num_indices == 1 {
-        0.0
-    } else {
-        1.0 / (num_indices - 1) as f64
-    };
-    let indices: Vec<f64> = (0..num_indices)
-        .map(|i| theta.powf(i as f64 * step) * (PI / 2.0))
-        .collect();
-
-    let current = num_indices * n_pos_dims; // 2046
-    let expected = dim / 2; // 2048
-    let pad_size = expected.saturating_sub(current); // 2
-    let head_half = expected / num_heads; // 64
-
-    let total = num_heads * seq * head_half;
-    let mut cos_out = vec![0f32; total];
-    let mut sin_out = vec![0f32; total];
-    for t in 0..seq {
-        let mut scaled = [0f64; 3];
-        for (d, s) in scaled.iter_mut().enumerate() {
-            let start = pos[idx(d, t, 0)] as f64;
-            let end = pos[idx(d, t, 1)] as f64;
-            let mid = (start + end) / 2.0;
-            *s = mid / max_pos[d] as f64 * 2.0 - 1.0;
-        }
-        for h in 0..num_heads {
-            for p in 0..head_half {
-                let flat = h * head_half + p;
-                let (c, s) = if flat < pad_size {
-                    (1.0f32, 0.0f32)
-                } else {
-                    let k = flat - pad_size;
-                    let i = k / n_pos_dims;
-                    let d = k % n_pos_dims;
-                    let ang = scaled[d] * indices[i];
-                    (ang.cos() as f32, ang.sin() as f32)
-                };
-                let o = (h * seq + t) * head_half + p;
-                cos_out[o] = c;
-                sin_out[o] = s;
-            }
-        }
-    }
-    let shape = (1, num_heads, seq, head_half);
-    Ok((
-        Tensor::from_vec(cos_out, shape, device)?,
-        Tensor::from_vec(sin_out, shape, device)?,
-    ))
 }
 
 /// Apply SPLIT (half-rotation) RoPE: `x` is `[B, H, T, D]`, `cos`/`sin` are `[1, H, T, D/2]`.
@@ -194,8 +122,8 @@ pub fn precompute_connector_freqs(
     ))
 }
 
-/// N-dim SPLIT RoPE — the generalization of [`precompute_split_freqs`] over an arbitrary number of
-/// position axes (1 for audio/cross-modal, 3 for video). `positions` is `[1, D, T, 2]`; `max_pos`
+/// N-dim SPLIT RoPE — split-RoPE `(cos, sin)` tables over an arbitrary number of position axes
+/// (1 for audio/cross-modal, 3 for video). `positions` is `[1, D, T, 2]`; `max_pos`
 /// carries one maximum per axis (`len == D`). Each token's per-axis scaled position is
 /// `mid/max_pos·2−1`; the padded `dim/2` frequency slots are filled C-major over `(freq_index, axis)`.
 pub fn precompute_split_freqs_nd(
@@ -294,24 +222,4 @@ pub fn create_audio_position_grid(audio_frames: usize, device: &Device) -> Resul
         data[f * 2 + 1] = time(f as i64 + 1);
     }
     Tensor::from_vec(data, (1, 1, t, 2), device)
-}
-
-/// Convenience: build the DiT video position grid + split-RoPE tables for a latent token grid.
-pub fn video_rope(
-    cfg: &TransformerConfig,
-    frames: usize,
-    height: usize,
-    width: usize,
-    fps: f32,
-    device: &Device,
-) -> Result<(Tensor, Tensor)> {
-    let grid = create_position_grid(frames, height, width, fps, device)?;
-    precompute_split_freqs(
-        &grid,
-        cfg.inner_dim(),
-        cfg.rope_theta,
-        &cfg.rope_max_pos,
-        cfg.num_heads,
-        device,
-    )
 }

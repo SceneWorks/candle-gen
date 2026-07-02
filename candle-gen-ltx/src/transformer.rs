@@ -1,7 +1,7 @@
-//! LTX-2.3 **video DiT** (`AVTransformer3DModel`, video-only / gated path) — port of mlx-gen-ltx
-//! `transformer.rs` (`LtxDiT`). patchify_proj (128→4096) → adaLN-single (timestep→9·dim) +
-//! prompt-adaLN (→2·dim) → 48 gated blocks → affine-false LayerNorm output head + 2-row scale-shift
-//! → proj_out (→128) velocity.
+//! LTX-2.3 **AudioVideo DiT** (`AVTransformer3DModel`) — port of mlx-gen-ltx `transformer.rs`
+//! (`AvDiT`). Each stream: patchify_proj (128→4096) → adaLN-single (timestep→9·dim) + prompt-adaLN
+//! (→2·dim) → 48 gated blocks → affine-false LayerNorm output head + 2-row scale-shift → proj_out
+//! (→128) velocity.
 //!
 //! Per-block (gated 9-row `scale_shift_table` + adaLN-single timestep; rows [shift,scale,gate] ×
 //! {MSA 0:3, FF 3:6, text-cross-attn 6:9}): MSA self-attn (q/k RMSNorm over full inner, split 3-D
@@ -14,7 +14,7 @@ use candle_gen::candle_nn::{
     ops::rms_norm, ops::sigmoid, ops::softmax_last_dim, Linear, Module, VarBuilder,
 };
 
-use crate::config::{AvConfig, TransformerConfig};
+use crate::config::AvConfig;
 use crate::rope::{apply_split_rope, precompute_split_freqs_nd, time_axis};
 
 fn linear(vb: &VarBuilder, key: &str) -> Result<Linear> {
@@ -91,10 +91,6 @@ struct Attention {
 }
 
 impl Attention {
-    fn load(vb: VarBuilder, cfg: &TransformerConfig) -> Result<Self> {
-        Self::load_with_dims(vb, cfg.num_heads, cfg.head_dim, cfg.norm_eps)
-    }
-
     /// Load with explicit head dims — the cross-modal + audio attns run at the audio inner dim
     /// (heads 32 × head_dim 64 = 2048), and the q/kv input dims ride on the loaded weight shapes.
     fn load_with_dims(vb: VarBuilder, heads: usize, dim_head: usize, eps: f64) -> Result<Self> {
@@ -217,64 +213,6 @@ impl AdaLayerNormSingle {
     }
 }
 
-struct VideoBlock {
-    attn1: Attention,
-    attn2: Attention,
-    ff: FeedForward,
-    scale_shift_table: Tensor,        // (9, inner) bf16
-    prompt_scale_shift_table: Tensor, // (2, inner) bf16
-    eps: f64,
-}
-
-impl VideoBlock {
-    fn load(vb: VarBuilder, cfg: &TransformerConfig) -> Result<Self> {
-        Ok(Self {
-            attn1: Attention::load(vb.pp("attn1"), cfg)?,
-            attn2: Attention::load(vb.pp("attn2"), cfg)?,
-            ff: FeedForward::load(vb.pp("ff"))?,
-            scale_shift_table: vb
-                .get_unchecked("scale_shift_table")?
-                .to_dtype(DType::BF16)?,
-            prompt_scale_shift_table: vb
-                .get_unchecked("prompt_scale_shift_table")?
-                .to_dtype(DType::BF16)?,
-            eps: cfg.norm_eps,
-        })
-    }
-
-    fn forward(
-        &self,
-        x: &Tensor,
-        ts_emb: &Tensor,
-        prompt_ts: &Tensor,
-        context: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-    ) -> Result<Tensor> {
-        // MSA (rows 0:3 = shift, scale, gate).
-        let msa = ada_values(&self.scale_shift_table, ts_emb, 0, 3)?;
-        let norm = modulate(&rms_noweight(x, self.eps)?, &msa[1], &msa[0])?;
-        let attn = self.attn1.forward(&norm, None, Some((cos, sin)), None)?;
-        let mut x = gated(x, &attn, &msa[2])?;
-
-        // prompt-adaLN on the text context (rows 0,1 = shift, scale).
-        let p = ada_values(&self.prompt_scale_shift_table, prompt_ts, 0, 2)?;
-        let v_context = modulate(context, &p[1], &p[0])?;
-
-        // Text cross-attention (rows 6:9).
-        let ca = ada_values(&self.scale_shift_table, ts_emb, 6, 9)?;
-        let norm_ca = modulate(&rms_noweight(&x, self.eps)?, &ca[1], &ca[0])?;
-        let cross = self.attn2.forward(&norm_ca, Some(&v_context), None, None)?;
-        x = gated(&x, &cross, &ca[2])?;
-
-        // FeedForward (rows 3:6).
-        let mlp = ada_values(&self.scale_shift_table, ts_emb, 3, 6)?;
-        let norm_mlp = modulate(&rms_noweight(&x, self.eps)?, &mlp[1], &mlp[0])?;
-        let ff = self.ff.forward(&norm_mlp)?;
-        gated(&x, &ff, &mlp[2])
-    }
-}
-
 /// Affine-false LayerNorm over the last axis (computed in f32, cast back).
 fn layer_norm_noaffine(x: &Tensor, eps: f64) -> Result<Tensor> {
     let xf = x.to_dtype(DType::F32)?.contiguous()?;
@@ -285,97 +223,8 @@ fn layer_norm_noaffine(x: &Tensor, eps: f64) -> Result<Tensor> {
     normed.to_dtype(x.dtype())
 }
 
-pub struct LtxDiT {
-    patchify_proj: Linear,
-    adaln: AdaLayerNormSingle,
-    prompt_adaln: AdaLayerNormSingle,
-    blocks: Vec<VideoBlock>,
-    scale_shift_table: Tensor, // (2, inner) bf16
-    proj_out: Linear,
-    cfg: TransformerConfig,
-    device: Device,
-}
-
-impl LtxDiT {
-    /// Build from a VarBuilder rooted at `model.diffusion_model.`.
-    pub fn new(vb: VarBuilder, cfg: &TransformerConfig) -> Result<Self> {
-        let device = vb.device().clone();
-        let mut blocks = Vec::with_capacity(cfg.num_layers);
-        for i in 0..cfg.num_layers {
-            blocks.push(VideoBlock::load(
-                vb.pp(format!("transformer_blocks.{i}")),
-                cfg,
-            )?);
-        }
-        Ok(Self {
-            patchify_proj: linear(&vb, "patchify_proj")?,
-            adaln: AdaLayerNormSingle::load(vb.pp("adaln_single"))?,
-            prompt_adaln: AdaLayerNormSingle::load(vb.pp("prompt_adaln_single"))?,
-            blocks,
-            scale_shift_table: vb
-                .get_unchecked("scale_shift_table")?
-                .to_dtype(DType::BF16)?,
-            proj_out: linear(&vb, "proj_out")?,
-            cfg: cfg.clone(),
-            device,
-        })
-    }
-
-    /// Velocity forward.
-    ///
-    /// * `latent_tokens` — `[B, S, 128]` patchified latent tokens.
-    /// * `sigma` — scalar σ (uniform per-token T2V timestep).
-    /// * `context` — `[B, ctx, 4096]` connector embeddings.
-    /// * `cos`/`sin` — split-RoPE tables `[1, heads, S, 64]` (f32).
-    pub fn forward(
-        &self,
-        latent_tokens: &Tensor,
-        sigma: f64,
-        context: &Tensor,
-        cos: &Tensor,
-        sin: &Tensor,
-    ) -> Result<Tensor> {
-        let b = latent_tokens.dim(0)?;
-        let inner = self.cfg.inner_dim();
-        let coeff = self.cfg.adaln_coeff;
-
-        let x = self
-            .patchify_proj
-            .forward(&latent_tokens.to_dtype(DType::BF16)?)?;
-
-        // adaLN-single + prompt-adaLN. Timestep enters as f32 (× scale_multiplier in f32, sinusoid in
-        // f32) so the bf16-rounding path is avoided (f32 input is the reference's "unaffected" case).
-        let ts_scaled = (sigma * self.cfg.timestep_scale_multiplier) as f32;
-        let ts_flat = Tensor::from_vec(vec![ts_scaled], (b,), &self.device)?;
-        let (ts_emb, emb_ts) = self.adaln.forward(&ts_flat, &self.device)?;
-        let ts_emb = ts_emb.reshape((b, 1, coeff * inner))?;
-        let emb_ts = emb_ts.reshape((b, 1, inner))?;
-        let (prompt_ts, _) = self.prompt_adaln.forward(&ts_flat, &self.device)?;
-        let prompt_ts = prompt_ts.reshape((b, 1, 2 * inner))?;
-
-        let context = context.to_dtype(DType::BF16)?;
-        let mut h = x;
-        for block in &self.blocks {
-            h = block.forward(&h, &ts_emb, &prompt_ts, &context, cos, sin)?;
-        }
-        self.output_head(&h, &emb_ts)
-    }
-
-    fn output_head(&self, h: &Tensor, emb_ts: &Tensor) -> Result<Tensor> {
-        let b = h.dim(0)?;
-        let inner = self.cfg.inner_dim();
-        let table = self.scale_shift_table.reshape((1, 1, 2, inner))?;
-        let ss = table.broadcast_add(&emb_ts.reshape((b, 1, 1, inner))?)?; // (b,1,2,inner)
-        let shift = ss.narrow(2, 0, 1)?.squeeze(2)?;
-        let scale = ss.narrow(2, 1, 1)?.squeeze(2)?;
-        let normed = layer_norm_noaffine(h, self.cfg.norm_eps)?;
-        let out = modulate(&normed, &scale, &shift)?;
-        self.proj_out.forward(&out)
-    }
-}
-
 // =================================================================================================
-// AvDiT — the dual-modal AudioVideo DiT (sc-5495). The video stack ([`AvStream`] + `VideoBlock`-shaped
+// AvDiT — the dual-modal AudioVideo DiT (sc-5495). The video stack ([`AvStream`] + gated video
 // attns) + an audio stack at the audio inner dim (2048) + bidirectional cross-modal attention. Per
 // block: video self+text-CA → audio self+text-CA → cross-modal (a2v updates video, v2a updates audio)
 // → video FF → audio FF. Predicts `(video_velocity, audio_velocity)`. Mirrors mlx-gen-ltx `AvDiT`.
