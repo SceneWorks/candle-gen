@@ -13,14 +13,14 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
 
 use crate::config::{TextEncoderConfig, TransformerConfig, NEGATIVE_FALLBACK};
+use crate::control_common;
 use crate::pipeline;
 use crate::text_encoder::QwenTextEncoder;
 use crate::transformer::{QwenControlNet, QwenTransformer};
@@ -29,6 +29,8 @@ use crate::vae::{QwenVae, QwenVaeEncoder};
 /// The transformer + control branch run bf16 (native dtype); the encoder + VAE run f32.
 const DIT_DTYPE: DType = DType::BF16;
 const ENC_DTYPE: DType = DType::F32;
+/// Error-message prefix for this lane (shared [`control_common`] helpers thread it through).
+const LABEL: &str = "qwen control";
 /// The InstantX `Qwen-Image-ControlNet-Union` ships a 5-block control transformer.
 const CONTROL_LAYERS: usize = 5;
 /// Default ControlNet conditioning scale (the strict-pose tier).
@@ -97,36 +99,6 @@ fn resolve_controlnet_file(path: &Path) -> Result<PathBuf> {
     )))
 }
 
-/// mmap a [`VarBuilder`] over every `.safetensors` in `root/sub` at `dtype`.
-fn component_vb(
-    root: &Path,
-    sub: &str,
-    dtype: DType,
-    device: &Device,
-) -> Result<VarBuilder<'static>> {
-    let dir = root.join(sub);
-    if !dir.is_dir() {
-        return Err(CandleError::Msg(format!(
-            "qwen control: snapshot is missing the {sub}/ dir (at {})",
-            root.display()
-        )));
-    }
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| CandleError::Msg(format!("qwen control: read {sub}/: {e}")))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "qwen control: no .safetensors in {sub}/ (at {})",
-            dir.display()
-        )));
-    }
-    // SAFETY: mmap of read-only weight files; standard candle loading path.
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? })
-}
-
 /// The loaded Qwen-Image ControlNet model: the reused base text encoder / DiT / VAE-decoder, plus the
 /// VAE encoder (to encode the pose skeleton) and the InstantX control branch.
 pub struct QwenControl {
@@ -150,14 +122,18 @@ impl QwenControl {
 
         let te = QwenTextEncoder::new(
             &te_cfg,
-            component_vb(&root, "text_encoder", ENC_DTYPE, &device)?,
+            control_common::component_vb(&root, "text_encoder", ENC_DTYPE, &device, LABEL)?,
         )?;
         let transformer = QwenTransformer::new(
             &dit_cfg,
-            component_vb(&root, "transformer", DIT_DTYPE, &device)?,
+            control_common::component_vb(&root, "transformer", DIT_DTYPE, &device, LABEL)?,
         )?;
-        let vae = QwenVae::new(component_vb(&root, "vae", ENC_DTYPE, &device)?)?;
-        let vae_encoder = QwenVaeEncoder::new(component_vb(&root, "vae", ENC_DTYPE, &device)?)?;
+        let vae = QwenVae::new(control_common::component_vb(
+            &root, "vae", ENC_DTYPE, &device, LABEL,
+        )?)?;
+        let vae_encoder = QwenVaeEncoder::new(control_common::component_vb(
+            &root, "vae", ENC_DTYPE, &device, LABEL,
+        )?)?;
 
         let cn_file = resolve_controlnet_file(&paths.controlnet)?;
         // SAFETY: mmap of a read-only weight file.
@@ -179,23 +155,15 @@ impl QwenControl {
     /// Tokenize + encode `prompt` → `prompt_embeds` `[1, seq, 3584]` at the DiT dtype (bf16). Mirrors
     /// the txt2img `Pipeline::encode`.
     fn encode(&self, prompt: &str) -> Result<Tensor> {
-        let tok = TextTokenizer::from_file(
-            self.root.join("tokenizer/tokenizer.json"),
-            TokenizerConfig {
-                max_length: self.te_cfg.max_length,
-                pad_token_id: self.te_cfg.pad_token_id,
-                chat_template: ChatTemplate::QwenImage,
-                pad_to_max_length: false,
-            },
+        control_common::encode(
+            &self.root,
+            &self.te_cfg,
+            &self.te,
+            &self.device,
+            DIT_DTYPE,
+            prompt,
+            LABEL,
         )
-        .map_err(|e| CandleError::Msg(format!("qwen control: load tokenizer: {e}")))?;
-        let out = tok
-            .tokenize(prompt)
-            .map_err(|e| CandleError::Msg(format!("qwen control: tokenize: {e}")))?;
-        let len = out.ids.len();
-        let ids: Vec<u32> = out.ids.iter().map(|&i| i as u32).collect();
-        let input_ids = Tensor::from_vec(ids, (1, len), &self.device)?;
-        Ok(self.te.prompt_embeds(&input_ids)?.to_dtype(DIT_DTYPE)?)
     }
 
     /// Strict-pose generation: condition the base MMDiT on `skeleton` (a rendered OpenPose image at the
@@ -225,7 +193,13 @@ impl QwenControl {
         };
 
         // VAE-encode + pack the pose skeleton → the control latent `[1, seq, 64]` (constant across steps).
-        let control_img = preprocess_control_image(skeleton, req.width, req.height, &self.device)?;
+        let control_img = control_common::preprocess_control_image(
+            skeleton,
+            req.width,
+            req.height,
+            &self.device,
+            LABEL,
+        )?;
         let control_latent = self.vae_encoder.encode(&control_img)?;
         let control_cond =
             pipeline::pack_latents(&control_latent, req.width, req.height)?.to_dtype(DIT_DTYPE)?;
@@ -298,63 +272,14 @@ impl QwenControl {
         on_progress(Progress::Decoding);
         let lat = pipeline::unpack_latents(&latents, req.width, req.height)?;
         let decoded = self.vae.decode(&lat)?;
-        to_image(&decoded)
+        control_common::to_image(&decoded)
     }
-}
-
-/// A pre-rendered RGB8 control image (the OpenPose skeleton, at the request size) → `[1, 3, H, W]` f32
-/// in `[-1, 1]` (the VAE encoder's input range). Requires `image` already at `width × height` (the
-/// worker renders the skeleton at the target size — no silent stretch).
-fn preprocess_control_image(
-    image: &Image,
-    width: u32,
-    height: u32,
-    device: &Device,
-) -> Result<Tensor> {
-    if image.width != width || image.height != height {
-        return Err(CandleError::Msg(format!(
-            "qwen control: control image {}x{} must match the request {width}x{height}",
-            image.width, image.height
-        )));
-    }
-    let (w, h) = (width as usize, height as usize);
-    if image.pixels.len() != w * h * 3 {
-        return Err(CandleError::Msg(format!(
-            "qwen control: control image buffer {} != {w}x{h}x3",
-            image.pixels.len()
-        )));
-    }
-    let mut data = vec![0f32; 3 * h * w];
-    for y in 0..h {
-        for x in 0..w {
-            for c in 0..3 {
-                let v = image.pixels[(y * w + x) * 3 + c] as f32 / 127.5 - 1.0;
-                data[c * h * w + y * w + x] = v;
-            }
-        }
-    }
-    Ok(Tensor::from_vec(data, (1, 3, h, w), device)?)
-}
-
-/// VAE output `[1, 3, H, W]` in `[-1, 1]` → an RGB8 [`Image`].
-fn to_image(decoded: &Tensor) -> Result<Image> {
-    let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
-    let img = img.i(0)?.to_device(&Device::Cpu)?;
-    let (c, h, w) = img.dims3()?;
-    if c != 3 {
-        return Err(CandleError::Msg(format!("expected 3 channels, got {c}")));
-    }
-    let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
-    Ok(Image {
-        width: w as u32,
-        height: h as u32,
-        pixels,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::gen_core::Image;
 
     #[test]
     fn request_defaults() {
@@ -378,6 +303,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// This lane's control-image preprocessing goes through the shared [`control_common`] helper with
+    /// this lane's `LABEL`; the numeric behavior is unchanged from the pre-dedup verbatim copy.
     #[test]
     fn control_preprocess_shape_and_range() {
         let img = Image {
@@ -385,12 +312,15 @@ mod tests {
             height: 8,
             pixels: vec![255u8; 16 * 8 * 3],
         };
-        let t = preprocess_control_image(&img, 16, 8, &Device::Cpu).unwrap();
+        let t = control_common::preprocess_control_image(&img, 16, 8, &Device::Cpu, LABEL).unwrap();
         assert_eq!(t.dims(), &[1, 3, 8, 16]);
         // 255 → 255/127.5 - 1 = 1.0
         let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(v.iter().all(|x| (x - 1.0).abs() < 1e-4));
-        // size mismatch errors loudly.
-        assert!(preprocess_control_image(&img, 32, 8, &Device::Cpu).is_err());
+        // size mismatch errors loudly, with this lane's label.
+        let e = control_common::preprocess_control_image(&img, 32, 8, &Device::Cpu, LABEL)
+            .unwrap_err()
+            .to_string();
+        assert!(e.starts_with("qwen control:"), "got: {e}");
     }
 }

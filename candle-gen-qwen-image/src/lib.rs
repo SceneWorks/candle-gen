@@ -28,6 +28,11 @@ pub mod config;
 // inject into the frozen base MMDiT. A bespoke provider the worker drives directly (the registered
 // `qwen_image` descriptor stays txt2img-only).
 pub mod control;
+// Shared scaffolding for the two control lanes (`control` + `control_fun`): the identical component
+// loader, prompt encoder, control-image preprocessor, and VAE-output converter, parameterized by an
+// error `label` (sc-9011, F-074). De-duplicates what used to be verbatim copies; both lanes' outputs are
+// preserved exactly.
+mod control_common;
 // Qwen-Image **2512-Fun-Controlnet-Union** (VACE) control — the candle structural-control lane
 // (sc-8350, mirrors mlx sc-8267). A `control_img_in` patch embedder feeds a control state threaded
 // through 5 VACE control blocks (seeded by `before_proj`), each emitting a zero-init `after_proj` hint
