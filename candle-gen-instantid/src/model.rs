@@ -92,9 +92,11 @@ fn validate_kps(kps: &[(f32, f32)]) -> Result<()> {
 
 /// Reject `steps == 0` with a typed error instead of running zero denoise iterations and VAE-decoding
 /// the pure scaled prior noise (sc-9016, F-032). Mirrors the registered `SdxlGenerator::validate` steps
-/// floor; the worker-driven InstantID path has no gen-core capability floor upstream of it. Every public
-/// entry (`generate`, `generate_angle`, `generate_with_kps`) funnels through `generate_with`, so guarding
-/// there covers the whole surface.
+/// floor; the worker-driven InstantID path has no gen-core capability floor upstream of it. The default
+/// entries (`generate`, `generate_angle`, `generate_with_kps`) funnel through `generate_with`; the
+/// worker-driven pose path (`generate_pose`, `generate_pose_with`, sc-3117) bypasses `generate_with` and
+/// runs its own `run_identity_denoise`, so it calls `check_steps` directly. Both `run_identity_denoise`
+/// callers are guarded.
 fn check_steps(steps: usize) -> Result<()> {
     if steps == 0 {
         return Err(CandleError::Msg(
@@ -574,6 +576,7 @@ impl InstantId {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        check_steps(req.steps)?;
         check_embedding(embedding)?;
         if let Some(kps) = face_kps {
             validate_kps(kps)?;
@@ -796,6 +799,27 @@ mod tests {
         assert!(err.contains("steps must be >= 1"), "got: {err}");
         assert!(check_steps(1).is_ok());
         assert!(check_steps(30).is_ok());
+    }
+
+    /// The worker-driven pose entry (`generate_pose`/`generate_pose_with`, sc-3117) bypasses
+    /// `generate_with` and runs its own `run_identity_denoise`, so it must guard `steps == 0` itself.
+    /// It applies `check_steps(req.steps)` right after the cancel check — assert that call rejects a
+    /// zero-step pose request before any denoise/VAE-decode of undenoised noise (sc-9016, F-032).
+    #[test]
+    fn pose_entry_rejects_zero_steps() {
+        let req = InstantIdRequest {
+            steps: 0,
+            ..Default::default()
+        };
+        // The exact guard `generate_pose_with` now runs on its request.
+        let err = check_steps(req.steps).unwrap_err().to_string();
+        assert!(err.contains("steps must be >= 1"), "got: {err}");
+        // A worker-typical pose step count passes the same guard.
+        let ok = InstantIdRequest {
+            steps: 30,
+            ..Default::default()
+        };
+        assert!(check_steps(ok.steps).is_ok());
     }
 
     /// `place_face_kps` centers the face landmarks at the head box and scales by the face-height frac:
