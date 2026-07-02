@@ -63,6 +63,8 @@ use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::{Module, VarBuilder};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
+// Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
+use candle_gen::image_seed;
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::clip::text_model::{
     Activation as ClipActivation, ClipTextConfig, ClipTextTransformer,
@@ -709,14 +711,6 @@ pub fn decode_latents(
     })
 }
 
-/// The per-image seed within a batch: image `index` of a `count`-image request renders at
-/// `base_seed + index` (wrapping). Mirrors `mlx-gen-flux`'s `seed + i` convention, so the *n*-th
-/// image of a batch reproduces in isolation as a single `count: 1` render at that derived seed. A
-/// pure function so the law is unit-testable without a GPU.
-pub(crate) fn image_seed(base_seed: u64, index: u32) -> u64 {
-    base_seed.wrapping_add(index as u64)
-}
-
 /// The fixed CLIP-L (openai/clip-vit-large-patch14) text config FLUX uses — identical across
 /// schnell/dev. Mirrors the candle `flux` example's hardcoded `ClipTextConfig`.
 pub fn clip_config() -> ClipTextConfig {
@@ -807,16 +801,6 @@ mod tests {
         assert_eq!(Variant::Schnell.t5_max_len(), 256);
         assert_eq!(Variant::Dev.t5_max_len(), 512);
         assert_eq!(LATENT_CHANNELS, 16);
-    }
-
-    /// Per-image seed in a `count`-batch is `base + index` (wrapping), so image *n* reproduces in
-    /// isolation at that derived seed — the mlx `seed + i` convention. Pure function, no GPU.
-    #[test]
-    fn image_seed_is_base_plus_index() {
-        assert_eq!(image_seed(42, 0), 42);
-        assert_eq!(image_seed(42, 1), 43);
-        assert_eq!(image_seed(42, 7), 49);
-        assert_eq!(image_seed(u64::MAX, 1), 0);
     }
 
     /// The DiT config tracks the variant only through `guidance_embed`: dev embeds the guidance scale,

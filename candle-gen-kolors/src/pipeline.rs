@@ -26,6 +26,8 @@ use candle_gen::gen_core::sampling::{
     schedule_sigmas, AlphaSchedule, DiscreteModelSampling, Scheduler, Solver,
 };
 use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
+// Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
+use candle_gen::image_seed;
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::stable_diffusion::vae::{AutoEncoderKL, AutoEncoderKLConfig};
 use rand::{rngs::StdRng, SeedableRng};
@@ -396,22 +398,9 @@ pub(crate) fn sdxl_vae_config() -> AutoEncoderKLConfig {
     }
 }
 
-/// Per-image seed within a batch: image `index` renders at `base_seed + index` (wrapping), so the
-/// *n*-th image reproduces in isolation at that derived seed (mlx `seed + i`).
-pub(crate) fn image_seed(base_seed: u64, index: u32) -> u64 {
-    base_seed.wrapping_add(index as u64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn image_seed_is_base_plus_index() {
-        assert_eq!(image_seed(42, 0), 42);
-        assert_eq!(image_seed(42, 7), 49);
-        assert_eq!(image_seed(u64::MAX, 1), 0);
-    }
 
     /// sc-8984: a scheduler-only curated request (default / absent sampler) MUST route the curated
     /// path — it was previously dropped on the floor by txt2img, silently rendering the native

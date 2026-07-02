@@ -58,6 +58,8 @@ use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{self, AdapterSpec, Conditioning, GenerationRequest, Image, Progress};
+// Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
+use candle_gen::image_seed;
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
 use candle_transformers::models::z_image::sampling::postprocess_image;
@@ -163,14 +165,6 @@ pub(crate) const QWEN_PAD_TOKEN_ID: i32 = 151643;
 /// Right-truncation cap for prompt tokenization (HF single-sequence truncation). Z-Image prompts are
 /// short; 512 is generous and never engages in practice.
 pub(crate) const TOKENIZER_MAX_LEN: usize = 512;
-
-/// The per-image seed within a batch: image `index` of a `count`-image request renders at
-/// `base_seed + index` (wrapping). Mirrors `mlx-gen-z-image`'s `seed + i` convention, so the *n*-th
-/// image of a batch reproduces in isolation as a single `count: 1` render at that derived seed. A
-/// pure function so the law is unit-testable without a GPU.
-pub(crate) fn image_seed(base_seed: u64, index: u32) -> u64 {
-    base_seed.wrapping_add(index as u64)
-}
 
 /// The VAE **encoder** runs f32 (the encode path's dtype, matching [`crate::edit`]); its distribution
 /// mean is cast to the compute dtype (bf16) for the img2img init latent. Only the base img2img /
@@ -1011,16 +1005,6 @@ mod tests {
         // The DiT timestep the base render feeds (1 − σ, OneMinusSigma) is derived from THIS σ table,
         // so it is consistent by construction — no `timesteps` desync (the Turbo `None`-path speckle
         // bug cannot occur on the base path).
-    }
-
-    /// Per-image seed in a `count`-batch is `base + index` (wrapping), so image *n* reproduces in
-    /// isolation at that derived seed — the mlx `seed + i` convention. Pure function, no GPU.
-    #[test]
-    fn image_seed_is_base_plus_index() {
-        assert_eq!(image_seed(42, 0), 42);
-        assert_eq!(image_seed(42, 1), 43);
-        assert_eq!(image_seed(42, 7), 49);
-        assert_eq!(image_seed(u64::MAX, 1), 0);
     }
 
     /// The flow-match Euler schedule the pipeline drives (`set_timesteps(steps, Some(mu))`) must, for

@@ -26,7 +26,8 @@ use candle_gen::gen_core::sampling::{
 use candle_gen::gen_core::{
     AdapterSpec, DetectedFace, FaceEmbedder, Image, Progress, WeightsSource,
 };
-use candle_gen::{CandleError, Result};
+// Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
+use candle_gen::{CandleError, Result, STEP_RNG_SALT};
 
 use candle_gen_face::CandleFaceAnalysis;
 use candle_gen_sdxl::ip_adapter::{load_ip_kv_pairs, Resampler, ResamplerConfig};
@@ -728,11 +729,6 @@ impl InstantId {
         Ok(out)
     }
 }
-
-/// A fixed offset so the per-step ancestral-noise RNG stream is *distinct* from the prior-noise stream
-/// (the prior is keyed by `seed`, the steps by `seed + STEP_RNG_SALT`) — otherwise the first ancestral
-/// draw would re-walk the prior's draws. Both are deterministic functions of `seed`.
-const STEP_RNG_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Re-place a detected face's 5-point landmarks at a pose's head box (the vendored
 /// `instantid_adapter.py::_run_pose` / `_normalized_kps`): normalize the reference kps to its detected

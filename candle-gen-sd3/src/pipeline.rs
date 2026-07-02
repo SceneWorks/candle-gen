@@ -32,6 +32,8 @@ use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress, Quant};
+// Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
+use candle_gen::image_seed;
 use candle_gen::{CandleError, Result};
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
@@ -454,12 +456,6 @@ fn decode_image(vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
     })
 }
 
-/// The per-image seed within a batch: image `index` of a `count`-image request renders at
-/// `base_seed + index` (wrapping). Mirrors the `seed + i` convention across the candle providers.
-pub(crate) fn image_seed(base_seed: u64, index: u32) -> u64 {
-    base_seed.wrapping_add(index as u64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,13 +521,6 @@ mod tests {
         assert_eq!(s.len(), 5);
         assert!((s[0] - 1.0).abs() < 1e-6);
         assert!(s[4].abs() < 1e-9);
-    }
-
-    #[test]
-    fn image_seed_is_base_plus_index() {
-        assert_eq!(image_seed(42, 0), 42);
-        assert_eq!(image_seed(42, 7), 49);
-        assert_eq!(image_seed(u64::MAX, 1), 0);
     }
 
     // ---- structural end-to-end tests (random weights) ---------------------------------------------

@@ -27,6 +27,8 @@ use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
+// Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
+use candle_gen::image_seed;
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::flux::sampling::unpack;
 use candle_transformers::models::t5::T5EncoderModel;
@@ -314,22 +316,9 @@ fn pack(x: &Tensor) -> Result<Tensor> {
     )
 }
 
-/// Per-image seed within a batch: image `index` renders at `base_seed + index` (wrapping), so the
-/// *n*-th image reproduces in isolation at that derived seed (mlx `seed + i`).
-pub(crate) fn image_seed(base_seed: u64, index: u32) -> u64 {
-    base_seed.wrapping_add(index as u64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn image_seed_is_base_plus_index() {
-        assert_eq!(image_seed(42, 0), 42);
-        assert_eq!(image_seed(42, 7), 49);
-        assert_eq!(image_seed(u64::MAX, 1), 0);
-    }
 
     /// HD's static shift moves the interior sigmas but keeps a descending 1→0 schedule of length N+1.
     #[test]

@@ -64,6 +64,8 @@ use candle_gen::gen_core::sampling::{
 };
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress};
+// Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
+use candle_gen::image_seed;
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
 use candle_transformers::models::stable_diffusion::schedulers::SchedulerConfig;
@@ -108,15 +110,6 @@ const SDXL_TRAIN_STEPS: usize = 1000;
 pub(crate) fn sdxl_alpha_schedule() -> Result<AlphaSchedule> {
     AlphaSchedule::scaled_linear(SDXL_TRAIN_STEPS, SDXL_BETA_START, SDXL_BETA_END)
         .map_err(|e| CandleError::Msg(format!("sdxl curated schedule: {e}")))
-}
-
-/// The per-image seed within a batch: image `index` of a `count`-image request renders at
-/// `base_seed + index` (wrapping at the u64 ceiling). Mirrors the SceneWorks `SdxlDiffusersAdapter`'s
-/// per-image seed increment (sc-3677 parity), so the *n*-th image of a batch reproduces in isolation
-/// as a single `count: 1` render at that derived seed. A pure function so the law is unit-testable
-/// without a GPU.
-pub(crate) fn image_seed(base_seed: u64, index: u32) -> u64 {
-    base_seed.wrapping_add(index as u64)
 }
 
 /// Build the SDXL-**Lightning** sampler *policy* (sc-6128) for `num_steps`: diffusers
@@ -879,18 +872,6 @@ mod tests {
         assert!(!c.center_input_sample);
         assert!(c.flip_sin_to_cos);
         assert_eq!(c.sliced_attention_size, None);
-    }
-
-    /// sc-3677 parity: each image in a `count`-image batch renders at `base_seed + index` (wrapping),
-    /// mirroring the Python adapter's per-image seed increment — so image *n* of a batch reproduces
-    /// in isolation at that derived seed. Pure function, no GPU/weights.
-    #[test]
-    fn parity_image_seed_is_base_plus_index() {
-        assert_eq!(image_seed(42, 0), 42);
-        assert_eq!(image_seed(42, 1), 43);
-        assert_eq!(image_seed(42, 7), 49);
-        // Wraps rather than panicking at the u64 ceiling (a non-default high base seed + a batch).
-        assert_eq!(image_seed(u64::MAX, 1), 0);
     }
 
     /// sc-6128: the Lightning policy is diffusers `EulerDiscreteScheduler(timestep_spacing="trailing",

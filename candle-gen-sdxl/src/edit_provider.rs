@@ -30,11 +30,11 @@ use candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::imageops::{resize_lanczos_u8, resize_nearest_u8};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{Image, Progress};
-use candle_gen::{CandleError, Result};
+// Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
+use candle_gen::{CandleError, Result, STEP_RNG_SALT};
 
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::conditioning::SdxlConditioner;
 use crate::denoise::{decode_image, text_time_ids, SPATIAL_SCALE};
@@ -52,11 +52,6 @@ pub const DEFAULT_EDIT_STRENGTH: f32 = 0.8;
 /// inpaint / outpaint default strength — higher, so the repaint region is substantially regenerated
 /// (the torch adapter's `use_inpaint` / `outpaint` value).
 pub const DEFAULT_INPAINT_STRENGTH: f32 = 0.85;
-
-/// Offset so the per-step ancestral-noise RNG stream is distinct from the init-noise stream (init keyed
-/// by `seed`, steps by `seed + STEP_RNG_SALT`) — the launch-portable determinism the IP/InstantID/PuLID
-/// ports use.
-const STEP_RNG_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// SDXL works in latent space at /8: both render dims must be multiples of 8.
 const SIZE_MULTIPLE: u32 = 8;
@@ -324,9 +319,7 @@ impl SdxlEdit {
 /// device- and launch-independent — sc-3673), then move to `device`. The init noise and each ancestral
 /// step's noise come from this.
 fn draw_noise(rng: &mut StdRng, c: usize, h: usize, w: usize, device: &Device) -> Result<Tensor> {
-    let n = c * h * w;
-    let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(rng)).collect();
-    Ok(Tensor::from_vec(noise, (1, c, h, w), &Device::Cpu)?.to_device(device)?)
+    Ok(candle_gen::seeded_noise_nchw(rng, c, h, w, device)?)
 }
 
 /// Build the latent inpaint mask `[1, 1, h/8, w/8]` (f16, values 0/1): resize the mask to the render

@@ -22,7 +22,8 @@ use candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::{schedule_sigmas, DiscreteModelSampling, Scheduler, Solver};
 use candle_gen::gen_core::{Image, Progress};
-use candle_gen::{CandleError, Result};
+// Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
+use candle_gen::{CandleError, Result, STEP_RNG_SALT};
 
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -47,11 +48,6 @@ const DTYPE: DType = DType::F16;
 /// Default `ip_adapter_scale` for SDXL IP-Adapter-Plus (the worker's `ipAdapterScale` default, matching
 /// the torch `SdxlDiffusersAdapter`).
 pub const DEFAULT_IP_ADAPTER_SCALE: f32 = 0.7;
-
-/// A fixed offset so the per-step ancestral-noise RNG stream is distinct from the prior-noise stream
-/// (prior keyed by `seed`, steps by `seed + STEP_RNG_SALT`) — the same launch-portable determinism the
-/// InstantID port uses.
-const STEP_RNG_SALT: u64 = 0x9E37_79B9_7F4A_7C15;
 
 /// Paths to the SDXL IP-Adapter-Plus checkpoints.
 pub struct IpAdapterSdxlPaths {

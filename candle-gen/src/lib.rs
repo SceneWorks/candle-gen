@@ -56,6 +56,13 @@ pub use sampler::{
     CandleAvLatentOps, CandleLatentOps,
 };
 
+// Shared seed-derivation + launch-portable seeded-noise helpers (sc-7792 consolidation / F-059,
+// sc-9043): the per-image batch seed (`base + index`), the ancestral-step RNG salt, and the CPU-first
+// noise draw. Previously hand-copied into every provider crate — a single divergent copy silently
+// breaks cross-provider / cross-backend reproducibility, so they get one home here.
+pub mod seed;
+pub use seed::{image_seed, seeded_noise_nchw, seeded_normal_vec, STEP_RNG_SALT};
+
 use thiserror::Error;
 
 /// The candle-backed crate error. gen-core cannot name candle types, so device/tensor failures

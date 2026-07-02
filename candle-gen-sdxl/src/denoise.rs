@@ -28,7 +28,6 @@ use candle_core::{DType, Device, IndexOp, Tensor};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use rand_distr::{Distribution, StandardNormal};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::DiscreteModelSampling;
@@ -61,9 +60,7 @@ pub fn text_time_ids(batch: usize, device: &Device, dtype: DType) -> Result<Tens
 /// CPU (so the draw sequence is device- and launch-independent — sc-3673), then move to `device`. The
 /// shared draw used by both the prior and each ancestral step.
 fn draw_noise(rng: &mut StdRng, c: usize, h: usize, w: usize, device: &Device) -> Result<Tensor> {
-    let n = c * h * w;
-    let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(rng)).collect();
-    Ok(Tensor::from_vec(noise, (1, c, h, w), &Device::Cpu)?.to_device(device)?)
+    Ok(candle_gen::seeded_noise_nchw(rng, c, h, w, device)?)
 }
 
 /// Sample the prior latents `noise · σ_last · rsqrt(σ_last²+1)` for a `width × height` render: draw
