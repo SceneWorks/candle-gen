@@ -325,26 +325,34 @@ pub fn install_adapters(
     }
 }
 
-/// Fire one optimizer update: LR-schedule, average the accumulated grads by `1/accum`, grad-norm clip,
-/// step. Panics if called with no pending accumulation (the caller fires it only on an accumulation
-/// boundary or the final flush).
+/// Fire one optimizer update: LR-schedule, average the accumulated grads by `1/micro_count`, grad-norm
+/// clip, step. `micro_count` is the ACTUAL number of micro-grads accumulated into this window — for a
+/// full window that equals `gradient_accumulation`, but for the final partial flush (when
+/// `steps % accum != 0`, or a mid-window cancel) it is the sub-`accum` remainder, so the tail update is
+/// a true mean of the `k` grads it holds rather than a `k/accum`-scaled underweighted step (F-034,
+/// sc-9018). Panics if called with no pending accumulation, or with `micro_count == 0` (the caller fires
+/// it only on an accumulation boundary or the final flush, both with ≥1 pending micro).
 #[allow(clippy::too_many_arguments)]
 pub fn apply_update(
     opt: &mut TrainOptimizer,
     accumulated: &mut Option<GradStore>,
     set: &LoraSet,
-    accum: u32,
+    micro_count: u32,
     cfg: &TrainingConfig,
     update_idx: u32,
     total_updates: u32,
     warmup_updates: u32,
 ) -> Result<()> {
+    assert!(
+        micro_count > 0,
+        "apply_update called with micro_count == 0 (no grads to average)"
+    );
     let mult = lr_multiplier(cfg.lr_scheduler, update_idx, total_updates, warmup_updates);
     opt.set_lr_scaled(mult);
     let mut avg = accumulated
         .take()
         .expect("apply_update called with a pending accumulation");
-    scale_grads(&mut avg, &set.vars, 1.0 / accum as f64)?;
+    scale_grads(&mut avg, &set.vars, 1.0 / micro_count as f64)?;
     clip_grad_norm(&mut avg, &set.vars, 1.0)?;
     opt.step(&avg)?;
     Ok(())
@@ -534,6 +542,10 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     // --- train loop ---
     let mut accumulated: Option<GradStore> = None;
     let mut micro = 0u32;
+    // Micro-grads accumulated into the CURRENT (not-yet-flushed) window. Resets to 0 on each flush; at
+    // a full boundary it equals `accum`, and whatever it holds when the loop ends is the sub-`accum`
+    // remainder the final flush must divide by (F-034, sc-9018).
+    let mut pending = 0u32;
     let mut update_idx = 0u32;
     let mut last_loss = 0.0f32;
     let mut steps_run = 0u32;
@@ -547,17 +559,19 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         steps_run = step;
         accumulate_grads(&mut accumulated, grads, &set.vars)?;
         micro += 1;
+        pending += 1;
         if micro.is_multiple_of(accum) {
             apply_update(
                 &mut opt,
                 &mut accumulated,
                 &set,
-                accum,
+                pending,
                 cfg,
                 update_idx,
                 total_updates,
                 warmup_updates,
             )?;
+            pending = 0;
             update_idx += 1;
         }
 
@@ -621,13 +635,15 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
     if steps_run == 0 {
         return Err(CandleError::Canceled);
     }
-    // Flush any pending (sub-`accum`) accumulation so the final partial step is applied.
+    // Flush any pending (sub-`accum`) accumulation so the final partial step is applied. Average by the
+    // ACTUAL `pending` micro-count, not the nominal `accum`, so this tail update is a true mean of the
+    // grads it holds rather than a `pending/accum`-underweighted step (F-034, sc-9018).
     if accumulated.is_some() {
         apply_update(
             &mut opt,
             &mut accumulated,
             &set,
-            accum,
+            pending,
             cfg,
             update_idx,
             total_updates,
@@ -907,6 +923,116 @@ mod tests {
             "expected Canceled, got {err:?}"
         );
         assert_eq!(model.saves.get(), 0, "nothing saved");
+    }
+
+    // --- F-034 (sc-9018): the final partial gradient-accumulation flush must average by the ACTUAL
+    //     micro-count it holds, not the nominal `gradient_accumulation`. ---
+
+    /// The averaging math `apply_update` applies: `k` identical micro-grads summed by
+    /// [`accumulate_grads`] then divided by the ACTUAL count `k` recover the single-micro grad exactly
+    /// (a true mean), whereas dividing the same sum by a larger nominal `accum` under-scales it to
+    /// `k/accum` of that mean — the F-034 mis-scaling. This is the load-bearing scaling decision, so it
+    /// is asserted directly on the grad tensors (the optimizer magnitude-normalizes, masking the
+    /// divisor downstream).
+    #[test]
+    fn final_partial_flush_averages_by_actual_micro_count() {
+        let dev = Device::Cpu;
+        let v = Var::from_tensor(&Tensor::zeros((1, 2), DType::F32, &dev).unwrap()).unwrap();
+        let vars = std::slice::from_ref(&v);
+        // One micro-step's gradient; `k` of these accumulate in the final (partial) window.
+        let micro = Tensor::from_vec(vec![0.3f32, -0.6], (1, 2), &dev).unwrap();
+        let (k, accum) = (3u32, 4u32); // steps % accum == 3 ≠ 0 → final window holds k=3 < accum=4.
+
+        // Accumulate k identical micro-grads → sum == k * micro.
+        let mut accumulated: Option<GradStore> = None;
+        for _ in 0..k {
+            let mut g = GradStore::default();
+            g.insert(v.as_tensor(), micro.clone());
+            accumulate_grads(&mut accumulated, g, vars).unwrap();
+        }
+        let summed = accumulated
+            .as_ref()
+            .unwrap()
+            .get(v.as_tensor())
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        assert!(
+            (summed[0][0] - 0.9).abs() < 1e-6 && (summed[0][1] + 1.8).abs() < 1e-6,
+            "sum of k grads should be k*micro, got {summed:?}"
+        );
+
+        // Correct (F-034 fix): divide by the actual count k → the true mean == the single micro-grad.
+        let mut correct = accumulated.take().unwrap();
+        scale_grads(&mut correct, vars, 1.0 / k as f64).unwrap();
+        let mean = correct
+            .get(v.as_tensor())
+            .unwrap()
+            .to_vec2::<f32>()
+            .unwrap();
+        assert!(
+            (mean[0][0] - 0.3).abs() < 1e-6 && (mean[0][1] + 0.6).abs() < 1e-6,
+            "1/k average must recover the per-micro grad, got {mean:?}"
+        );
+
+        // Buggy (pre-fix): dividing the same sum by the nominal `accum` under-scales to k/accum of the
+        // mean — i.e. 3/4 of the correct step. Kept as a guard on what the fix specifically avoids.
+        let mut buggy = GradStore::default();
+        buggy.insert(
+            v.as_tensor(),
+            Tensor::from_vec(vec![0.9f32, -1.8], (1, 2), &dev).unwrap(),
+        );
+        scale_grads(&mut buggy, vars, 1.0 / accum as f64).unwrap();
+        let under = buggy.get(v.as_tensor()).unwrap().to_vec2::<f32>().unwrap();
+        let ratio = under[0][0] / mean[0][0];
+        assert!(
+            (ratio - k as f32 / accum as f32).abs() < 1e-6,
+            "buggy divisor should be k/accum={} of the correct mean, got ratio {ratio}",
+            k as f32 / accum as f32
+        );
+    }
+
+    /// A full accumulation window is unchanged by the fix: `accum` identical micro-grads divided by the
+    /// actual count (== `accum`) still yield the per-micro mean. Guards the common case.
+    #[test]
+    fn full_window_averaging_unchanged() {
+        let dev = Device::Cpu;
+        let v = Var::from_tensor(&Tensor::zeros((1, 2), DType::F32, &dev).unwrap()).unwrap();
+        let vars = std::slice::from_ref(&v);
+        let micro = Tensor::from_vec(vec![0.25f32, 0.5], (1, 2), &dev).unwrap();
+        let accum = 4u32;
+        let mut accumulated: Option<GradStore> = None;
+        for _ in 0..accum {
+            let mut g = GradStore::default();
+            g.insert(v.as_tensor(), micro.clone());
+            accumulate_grads(&mut accumulated, g, vars).unwrap();
+        }
+        let mut avg = accumulated.take().unwrap();
+        // In a full window the actual micro-count == accum, so the fix passes `accum` here (unchanged).
+        scale_grads(&mut avg, vars, 1.0 / accum as f64).unwrap();
+        let mean = avg.get(v.as_tensor()).unwrap().to_vec2::<f32>().unwrap();
+        assert!(
+            (mean[0][0] - 0.25).abs() < 1e-6 && (mean[0][1] - 0.5).abs() < 1e-6,
+            "full window must average to the per-micro grad, got {mean:?}"
+        );
+    }
+
+    /// End-to-end: a run whose `steps` is NOT a multiple of `accum` exercises the final partial flush
+    /// path (the F-034 site). It must complete without panicking on the new `micro_count > 0` assert and
+    /// report all steps run.
+    #[test]
+    fn driver_partial_final_window_completes() {
+        let model = MockTrainer {
+            device: Device::Cpu,
+            steps_seen: Cell::new(0),
+            saves: Cell::new(0),
+            cache_len: 3,
+        };
+        // steps=7, accum=4 → windows [1..4] full, [5..7] partial (3 micros) flushed at the end.
+        let req = mock_request(3, 7, 4, 0, CancelFlag::new());
+        let out = run_flow_match_training(&model, &req, &mut |_| {}).unwrap();
+        assert_eq!(out.steps, 7);
+        assert!(out.final_loss.is_finite());
     }
 
     /// An empty cache (no usable items, not cancelled) is a typed error, not a panic or a save.
