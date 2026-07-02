@@ -31,6 +31,11 @@ pub use gen_core::{
 pub use candle_core;
 pub use candle_nn;
 
+// The MLX-packed → GGML repack seam (sc-9085 spike → sc-9086, epic 9083): lets the candle lane
+// load the hosted MLX quant tiers (epic 8506) directly — no dense staging, no second artifact
+// matrix. Provider crates' packed-detect loaders build on this.
+pub mod quant;
+
 // The shared native training harness (epic 5164 / sc-5165) — the candle twin of `mlx_gen::train`.
 // Provider crates (sdxl/z-image/wan/lens) build their `gen_core::Trainer` on top of this.
 pub mod train;

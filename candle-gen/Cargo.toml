@@ -20,6 +20,10 @@ thiserror = { workspace = true }
 # (candle-core's own save passes `None`). `rand`/`rand_distr` seed deterministic, launch-portable
 # adapter-factor init (the sc-3673 philosophy applied to LoRA `A`); `image` decodes the dataset.
 safetensors = "0.7"
+# Raw f16 block-byte assembly for the MLX-packed → GGML `Q4_1` repack seam (sc-9085/sc-9086):
+# `block_q4_1` stores its per-block scale/min as f16 and candle-core does not re-export `half`.
+# Same version candle-core itself resolves (Cargo.lock), so no duplicate-crate risk.
+half = "2"
 # Parse the PEFT/diffusers `lora_adapter_metadata` JSON blob (sc-5374) in `train::lora` so the
 # inference adapter merge recovers `lora_alpha`/`r` when a file ships no per-target `.alpha` tensor.
 serde_json = { workspace = true }
