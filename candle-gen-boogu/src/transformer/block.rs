@@ -8,10 +8,10 @@
 
 use candle_gen::candle_core::{Result, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
-use candle_gen::candle_nn::{Linear, Module};
 
 use super::rope::apply_interleaved_rope;
-use crate::loader::{linear, rmsnorm, Weights};
+use crate::loader::{linear_detect, rmsnorm, Weights};
+use crate::quant::QLinear;
 
 /// diffusers `Attention(eps=1e-5)` — the per-head q/k RMSNorm epsilon.
 const QK_EPS: f64 = 1e-5;
@@ -92,10 +92,10 @@ fn sdpa_budgeted(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, budget: usize) 
 
 // ── GQA self-attention (standard `BooguImageAttnProcessor`) ─────────────────────────────────
 pub struct SelfAttention {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    o: Linear,
+    q: QLinear,
+    k: QLinear,
+    v: QLinear,
+    o: QLinear,
     norm_q: Tensor,
     norm_k: Tensor,
     heads: usize,
@@ -113,10 +113,10 @@ impl SelfAttention {
         head_dim: usize,
     ) -> Result<Self> {
         Ok(Self {
-            q: linear(w, &join(prefix, "to_q"), false)?,
-            k: linear(w, &join(prefix, "to_k"), false)?,
-            v: linear(w, &join(prefix, "to_v"), false)?,
-            o: linear(w, &join(prefix, "to_out.0"), false)?,
+            q: linear_detect(w, &join(prefix, "to_q"), false)?,
+            k: linear_detect(w, &join(prefix, "to_k"), false)?,
+            v: linear_detect(w, &join(prefix, "to_v"), false)?,
+            o: linear_detect(w, &join(prefix, "to_out.0"), false)?,
             norm_q: w.get(&join(prefix, "norm_q.weight"))?,
             norm_k: w.get(&join(prefix, "norm_k.weight"))?,
             heads,
@@ -158,15 +158,15 @@ impl SelfAttention {
 /// jointly, split back, projected by separate `img_out`/`instruct_out`, re-merged, and run through
 /// the shared `to_out.0`.
 pub struct JointAttention {
-    img_q: Linear,
-    img_k: Linear,
-    img_v: Linear,
-    instruct_q: Linear,
-    instruct_k: Linear,
-    instruct_v: Linear,
-    img_out: Linear,
-    instruct_out: Linear,
-    to_out: Linear,
+    img_q: QLinear,
+    img_k: QLinear,
+    img_v: QLinear,
+    instruct_q: QLinear,
+    instruct_k: QLinear,
+    instruct_v: QLinear,
+    img_out: QLinear,
+    instruct_out: QLinear,
+    to_out: QLinear,
     norm_q: Tensor,
     norm_k: Tensor,
     heads: usize,
@@ -185,15 +185,15 @@ impl JointAttention {
     ) -> Result<Self> {
         let p = |s: &str| join(prefix, s);
         Ok(Self {
-            img_q: linear(w, &p("processor.img_to_q"), false)?,
-            img_k: linear(w, &p("processor.img_to_k"), false)?,
-            img_v: linear(w, &p("processor.img_to_v"), false)?,
-            instruct_q: linear(w, &p("processor.instruct_to_q"), false)?,
-            instruct_k: linear(w, &p("processor.instruct_to_k"), false)?,
-            instruct_v: linear(w, &p("processor.instruct_to_v"), false)?,
-            img_out: linear(w, &p("processor.img_out"), false)?,
-            instruct_out: linear(w, &p("processor.instruct_out"), false)?,
-            to_out: linear(w, &p("to_out.0"), false)?,
+            img_q: linear_detect(w, &p("processor.img_to_q"), false)?,
+            img_k: linear_detect(w, &p("processor.img_to_k"), false)?,
+            img_v: linear_detect(w, &p("processor.img_to_v"), false)?,
+            instruct_q: linear_detect(w, &p("processor.instruct_to_q"), false)?,
+            instruct_k: linear_detect(w, &p("processor.instruct_to_k"), false)?,
+            instruct_v: linear_detect(w, &p("processor.instruct_to_v"), false)?,
+            img_out: linear_detect(w, &p("processor.img_out"), false)?,
+            instruct_out: linear_detect(w, &p("processor.instruct_out"), false)?,
+            to_out: linear_detect(w, &p("to_out.0"), false)?,
             norm_q: w.get(&p("norm_q.weight"))?,
             norm_k: w.get(&p("norm_k.weight"))?,
             heads,
@@ -215,7 +215,7 @@ impl JointAttention {
         let (b, li, _) = img.dims3()?;
         let lt = instruct.dim(1)?;
         let hd = self.head_dim;
-        let to_heads = |x: &Tensor, proj: &Linear, n: usize, l: usize| -> Result<Tensor> {
+        let to_heads = |x: &Tensor, proj: &QLinear, n: usize, l: usize| -> Result<Tensor> {
             proj.forward(x)?.reshape((b, l, n, hd))
         };
 
@@ -277,17 +277,17 @@ impl JointAttention {
 
 // ── SwiGLU feed-forward (`LuminaFeedForward`) ───────────────────────────────────────────────
 pub struct SwiGlu {
-    w1: Linear,
-    w2: Linear,
-    w3: Linear,
+    w1: QLinear,
+    w2: QLinear,
+    w3: QLinear,
 }
 
 impl SwiGlu {
     pub fn load(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
-            w1: linear(w, &join(prefix, "linear_1"), false)?,
-            w2: linear(w, &join(prefix, "linear_2"), false)?,
-            w3: linear(w, &join(prefix, "linear_3"), false)?,
+            w1: linear_detect(w, &join(prefix, "linear_1"), false)?,
+            w2: linear_detect(w, &join(prefix, "linear_2"), false)?,
+            w3: linear_detect(w, &join(prefix, "linear_3"), false)?,
         })
     }
 
@@ -301,7 +301,7 @@ impl SwiGlu {
 /// `emb = linear(silu(temb))` (`1024 → 4·D`), chunked into 4; the returned hidden is
 /// `RMSNorm(x)·(1 + scale_msa)`. The caller reuses the other three chunks per its pattern.
 pub struct ModNorm {
-    linear: Linear,
+    linear: QLinear,
     norm: Tensor,
     eps: f64,
 }
@@ -309,7 +309,7 @@ pub struct ModNorm {
 impl ModNorm {
     pub fn load(w: &Weights, prefix: &str, eps: f64) -> Result<Self> {
         Ok(Self {
-            linear: linear(w, &join(prefix, "linear"), true)?,
+            linear: linear_detect(w, &join(prefix, "linear"), true)?,
             norm: w.get(&join(prefix, "norm.weight"))?,
             eps,
         })

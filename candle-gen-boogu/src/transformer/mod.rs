@@ -25,10 +25,10 @@ pub mod block;
 pub mod rope;
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
-use candle_gen::candle_nn::{Linear, Module};
 
 use crate::config::BooguConfig;
-use crate::loader::{layernorm_noaffine, linear, rmsnorm, Weights};
+use crate::loader::{layernorm_noaffine, linear_detect, rmsnorm, Weights};
+use crate::quant::QLinear;
 use block::{DoubleBlock, ModBlock, PlainBlock};
 use rope::RopeTables;
 
@@ -39,20 +39,20 @@ pub struct BooguTransformer {
     cfg: BooguConfig,
     device: Device,
     dtype: DType,
-    x_embedder: Linear,
-    ref_image_patch_embedder: Linear,
+    x_embedder: QLinear,
+    ref_image_patch_embedder: QLinear,
     image_index_embedding: Tensor,
     caption_norm: Tensor,
-    caption_linear: Linear,
-    time_lin1: Linear,
-    time_lin2: Linear,
+    caption_linear: QLinear,
+    time_lin1: QLinear,
+    time_lin2: QLinear,
     context_refiner: Vec<PlainBlock>,
     noise_refiner: Vec<ModBlock>,
     ref_image_refiner: Vec<ModBlock>,
     double_stream: Vec<DoubleBlock>,
     single_stream: Vec<ModBlock>,
-    norm_out_lin1: Linear,
-    norm_out_lin2: Linear,
+    norm_out_lin1: QLinear,
+    norm_out_lin2: QLinear,
 }
 
 impl BooguTransformer {
@@ -69,13 +69,13 @@ impl BooguTransformer {
             cfg: cfg.clone(),
             device: w.device().clone(),
             dtype: w.dtype(),
-            x_embedder: linear(w, "x_embedder", true)?,
-            ref_image_patch_embedder: linear(w, "ref_image_patch_embedder", true)?,
+            x_embedder: linear_detect(w, "x_embedder", true)?,
+            ref_image_patch_embedder: linear_detect(w, "ref_image_patch_embedder", true)?,
             image_index_embedding: w.get("image_index_embedding")?,
             caption_norm: w.get("time_caption_embed.caption_embedder.0.weight")?,
-            caption_linear: linear(w, "time_caption_embed.caption_embedder.1", true)?,
-            time_lin1: linear(w, "time_caption_embed.timestep_embedder.linear_1", true)?,
-            time_lin2: linear(w, "time_caption_embed.timestep_embedder.linear_2", true)?,
+            caption_linear: linear_detect(w, "time_caption_embed.caption_embedder.1", true)?,
+            time_lin1: linear_detect(w, "time_caption_embed.timestep_embedder.linear_1", true)?,
+            time_lin2: linear_detect(w, "time_caption_embed.timestep_embedder.linear_2", true)?,
             context_refiner: (0..cfg.num_refiner_layers)
                 .map(|i| plain(format!("context_refiner.{i}")))
                 .collect::<Result<_>>()?,
@@ -91,8 +91,8 @@ impl BooguTransformer {
             single_stream: (0..cfg.num_single_stream_layers())
                 .map(|i| mod_(format!("single_stream_layers.{i}")))
                 .collect::<Result<_>>()?,
-            norm_out_lin1: linear(w, "norm_out.linear_1", true)?,
-            norm_out_lin2: linear(w, "norm_out.linear_2", true)?,
+            norm_out_lin1: linear_detect(w, "norm_out.linear_1", true)?,
+            norm_out_lin2: linear_detect(w, "norm_out.linear_2", true)?,
         })
     }
 

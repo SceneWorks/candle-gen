@@ -22,12 +22,16 @@
 //! re-quantize (mirroring MLX's `AdaptableLinear::quantize` no-op-when-`Quantized`). So a loader can
 //! packed-detect *and* keep an unconditional post-load `quantize` pass, and the two compose.
 //!
-//! **Bit-width & repack.** MLX packs group-wise **affine** (`w = scale·q + bias`) at group size 64;
-//! the bit-width is inferred from the packed shapes ([`repack::mlx_packed_bits`]), so no side
-//! manifest is needed. Q4 repacks **losslessly** into GGML `Q4_1` (same affine form; one MLX group =
-//! two `Q4_1` blocks). Q8 has no affine GGML container, so the Q8 tier is materialized to its exact
-//! MLX grid and re-quantized to symmetric `Q8_0` (0.56 % mean / 0.87 % worst relative RMS on the real
-//! z-image Q8 tier — the accepted sc-9085 double-quant). See [`repack`] for the byte-level details.
+//! **Bit-width, group size & repack.** MLX packs group-wise **affine** (`w = scale·q + bias`). The
+//! z-image / flux tiers use group size 64, the default that the shape-inferring
+//! [`repack::mlx_packed_bits`] and `lin`/`embedding`/`from_packed` assume; the boogu tier packs at
+//! group **32** (sc-9410), which the shapes can't disambiguate, so its loaders pass the group size
+//! explicitly (the `*_gs` entry points, read from `config.json`'s `quantization.group_size`,
+//! [`PackedConfig`]). Q4 repacks **losslessly** into GGML `Q4_1` (same affine form; one MLX group of
+//! `g` splits into `g / 32` `Q4_1` blocks). Q8 has no affine GGML container, so the Q8 tier is
+//! materialized to its exact MLX grid and re-quantized to symmetric `Q8_0` (the accepted sc-9085
+//! double-quant, 0.56 % mean relative RMS on the real z-image Q8 tier). See [`repack`] for the
+//! byte-level details.
 
 pub mod repack;
 
@@ -41,8 +45,9 @@ pub mod cublaslt;
 pub mod eight_bit_linear;
 
 pub use repack::{
-    dequant_mlx_q4_reference, dequant_mlx_q8, f16_exact, mlx_packed_bits, repack_mlx_q4_to_q4_1,
-    MLX_GROUP_SIZE,
+    dequant_mlx_q4_reference, dequant_mlx_q4_reference_gs, dequant_mlx_q8, dequant_mlx_q8_gs,
+    f16_exact, mlx_packed_bits, mlx_packed_bits_gs, repack_mlx_q4_to_q4_1,
+    repack_mlx_q4_to_q4_1_gs, MLX_GROUP_SIZE,
 };
 
 #[cfg(feature = "cuda")]
@@ -124,10 +129,11 @@ impl QLinear {
     }
 
     /// Build a `Quantized` projection directly from an MLX packed triple (`wq` u32 codes + `scales` +
-    /// `biases`) on `device` — Q4 via the lossless `Q4_1` repack, Q8 via dequant → `Q8_0` re-quant
-    /// (bit-width inferred from the shapes). `bias` is the optional dense `{base}.bias`, kept
-    /// full-precision. No dense weight is ever materialized on the Q4 path (the whole point: the
-    /// packed footprint lands on `device` directly).
+    /// `biases`) on `device` at the default group size 64 — Q4 via the lossless `Q4_1` repack, Q8 via
+    /// dequant → `Q8_0` re-quant (bit-width inferred from the shapes). `bias` is the optional dense
+    /// `{base}.bias`, kept full-precision. No dense weight is ever materialized on the Q4 path (the
+    /// whole point: the packed footprint lands on `device` directly). See [`Self::from_packed_gs`] for a
+    /// non-64 group tier (boogu packs at 32).
     pub fn from_packed(
         wq: &Tensor,
         scales: &Tensor,
@@ -135,7 +141,22 @@ impl QLinear {
         bias: Option<Tensor>,
         device: &Device,
     ) -> Result<Self> {
-        let weight = repack_packed_weight(wq, scales, biases, device)?;
+        Self::from_packed_gs(wq, scales, biases, bias, MLX_GROUP_SIZE, device)
+    }
+
+    /// As [`Self::from_packed`], but at an explicit MLX `group_size` (sc-9410) — the boogu tier packs
+    /// at group 32 (the z-image / flux tiers at the default 64). The group size is not recoverable from
+    /// the packed shapes alone (see [`repack`]), so a non-64 tier must pass it (from its component
+    /// `config.json`'s `quantization.group_size`).
+    pub fn from_packed_gs(
+        wq: &Tensor,
+        scales: &Tensor,
+        biases: &Tensor,
+        bias: Option<Tensor>,
+        group_size: usize,
+        device: &Device,
+    ) -> Result<Self> {
+        let weight = repack_packed_weight(wq, scales, biases, group_size, device)?;
         Ok(Self::Quantized { weight, bias })
     }
 
@@ -221,6 +242,25 @@ impl QEmbedding {
         Self::from_packed_dtype(wq, scales, biases, device, DType::F32)
     }
 
+    /// As [`Self::from_packed_dtype`], but at an explicit MLX `group_size` (sc-9410, the boogu
+    /// group-32 tier). See [`QLinear::from_packed_gs`].
+    pub fn from_packed_dtype_gs(
+        wq: &Tensor,
+        scales: &Tensor,
+        biases: &Tensor,
+        device: &Device,
+        out_dtype: DType,
+        group_size: usize,
+    ) -> Result<Self> {
+        let table = repack_packed_weight(wq, scales, biases, group_size, device)?;
+        let hidden = table.shape().dims()[1];
+        Ok(Self::Quantized {
+            table,
+            hidden_size: hidden,
+            out_dtype,
+        })
+    }
+
     /// As [`Self::from_packed`], but the forward dequantizes to `out_dtype` (the dense-path table
     /// dtype, `vb.dtype()`) — so a packed bf16 embedding yields bf16 rows exactly as the dense path
     /// would, mirroring [`QLinear::forward`]'s activation-dtype cast.
@@ -231,13 +271,7 @@ impl QEmbedding {
         device: &Device,
         out_dtype: DType,
     ) -> Result<Self> {
-        let table = repack_packed_weight(wq, scales, biases, device)?;
-        let hidden = table.shape().dims()[1];
-        Ok(Self::Quantized {
-            table,
-            hidden_size: hidden,
-            out_dtype,
-        })
+        Self::from_packed_dtype_gs(wq, scales, biases, device, out_dtype, MLX_GROUP_SIZE)
     }
 
     /// Index-select the embedding rows for `indexes`. Dense delegates to `candle_nn::Embedding`;
@@ -270,18 +304,19 @@ fn repack_packed_weight(
     wq: &Tensor,
     scales: &Tensor,
     biases: &Tensor,
+    group_size: usize,
     device: &Device,
 ) -> Result<QTensor> {
     let (wq_cols, s_cols) = (wq.dims2()?.1, scales.dims2()?.1);
-    match mlx_packed_bits(wq_cols, s_cols) {
-        4 => repack_mlx_q4_to_q4_1(wq, scales, biases, device),
+    match mlx_packed_bits_gs(wq_cols, s_cols, group_size) {
+        4 => repack_mlx_q4_to_q4_1_gs(wq, scales, biases, group_size, device),
         8 => {
-            let grid = dequant_mlx_q8(wq, scales, biases)?;
-            // `quantize_onto` needs a CPU source; `dequant_mlx_q8` already returns on the CPU.
+            let grid = dequant_mlx_q8_gs(wq, scales, biases, group_size)?;
+            // `quantize_onto` needs a CPU source; `dequant_mlx_q8_gs` already returns on the CPU.
             QTensor::quantize_onto(&grid, GgmlDType::Q8_0, device)
         }
         b => candle_core::bail!(
-            "unsupported MLX packed bit-width {b} (wq {wq_cols}, scales {s_cols})"
+            "unsupported MLX packed bit-width {b} (wq {wq_cols}, scales {s_cols}, group {group_size})"
         ),
     }
 }
@@ -300,6 +335,19 @@ pub fn lin(
     out_dim: usize,
     bias: bool,
 ) -> Result<QLinear> {
+    lin_gs(vb, base, in_dim, out_dim, bias, MLX_GROUP_SIZE)
+}
+
+/// As [`lin`], but at an explicit MLX `group_size` (sc-9410) — the packed branch repacks at
+/// `group_size` (the boogu tier's 32; z-image / flux default to 64). The dense branch is unchanged.
+pub fn lin_gs(
+    vb: &VarBuilder,
+    base: &str,
+    in_dim: usize,
+    out_dim: usize,
+    bias: bool,
+    group_size: usize,
+) -> Result<QLinear> {
     let scales_key = format!("{base}.scales");
     if vb.contains_tensor(&scales_key) {
         let device = vb.device().clone();
@@ -313,7 +361,7 @@ pub fn lin(
         } else {
             None
         };
-        return QLinear::from_packed(&wq, &scales, &biases, bias, &device);
+        return QLinear::from_packed_gs(&wq, &scales, &biases, bias, group_size, &device);
     }
     if bias {
         QLinear::linear(in_dim, out_dim, vb.pp(base))
@@ -327,6 +375,17 @@ pub fn lin(
 /// `embed_tokens` is packed in the MLX tiers, so this closes the packed-detect surface over both the
 /// projections and the token embedding.
 pub fn embedding(vb: &VarBuilder, base: &str, vocab: usize, hidden: usize) -> Result<QEmbedding> {
+    embedding_gs(vb, base, vocab, hidden, MLX_GROUP_SIZE)
+}
+
+/// As [`embedding`], but at an explicit MLX `group_size` (sc-9410, the boogu group-32 tier).
+pub fn embedding_gs(
+    vb: &VarBuilder,
+    base: &str,
+    vocab: usize,
+    hidden: usize,
+    group_size: usize,
+) -> Result<QEmbedding> {
     let scales_key = format!("{base}.scales");
     if vb.contains_tensor(&scales_key) {
         let device = vb.device().clone();
@@ -335,7 +394,14 @@ pub fn embedding(vb: &VarBuilder, base: &str, vocab: usize, hidden: usize) -> Re
         let biases = vb.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?;
         // Dequantize the table to the dense-path table dtype (`vb.dtype()`), so a packed bf16
         // text-encoder embedding yields bf16 rows exactly as the dense path would (dtype parity).
-        return QEmbedding::from_packed_dtype(&wq, &scales, &biases, &device, vb.dtype());
+        return QEmbedding::from_packed_dtype_gs(
+            &wq,
+            &scales,
+            &biases,
+            &device,
+            vb.dtype(),
+            group_size,
+        );
     }
     QEmbedding::embedding(vocab, hidden, vb.pp(base))
 }
