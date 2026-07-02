@@ -38,15 +38,13 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{self as nn, Linear, Module, VarBuilder};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
-use candle_transformers::models::z_image::sampling::postprocess_image;
 use candle_transformers::models::z_image::scheduler::{
     calculate_shift, FlowMatchEulerDiscreteScheduler, SchedulerConfig, BASE_IMAGE_SEQ_LEN,
     BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT,
@@ -56,20 +54,14 @@ use candle_transformers::models::z_image::transformer::{
     create_coordinate_grid, patchify, unpatchify, Config as DitConfig,
 };
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder, VaeConfig};
-use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
+// Shared Z-Image plumbing (loader/decode/preprocess/tokenizer/seed) — one home (sc-9002 / F-022).
+use crate::common::{self, ResizePolicy, ENC_DTYPE, PATCH_SIZE, SPATIAL_SCALE};
 use crate::dit::{ZImageTransformer2DModel, ZImageTransformerBlock};
 
 /// The control transformer + context run bf16 (Z-Image native, candle txt2img dtype); the VAE encoder
 /// runs f32 (the encode path's dtype) and its output is cast to bf16 for the control context.
 const DTYPE: DType = DType::BF16;
-const ENC_DTYPE: DType = DType::F32;
-
-/// VAE spatial downscale (latent = image/8 per side) + DiT patch size — shared with the txt2img pipeline.
-const SPATIAL_SCALE: u32 = 8;
-const PATCH_SIZE: u32 = 2;
-const LATENT_CHANNELS: usize = 16;
 
 /// Channel count of the VAE-encoded control context: 16 control latent + 1 zero mask + 16 zero inpaint
 /// (the Fun-Controlnet-Union `control_all_x_embedder`'s 33ch input). Pure-pose control zeroes the mask +
@@ -90,9 +82,6 @@ const BASE_DEFAULT_STEPS: usize = 50;
 /// reference `ZImagePipeline` example and `mlx-gen-z-image::model_base::DEFAULT_GUIDANCE` (sc-8251).
 /// Used when a base-mode request omits `guidance`; ignored in Turbo mode (guidance-distilled).
 const BASE_DEFAULT_GUIDANCE: f32 = 4.0;
-/// Qwen3 pad token id (`<|endoftext|>`) — matches the txt2img tokenizer config.
-const QWEN_PAD_TOKEN_ID: i32 = 151643;
-const TOKENIZER_MAX_LEN: usize = 512;
 
 /// Default ControlNet conditioning scale (the strict-pose tier — parity with the Qwen/Kolors slices).
 pub const DEFAULT_CONTROL_SCALE: f32 = 1.0;
@@ -671,92 +660,56 @@ impl ZImageControl {
         self.decode(&latents)
     }
 
-    /// Deterministic, launch-portable initial latent noise (sc-3673): N(0,1) from a fixed-algorithm CPU
-    /// RNG seeded by `seed`, built on CPU then moved to the device at the model dtype. Shared by the
-    /// Turbo + base control loops so both are pure functions of `(seed, request)`.
+    /// Deterministic, launch-portable initial latent noise (sc-3673, shared [`common::seed_noise`]).
+    /// Used by the Turbo + base control loops so both are pure functions of `(seed, request)`.
     fn seed_noise(&self, seed: u64, lat_h: usize, lat_w: usize) -> Result<Tensor> {
-        let n = LATENT_CHANNELS * lat_h * lat_w;
-        let mut rng = StdRng::seed_from_u64(seed);
-        let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
-        Ok(
-            Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
-                .to_device(&self.device)?
-                .to_dtype(DTYPE)?,
-        )
+        common::seed_noise(seed, lat_h, lat_w, &self.device, DTYPE)
     }
 
-    /// Build the Z-Image Qwen tokenizer (chat template + max-length policy). Shared by the conditional
-    /// ([`text_embeddings`](Self::text_embeddings)) and unconditional
-    /// ([`uncond_embeddings`](Self::uncond_embeddings)) encode paths.
-    fn tokenizer(&self) -> Result<TextTokenizer> {
-        TextTokenizer::from_file(
-            self.root.join("tokenizer/tokenizer.json"),
-            TokenizerConfig {
-                max_length: TOKENIZER_MAX_LEN,
-                pad_token_id: QWEN_PAD_TOKEN_ID,
-                chat_template: ChatTemplate::QwenInstruct,
-                pad_to_max_length: false,
-            },
-        )
-        .map_err(|e| CandleError::Msg(format!("z-image control: load tokenizer: {e}")))
-    }
-
-    /// Token `ids` → `cap_feats` `(seq, 2560)` at bf16 via the Qwen3 encoder.
-    fn encode_cap(&self, ids: &[i32]) -> Result<Tensor> {
-        let ids: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
-        let len = ids.len();
-        let input_ids = Tensor::from_vec(ids, (1, len), &self.device)?;
-        let enc = self.text_encoder.forward(&input_ids)?; // (1, L, 2560)
-        Ok(enc.squeeze(0)?.to_dtype(DTYPE)?)
-    }
-
-    /// Prompt → `cap_feats` `(seq, 2560)` at bf16 via the Qwen3 encoder + the Qwen chat template (the
-    /// txt2img path's tokenizer config).
+    /// Prompt → `cap_feats` `(seq, 2560)` at bf16 via the Qwen3 encoder + the shared Qwen chat template
+    /// ([`common::prompt_ids`] + [`common::encode_ids`]).
     fn text_embeddings(&self, prompt: &str) -> Result<Tensor> {
-        let out = self
-            .tokenizer()?
-            .tokenize(prompt)
-            .map_err(|e| CandleError::Msg(format!("z-image control: tokenize: {e}")))?;
-        if out.ids.is_empty() {
-            return Err(CandleError::Msg("z-image control: empty prompt".into()));
-        }
-        self.encode_cap(&out.ids)
+        let ids = common::prompt_ids(&self.root, prompt, "z-image control")?;
+        common::encode_ids(&ids, &self.device, DTYPE, |input_ids| {
+            self.text_encoder.forward(input_ids)
+        })
     }
 
     /// Negative prompt → `cap_feats` for the **unconditional** CFG branch of the base control path
-    /// (sc-8680). Identical encoding to [`text_embeddings`](Self::text_embeddings), but the negative
-    /// prompt may be the **empty string** (the unconditional embedding).
-    ///
-    /// gen-core's [`TextTokenizer::tokenize`] short-circuits an empty prompt to a `(1, 0)` sequence
-    /// **before** the chat template is applied (`pad_to_max_length = false`), so an empty negative
-    /// prompt must be encoded via [`encode_chat_ids`], which renders the QwenInstruct scaffolding
-    /// around `""` and tokenizes it to the non-empty role-marker sequence — matching the reference
-    /// `mlx-gen-z-image::model_base_control` uncond branch and mirroring
-    /// [`crate::pipeline::Pipeline::uncond_embeddings`]. See sc-8646.
+    /// (sc-8680). Delegates to the shared [`common::uncond_ids`], which routes the **empty string**
+    /// through the QwenInstruct chat-template scaffolding rather than the empty-short-circuiting
+    /// `tokenize` (the sc-8646 fix). Mirrors [`crate::pipeline::Pipeline::uncond_embeddings`].
     fn uncond_embeddings(&self, negative_prompt: &str) -> Result<Tensor> {
-        if !negative_prompt.is_empty() {
-            return self.text_embeddings(negative_prompt);
-        }
-        let ids = self
-            .tokenizer()?
-            .encode_chat_ids("", true)
-            .map_err(|e| CandleError::Msg(format!("z-image control: tokenize uncond: {e}")))?;
-        if ids.is_empty() {
-            return Err(CandleError::Msg(
-                "z-image control: unconditional embedding tokenized to an empty sequence".into(),
-            ));
-        }
-        self.encode_cap(&ids)
+        let ids = common::uncond_ids(&self.root, negative_prompt, "z-image control")?;
+        common::encode_ids(&ids, &self.device, DTYPE, |input_ids| {
+            self.text_encoder.forward(input_ids)
+        })
     }
 
-    /// Build the 33ch VAE-encoded control context `(1, 33, 1, H/8, W/8)` (bf16): VAE-encode the pose to
-    /// 16ch latents + a zero mask (1ch) + a zero inpaint latent (16ch) — the Fun-Controlnet-Union
+    /// Build the 33ch VAE-encoded control context `(1, 33, 1, H/8, W/8)` (bf16): the shared deterministic
+    /// encode **mean** ([`common::encode_mean`]) of the pose → 16ch latents, then the control-specific
+    /// channel-cat of a zero mask (1ch) + a zero inpaint latent (16ch) — the Fun-Controlnet-Union
     /// channel layout. Pure-pose control has no init/mask, so those groups are zeros.
     fn encode_control_context(&self, skeleton: &Image, width: u32, height: u32) -> Result<Tensor> {
-        let img = preprocess_control_image(skeleton, width, height, &self.device)?; // f32 (1,3,H,W) [-1,1]
-        let moments = img.apply(&self.vae_encoder)?; // (1, 32, H/8, W/8)
-        let mean = moments.chunk(2, 1)?[0].clone(); // (1, 16, H/8, W/8)
-        let control_latents = ((mean - self.vae_shift)? * self.vae_scale)?;
+        // `RequireExact`: the worker renders the skeleton at the target size; a silent stretch would
+        // distort the pose.
+        let img = common::preprocess_image(
+            skeleton,
+            width,
+            height,
+            ResizePolicy::RequireExact,
+            &self.device,
+            "z-image control",
+        )?; // f32 (1,3,H,W) [-1,1]
+            // Deterministic mean encode at f32 (the control context is assembled at ENC_DTYPE, then cast to
+            // bf16 once at the end — matching the original per-channel-group dtype).
+        let control_latents = common::encode_mean(
+            &self.vae_encoder,
+            &img,
+            self.vae_shift,
+            self.vae_scale,
+            ENC_DTYPE,
+        )?;
         let (b, c, lh, lw) = control_latents.dims4()?;
         // Add the singleton frame axis → (1, 16, 1, H/8, W/8).
         let control_latents = control_latents.reshape((b, c, 1, lh, lw))?;
@@ -766,56 +719,10 @@ impl ZImageControl {
         Ok(context.to_dtype(DTYPE)?)
     }
 
-    /// VAE-decode the final latents `(1, 16, 1, h, w)` → an RGB8 [`Image`] (the txt2img decode).
+    /// VAE-decode the final latents `(1, 16, 1, h, w)` → an RGB8 [`Image`] (the shared txt2img decode).
     fn decode(&self, latents: &Tensor) -> Result<Image> {
-        let latents = latents.squeeze(2)?; // (1, 16, h, w)
-        let decoded = self.vae.decode(&latents)?.to_dtype(DType::F32)?; // (1, 3, H, W) in [-1,1]
-        let img = postprocess_image(&decoded)?.i(0)?.to_device(&Device::Cpu)?;
-        let (c, h, w) = img.dims3()?;
-        if c != 3 {
-            return Err(CandleError::Msg(format!("expected 3 channels, got {c}")));
-        }
-        let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
-        Ok(Image {
-            width: w as u32,
-            height: h as u32,
-            pixels,
-        })
+        common::decode(&self.vae, latents)
     }
-}
-
-/// A pre-rendered RGB8 control image (the OpenPose skeleton, at the request size) → `[1, 3, H, W]` f32
-/// in `[-1, 1]` (the VAE encoder's input range). Requires `image` already at `width × height` (the
-/// worker renders at the target size — no silent stretch).
-fn preprocess_control_image(
-    image: &Image,
-    width: u32,
-    height: u32,
-    device: &Device,
-) -> Result<Tensor> {
-    if image.width != width || image.height != height {
-        return Err(CandleError::Msg(format!(
-            "z-image control: control image {}x{} must match the request {width}x{height}",
-            image.width, image.height
-        )));
-    }
-    let (w, h) = (width as usize, height as usize);
-    if image.pixels.len() != w * h * 3 {
-        return Err(CandleError::Msg(format!(
-            "z-image control: control image buffer {} != {w}x{h}x3",
-            image.pixels.len()
-        )));
-    }
-    let mut data = vec![0f32; 3 * h * w];
-    for y in 0..h {
-        for x in 0..w {
-            for c in 0..3 {
-                data[c * h * w + y * w + x] =
-                    image.pixels[(y * w + x) * 3 + c] as f32 / 127.5 - 1.0;
-            }
-        }
-    }
-    Ok(Tensor::from_vec(data, (1, 3, h, w), device)?)
 }
 
 /// Deterministic overlay-file resolution (sc-8680): pick the intended Fun-Controlnet-**Union** weight
@@ -1000,6 +907,9 @@ mod tests {
         assert!(cfg.n_refiner_layers >= CONTROL_REFINER_PLACES.len());
     }
 
+    /// The control preprocess (shared [`common::preprocess_image`] with `RequireExact`) maps
+    /// `[0,255] → [-1,1]` at the exact request size and rejects an off-size control image (no silent
+    /// stretch of the pose skeleton).
     #[test]
     fn control_preprocess_shape_and_range() {
         let img = Image {
@@ -1007,11 +917,27 @@ mod tests {
             height: 8,
             pixels: vec![255u8; 16 * 8 * 3],
         };
-        let t = preprocess_control_image(&img, 16, 8, &Device::Cpu).unwrap();
+        let t = common::preprocess_image(
+            &img,
+            16,
+            8,
+            ResizePolicy::RequireExact,
+            &Device::Cpu,
+            "z-image control",
+        )
+        .unwrap();
         assert_eq!(t.dims(), &[1, 3, 8, 16]);
         let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(v.iter().all(|x| (x - 1.0).abs() < 1e-4)); // 255 → 1.0
-        assert!(preprocess_control_image(&img, 32, 8, &Device::Cpu).is_err());
+        assert!(common::preprocess_image(
+            &img,
+            32,
+            8,
+            ResizePolicy::RequireExact,
+            &Device::Cpu,
+            "z-image control"
+        )
+        .is_err());
     }
 
     /// The exact-name fast path + `File` passthrough (Turbo repo's single-file layout).

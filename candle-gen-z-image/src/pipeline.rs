@@ -52,17 +52,14 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{self, AdapterSpec, Conditioning, GenerationRequest, Image, Progress};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::image_seed;
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
-use candle_transformers::models::z_image::sampling::postprocess_image;
 use candle_transformers::models::z_image::scheduler::{
     calculate_shift, FlowMatchEulerDiscreteScheduler, SchedulerConfig, BASE_IMAGE_SEQ_LEN,
     BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT,
@@ -72,9 +69,8 @@ use candle_transformers::models::z_image::transformer::{
     Config as DitConfig, ZImageTransformer2DModel,
 };
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder, VaeConfig};
-use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
+use crate::common::{self, ResizePolicy};
 use crate::packed_dit::ZImageTransformer2DModel as PackedDit;
 use crate::packed_te::ZImageTextEncoder as PackedTe;
 
@@ -141,35 +137,12 @@ pub(crate) const BASE_SCHEDULE_SHIFT: f64 = 6.0;
 /// omits `guidance`.
 pub(crate) const BASE_DEFAULT_GUIDANCE: f32 = 4.0;
 
-/// VAE spatial downscale — the latent is image/8 per side (the 4-stage `block_out_channels`
-/// `[128,256,512,512]` AutoencoderKL has 3 downsamplers). Matches `mlx-gen-z-image`'s `SPATIAL_SCALE`.
-/// `pub(crate)` so the trainer's preview-sample path (sc-8650) shapes its seeded noise at the identical
-/// /8 latent geometry inference uses (single source of truth).
-pub(crate) const SPATIAL_SCALE: u32 = 8;
-
-/// DiT patch size on each spatial axis (`Config::z_image_turbo().all_patch_size[0]`). The flow-match
-/// `mu` shift is computed from the post-patchify image sequence length, so it is needed here.
-/// `pub(crate)` so the trainer's preview `mu` (sc-8650) is derived identically to inference.
-pub(crate) const PATCH_SIZE: u32 = 2;
-
-/// Z-Image latent channel count (the VAE's `latent_channels` and the DiT's `in_channels`).
-/// `pub(crate)` so the trainer's preview noise (sc-8650) is the identical 16-channel prior.
-pub(crate) const LATENT_CHANNELS: usize = 16;
-
-/// Qwen3 pad token id (`<|endoftext|>`). Only consulted when padding to a fixed length, which the
-/// txt2img path does not do (`pad_to_max_length: false`); the DiT's `prepare_inputs` does the
-/// SEQ_MULTI_OF padding + mask. Carried for correctness/parity with the mlx loader. `pub(crate)` so
-/// the trainer's caption caching uses the exact same tokenizer config (single source of truth).
-pub(crate) const QWEN_PAD_TOKEN_ID: i32 = 151643;
-
-/// Right-truncation cap for prompt tokenization (HF single-sequence truncation). Z-Image prompts are
-/// short; 512 is generous and never engages in practice.
-pub(crate) const TOKENIZER_MAX_LEN: usize = 512;
-
-/// The VAE **encoder** runs f32 (the encode path's dtype, matching [`crate::edit`]); its distribution
-/// mean is cast to the compute dtype (bf16) for the img2img init latent. Only the base img2img /
-/// `Reference` path (sc-8646) builds/uses an encoder — txt2img never touches it.
-const ENC_DTYPE: DType = DType::F32;
+// The shared Z-Image geometry/tokenizer constants now live in [`crate::common`] (sc-9002 / F-022) —
+// re-exported here at their historical `crate::pipeline::…` paths so the trainer's preview-sample path
+// (sc-8650) keeps importing them from one place. Single source of truth: [`crate::common`].
+pub(crate) use crate::common::{
+    ENC_DTYPE, LATENT_CHANNELS, PATCH_SIZE, QWEN_PAD_TOKEN_ID, SPATIAL_SCALE, TOKENIZER_MAX_LEN,
+};
 
 /// img2img start step — the Z-Image "structure-preservation" convention (the fork's `init_time_step`,
 /// mirrored from `mlx-gen`'s shared `img2img::init_time_step`): for a reference with `strength` in
@@ -453,87 +426,49 @@ impl Pipeline {
         height: u32,
     ) -> Result<Tensor> {
         let vae_cfg = VaeConfig::z_image();
-        let img = preprocess_source(source, width, height, &self.device)?; // f32 (1,3,H,W) [-1,1]
-        let moments = img.apply(encoder)?; // (1, 32, H/8, W/8) — [mean | logvar]
-        let mean = moments.chunk(2, 1)?[0].clone(); // (1, 16, H/8, W/8)
-        let latents = ((mean - vae_cfg.shift_factor)? * vae_cfg.scaling_factor)?;
-        Ok(latents.to_dtype(self.dtype)?)
-    }
-
-    /// Build the Z-Image Qwen tokenizer (chat template + max-length policy). Shared by the conditional
-    /// ([`text_embeddings`](Self::text_embeddings)) and unconditional
-    /// ([`uncond_embeddings`](Self::uncond_embeddings)) encode paths so their tokenization policy can
-    /// never drift.
-    fn tokenizer(&self) -> Result<TextTokenizer> {
-        TextTokenizer::from_file(
-            self.root.join("tokenizer/tokenizer.json"),
-            TokenizerConfig {
-                max_length: TOKENIZER_MAX_LEN,
-                pad_token_id: QWEN_PAD_TOKEN_ID,
-                chat_template: ChatTemplate::QwenInstruct,
-                pad_to_max_length: false,
-            },
+        // `ResizeIfNeeded`: no-op when the reference is already at the render size (the base img2img
+        // resize policy — see [`ResizePolicy`]).
+        let img = common::preprocess_image(
+            source,
+            width,
+            height,
+            ResizePolicy::ResizeIfNeeded,
+            &self.device,
+            "z_image img2img",
+        )?; // f32 (1,3,H,W) [-1,1]
+        common::encode_mean(
+            encoder,
+            &img,
+            vae_cfg.shift_factor,
+            vae_cfg.scaling_factor,
+            self.dtype,
         )
-        .map_err(|e| CandleError::Msg(format!("z-image: load tokenizer: {e}")))
     }
 
-    /// Token `ids` → `cap_feats` `(seq, 2560)` at the compute dtype: run the Qwen3 encoder and squeeze
-    /// the batch axis. The reference `prepare_inputs` does the SEQ_MULTI_OF padding + attention mask
-    /// downstream, so every id here is a valid token (no padding at this seam).
+    /// Token `ids` → `cap_feats` `(seq, 2560)` at the compute dtype: run the dense-or-packed Qwen3
+    /// encoder and squeeze the batch axis via the shared [`common::encode_ids`]. The reference
+    /// `prepare_inputs` does the SEQ_MULTI_OF padding + attention mask downstream, so every id here is a
+    /// valid token.
     fn encode_cap(&self, te: &TextEnc, ids: &[i32]) -> Result<Tensor> {
-        // candle embeddings index with u32; the chat-template ids are small non-negative Qwen ids.
-        let ids: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
-        let len = ids.len();
-        let input_ids = Tensor::from_vec(ids, (1, len), &self.device)?;
-        let enc = te.forward(&input_ids)?; // (1, L, 2560)
-        Ok(enc.squeeze(0)?.to_dtype(self.dtype)?) // (L, 2560)
+        common::encode_ids(ids, &self.device, self.dtype, |input_ids| {
+            te.forward(input_ids)
+        })
     }
 
-    /// Prompt → `cap_feats` `(seq, 2560)`. Tokenizes with the Qwen chat template (gen-core's
-    /// [`TextTokenizer`]) and runs the Qwen3 encoder.
+    /// Prompt → `cap_feats` `(seq, 2560)`. Tokenizes with the shared Qwen chat template
+    /// ([`common::prompt_ids`]) and runs the Qwen3 encoder.
     pub(crate) fn text_embeddings(&self, te: &TextEnc, prompt: &str) -> Result<Tensor> {
-        let out = self
-            .tokenizer()?
-            .tokenize(prompt)
-            .map_err(|e| CandleError::Msg(format!("z-image: tokenize: {e}")))?;
-        if out.ids.is_empty() {
-            // Defense-in-depth: `validate` already rejects an empty prompt; guard before the
-            // (1, 0) tensor would reach the encoder.
-            return Err(CandleError::Msg("z-image: empty prompt".into()));
-        }
-        self.encode_cap(te, &out.ids)
+        let ids = common::prompt_ids(&self.root, prompt, "z-image")?;
+        self.encode_cap(te, &ids)
     }
 
     /// Negative prompt → `cap_feats` for the **unconditional** CFG branch of the base path (sc-8414).
-    /// Identical encoding to [`text_embeddings`](Self::text_embeddings) — same Qwen chat template, same
-    /// encoder — but the negative prompt may be the **empty string** (the unconditional embedding).
-    ///
-    /// The empty-string case must NOT route through `text_embeddings`: gen-core's
-    /// [`TextTokenizer::tokenize`] short-circuits an empty prompt to a `(1, 0)` sequence **before** the
-    /// chat template is applied (our config has `pad_to_max_length = false`), so an empty negative
-    /// prompt would trip the empty-`ids` guard and error `z-image: empty prompt` (sc-8646, observed on
-    /// real weights: base CFG with an unset negative prompt). Instead we render the QwenInstruct
-    /// scaffolding around `""` via [`encode_chat_ids`] — `<|im_start|>user\n<|im_end|>\n<|im_start|>
-    /// assistant\n` — which tokenizes to the non-empty role-marker sequence the reference
-    /// `mlx-gen-z-image::model_base` feeds its uncond branch. A non-empty negative prompt takes the
-    /// ordinary `text_embeddings` path.
+    /// Delegates to the shared [`common::uncond_ids`], which routes the **empty string** through the
+    /// QwenInstruct chat-template scaffolding rather than the empty-short-circuiting `tokenize` (the
+    /// sc-8646 fix — a plain `tokenize("")` yields `(1, 0)` before the template and breaks the empty
+    /// negative prompt). A non-empty negative prompt takes the ordinary conditional path.
     pub(crate) fn uncond_embeddings(&self, te: &TextEnc, negative_prompt: &str) -> Result<Tensor> {
-        if !negative_prompt.is_empty() {
-            return self.text_embeddings(te, negative_prompt);
-        }
-        // `add_special_tokens = true` mirrors `tokenize`'s `encode(text, true)`. For Qwen this only
-        // governs the auto-added BOS/EOS (Qwen adds none), so the ids equal the templated tokens.
-        let ids = self
-            .tokenizer()?
-            .encode_chat_ids("", true)
-            .map_err(|e| CandleError::Msg(format!("z-image: tokenize uncond: {e}")))?;
-        if ids.is_empty() {
-            // Only reachable if a degenerate template rendered "" to nothing — surface as a typed
-            // error rather than letting a (1, 0) tensor reach the encoder.
-            return Err(CandleError::Msg(
-                "z-image: unconditional embedding tokenized to an empty sequence".into(),
-            ));
-        }
+        let ids = common::uncond_ids(&self.root, negative_prompt, "z-image")?;
         self.encode_cap(te, &ids)
     }
 
@@ -557,16 +492,8 @@ impl Pipeline {
         for index in 0..req.count {
             let seed = image_seed(base_seed, index);
 
-            // sc-3673 parity — deterministic, launch-portable initial noise: N(0,1) from a
-            // fixed-algorithm CPU RNG seeded by `seed`, built on CPU then moved to the device. The
-            // flow-match Euler step injects no per-step noise, so generation is a pure function of
-            // `(seed, request)`.
-            let n = LATENT_CHANNELS * lat_h * lat_w;
-            let mut rng = StdRng::seed_from_u64(seed);
-            let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
-            let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
-                .to_device(&self.device)?
-                .to_dtype(self.dtype)?;
+            // sc-3673 parity — deterministic, launch-portable initial noise (shared [`common::seed_noise`]).
+            let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
 
             // Flow-match Euler schedule. Match the candle `z_image` reference: pass `Some(mu)` (the
             // resolution-dependent shift parameter from `calculate_shift`). Under
@@ -694,13 +621,8 @@ impl Pipeline {
         for index in 0..req.count {
             let seed = image_seed(base_seed, index);
 
-            // sc-3673 parity — deterministic, launch-portable initial noise (see `render`).
-            let n = LATENT_CHANNELS * lat_h * lat_w;
-            let mut rng = StdRng::seed_from_u64(seed);
-            let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
-            let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
-                .to_device(&self.device)?
-                .to_dtype(self.dtype)?;
+            // sc-3673 parity — deterministic, launch-portable initial noise (shared [`common::seed_noise`]).
+            let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
 
             // Static shift=6.0 schedule (the base model's scheduler_config.json). Unlike the Turbo
             // path's `Some(mu)` no-op, the base passes `None` so the static-shift branch actually
@@ -790,57 +712,12 @@ impl Pipeline {
         Ok(images)
     }
 
-    /// VAE-decode the final latents `(1, 16, 1, h, w)` to an RGB8 [`Image`]. The VAE applies its own
-    /// `/scaling_factor + shift_factor` un-scale inside `decode`; `postprocess_image` maps the
-    /// `[-1, 1]` output to `[0, 255]` u8.
+    /// VAE-decode the final latents `(1, 16, 1, h, w)` to an RGB8 [`Image`] via the shared
+    /// [`common::decode`]. The VAE applies its own `/scaling_factor + shift_factor` un-scale inside
+    /// `decode`; `postprocess_image` maps the `[-1, 1]` output to `[0, 255]` u8.
     fn decode(&self, vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
-        // Drop the singleton frame axis: (1, 16, 1, h, w) -> (1, 16, h, w).
-        let latents = latents.squeeze(2)?;
-        let decoded = vae.decode(&latents)?.to_dtype(DType::F32)?; // (1, 3, H, W) in [-1, 1]
-        let img = postprocess_image(&decoded)? // u8 (1, 3, H, W)
-            .i(0)?
-            .to_device(&Device::Cpu)?;
-        let (c, h, w) = img.dims3()?;
-        if c != 3 {
-            return Err(CandleError::Msg(format!("expected 3 channels, got {c}")));
-        }
-        let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
-        Ok(Image {
-            width: w as u32,
-            height: h as u32,
-            pixels,
-        })
+        common::decode(vae, latents)
     }
-}
-
-/// An RGB8 img2img reference → `[1, 3, H, W]` f32 in `[-1, 1]` (the VAE encoder's input range),
-/// LANCZOS-resized to the render `width × height` (the worker pre-fits, but resizing here keeps the
-/// base provider robust to an off-size reference — the same normalization [`crate::edit`] uses,
-/// sc-8646). A no-op resize when already at the render size.
-fn preprocess_source(image: &Image, width: u32, height: u32, device: &Device) -> Result<Tensor> {
-    let (iw, ih) = (image.width as usize, image.height as usize);
-    if image.pixels.len() != iw * ih * 3 {
-        return Err(CandleError::Msg(format!(
-            "z_image img2img: reference buffer {} != {iw}x{ih}x3",
-            image.pixels.len()
-        )));
-    }
-    let (rw, rh) = (width as usize, height as usize);
-    let resized: Vec<f32> = if (ih, iw) == (rh, rw) {
-        image.pixels.iter().map(|&p| p as f32).collect()
-    } else {
-        resize_lanczos_u8(&image.pixels, ih, iw, rh, rw) // HWC f32 [0,255]
-    };
-    // [0,255] → [-1,1], HWC → CHW.
-    let mut data = vec![0f32; 3 * rh * rw];
-    for y in 0..rh {
-        for x in 0..rw {
-            for c in 0..3 {
-                data[c * rh * rw + y * rw + x] = resized[(y * rw + x) * 3 + c] / 127.5 - 1.0;
-            }
-        }
-    }
-    Ok(Tensor::from_vec(data, (1, 3, rh, rw), device)?.to_dtype(ENC_DTYPE)?)
 }
 
 #[cfg(test)]
@@ -922,32 +799,30 @@ mod tests {
         let snap = std::env::var("Z_IMAGE_BASE_SNAPSHOT")
             .or_else(|_| std::env::var("Z_IMAGE_SNAPSHOT"))
             .expect("set Z_IMAGE_SNAPSHOT or Z_IMAGE_BASE_SNAPSHOT to a Z-Image snapshot dir");
-        let tok = TextTokenizer::from_file(
-            Path::new(&snap).join("tokenizer/tokenizer.json"),
-            TokenizerConfig {
-                max_length: TOKENIZER_MAX_LEN,
-                pad_token_id: QWEN_PAD_TOKEN_ID,
-                chat_template: ChatTemplate::QwenInstruct,
-                pad_to_max_length: false,
-            },
-        )
-        .expect("load tokenizer.json");
+        let root = std::path::Path::new(&snap);
+        // The shared tokenizer (`common::build_tokenizer`) with the shared config — the same seam the
+        // three entry points now use (sc-9002).
+        let tok = common::build_tokenizer(root, "z-image").expect("load tokenizer.json");
 
         // The trap: an empty prompt short-circuits to (1, 0) BEFORE the chat template is applied.
         assert!(
             tok.tokenize("").unwrap().ids.is_empty(),
             "empty prompt must short-circuit before the chat template (the sc-8646 trap)"
         );
-        // The fix: the QwenInstruct scaffolding around "" tokenizes to a non-empty sequence, distinct
-        // from a real prompt's encoding.
-        let uncond_ids = tok.encode_chat_ids("", true).expect("encode empty uncond");
+        // The fix now lives in the shared `common::uncond_ids`: an empty negative prompt tokenizes via
+        // the QwenInstruct chat template to a non-empty sequence, distinct from a real prompt — while
+        // `common::prompt_ids("")` still errors on the empty short-circuit (the trap is real).
+        let uncond_ids = common::uncond_ids(root, "", "z-image").expect("encode empty uncond");
         assert!(
             !uncond_ids.is_empty(),
             "empty uncond must tokenize via the chat template to a non-empty sequence"
         );
-        let real_ids = tok
-            .encode_chat_ids("a red fox", true)
-            .expect("encode real prompt");
+        assert!(
+            common::prompt_ids(root, "", "z-image").is_err(),
+            "an empty prompt through the conditional path must still error"
+        );
+        let real_ids =
+            common::uncond_ids(root, "a red fox", "z-image").expect("encode real prompt");
         assert_ne!(uncond_ids, real_ids, "uncond scaffolding != a real prompt");
     }
 

@@ -22,6 +22,10 @@
 //! choices reconciled against the macOS `mlx-gen-z-image` provider.
 
 mod adapters;
+// Crate-private shared plumbing (sc-9002 / F-022): the loader, VAE decode → RGB8, `[0,255] → [-1,1]`
+// image preprocess, deterministic VAE-encode mean, seeded-noise prior, and the Qwen tokenizer policy —
+// one home for what the three entry points (pipeline/edit/control) used to triplicate.
+mod common;
 mod dit;
 mod pipeline;
 // The packed-load seam (sc-9408, sc-9089 umbrella): the local dense-or-packed `QLinear`/`QEmbedding`

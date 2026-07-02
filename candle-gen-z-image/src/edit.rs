@@ -35,15 +35,12 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
-use candle_transformers::models::z_image::sampling::postprocess_image;
 use candle_transformers::models::z_image::scheduler::{
     calculate_shift, FlowMatchEulerDiscreteScheduler, SchedulerConfig, BASE_IMAGE_SEQ_LEN,
     BASE_SHIFT, MAX_IMAGE_SEQ_LEN, MAX_SHIFT,
@@ -53,27 +50,20 @@ use candle_transformers::models::z_image::transformer::{
     Config as DitConfig, ZImageTransformer2DModel,
 };
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder, VaeConfig};
-use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
+
+// Shared Z-Image plumbing (loader/decode/preprocess/tokenizer/seed) — one home (sc-9002 / F-022).
+use crate::common::{self, ResizePolicy, ENC_DTYPE, PATCH_SIZE, SPATIAL_SCALE};
 
 /// The transformer + latents run bf16 (Z-Image native, the validated candle txt2img dtype); the VAE
 /// encoder runs f32 (the encode path's dtype) and its mean is cast to bf16 for the init latent.
 const DTYPE: DType = DType::BF16;
-const ENC_DTYPE: DType = DType::F32;
 
-/// VAE spatial downscale (latent = image/8 per side) + DiT patch size — shared with the txt2img pipeline.
-const SPATIAL_SCALE: u32 = 8;
-const PATCH_SIZE: u32 = 2;
-const LATENT_CHANNELS: usize = 16;
 /// Z-Image works at /8 then patchifies /2, so both image dims must be multiples of 16 for a clean
 /// patchify (the txt2img `validate` floor).
 const SIZE_MULTIPLE: u32 = 16;
 
 /// Z-Image-Turbo is guidance-distilled to a fixed 4-step schedule (the txt2img default).
 const DEFAULT_STEPS: usize = 4;
-/// Qwen3 pad token id (`<|endoftext|>`) — matches the txt2img tokenizer config.
-const QWEN_PAD_TOKEN_ID: i32 = 151643;
-const TOKENIZER_MAX_LEN: usize = 512;
 
 /// img2img default strength — the worker's `advanced.strength` default (`resolve_zimage_edit_init`,
 /// torch `ZImageImg2ImgPipeline` 0.6). With the fork's `init_time_step`, higher → closer to the source.
@@ -231,13 +221,8 @@ impl ZImageEdit {
         let start = init_time_step(steps, req.strength);
         let sigma_start = scheduler.sigmas[start];
 
-        // Deterministic, launch-portable init noise (sc-3673): N(0,1) from a seeded CPU RNG → device.
-        let n = LATENT_CHANNELS * lat_h * lat_w;
-        let mut rng = StdRng::seed_from_u64(req.seed);
-        let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
-        let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
-            .to_device(&self.device)?
-            .to_dtype(DTYPE)?;
+        // Deterministic, launch-portable init noise (sc-3673, shared [`common::seed_noise`]).
+        let noise = common::seed_noise(req.seed, lat_h, lat_w, &self.device, DTYPE)?;
 
         // Flow-match interpolation blend: x_t = (1 − σ_start)·clean + σ_start·noise.
         let x_t = ((clean * (1.0 - sigma_start))? + (noise * sigma_start)?)?;
@@ -277,86 +262,43 @@ impl ZImageEdit {
         self.decode(&latents)
     }
 
-    /// Prompt → `cap_feats` `(seq, 2560)` at bf16 via the Qwen3 encoder + the Qwen chat template (the
-    /// txt2img tokenizer config).
+    /// Prompt → `cap_feats` `(seq, 2560)` at bf16 via the Qwen3 encoder + the shared Qwen chat template
+    /// ([`common::prompt_ids`] + [`common::encode_ids`]).
     fn text_embeddings(&self, prompt: &str) -> Result<Tensor> {
-        let tok = TextTokenizer::from_file(
-            self.root.join("tokenizer/tokenizer.json"),
-            TokenizerConfig {
-                max_length: TOKENIZER_MAX_LEN,
-                pad_token_id: QWEN_PAD_TOKEN_ID,
-                chat_template: ChatTemplate::QwenInstruct,
-                pad_to_max_length: false,
-            },
-        )
-        .map_err(|e| CandleError::Msg(format!("z-image edit: load tokenizer: {e}")))?;
-        let out = tok
-            .tokenize(prompt)
-            .map_err(|e| CandleError::Msg(format!("z-image edit: tokenize: {e}")))?;
-        if out.ids.is_empty() {
-            return Err(CandleError::Msg("z-image edit: empty prompt".into()));
-        }
-        let ids: Vec<u32> = out.ids.iter().map(|&i| i as u32).collect();
-        let len = ids.len();
-        let input_ids = Tensor::from_vec(ids, (1, len), &self.device)?;
-        let enc = self.text_encoder.forward(&input_ids)?; // (1, L, 2560)
-        Ok(enc.squeeze(0)?.to_dtype(DTYPE)?)
+        let ids = common::prompt_ids(&self.root, prompt, "z-image edit")?;
+        common::encode_ids(&ids, &self.device, DTYPE, |input_ids| {
+            self.text_encoder.forward(input_ids)
+        })
     }
 
     /// VAE-encode `source` (LANCZOS-resized to the render size, normalized to `[-1, 1]` NCHW) to the
     /// deterministic clean latent `(1, 16, H/8, W/8)` bf16: the distribution **mean** (not a sampled
-    /// draw), mapped to latent space as `(mean − shift) · scale`. The candle `AutoEncoderKL::encode`
-    /// samples via the device RNG (not launch-portable, sc-3673), so the raw `Encoder` is run here
-    /// instead — the same deterministic path [`crate::control`] uses for the pose context.
+    /// draw), mapped to latent space as `(mean − shift) · scale` via the shared [`common::encode_mean`].
+    /// The candle `AutoEncoderKL::encode` samples via the device RNG (not launch-portable, sc-3673), so
+    /// the raw `Encoder` is run here instead — the same deterministic path [`crate::control`] uses.
     fn encode_source(&self, source: &Image, width: u32, height: u32) -> Result<Tensor> {
-        let img = preprocess_source(source, width, height, &self.device)?; // f32 (1,3,H,W) [-1,1]
-        let moments = img.apply(&self.vae_encoder)?; // (1, 32, H/8, W/8) — [mean | logvar]
-        let mean = moments.chunk(2, 1)?[0].clone(); // (1, 16, H/8, W/8)
-        let latents = ((mean - self.vae_shift)? * self.vae_scale)?;
-        Ok(latents.to_dtype(DTYPE)?)
+        // `ResizeAlways`: the edit provider always LANCZOS-fits the source to the render size.
+        let img = common::preprocess_image(
+            source,
+            width,
+            height,
+            ResizePolicy::ResizeAlways,
+            &self.device,
+            "z-image edit",
+        )?; // f32 (1,3,H,W) [-1,1]
+        common::encode_mean(
+            &self.vae_encoder,
+            &img,
+            self.vae_shift,
+            self.vae_scale,
+            DTYPE,
+        )
     }
 
-    /// VAE-decode the final latents `(1, 16, 1, h, w)` → an RGB8 [`Image`] (the txt2img decode).
+    /// VAE-decode the final latents `(1, 16, 1, h, w)` → an RGB8 [`Image`] (the shared txt2img decode).
     fn decode(&self, latents: &Tensor) -> Result<Image> {
-        let latents = latents.squeeze(2)?; // (1, 16, h, w)
-        let decoded = self.vae.decode(&latents)?.to_dtype(DType::F32)?; // (1, 3, H, W) in [-1,1]
-        let img = postprocess_image(&decoded)?.i(0)?.to_device(&Device::Cpu)?;
-        let (c, h, w) = img.dims3()?;
-        if c != 3 {
-            return Err(CandleError::Msg(format!("expected 3 channels, got {c}")));
-        }
-        let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
-        Ok(Image {
-            width: w as u32,
-            height: h as u32,
-            pixels,
-        })
+        common::decode(&self.vae, latents)
     }
-}
-
-/// An RGB8 source image → `[1, 3, H, W]` f32 in `[-1, 1]` (the VAE encoder's input range), LANCZOS-resized
-/// to the render `width × height` (the worker pre-fits with crop/pad/outpaint, but resizing here keeps the
-/// provider robust to an off-size source, matching the SDXL edit provider's `encode_source`).
-fn preprocess_source(image: &Image, width: u32, height: u32, device: &Device) -> Result<Tensor> {
-    let (iw, ih) = (image.width as usize, image.height as usize);
-    if image.pixels.len() != iw * ih * 3 {
-        return Err(CandleError::Msg(format!(
-            "z-image edit: source buffer {} != {iw}x{ih}x3",
-            image.pixels.len()
-        )));
-    }
-    let (rw, rh) = (width as usize, height as usize);
-    let resized = resize_lanczos_u8(&image.pixels, ih, iw, rh, rw); // HWC f32 [0,255]
-                                                                    // [0,255] → [-1,1], HWC → CHW.
-    let mut data = vec![0f32; 3 * rh * rw];
-    for y in 0..rh {
-        for x in 0..rw {
-            for c in 0..3 {
-                data[c * rh * rw + y * rw + x] = resized[(y * rw + x) * 3 + c] / 127.5 - 1.0;
-            }
-        }
-    }
-    Ok(Tensor::from_vec(data, (1, 3, rh, rw), device)?.to_dtype(ENC_DTYPE)?)
 }
 
 /// mmap a [`VarBuilder`] over every `.safetensors` in `root/sub` at `dtype` (the txt2img loader, shared
@@ -436,8 +378,9 @@ mod tests {
         assert!(s.sigmas[full].abs() < 1e-12);
     }
 
-    /// `preprocess_source` resizes to the render size and maps `[0,255] → [-1,1]` in CHW f32. A solid
-    /// white source ⇒ all ≈ 1.0; a non-multiple buffer errors.
+    /// The edit source preprocess (shared [`common::preprocess_image`] with `ResizeAlways`) resizes to
+    /// the render size and maps `[0,255] → [-1,1]` in CHW f32. A solid white source ⇒ all ≈ 1.0; a
+    /// non-multiple buffer errors.
     #[test]
     fn source_preprocess_shape_and_range() {
         let img = Image {
@@ -445,7 +388,15 @@ mod tests {
             height: 8,
             pixels: vec![255u8; 8 * 8 * 3],
         };
-        let t = preprocess_source(&img, 16, 16, &Device::Cpu).unwrap();
+        let t = common::preprocess_image(
+            &img,
+            16,
+            16,
+            ResizePolicy::ResizeAlways,
+            &Device::Cpu,
+            "z-image edit",
+        )
+        .unwrap();
         assert_eq!(t.dims(), &[1, 3, 16, 16]); // resized to the render size
         let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert!(v.iter().all(|x| (x - 1.0).abs() < 1e-3)); // 255 → 1.0
@@ -454,6 +405,14 @@ mod tests {
             height: 8,
             pixels: vec![0u8; 8 * 8 * 3 - 1],
         };
-        assert!(preprocess_source(&bad, 8, 8, &Device::Cpu).is_err());
+        assert!(common::preprocess_image(
+            &bad,
+            8,
+            8,
+            ResizePolicy::ResizeAlways,
+            &Device::Cpu,
+            "z-image edit"
+        )
+        .is_err());
     }
 }
