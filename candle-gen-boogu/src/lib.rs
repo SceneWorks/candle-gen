@@ -56,8 +56,12 @@ const SIZE_MULTIPLE: u32 = 16;
 const MAX_EDIT_REFERENCES: usize = 5;
 
 /// The curated samplers the Turbo DMD student stays coherent under (the stochastic / re-noising
-/// solvers — `lcm` most of all). The deterministic ODE solvers feed the few-step student
-/// out-of-regime latents, so they stay off the menu. Mirrors `mlx-gen-boogu`'s `TURBO_SAMPLERS`.
+/// solvers — `lcm` most of all; real-weight survey sc-7491). The student was distilled against a
+/// stochastic (re-noised) trajectory, so the curated stochastic solvers match its training regime;
+/// the deterministic ODE solvers feed the few-step student out-of-regime latents, so they stay off
+/// the menu. A selected name routes `render_turbo` through the unified `run_flow_sampler` over the
+/// DMD σ grid (sc-9009); unset stays the byte-exact native DMD loop. Mirrors `mlx-gen-boogu`'s
+/// `TURBO_SAMPLERS`.
 const TURBO_SAMPLERS: &[&str] = &["lcm", "euler_ancestral", "dpmpp_sde"];
 
 /// Which Boogu sampler path a generator drives.
@@ -222,7 +226,9 @@ pub fn descriptor() -> ModelDescriptor {
 }
 
 /// Boogu Turbo descriptor — same base, CFG-free DMD few-step; guidance is inert. The advertised
-/// sampler menu is the DMD-compatible stochastic subset ([`TURBO_SAMPLERS`]).
+/// sampler menu is the DMD-compatible stochastic subset ([`TURBO_SAMPLERS`]); a selected sampler or
+/// scheduler routes the few-step denoise through the unified curated framework over the DMD σ grid
+/// (sc-9009), while unset keeps the byte-exact native DMD student loop.
 pub fn descriptor_turbo() -> ModelDescriptor {
     let mut d = descriptor();
     d.id = BOOGU_IMAGE_TURBO_ID;
@@ -341,6 +347,26 @@ mod tests {
         assert_eq!(t.id, BOOGU_IMAGE_TURBO_ID);
         assert!(!t.capabilities.supports_guidance);
         assert_eq!(t.capabilities.samplers, TURBO_SAMPLERS.to_vec());
+    }
+
+    #[test]
+    fn turbo_advertised_menu_is_honored_curated_names() {
+        // sc-9009: every advertised Turbo sampler must be a real curated solver name — the routing in
+        // `render_turbo` hands `req.sampler` to `run_flow_sampler`, whose N3 fallback silently
+        // substitutes Euler for an unknown name, which would resurrect the silent-ignore trap.
+        let curated = candle_gen::curated_sampler_names();
+        for s in TURBO_SAMPLERS {
+            assert!(
+                curated.contains(s),
+                "advertised turbo sampler {s:?} is not a curated solver: {curated:?}"
+            );
+        }
+        // The scheduler axis is advertised (inherited from Base) and honored by the same routing.
+        let t = descriptor_turbo();
+        assert_eq!(
+            t.capabilities.schedulers,
+            candle_gen::curated_scheduler_names()
+        );
     }
 
     #[test]

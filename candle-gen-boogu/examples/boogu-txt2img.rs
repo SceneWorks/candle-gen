@@ -6,6 +6,7 @@
 //!   boogu_image D:\models\Boogu-Image-0.1-Base "a red apple on a wooden table" 1024 1024 0 42 out.png
 //! ```
 //! Arg order: <model_id> <snapshot_dir> <prompt> [width] [height] [steps(0=default)] [seed] [out.png]
+//!            [sampler] [scheduler]  — curated names (sc-9009); omit for the engine's native path.
 
 use candle_gen::gen_core::{
     registry, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
@@ -32,6 +33,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(8)
         .cloned()
         .unwrap_or_else(|| "boogu_render.png".into());
+    let sampler = a.get(9).cloned().filter(|s| !s.is_empty());
+    let scheduler = a.get(10).cloned().filter(|s| !s.is_empty());
 
     let spec = LoadSpec::new(WeightsSource::Dir(snapshot.into()));
     let gen = registry::load(&model, &spec)?;
@@ -43,6 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         count: 1,
         seed: Some(seed),
         steps: if steps == 0 { None } else { Some(steps) },
+        sampler,
+        scheduler,
         ..Default::default()
     };
 

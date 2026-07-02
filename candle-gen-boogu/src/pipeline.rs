@@ -8,7 +8,10 @@
 //!   noise-fraction FLOW convention. True-CFG: `pred = cond + (scale − 1)·(cond − uncond)`.
 //! - **Turbo** (`boogu_image_turbo`): the DMD student few-step loop (CFG-free) over the
 //!   `linspace(conditioning_sigma, 1, steps+1)[:-1]` clean-fraction grid — predict the clean estimate
-//!   `x += (1 − σ)·v`, then renoise to the next level with fresh noise.
+//!   `x += (1 − σ)·v`, then renoise to the next level with fresh noise. An unset `req.sampler` /
+//!   `req.scheduler` is that native loop, byte-exact; a selected curated sampler/scheduler routes the
+//!   few-step denoise through [`candle_gen::run_flow_sampler`] over the DMD σ grid instead (sc-9009,
+//!   mirroring the mlx twin's sc-7491 Turbo sampler axis).
 //!
 //! Per-sample `B = 1`; the DiT runs once per condition. Deterministic CPU-seeded initial noise
 //! (sc-3673 parity), exactly as the z-image/ideogram providers.
@@ -183,6 +186,43 @@ pub(crate) fn render_turbo(
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let cond = comps.te.last_hidden(&comps.tok.encode_t2i(&req.prompt)?)?;
+
+    // Curated sampler axis (sc-9009, mirroring the mlx twin's sc-7491): a selected sampler/scheduler
+    // routes the few-step denoise through the unified framework over the DMD σ grid. The DMD x0
+    // estimate is identical to the native loop (`x0 = x + (1−c)·v`, the OneMinusSigma flow denoise
+    // with the velocity negated); only the renoise convention differs (the curated solver re-noises,
+    // the native loop flow-blends). Unset (the default) is the native DMD student loop, byte-exact
+    // below.
+    if req.sampler.is_some() || req.scheduler.is_some() {
+        let native = turbo_native_sigmas(DEFAULT_TURBO_SIGMA, steps);
+        // The DMD grid is linear in clean-fraction (no logistic shift), so mu = 0 for a curated
+        // scheduler re-shape over the same σ span.
+        let sigmas =
+            candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
+        let mut images = Vec::with_capacity(req.count as usize);
+        for index in 0..req.count {
+            let seed = base_seed.wrapping_add(index as u64);
+            let noise = init_noise(req.height, req.width, seed, 0, device)?;
+            let lat = candle_gen::run_flow_sampler(
+                req.sampler.as_deref(),
+                TimestepConvention::OneMinusSigma,
+                &sigmas,
+                noise,
+                seed,
+                &req.cancel,
+                on_progress,
+                |x, timestep| -> Result<Tensor> {
+                    let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                    let v = comps.dit.forward(x, &t, &cond)?;
+                    Ok(v.to_dtype(DType::F32)?.neg()?)
+                },
+            )?;
+            on_progress(Progress::Decoding);
+            images.push(decode(&comps.vae, &lat)?);
+        }
+        return Ok(images);
+    }
+
     let sigmas = dmd_sigmas(DEFAULT_TURBO_SIGMA, steps);
 
     let mut images = Vec::with_capacity(req.count as usize);
@@ -504,6 +544,22 @@ fn dmd_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
         .collect()
 }
 
+/// The Turbo DMD grid as the curated framework's **noise-fraction** schedule: `σ_i = 1 − c_i` for each
+/// clean-fraction [`dmd_sigmas`] entry (descending), plus the trailing `0.0` the curated solvers
+/// integrate toward. `run_flow_sampler` feeds `1 − σ = c_i` (the clean-fraction) back to the DiT
+/// (OneMinusSigma), so each curated step's x0 estimate matches the native DMD loop's; the curated
+/// solver then supplies the renoise. The final node `σ = 0` is the last native x0 estimate (the DMD
+/// loop's last step never renoises), so a consistency solver lands on the same terminal prediction.
+/// Verbatim mirror of `mlx-gen-boogu`'s `turbo_native_sigmas`.
+fn turbo_native_sigmas(conditioning_sigma: f32, steps: usize) -> Vec<f32> {
+    let mut s: Vec<f32> = dmd_sigmas(conditioning_sigma, steps)
+        .iter()
+        .map(|&c| 1.0 - c)
+        .collect();
+    s.push(0.0);
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +589,42 @@ mod tests {
             assert!(w[1] > w[0], "dmd sigmas ascend: {s:?}");
         }
         assert!(s[3] < 1.0);
+    }
+
+    #[test]
+    fn turbo_native_grid_is_descending_noise_fraction() {
+        // The curated-framework view of the DMD grid: σ_i = 1 − c_i, plus the trailing 0.0
+        // (length steps + 1), strictly descending — the shape `run_flow_sampler` integrates over.
+        let steps = 4;
+        let clean = dmd_sigmas(DEFAULT_TURBO_SIGMA, steps);
+        let s = turbo_native_sigmas(DEFAULT_TURBO_SIGMA, steps);
+        assert_eq!(s.len(), steps + 1);
+        assert_eq!(s[steps], 0.0, "terminal sigma must be 0");
+        for (i, &c) in clean.iter().enumerate() {
+            assert!(
+                (s[i] - (1.0 - c)).abs() < 1e-6,
+                "σ_{i} must be 1 − c_{i}: {s:?} vs {clean:?}"
+            );
+        }
+        for w in s.windows(2) {
+            assert!(w[0] > w[1], "turbo native sigmas descend: {s:?}");
+        }
+        // First node is the near-pure-noise start (1 − conditioning_sigma).
+        assert!((s[0] - (1.0 - DEFAULT_TURBO_SIGMA)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn turbo_default_schedule_resolves_native_verbatim() {
+        // The N1 default-parity guarantee for the sc-9009 routing: an unset scheduler hands
+        // `run_flow_sampler` the exact native DMD grid (and the native-loop branch is taken anyway
+        // when the sampler is also unset).
+        let steps = 4;
+        let native = turbo_native_sigmas(DEFAULT_TURBO_SIGMA, steps);
+        let resolved = candle_gen::resolve_flow_schedule(None, 0.0, steps, &native);
+        assert_eq!(resolved, native);
+        // A curated scheduler actually re-shapes the grid (the axis is live, not a pass-through).
+        let curated = candle_gen::resolve_flow_schedule(Some("sgm_uniform"), 0.0, steps, &native);
+        assert_ne!(curated, native);
+        assert!(curated.len() >= 2 && curated.last().copied() == Some(0.0));
     }
 }
