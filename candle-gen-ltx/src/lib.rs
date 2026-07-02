@@ -4,8 +4,10 @@
 //! (Windows/CUDA) sibling of `mlx-gen-ltx`. LTX has **no** `candle-transformers` reference: the
 //! `AVTransformer3DModel` video DiT ([`transformer`]), the `CausalVideoAutoencoder` temporal VAE
 //! ([`vae`], on a from-scratch [`conv3d`]), the **Gemma-3-12B** text encoder ([`gemma`]) +
-//! per-token-RMS aggregation + 8-layer learnable-register connector ([`text_encoder`], [`connector`]),
-//! and the rectified-flow distilled scheduler ([`scheduler`]) are all ported here.
+//! per-token-RMS aggregation + 8-layer learnable-register connector ([`text_encoder`], [`connector`])
+//! are all ported here. The distilled rectified-flow denoise runs through the unified
+//! `candle_gen::run_av_curated_sampler` over the fixed [`STAGE1_SIGMAS`](config::STAGE1_SIGMAS)
+//! schedule (epic 7114), so no per-crate scheduler module is needed.
 //!
 //! **txt2video+audio (sc-3698 / sc-5495):** [`LtxGenerator::generate`] runs Gemma-3-12B → video +
 //! audio text projections → connectors → the 48-layer dual-modal [`AvDiT`](transformer::AvDiT) (split
@@ -31,7 +33,6 @@ pub mod conv3d;
 pub mod gemma;
 pub mod pipeline;
 pub mod rope;
-pub mod scheduler;
 pub mod text_encoder;
 pub mod transformer;
 pub mod vae;

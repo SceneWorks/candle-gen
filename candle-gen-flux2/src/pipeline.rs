@@ -133,20 +133,12 @@ pub fn build_sigmas(num_steps: usize, mu: f32) -> Vec<f32> {
     sigmas
 }
 
-/// The full schedule for a render: the sigmas (length `steps+1`) and the per-step transformer
-/// timesteps `σ·1000` (length `steps`).
-pub fn schedule(steps: usize, width: u32, height: u32) -> (Vec<f32>, Vec<f32>) {
+/// The native flow-match sigma schedule for a render (length `steps+1`, descending, trailing `0.0`).
+/// The empirical-mu shift is fit from the image sequence length via [`compute_mu`]. This is the N1
+/// native schedule the unified sampler (`candle_gen::run_flow_sampler`) integrates over.
+pub fn schedule(steps: usize, width: u32, height: u32) -> Vec<f32> {
     let mu = compute_mu(image_seq_len(width, height), steps);
-    let sigmas = build_sigmas(steps, mu);
-    let timesteps: Vec<f32> = sigmas[..steps].iter().map(|s| s * 1000.0).collect();
-    (sigmas, timesteps)
-}
-
-/// One flow-match Euler step: `x_{i+1} = x_i + (σ_{i+1} − σ_i)·v`. Sigmas descend, so `dt < 0` and
-/// the velocity is applied with NO negation (the FLUX.2 sign convention; contrast Z-Image).
-pub fn euler_step(latents: &Tensor, velocity: &Tensor, sigmas: &[f32], i: usize) -> Result<Tensor> {
-    let dt = (sigmas[i + 1] - sigmas[i]) as f64;
-    latents + (velocity * dt)?
+    build_sigmas(steps, mu)
 }
 
 #[cfg(test)]
@@ -231,17 +223,12 @@ mod tests {
 
     #[test]
     fn sigmas_descend_from_below_one_to_zero() {
-        let (sigmas, timesteps) = schedule(4, 1024, 1024);
+        let sigmas = schedule(4, 1024, 1024);
         assert_eq!(sigmas.len(), 5);
-        assert_eq!(timesteps.len(), 4);
         assert!(sigmas[0] > 0.0 && sigmas[0] <= 1.0, "start {}", sigmas[0]);
         assert!(sigmas[4].abs() < 1e-9, "terminal sigma is 0");
         for w in sigmas.windows(2) {
             assert!(w[0] > w[1], "sigmas must strictly descend: {sigmas:?}");
-        }
-        // timesteps are σ·1000.
-        for (t, s) in timesteps.iter().zip(&sigmas) {
-            assert!((t - s * 1000.0).abs() < 1e-3);
         }
     }
 
@@ -254,18 +241,5 @@ mod tests {
         let a = compute_mu(5000, 4);
         let b = compute_mu(5000, 50);
         assert!((a - b).abs() < 1e-6, "large-seq mu is step-independent");
-    }
-
-    #[test]
-    fn euler_step_uses_negative_dt_without_negation() {
-        let dev = Device::Cpu;
-        let latents = Tensor::ones((1, 4, 8), candle_gen::candle_core::DType::F32, &dev).unwrap();
-        let v = Tensor::ones((1, 4, 8), candle_gen::candle_core::DType::F32, &dev).unwrap();
-        // sigmas[1]-sigmas[0] = 0.5-1.0 = -0.5, so x = 1 + (-0.5)*1 = 0.5
-        let out = euler_step(&latents, &v, &[1.0, 0.5, 0.0], 0).unwrap();
-        let ov = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        for x in ov {
-            assert!((x - 0.5).abs() < 1e-6);
-        }
     }
 }

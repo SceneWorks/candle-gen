@@ -1,17 +1,18 @@
 //! Lens sampling schedule + CFG (sc-5114). The schedule is the core flow-match Euler verbatim: the
 //! Lens `compute_empirical_mu` is **byte-identical** to gen-core's [`compute_mu`] (same calibrated
 //! constants + `>4300` branch), and the Lens `linspace(1, 1/n, n)` → dynamic-shift `set_timesteps`
-//! is exactly [`build_flow_sigmas`]. Only two pieces are Lens-specific:
+//! is exactly [`build_flow_sigmas`], exposed as [`lens_sigmas`]. Only two pieces are Lens-specific:
 //!
 //! 1. **Timestep convention** — Lens feeds the transformer the *shifted sigma* directly (the
 //!    reference `timestep / 1000`, where `scheduler.timesteps = shifted_sigma · 1000`), **not** the
-//!    `1 − sigma` other DiT families use. [`timesteps`] returns those shifted sigmas.
+//!    `1 − sigma` other DiT families use.
 //! 2. **Norm-rescaled CFG** — [`cfg_rescale`]: `comb = uncond + g·(cond − uncond)`, then rescale
 //!    `comb` to carry `cond`'s per-token (channel-axis) L2 norm.
 //!
-//! The denoise step itself is the core flow-match Euler step ([`euler_step`]). **Lens is the
-//! standard-guidance family, NOT true-CFG**: Turbo = 4-step / guidance 1.0 (≈ no CFG), base =
-//! 20-step / guidance 5.0.
+//! The denoise loop itself runs through the unified `candle_gen::run_flow_sampler` (epic 7114): its
+//! default `euler` over the native [`lens_sigmas`] schedule is the N1 no-op that reproduces the legacy
+//! per-crate flow-match Euler step within tolerance. **Lens is the standard-guidance family, NOT
+//! true-CFG**: Turbo = 4-step / guidance 1.0 (≈ no CFG), base = 20-step / guidance 5.0.
 
 use candle_gen::candle_core::{DType, Result, Tensor, D};
 use candle_gen::gen_core::sampling::{build_flow_sigmas, compute_mu};
@@ -47,19 +48,6 @@ pub fn lens_mu(num_steps: usize, latent_h: usize, latent_w: usize) -> f32 {
 /// token count `latent_h · latent_w` (== the reference `compute_empirical_mu(seq_len, num_steps)`).
 pub fn lens_sigmas(num_steps: usize, latent_h: usize, latent_w: usize) -> Vec<f32> {
     build_flow_sigmas(num_steps, lens_mu(num_steps, latent_h, latent_w))
-}
-
-/// The per-step transformer timesteps: the **shifted sigmas** `sigmas[0..num_steps]` (Lens feeds the
-/// sigma directly; the reference's `scheduler.timesteps` is these `· 1000`).
-pub fn timesteps(sigmas: &[f32]) -> &[f32] {
-    &sigmas[..sigmas.len() - 1]
-}
-
-/// One flow-match Euler step: `x_{i+1} = x_i + (σ_{i+1} − σ_i)·v` (descending sigmas → negative dt, no
-/// velocity negation). The model timestep is the **raw sigma** `σ_i` (see [`timesteps`]).
-pub fn euler_step(latents: &Tensor, velocity: &Tensor, sigmas: &[f32], i: usize) -> Result<Tensor> {
-    let dt = (sigmas[i + 1] - sigmas[i]) as f64;
-    latents + (velocity * dt)?
 }
 
 /// Norm-rescaled classifier-free guidance (the reference per-step CFG).
@@ -108,21 +96,6 @@ mod tests {
             assert_eq!(*s.last().unwrap(), 0.0, "n={n} trailing 0");
             assert!((s[0] - 1.0).abs() < 1e-4, "n={n} start ~1: {}", s[0]);
             assert!(s[..n].windows(2).all(|w| w[0] > w[1]), "n={n} descending");
-            // timesteps drop the trailing 0 (the model sees the shifted sigma directly).
-            assert_eq!(timesteps(&s).len(), n);
-            assert_eq!(timesteps(&s), &s[..n]);
-        }
-    }
-
-    #[test]
-    fn euler_step_is_pure_flow_match() {
-        let dev = Device::Cpu;
-        let x = Tensor::ones((1, 4, 8), DType::F32, &dev).unwrap();
-        let v = Tensor::ones((1, 4, 8), DType::F32, &dev).unwrap();
-        let out = euler_step(&x, &v, &[1.0, 0.7, 0.0], 0).unwrap();
-        let ov = out.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        for z in ov {
-            assert!((z - 0.7).abs() < 1e-6); // 1 + (0.7 - 1.0)·1
         }
     }
 
