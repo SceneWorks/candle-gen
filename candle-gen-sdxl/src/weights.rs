@@ -291,4 +291,65 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// `from_files_filtered` unions the prefix-matched keys across shards (F-037 × F-010) and still
+    /// drops the unmatched tower; a cross-shard duplicate is the same hard error as `from_files`.
+    #[test]
+    fn from_files_filtered_unions_shards_and_drops_unmatched() {
+        let dir = scratch_dir("filter_shards");
+        let a = dir.join("model-00001-of-00002.safetensors");
+        let b = dir.join("model-00002-of-00002.safetensors");
+        // Vision tensors split across two shards; a text-tower tensor (co-resident in shard b) that
+        // must be dropped. `write_st` writes a single-tensor file, so shard b is saved directly.
+        write_st(&a, "vision_model.a.weight", 1.0);
+        let mut mb = HashMap::new();
+        mb.insert(
+            "visual_projection.weight".to_string(),
+            Tensor::new(&[2.0f32], &Device::Cpu).unwrap(),
+        );
+        mb.insert(
+            "text_model.dead.weight".to_string(),
+            Tensor::new(&[9.0f32], &Device::Cpu).unwrap(),
+        );
+        cst::save(&mb, &b).unwrap();
+
+        let w = Weights::from_files_filtered(
+            &[a, b],
+            &Device::Cpu,
+            DType::F32,
+            &["vision_model.", "visual_projection."],
+        )
+        .unwrap();
+        assert_eq!(
+            w.require("vision_model.a.weight")
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![1.0]
+        );
+        assert!(w.contains("visual_projection.weight"));
+        assert!(!w.contains("text_model.dead.weight"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cross-shard DUPLICATE under a matched prefix is a HARD ERROR naming the key — the same F-064
+    /// (sc-9050) policy `from_files` enforces, extended to the filtered/header-only path.
+    #[test]
+    fn from_files_filtered_errors_on_cross_shard_duplicate() {
+        let dir = scratch_dir("filter_dup");
+        let a = dir.join("model-00001-of-00002.safetensors");
+        let b = dir.join("model-00002-of-00002.safetensors");
+        // Same matched-prefix key in BOTH shards → must not silently last-file-wins.
+        write_st(&a, "vision_model.shared.weight", 1.0);
+        write_st(&b, "vision_model.shared.weight", 2.0);
+        match Weights::from_files_filtered(&[a, b], &Device::Cpu, DType::F32, &["vision_model."]) {
+            Err(CandleError::Msg(m)) => assert!(
+                m.contains("duplicate tensor key") && m.contains("vision_model.shared.weight"),
+                "expected a duplicate-key error naming the key, got: {m}"
+            ),
+            Err(e) => panic!("expected a duplicate-key CandleError::Msg, got: {e}"),
+            Ok(_) => panic!("expected a duplicate-key error, but from_files_filtered succeeded"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

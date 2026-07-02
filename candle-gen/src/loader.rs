@@ -402,6 +402,53 @@ mod tests {
     }
 
     #[test]
+    fn load_one_tensor_sharded_finds_the_owning_shard_and_errors_when_absent() {
+        // Two shards, each holding a different tensor: the helper probes headers and reads the named
+        // tensor from whichever shard owns it — the resharded-snapshot path (F-037 × F-010).
+        let dir = tmp_dir("one_tensor_sharded");
+        let a = dir.join("model-00001-of-00002.safetensors");
+        let b = dir.join("model-00002-of-00002.safetensors");
+        write_st(&a, "text_model.embed.weight", 1.0);
+        write_st(&b, "text_projection.weight", 7.0);
+        let files = sorted_safetensors(&dir, "prov").unwrap();
+
+        // Lives in the SECOND (non-first) shard — found regardless of scan position, with value intact.
+        let t = load_one_tensor_sharded(
+            &files,
+            "text_projection.weight",
+            DType::F32,
+            &Device::Cpu,
+            "prov",
+        )
+        .unwrap();
+        assert_eq!(t.to_vec1::<f32>().unwrap(), vec![7.0]);
+
+        // The requested dtype is honored on the owning-shard read: the f32 fixture is coerced to F16.
+        let t16 = load_one_tensor_sharded(
+            &files,
+            "text_projection.weight",
+            DType::F16,
+            &Device::Cpu,
+            "prov",
+        )
+        .unwrap();
+        assert_eq!(t16.dtype(), DType::F16);
+        assert_eq!(
+            t16.to_dtype(DType::F32).unwrap().to_vec1::<f32>().unwrap(),
+            vec![7.0]
+        );
+
+        // Absent from every shard → crafted, label-prefixed error naming the key.
+        let err = load_one_tensor_sharded(&files, "nope.weight", DType::F32, &Device::Cpu, "prov")
+            .unwrap_err();
+        assert!(
+            matches!(err, CandleError::Msg(m) if m.contains("prov") && m.contains("nope.weight")),
+            "expected a crafted missing-tensor error across shards"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn component_vb_missing_subdir_errors() {
         let dir = tmp_dir("component");
         match component_vb(&dir, "transformer", DType::F32, &Device::Cpu, "prov") {
