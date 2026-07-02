@@ -869,6 +869,62 @@ mod tests {
         }
     }
 
+    /// **CUDA guidance-gate validation (sc-8993).** On the Blackwell GPU, prove the two AC halves:
+    /// (1) at `cfg_scale == 1.0` the CFG blend `Some(uncond)` path is **byte-identical** to the
+    /// cond-only (`None`) path — so skipping the uncond forward when guidance is disabled cannot alter
+    /// output; and (2) a genuinely guided render (`cfg_scale = 4.0`, `Some(uncond)`) still decodes a
+    /// finite, right-shaped image and differs from the cond-only render (guidance is doing something —
+    /// its output is the code path this optimization deliberately leaves untouched). Built at
+    /// `CUDA_COMPUTE_CAP=80` under `scripts/check-cuda.ps1`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn cuda_cfg_gate_matches_cond_only_and_preserves_guided() {
+        let device = Device::new_cuda(0).expect("CUDA device 0");
+        let cfg = tiny_cfg();
+        let (transformer, vae, cond, uncond) = harness(&cfg, &device);
+        let cancel = CancelFlag::default();
+        let render = |uncond_ref: Option<&Sd3Conditioning>, scale: f32| {
+            render_core(
+                &transformer,
+                &vae,
+                &cond,
+                uncond_ref,
+                scale,
+                4,
+                3.0,
+                (4, 4),
+                7,
+                device.clone(),
+                DType::F32,
+                None,
+                None,
+                &cancel,
+                &mut |_p: Progress| {},
+            )
+            .unwrap()
+        };
+        // (1) cfg 1.0: the wasted-uncond path == cond-only, bit-for-bit, ON THE GPU.
+        let with_uncond_1 = render(Some(&uncond), 1.0);
+        let cond_only = render(None, 1.0);
+        assert_eq!(
+            with_uncond_1.pixels, cond_only.pixels,
+            "sc-8993: cfg 1.0 with uncond must equal cond-only on CUDA"
+        );
+        // (2) guided (cfg 4.0) still renders and is a distinct, untouched code path.
+        let guided = render(Some(&uncond), 4.0);
+        assert_eq!(
+            guided.pixels.len(),
+            (guided.width * guided.height * 3) as usize
+        );
+        assert_ne!(
+            guided.pixels, cond_only.pixels,
+            "guided (cfg 4.0) output must differ from cond-only — guidance is active"
+        );
+        eprintln!(
+            "sc-8993 CUDA gate: cfg1.0==cond-only (byte-eq), cfg4.0 guided distinct + decoded"
+        );
+    }
+
     /// **Real-weight memory profile — GATED (sc-7879 / C6).** Measures the TRUE peak CUDA memory of a
     /// real SD3.5 load at each precision (bf16 / Q8 / Q4) and prints it alongside the principled
     /// [`crate::memory::min_memory_gb`] estimate, so C6 can confirm the estimate is a safe ceiling.
