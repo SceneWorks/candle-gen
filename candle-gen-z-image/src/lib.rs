@@ -24,6 +24,13 @@
 mod adapters;
 mod dit;
 mod pipeline;
+// The packed-load seam (sc-9408, sc-9089 umbrella): the local dense-or-packed `QLinear`/`QEmbedding`
+// wrapper over the shared `candle_gen::quant` module, plus the vendored inference DiT + Qwen3 TE that
+// build their projections from it. Used only when the snapshot is a pre-quantized MLX-packed tier
+// (`SceneWorks/z-image-turbo-mlx`); a dense snapshot keeps the stock candle-transformers models.
+mod packed_dit;
+mod packed_te;
+mod quant;
 mod training;
 
 // Base (non-Turbo) `z_image` text-to-image generator (sc-8414, the candle sibling of mlx sc-8320).
@@ -259,9 +266,17 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             ));
         }
     };
+    // z-image loads a **pre-quantized MLX-packed tier** (`SceneWorks/z-image-turbo-mlx` q4/q8)
+    // transparently when the snapshot dir carries a `quantization` block in its component `config.json`
+    // (sc-9408, auto-detected at first `generate`) — no `spec.quantize` needed, the tier is already
+    // quantized. `spec.quantize` is the *on-the-fly* quant of a *dense* tier, which z-image does not do
+    // (the packed tier is the only quantized path), so it stays rejected — honest rather than
+    // silently loading the dense tier at full precision.
     if spec.quantize.is_some() {
         return Err(gen_core::Error::Unsupported(
-            "candle z_image_turbo does not support on-the-fly Q4/Q8 quantization yet".into(),
+            "candle z_image_turbo does not quantize a dense tier on the fly — point the weights dir at \
+             a pre-quantized packed tier (SceneWorks/z-image-turbo-mlx q4/q8), which loads directly"
+                .into(),
         ));
     }
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
