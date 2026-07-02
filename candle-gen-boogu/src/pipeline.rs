@@ -53,7 +53,9 @@ const SPATIAL_SCALE: u32 = 8;
 const LATENT_CHANNELS: usize = 16;
 
 /// Max prompt tokens the Qwen3-VL RoPE table is sized for (generous; Boogu prompts are short).
-const MAX_TEXT_TOKENS: usize = 1280;
+/// Enforced up front by [`crate::tokenizer::BooguTokenizer`] so an over-length prompt returns a clear
+/// length error instead of an opaque tensor-shape error deep in the condition encoder (sc-9047).
+pub(crate) const MAX_TEXT_TOKENS: usize = 1280;
 
 /// Component compute dtypes. The Qwen3-VL TE runs in **f32** (parity-grade for this encoder, shared
 /// with the ideogram port); the 10 B DiT runs **bf16** (native on candle's CUDA backend); the small
@@ -72,7 +74,7 @@ pub(crate) struct Components {
 
 /// Load the text-to-image components from a Boogu snapshot (`mllm/ transformer/ vae/`).
 pub(crate) fn load_components(root: &Path, device: &Device) -> Result<Components> {
-    let tok = BooguTokenizer::from_snapshot(root, device)?;
+    let tok = BooguTokenizer::from_snapshot(root, device, MAX_TEXT_TOKENS)?;
 
     let te_w = Weights::from_dir(&root.join("mllm"), device, TE_DTYPE)?;
     let te = BooguTextEncoder::load(

@@ -165,7 +165,7 @@ fn compute_loss_grads(
 /// `(L, num_text_layers, text_hidden)` at f32 — the exact tokenizer + select-layer stack the inference
 /// [`crate::pipeline`] uses (parity), minus the device-dtype cast (caching keeps f32).
 fn encode_caption(tok: &KreaTokenizer, te: &KreaTextEncoder, caption: &str) -> Result<Tensor> {
-    let ids = tok.encode_prompt(caption)?;
+    let ids = tok.encode_prompt(caption, MAX_TEXT_TOKENS)?;
     let enc = te.forward(&ids)?; // (1, L, num_text_layers, text_hidden)
     Ok(enc.squeeze(0)?.to_dtype(DType::F32)?)
 }

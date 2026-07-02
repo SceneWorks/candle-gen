@@ -42,8 +42,10 @@ const SPATIAL_SCALE: u32 = 8;
 const LATENT_CHANNELS: usize = 16;
 
 /// Max prompt tokens the Qwen3-VL RoPE table is sized for (generous; Krea prompts + the 34-token
-/// template prefix are short).
-const MAX_TEXT_TOKENS: usize = 1024;
+/// template prefix are short). Enforced up front by [`crate::tokenizer::KreaTokenizer::encode_prompt`]
+/// so an over-length prompt returns a clear length error instead of an opaque tensor-shape error deep
+/// in the condition encoder (sc-9047).
+pub(crate) const MAX_TEXT_TOKENS: usize = 1024;
 
 /// The loaded Krea 2 Turbo components, `Arc`-shared so the generator caches them across `generate`.
 pub struct Components {
@@ -100,7 +102,9 @@ pub fn render(
 
     // Condition encoding (seed-independent): the 12 selected Qwen3-VL hidden layers, stacked +
     // prefix-dropped → the DiT's text_fusion context [1, n_tok, 12, 2560]. CFG-free, B=1.
-    let context = comps.te.forward(&comps.tok.encode_prompt(&req.prompt)?)?;
+    let context = comps
+        .te
+        .forward(&comps.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
 
     // Native exponential-mu Turbo sigmas are the byte-exact default; a curated scheduler reshapes over
     // the same mu. Raw sigma → DiT timestep, raw velocity → Euler `x + v·(σ_{i+1} − σ_i)`.
