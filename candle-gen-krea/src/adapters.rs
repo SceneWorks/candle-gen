@@ -444,10 +444,23 @@ pub fn merge_into_weights(
     let mut map: HashMap<String, Tensor> = HashMap::new();
     for key in merge_surface_keys(cfg) {
         if w.contains(&key) {
-            map.insert(key.clone(), w.get_cpu(&key)?);
+            // Packed-aware base: on a packed tier the surface `{base}.weight` is u32 codes, so
+            // reconstruct the dense grid from the packed triple before folding the delta (sc-9411).
+            // On a dense tier this is the plain CPU weight. `merge_adapters` folds each targeted
+            // delta into this base in place.
+            map.insert(key.clone(), w.get_cpu_merge_base(&key)?);
         }
     }
+
+    // Snapshot the preloaded base identities so, after the merge, we can install into the overlay
+    // ONLY the projections a delta actually folded into (sc-9411 adapter compose). `merge_into`
+    // replaces a merged key's tensor with a fresh one (new `TensorId`), so a changed id ⇔ merged.
+    // Keeping untargeted keys out of the overlay lets them stay **packed** on a packed tier (the
+    // overlay would otherwise force the whole reconstructed-dense DiT resident); on a dense tier the
+    // untargeted keys are identical to the mmap, so dropping them is a pure memory win.
+    let base_ids: HashMap<String, _> = map.iter().map(|(k, t)| (k.clone(), t.id())).collect();
     let report = merge_adapters(&mut map, specs)?;
+    map.retain(|k, t| base_ids.get(k).is_none_or(|&id| t.id() != id));
     w.set_overlay(map);
     Ok(report)
 }
@@ -1129,6 +1142,137 @@ mod tests {
         );
 
         std::fs::remove_file(&base_file).ok();
+        std::fs::remove_file(&adapter_file).ok();
+    }
+
+    /// **Adapter merge composes with a PACKED base (sc-9411).** A packed q4 transformer component whose
+    /// `to_q`/`to_k`/`to_v`/`to_out.0` are MLX-packed triples: merging a LoRA that targets only `to_q`
+    /// must (a) reconstruct the dense grid from `to_q`'s packed parts, fold the delta in, and install
+    /// the merged **dense** weight in the overlay (so `Weights::get` serves `dequant(grid) + δ`); and
+    /// (b) leave every untargeted packed projection **out** of the overlay, so it still loads packed via
+    /// `linear_detect`. This is the packed-base ⊕ adapter-overlay compose the story requires.
+    #[test]
+    fn merge_into_weights_composes_with_packed_base() {
+        use candle_gen::candle_core::safetensors;
+        use candle_gen::quant::dequant_mlx_q4_reference_gs;
+
+        let dev = Device::Cpu;
+        const G: usize = 64;
+        // Build an MLX group-64 Q4 packed triple for an [out, in] weight, returning (wq, scales, biases).
+        let q4 = |out_dim: usize, in_dim: usize| {
+            let codes: Vec<u8> = (0..out_dim * in_dim)
+                .map(|i| ((i * 5 + i / 7) % 16) as u8)
+                .collect();
+            let groups = out_dim * in_dim / G;
+            let scales: Vec<f32> = (0..groups).map(|g| 0.05 * (g as f32 + 1.0)).collect();
+            let biases: Vec<f32> = (0..groups).map(|g| -0.4 - 0.1 * g as f32).collect();
+            let words: Vec<u32> = codes
+                .chunks_exact(8)
+                .map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .fold(0u32, |acc, (i, &q)| acc | ((q as u32 & 0xF) << (4 * i)))
+                })
+                .collect();
+            (
+                Tensor::from_vec(words, (out_dim, in_dim / 8), &dev).unwrap(),
+                Tensor::from_vec(scales, (out_dim, in_dim / G), &dev).unwrap(),
+                Tensor::from_vec(biases, (out_dim, in_dim / G), &dev).unwrap(),
+            )
+        };
+
+        // A 1-block packed component: all four attention projections packed (128×128 ⇒ group-64).
+        let (dim, pid) = (128usize, std::process::id());
+        let dir = std::env::temp_dir().join(format!("krea_packed_compose_{pid}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        let mut grids: HashMap<String, Tensor> = HashMap::new();
+        for target in ["to_q", "to_k", "to_v", "to_out.0"] {
+            let (wq, s, b) = q4(dim, dim);
+            let base = format!("transformer_blocks.0.attn.{target}");
+            grids.insert(
+                target.to_string(),
+                dequant_mlx_q4_reference_gs(&wq, &s, &b, G).unwrap(),
+            );
+            tensors.insert(format!("{base}.weight"), wq);
+            tensors.insert(format!("{base}.scales"), s);
+            tensors.insert(format!("{base}.biases"), b);
+        }
+        safetensors::save(&tensors, dir.join("model.safetensors")).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::json!({ "quantization": { "bits": 4, "group_size": G } }).to_string(),
+        )
+        .unwrap();
+
+        // A bare-dotted LoRA targeting only to_q.
+        let down = Tensor::randn(0f32, 1f32, (2, dim), &dev).unwrap();
+        let up = Tensor::randn(0f32, 1f32, (dim, 2), &dev).unwrap();
+        let adapter_file = std::env::temp_dir().join(format!("krea_packed_lora_{pid}.safetensors"));
+        safetensors::save(
+            &HashMap::from([
+                (
+                    "transformer_blocks.0.attn.to_q.lora_A.weight".to_string(),
+                    down.clone(),
+                ),
+                (
+                    "transformer_blocks.0.attn.to_q.lora_B.weight".to_string(),
+                    up.clone(),
+                ),
+                (
+                    "transformer_blocks.0.attn.to_q.alpha".to_string(),
+                    Tensor::from_vec(vec![2.0f32], (1,), &dev).unwrap(),
+                ),
+            ]),
+            &adapter_file,
+        )
+        .unwrap();
+
+        let mut cfg = Krea2Config::turbo();
+        cfg.num_layers = 1;
+        let mut w = Weights::from_dir(&dir, &dev, DType::BF16).unwrap();
+        assert!(w.packed().is_some(), "packed component");
+
+        let report = merge_into_weights(
+            &mut w,
+            &cfg,
+            &[AdapterSpec::new(
+                adapter_file.clone(),
+                1.0,
+                AdapterKind::Lora,
+            )],
+        )
+        .unwrap();
+        assert_eq!(report.merged, 1, "only to_q merges");
+
+        // (a) to_q now serves dequant(grid) + δ — a DENSE overlay weight (not the packed triple).
+        let merged = w.get_f32("transformer_blocks.0.attn.to_q.weight").unwrap();
+        let delta = reconstruct_lora_delta(&down, &up, 2.0, 2.0, 1.0).unwrap();
+        let expected = (grids["to_q"].clone() + delta).unwrap();
+        assert!(
+            max_abs(&(merged - expected).unwrap()) < 1e-2,
+            "packed to_q must merge into dequant(grid)+δ"
+        );
+
+        // (b) the untargeted projections load PACKED (they were left out of the overlay), so the packed
+        // base stays packed — the compose invariant.
+        for target in ["to_k", "to_v", "to_out.0"] {
+            let lin = crate::loader::linear_detect(
+                &w,
+                &format!("transformer_blocks.0.attn.{target}"),
+                false,
+            )
+            .unwrap();
+            assert!(
+                lin.is_packed(),
+                "{target} was not adapter-targeted ⇒ must remain packed after the merge"
+            );
+        }
+        // to_q now resolves dense (its overlay shadows the packed triple).
+        let q = crate::loader::linear_detect(&w, "transformer_blocks.0.attn.to_q", false).unwrap();
+        assert!(!q.is_packed(), "adapter-merged to_q resolves dense");
+
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_file(&adapter_file).ok();
     }
 }
