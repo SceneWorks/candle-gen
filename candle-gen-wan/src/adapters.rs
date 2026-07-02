@@ -23,7 +23,9 @@
 //! **Key conventions.** The candle trainer writes **bare** dotted PEFT/LoKr keys (no prefix). Community
 //! Wan LoRAs carry a `diffusion_model.` / `transformer.` namespace (the diffusers/sd-scripts exports) or
 //! the kohya `lora_unet_<flattened>` form; all resolve. Out-of-surface keys are counted in
-//! [`MergeReport`] and surfaced, never silently dropped.
+//! [`MergeReport`] (so a zero-match spec list hard-errors rather than silently no-op'ing), but the
+//! populated report is *discarded* at the call site — F-051 (sc-9035) ratified silent library-side
+//! merges (no per-merge stderr), matching the Z-Image/sd3/qwen-image-edit twins.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -56,7 +58,8 @@ const LOKR_SUFFIXES: [&str; 6] = [
 ];
 
 /// Outcome of merging adapter specs into one expert's tensor map: base weights updated, and keys that
-/// fell outside the merge surface (text-encoder / unresolved — surfaced, not silently dropped).
+/// fell outside the merge surface (text-encoder / unresolved). The count gates the zero-match hard-error
+/// inside [`merge_adapters`]; the caller discards the populated report (F-051 / sc-9035, no stderr).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct MergeReport {
     pub merged: usize,
@@ -485,8 +488,9 @@ mod tests {
     }
 
     /// sc-9027 / F-043: a partially-matching LoRA (one on-surface target + one off-surface) merges the
-    /// hit and reports the miss, so `build_expert` can surface `skipped_keys > 0` instead of letting the
-    /// partial match vanish silently.
+    /// hit and counts the miss in [`MergeReport::skipped_keys`], so the merge machinery distinguishes a
+    /// partial match from a total miss (the latter hard-errors). The caller discards the report (F-051),
+    /// so this asserts the report contents directly from the merge, not any call-site side effect.
     #[test]
     fn merge_lora_partial_match_reports_skipped() {
         let mut map = base_map();

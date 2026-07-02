@@ -174,7 +174,10 @@ impl Pipeline {
     /// mmap path is used; otherwise the weights are loaded to CPU, the delta is merged
     /// ([`crate::adapters::merge_adapters`], f32 math), and the expert is built from the merged map
     /// (`VarBuilder::from_tensors` casts/moves per-tensor on `get`, so peak GPU is unchanged) — the
-    /// merge-not-residual pattern the SDXL/Z-Image ports established.
+    /// merge-not-residual pattern the SDXL/Z-Image ports established. The [`crate::adapters::MergeReport`]
+    /// is discarded (only the `?` error path is kept, so a zero-match adapter still hard-errors inside
+    /// `merge_adapters`), matching the silent library-side merge of the SDXL/Z-Image/sd3/qwen-image-edit
+    /// twins (F-051 / sc-9035: per-merge stderr is unstructured, uncapturable noise).
     fn build_expert(&self, sub: &str, expert: MoeExpert) -> CResult<WanTransformer> {
         let specs: Vec<AdapterSpec> = self
             .adapters
@@ -189,14 +192,10 @@ impl Pipeline {
             )?);
         }
         let mut map = self.load_component_map(sub)?;
-        // Surface the merge report at the call site (sc-9027 / F-043): a partially-matching community
-        // LoRA merges with weaker effect, and only the zero-match case errors inside `merge_adapters`.
-        // Log per-expert so a half-applied adapter is diagnosable, matching the scail2 sibling.
-        let report = crate::adapters::merge_adapters(&mut map, &specs)?;
-        eprintln!(
-            "[wan-14b] {} expert: merged {} adapter file(s): {} deltas applied, {} keys off-surface/skipped",
-            sub, specs.len(), report.merged, report.skipped_keys
-        );
+        // Merge the adapter delta, discarding the report (sc-9027 / F-043). The `?` keeps the zero-match
+        // hard-error; the per-expert merge count is *not* printed to stderr — F-051 (sc-9035) ratified
+        // silent library-side merges, matching the Z-Image/sd3/qwen-image-edit twins.
+        crate::adapters::merge_adapters(&mut map, &specs)?;
         let vb = VarBuilder::from_tensors(map, DIT_DTYPE, &self.device);
         Ok(WanTransformer::new(&self.dit_cfg, vb)?)
     }
