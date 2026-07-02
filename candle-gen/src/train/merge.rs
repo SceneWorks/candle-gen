@@ -545,7 +545,7 @@ mod tests {
             Some("attn.to_q")
         );
         assert!(
-            linear_only.get("conv").is_none(),
+            !linear_only.contains_key("conv"),
             "conv is 4-D, excluded from a 2-D table"
         );
         let with_conv = build_kohya_table(&map, &[2, 4]);
