@@ -15,6 +15,8 @@
 //! DiT adds. With `scale == 0.0` every residual is `None`, so the forked DiT renders byte-identically to
 //! the plain (stock) FLUX path — that is the no-IP arm of the validation ablation.
 
+use std::cell::RefCell;
+
 use candle_core::{Result, Tensor, D};
 use candle_nn::ops::softmax_last_dim;
 use candle_nn::{LayerNorm, Linear, Module};
@@ -134,15 +136,25 @@ pub struct FluxIpInjector<'a> {
     /// The `ip_adapter_scale` weight applied to the decoupled-cross-attention residual. `0.0` ⇒ every
     /// block residual is `None` (the no-IP ablation arm).
     scale: f64,
+    /// Per-block cache of the head-shaped image-token K/V (`[B, heads, num_tokens, head_dim]` each),
+    /// computed lazily on the first `double_block_residual` call for a block and reused across every
+    /// denoise step (sc-9038 / F-054). The image `tokens` and each block's `to_k_ip`/`to_v_ip`
+    /// projections are step-invariant, and the head geometry (`heads`/`head_dim`) is fixed per render,
+    /// so the cached K/V is bit-identical to recomputing it every step. Keyed by block index (each block
+    /// has its OWN K/V projection weights). `RefCell` gives interior mutability behind the `&self`
+    /// forward; the injector is used single-threaded within one render's denoise loop.
+    block_kv: RefCell<Vec<Option<(Tensor, Tensor)>>>,
 }
 
 impl<'a> FluxIpInjector<'a> {
     /// Bind `adapter` to the precomputed image `tokens` (`[B, num_tokens, cross_attn_dim]`) at `scale`.
     pub fn new(adapter: &'a FluxIpAdapter, tokens: Tensor, scale: f64) -> Self {
+        let block_kv = RefCell::new(vec![None; adapter.blocks.len()]);
         Self {
             adapter,
             tokens,
             scale,
+            block_kv,
         }
     }
 
@@ -159,17 +171,12 @@ impl<'a> FluxIpInjector<'a> {
         if self.scale == 0.0 || block_idx >= self.adapter.blocks.len() {
             return Ok(None);
         }
-        let (k_proj, v_proj) = &self.adapter.blocks[block_idx];
-        let (b, num_tokens, _) = self.tokens.dims3()?;
-        let (_, heads, img_seq, head_dim) = img_q.dims4()?;
-        // K/V projection of the image tokens → per-head `[B, heads, num_tokens, head_dim]`.
-        let to_heads = |t: Tensor| -> Result<Tensor> {
-            t.reshape((b, num_tokens, heads, head_dim))?
-                .transpose(1, 2)?
-                .contiguous()
-        };
-        let k = to_heads(k_proj.forward(&self.tokens)?)?;
-        let v = to_heads(v_proj.forward(&self.tokens)?)?;
+        let (b, heads, img_seq, head_dim) = img_q.dims4()?;
+        // The image tokens' K/V for this block are step-invariant (sc-9038 / F-054): the tokens and the
+        // block's projection weights never change across the denoise, and the head geometry is fixed per
+        // render. Project + head-shape ONCE per block, then reuse the cached `[B, heads, num_tokens,
+        // head_dim]` K/V on every subsequent step — bit-identical to recomputing it each step.
+        let (k, v) = self.block_kv(block_idx, heads, head_dim)?;
         // Decoupled cross-attention (no RoPE, no mask): scale = 1/√head_dim, matching the FLUX heads.
         let q = img_q.contiguous()?;
         let scale = 1.0 / (head_dim as f64).sqrt();
@@ -184,6 +191,34 @@ impl<'a> FluxIpInjector<'a> {
             .contiguous()?
             .reshape((b, img_seq, heads * head_dim))?;
         Ok(Some((o * self.scale)?))
+    }
+
+    /// The head-shaped image-token K/V for `block_idx` — `[B, heads, num_tokens, head_dim]` each —
+    /// projected via that block's `to_k_ip`/`to_v_ip` and cached on first use, then returned (cheaply
+    /// cloned; candle tensors are refcounted `Arc` handles) on every subsequent step (sc-9038 / F-054).
+    /// The `heads`/`head_dim` geometry is fixed per render, so the cache is populated once per block and
+    /// the returned K/V is bit-identical to recomputing the projection each step.
+    fn block_kv(
+        &self,
+        block_idx: usize,
+        heads: usize,
+        head_dim: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        if let Some(kv) = &self.block_kv.borrow()[block_idx] {
+            return Ok((kv.0.clone(), kv.1.clone()));
+        }
+        let (k_proj, v_proj) = &self.adapter.blocks[block_idx];
+        let (b, num_tokens, _) = self.tokens.dims3()?;
+        // K/V projection of the image tokens → per-head `[B, heads, num_tokens, head_dim]`.
+        let to_heads = |t: Tensor| -> Result<Tensor> {
+            t.reshape((b, num_tokens, heads, head_dim))?
+                .transpose(1, 2)?
+                .contiguous()
+        };
+        let k = to_heads(k_proj.forward(&self.tokens)?)?;
+        let v = to_heads(v_proj.forward(&self.tokens)?)?;
+        self.block_kv.borrow_mut()[block_idx] = Some((k.clone(), v.clone()));
+        Ok((k, v))
     }
 }
 
@@ -274,5 +309,70 @@ mod tests {
         let off = FluxIpInjector::new(&adapter, tokens, 0.0);
         assert!(off.double_block_residual(0, &img_q).unwrap().is_none());
         assert_eq!(adapter.num_blocks(), 1);
+    }
+
+    /// sc-9038 / F-054: the per-block K/V cache must be populated once and reused, producing a
+    /// residual **bit-identical** to a freshly recomputed one across every "step". We simulate a
+    /// multi-step, multi-block render: the same injector is called repeatedly (as the denoise loop
+    /// does), and every residual must match the value from a fresh injector that has never cached
+    /// anything for that (block, img_q) — proving the reuse is lossless, not merely close.
+    #[test]
+    fn cached_kv_is_bit_identical_across_steps() {
+        let dev = Device::Cpu;
+        let (b, num_tokens, cross) = (1usize, 4usize, 8usize);
+        let (heads, head_dim, img_seq) = (2usize, 3usize, 5usize);
+        let hidden = heads * head_dim;
+        let mk = || Linear::new(randn(&[hidden, cross], &dev), Some(randn(&[hidden], &dev)));
+        let proj = Linear::new(
+            randn(&[num_tokens * cross, cross], &dev),
+            Some(randn(&[num_tokens * cross], &dev)),
+        );
+        let proj_model = FluxImageProjModel {
+            proj,
+            norm: LayerNorm::new(randn(&[cross], &dev), randn(&[cross], &dev), PROJ_LN_EPS),
+            num_tokens,
+            cross_attn_dim: cross,
+        };
+        // Two blocks so we exercise per-block keying (each has its OWN k/v weights).
+        let adapter = FluxIpAdapter {
+            proj_model,
+            blocks: vec![(mk(), mk()), (mk(), mk())],
+        };
+        let tokens = randn(&[b, num_tokens, cross], &dev);
+
+        let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+
+        // The long-lived injector shared across steps (its cache fills in on the first touch of a block).
+        let cached = FluxIpInjector::new(&adapter, tokens.clone(), 0.7);
+
+        // Distinct per-step queries (the query DOES change across steps; the image K/V does not).
+        for _step in 0..3 {
+            for block in 0..adapter.num_blocks() {
+                let img_q = randn(&[b, heads, img_seq, head_dim], &dev);
+                // Reference: a brand-new injector with an empty cache computes the residual from scratch.
+                let fresh = FluxIpInjector::new(&adapter, tokens.clone(), 0.7);
+                let want = fresh
+                    .double_block_residual(block, &img_q)
+                    .unwrap()
+                    .expect("residual");
+                let got = cached
+                    .double_block_residual(block, &img_q)
+                    .unwrap()
+                    .expect("residual");
+                assert_eq!(
+                    flat(&got),
+                    flat(&want),
+                    "cached K/V residual must be bit-identical to a fresh recompute (block {block})"
+                );
+            }
+        }
+
+        // After the render, every block's K/V is cached exactly once (populated, not re-created).
+        let cache = cached.block_kv.borrow();
+        assert_eq!(cache.len(), adapter.num_blocks());
+        assert!(
+            cache.iter().all(|slot| slot.is_some()),
+            "every touched block must have a populated K/V cache slot"
+        );
     }
 }
