@@ -12,18 +12,29 @@
 //! sliding/full attention**, **YaRN RoPE**, the **clamped-SwiGLU** expert, and **MXFP4** fused-expert
 //! weights — have no candle-transformers precedent and are carried over from that reference.
 //!
-//! Expert weights ship fused + MXFP4 (`gate_up_proj` / `down_proj` as `_blocks` + `_scales`, one e8m0
-//! exponent per 32-value block); they are unpacked to floats at load (see [`dequant_mxfp4`]). gate/up
-//! are interleaved on the output dim. Everything else (attention, router, embeddings) is bf16 per the
-//! checkpoint `quantization_config.modules_to_not_convert`.
+//! **Two on-disk expert formats, three load modes.** The stock diffusers snapshot (`SceneWorks/Lens`)
+//! ships the experts fused + **MXFP4** (`gate_up_proj` / `down_proj` as `_blocks` + `_scales`, one e8m0
+//! exponent per 32-value block; unpacked by [`dequant_mxfp4`], gate/up interleaved on the output dim).
+//! The hosted **packed** tier (`SceneWorks/lens-mlx` / `lens-turbo-mlx` q4/q8) instead ships each fused
+//! projection as the *3-D per-expert MLX affine triple* `experts.{gate_up_proj,down_proj}` = `.weight`
+//! (u32 codes) + `.scales` + `.biases` (group 64) — the same affine packing the DiT tier uses
+//! (sc-9413), batched over the 32 experts. Everything else (attention, router, embeddings, norms) is
+//! bf16 in both.
 //!
-//! Two expert load modes (sc-5111): the default **dense** path dequantizes to bf16 (~40 GB resident);
-//! [`GptOssTextEncoder::new_quant`] instead **transcodes** MXFP4 → GGUF `Q4_0`/`Q8_0` `QMatMul` (the
-//! contraction dim 2880 is ÷32 but not ÷256, so only the 32-block quants apply), keeping the experts
-//! at ~4/8 bits (~13 GB at Q4). At inference the Q weight is dequantized to an f16 tile and run through
-//! the *standard* matmul ([`ExpertProj`]) — candle's GGUF mat-vec/mat-mul CUDA kernels miscompute on
-//! Blackwell sm_120 at our pin. The transcode is lossy-on-lossy (Q4 is "coherent", Q8 near-lossless);
-//! both are parity-gated against the bf16 floor.
+//! [`GptOssTextEncoder::new_quant`] picks the mode by **detecting the on-disk format** ([`SparseMoe::new`]):
+//! 1. **Packed tier** (`experts.gate_up_proj.scales` present, sc-9457 / sc-9089): each expert-slice is
+//!    repacked straight to a resident GGUF `Q4_1` (q4) / `Q8_0` (q8) `QMatMul` via the shared
+//!    [`candle_gen::quant::repack_packed_weight`] seam — no MXFP4 dependency, no dense staging — so a
+//!    pure `lens-mlx` snapshot loads packed end-to-end (DiT + encoder + VAE). `quant` is irrelevant
+//!    here (the bit-width is the tier's).
+//! 2. **MXFP4 → GGUF transcode** (`quant = Some(Q4_0 | Q8_0)`, sc-5111): dequantize the fused MXFP4
+//!    experts and re-quantize per expert to `Q4_0`/`Q8_0`, keeping them at ~4/8 bits (~13 GB at Q4).
+//! 3. **MXFP4 → dense bf16** (`quant = None`): the sc-5108 bring-up path (~40 GB resident).
+//!
+//! At inference the quantized weight (modes 1 & 2) is dequantized to an f16 tile and run through the
+//! *standard* matmul ([`ExpertProj`]) — candle's GGUF mat-vec/mat-mul CUDA kernels miscompute on
+//! Blackwell sm_120 at our pin (sc-7702). The quant is lossy (Q4 "coherent", Q8 near-lossless); both
+//! are parity-gated against the bf16 floor.
 
 use candle_gen::candle_core::quantized::{GgmlDType, QMatMul, QTensor};
 use candle_gen::candle_core::{DType, Device, IndexOp, Result, Tensor, D};
@@ -31,6 +42,7 @@ use candle_gen::candle_nn::{
     embedding, linear, linear_no_bias, ops::sigmoid, ops::softmax_last_dim, rms_norm, Embedding,
     Linear, Module, RmsNorm, VarBuilder,
 };
+use candle_gen::quant as shared;
 
 // --- Config -----------------------------------------------------------------
 
@@ -486,9 +498,12 @@ fn dequant_mxfp4(blocks: &Tensor, scales: &Tensor, dtype: DType) -> Result<Tenso
         .to_device(&dev)
 }
 
-/// One expert projection. The dense path is a bf16 [`Linear`] (sc-5108); the quantized path (sc-5111)
-/// is a GGUF `Q4_0`/`Q8_0` [`QMatMul`] with a separate dense (f32) bias — quant only ever touches the
-/// expert weight matrices, the biases stay full-precision.
+/// One expert projection. The dense path is a bf16 [`Linear`] (sc-5108); the quantized path is a GGUF
+/// [`QMatMul`] with a separate dense (f32) model bias — quant only ever touches the expert weight
+/// matrices, the biases stay full-precision. The `Quant` arm is fed either by the MXFP4 → `Q4_0`/`Q8_0`
+/// transcode (sc-5111) or, from a packed `SceneWorks/lens-mlx` tier, by the `Q4_1`/`Q8_0` repack of the
+/// 3-D per-expert MLX affine triple ([`packed_experts`], sc-9457) — the *same* `QMatMul` forward serves
+/// both, so the packed load needs no new arm.
 #[derive(Debug, Clone)]
 enum ExpertProj {
     Dense(Linear),
@@ -557,6 +572,33 @@ impl SparseMoe {
         let i = cfg.intermediate_size;
         let dtype = vb.dtype();
         let vb_e = vb.pp("experts");
+
+        // Packed MLX-affine tier (sc-9457, sc-9089 umbrella): the `SceneWorks/lens-mlx` q4/q8 tiers
+        // store each fused expert projection as the 3-D affine triple `{gate_up_proj,down_proj}.weight`
+        // (u32 codes) + `.scales` + `.biases` (group 64) — NOT the dense-tier MXFP4 fused format. Detect
+        // by the `.scales` sibling and build every expert straight from the packed parts (no MXFP4, no
+        // dense staging), exactly as the DiT packed-detects its linears (sc-9413). `quant` is irrelevant
+        // here: the experts land quantized at the on-disk tier's bit-width regardless of the request.
+        if vb_e.contains_tensor("gate_up_proj.scales") {
+            return Ok(Self {
+                router,
+                experts: packed_experts(&vb_e, cfg)?,
+                num_experts_per_tok: cfg.num_experts_per_tok,
+                quantized: true,
+            });
+        }
+        // Guard (sc-9457): a component whose `config.json` carries `quantization` but whose experts lack
+        // `.scales` falls through here; if the MXFP4 `_blocks` are ALSO absent the weights are neither
+        // format we know, so fail loudly rather than mis-read u32 codes / dense bf16 as MXFP4.
+        if !vb_e.contains_tensor("gate_up_proj_blocks") {
+            return Err(candle_gen::candle_core::Error::Msg(
+                "lens text_encoder experts: neither MLX-packed affine \
+                 (`experts.gate_up_proj.scales`) nor MXFP4 (`experts.gate_up_proj_blocks`) present — \
+                 unknown expert weight format"
+                    .to_string(),
+            ));
+        }
+
         // Fused MXFP4 expert weights: blocks/scales load as raw u8 (get_unchecked_dtype avoids the
         // dtype coercion get() would apply). gate_up: [E, 2*inter, hidden]; down: [E, hidden, inter].
         let gate_up_blocks = vb_e.get_unchecked_dtype("gate_up_proj_blocks", DType::U8)?;
@@ -645,6 +687,70 @@ impl SparseMoe {
             quantized: quant.is_some(),
         })
     }
+}
+
+/// Load the fused MoE experts from an **MLX-packed** tier (`SceneWorks/lens-mlx`, sc-9457 / sc-9089
+/// umbrella). Each of the two fused projections is the 3-D MLX affine triple
+/// `experts.{gate_up_proj,down_proj}` = `.weight` (u32 codes `[E, out, in/8]`) + `.scales` + `.biases`
+/// (`[E, out, in/64]`, group 64) — the same affine packing the DiT tier uses (sc-9413), batched over
+/// the experts — plus a dense per-expert model bias `experts.{…}_bias` (`[E, out]`). Each expert-slice
+/// is repacked straight to a resident GGUF `Q4_1` (q4 tier) / `Q8_0` (q8 tier) [`QMatMul`] via the
+/// shared [`candle_gen::quant::repack_packed_weight`] seam — no MXFP4 dependency and no dense staging.
+///
+/// **`.biases` ≠ model bias.** The triple's `.biases` is the affine quant offset (`w = scale·q + bias`,
+/// per group) consumed by the repack; the model's expert bias is the separate `_bias` key, kept
+/// full-precision and added after the (dequantized) matmul in [`ExpertProj::forward`]. The Lens tier
+/// packs at MLX's default group size 64 (matching the DiT — [[mlx-packed-tier-format-facts]]).
+fn packed_experts(vb_e: &VarBuilder, cfg: &Config) -> Result<Vec<Expert>> {
+    let e = cfg.num_local_experts;
+    let dev = vb_e.device().clone();
+    let cpu = Device::Cpu;
+    // The u32 codes + f32 scales/biases pull to the CPU once per projection (the repack seam consumes
+    // a CPU source; one bulk move beats 2·E device→CPU slice transfers). The small dense per-expert
+    // model biases stay on-device — they are added on the activation device at forward.
+    let triple = |base: &str| -> Result<(Tensor, Tensor, Tensor)> {
+        Ok((
+            vb_e.get_unchecked_dtype(&format!("{base}.weight"), DType::U32)?
+                .to_device(&cpu)?,
+            vb_e.get_unchecked_dtype(&format!("{base}.scales"), DType::F32)?
+                .to_device(&cpu)?,
+            vb_e.get_unchecked_dtype(&format!("{base}.biases"), DType::F32)?
+                .to_device(&cpu)?,
+        ))
+    };
+    let (gu_wq, gu_s, gu_qb) = triple("gate_up_proj")?;
+    let (dn_wq, dn_s, dn_qb) = triple("down_proj")?;
+    let gu_bias = vb_e.get_unchecked_dtype("gate_up_proj_bias", DType::F32)?; // [E, 2*inter], on dev
+    let dn_bias = vb_e.get_unchecked_dtype("down_proj_bias", DType::F32)?; // [E, hidden], on dev
+
+    // One expert-slice → a `Q4_1`/`Q8_0` `QMatMul` (bit-width inferred from the packed shapes) plus its
+    // full-precision model bias, shaped exactly like the MXFP4 transcode's `ExpertProj::Quant`.
+    let proj = |wq: &Tensor, scales: &Tensor, qbias: &Tensor, bias: Tensor| -> Result<ExpertProj> {
+        let weight = shared::repack_packed_weight(wq, scales, qbias, shared::MLX_GROUP_SIZE, &dev)?;
+        Ok(ExpertProj::Quant {
+            w: QMatMul::from_qtensor(weight)?,
+            bias,
+        })
+    };
+    (0..e)
+        .map(|x| {
+            Ok(Expert {
+                gate_up_proj: proj(
+                    &gu_wq.i(x)?,
+                    &gu_s.i(x)?,
+                    &gu_qb.i(x)?,
+                    gu_bias.i(x)?.contiguous()?,
+                )?,
+                down_proj: proj(
+                    &dn_wq.i(x)?,
+                    &dn_s.i(x)?,
+                    &dn_qb.i(x)?,
+                    dn_bias.i(x)?.contiguous()?,
+                )?,
+                limit: cfg.swiglu_limit,
+            })
+        })
+        .collect()
 }
 
 impl Module for SparseMoe {
@@ -805,6 +911,11 @@ impl GptOssTextEncoder {
     /// As [`new`](Self::new) but transcodes the MoE experts to GGUF `Q4_0` (`quant = Some(Q4_0)`) or
     /// `Q8_0` (sc-5111), keeping the experts at ~4/8 bits resident (~12 GB at Q4 vs ~40 GB dense).
     /// Attention / router / embeddings / norms stay bf16. `quant = None` is the dense path.
+    ///
+    /// **Packed tier auto-detect (sc-9457).** If the snapshot is a packed `SceneWorks/lens-mlx` tier
+    /// ([`SparseMoe::new`] finds the `experts.gate_up_proj.scales` sibling), the experts load straight
+    /// from the packed parts at the tier's own bit-width and `quant` is ignored for them — so a pure
+    /// `lens-mlx` snapshot loads packed end-to-end regardless of the `quant` argument.
     pub fn new_quant(cfg: &Config, vb: VarBuilder, quant: Option<GgmlDType>) -> Result<Self> {
         let vb_m = vb.pp("model");
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, vb_m.pp("embed_tokens"))?;
@@ -1228,6 +1339,186 @@ mod tests {
         );
         let cos = cosine_cpu(&got, &want);
         assert!(cos > 0.99, "Q8 MoE cosine {cos:.5} ≤ 0.99 vs dense");
+    }
+
+    // ---- sc-9457 packed-tier fused experts (`SceneWorks/lens-mlx`) ---------------------------
+
+    /// Build an MLX **Q4** packed triple for `[E, out, in]` fused experts (group 64, LSB-first nibbles)
+    /// plus the exact affine grid it represents. `scales`/`biases` are f16-exact and per-group distinct,
+    /// and the codes are position-dependent, so the grid parity below is sensitive to any expert /
+    /// row / nibble / group ordering slip in the 3-D slice → repack path. Returns
+    /// `(wq [E,out,in/8] u32, scales [E,out,in/64] f32, biases [E,out,in/64] f32, grid [E,out,in] f32)`.
+    fn packed_expert_fixture(
+        e: usize,
+        out: usize,
+        inn: usize,
+        seed: u64,
+    ) -> (Tensor, Tensor, Tensor, Tensor) {
+        const G: usize = 64;
+        let dev = Device::Cpu;
+        let n = e * out * inn;
+        let codes: Vec<u8> = (0..n)
+            .map(|i| ((i as u64 * 7 + i as u64 / 13 + seed) % 16) as u8)
+            .collect();
+        let gpr = inn / G; // groups per output row
+        let groups = e * out * gpr;
+        // f16-exact (dyadic) and per-group distinct, including negatives.
+        let scales: Vec<f32> = (0..groups)
+            .map(|g| 0.0625 * ((g % 7) as f32 + 1.0))
+            .collect();
+        let biases: Vec<f32> = (0..groups).map(|g| -0.5 + 0.125 * (g % 5) as f32).collect();
+        let grid: Vec<f32> = (0..n)
+            .map(|idx| {
+                let row = idx / inn; // flat output row = expert*out + row-in-expert
+                let col = idx % inn;
+                let g = row * gpr + col / G;
+                scales[g] * codes[idx] as f32 + biases[g]
+            })
+            .collect();
+        let words: Vec<u32> = codes
+            .chunks_exact(8)
+            .map(|c| {
+                c.iter()
+                    .enumerate()
+                    .fold(0u32, |acc, (i, &q)| acc | ((q as u32 & 0xF) << (4 * i)))
+            })
+            .collect();
+        let wq = Tensor::from_vec(words, (e, out, inn / 8), &dev).unwrap();
+        let s = Tensor::from_vec(scales, (e, out, gpr), &dev).unwrap();
+        let b = Tensor::from_vec(biases, (e, out, gpr), &dev).unwrap();
+        let grid = Tensor::from_vec(grid, (e, out, inn), &dev).unwrap();
+        (wq, s, b, grid)
+    }
+
+    /// **Packed-detect fires on the 3-D affine expert layout, and the packed MoE reproduces the affine
+    /// grid (sc-9457).** Feeds `SparseMoe::new` a VarBuilder mimicking the `lens-mlx` `text_encoder`
+    /// expert keys — the `experts.{gate_up_proj,down_proj}` affine triple (`.weight`/`.scales`/`.biases`)
+    /// plus the separate dense `_bias` — and asserts two things. First, the `.scales` sibling routes
+    /// every expert to the packed `Quant` arm (not a silent MXFP4 miss). Second, the packed MoE tracks a
+    /// dense MoE built from the exact affine grids the pack represents (the Q4→Q4_1 repack is lossless;
+    /// the residual is only the `forward_via_f16` weight cast). `quant = None` here also proves the packed
+    /// load is quant-independent.
+    #[test]
+    fn packed_experts_detect_and_grid_parity() {
+        use std::collections::HashMap;
+        let dev = Device::Cpu;
+        // Tiny gpt-oss-shaped MoE: hidden = intermediate = 64 (÷64 → one group/row), 4 experts top-2.
+        let mut cfg = Config::gpt_oss_20b();
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 64;
+        cfg.num_local_experts = 4;
+        cfg.num_experts_per_tok = 2;
+        let (e, h, i) = (
+            cfg.num_local_experts,
+            cfg.hidden_size,
+            cfg.intermediate_size,
+        );
+
+        let (gu_wq, gu_s, gu_b, gu_grid) = packed_expert_fixture(e, 2 * i, h, 1);
+        let (dn_wq, dn_s, dn_b, dn_grid) = packed_expert_fixture(e, h, i, 2);
+        let gu_bias = Tensor::from_vec(prng(e * 2 * i, 14), (e, 2 * i), &dev).unwrap();
+        let dn_bias = Tensor::from_vec(prng(e * h, 15), (e, h), &dev).unwrap();
+        let router_w = Tensor::from_vec(prng(e * h, 12), (e, h), &dev).unwrap();
+        let router_b = Tensor::from_vec(prng(e, 13), (e,), &dev).unwrap();
+
+        let tensors = HashMap::from([
+            ("router.weight".to_string(), router_w.clone()),
+            ("router.bias".to_string(), router_b.clone()),
+            ("experts.gate_up_proj.weight".to_string(), gu_wq),
+            ("experts.gate_up_proj.scales".to_string(), gu_s),
+            ("experts.gate_up_proj.biases".to_string(), gu_b),
+            ("experts.gate_up_proj_bias".to_string(), gu_bias.clone()),
+            ("experts.down_proj.weight".to_string(), dn_wq),
+            ("experts.down_proj.scales".to_string(), dn_s),
+            ("experts.down_proj.biases".to_string(), dn_b),
+            ("experts.down_proj_bias".to_string(), dn_bias.clone()),
+        ]);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &dev);
+
+        // (1) `.scales` present ⇒ packed load, quant-independent (`None`).
+        let packed = SparseMoe::new(&cfg, vb, None).unwrap();
+        assert!(packed.quantized, "packed tier ⇒ experts computed in f32");
+        assert_eq!(packed.experts.len(), e);
+        for (x, ex) in packed.experts.iter().enumerate() {
+            assert!(
+                matches!(ex.gate_up_proj, ExpertProj::Quant { .. }),
+                "expert {x} gate_up must be packed-quantized (packed-detect missed)"
+            );
+            assert!(
+                matches!(ex.down_proj, ExpertProj::Quant { .. }),
+                "expert {x} down must be packed-quantized (packed-detect missed)"
+            );
+        }
+
+        // (2) Reference: a dense MoE built from the exact affine grids + the same router / model biases.
+        let ref_experts = (0..e)
+            .map(|x| {
+                Ok(Expert {
+                    gate_up_proj: ExpertProj::Dense(Linear::new(
+                        gu_grid.i(x)?.contiguous()?,
+                        Some(gu_bias.i(x)?.contiguous()?),
+                    )),
+                    down_proj: ExpertProj::Dense(Linear::new(
+                        dn_grid.i(x)?.contiguous()?,
+                        Some(dn_bias.i(x)?.contiguous()?),
+                    )),
+                    limit: cfg.swiglu_limit,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        let reference = SparseMoe {
+            router: Linear::new(router_w, Some(router_b)),
+            experts: ref_experts,
+            num_experts_per_tok: cfg.num_experts_per_tok,
+            quantized: false,
+        };
+
+        let xs = Tensor::from_vec(prng(2 * 3 * h, 20), (2, 3, h), &dev).unwrap();
+        let got = packed.forward(&xs).unwrap();
+        let want = reference.forward(&xs).unwrap();
+        assert_eq!(got.dims(), want.dims());
+        let g = got.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            g.iter().all(|v| v.is_finite()),
+            "packed MoE produced non-finite output"
+        );
+        let cos = cosine_cpu(&got, &want);
+        assert!(
+            cos > 0.999,
+            "packed-expert MoE cosine {cos:.5} ≤ 0.999 vs the dense affine grid"
+        );
+    }
+
+    /// The detect guard (sc-9457): experts that are neither packed affine (`.scales`) nor MXFP4
+    /// (`_blocks`) must error loudly, not silently mis-read the weights.
+    #[test]
+    fn packed_detect_guard_errors_on_unknown_format() {
+        let dev = Device::Cpu;
+        let mut cfg = Config::gpt_oss_20b();
+        cfg.hidden_size = 64;
+        cfg.intermediate_size = 64;
+        cfg.num_local_experts = 2;
+        cfg.num_experts_per_tok = 1;
+        // Only the router is present — no `.scales`, no `_blocks`.
+        let tensors = std::collections::HashMap::from([
+            (
+                "router.weight".to_string(),
+                Tensor::from_vec(prng(2 * 64, 1), (2, 64), &dev).unwrap(),
+            ),
+            (
+                "router.bias".to_string(),
+                Tensor::from_vec(prng(2, 2), (2,), &dev).unwrap(),
+            ),
+        ]);
+        let vb = VarBuilder::from_tensors(tensors, DType::F32, &dev);
+        let err = SparseMoe::new(&cfg, vb, None)
+            .expect_err("unknown expert format must error")
+            .to_string();
+        assert!(
+            err.contains("unknown expert weight format"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

@@ -311,7 +311,13 @@ impl QEmbedding {
 /// `Q4_1` repack ([`repack_mlx_q4_to_q4_1`]); **Q8** via the exact-grid dequant + a `Q8_0` re-quant
 /// (no affine 8-bit GGML container — the accepted sc-9085 double-quant, 0.56 % mean rel RMS). The
 /// bit-width is inferred from the packed shapes ([`mlx_packed_bits`]).
-fn repack_packed_weight(
+///
+/// **Public so a per-crate loader that can't use [`QLinear`] directly can still reuse the exact
+/// Q4/Q8 dispatch (sc-9457).** The Lens gpt-oss encoder packs its fused MoE experts as a *3-D*
+/// `[E, out, in/g]` affine triple that neither [`lin`] nor [`QLinear`] consumes (both are 2-D);
+/// it slices each expert's `[out, in/g]` triple and calls this to build the resident `QTensor` it
+/// wraps in a `QMatMul`, so the packed Q4→Q4_1 / Q8→Q8_0 conversion has a single implementation.
+pub fn repack_packed_weight(
     wq: &Tensor,
     scales: &Tensor,
     biases: &Tensor,
