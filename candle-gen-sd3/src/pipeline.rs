@@ -282,11 +282,10 @@ impl Pipeline {
             let part = candle_gen::candle_core::safetensors::load(f, &Device::Cpu)?;
             tensors.extend(part);
         }
-        let report = crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
-        eprintln!(
-            "sd3: merged {} LoRA/LoKr target(s) into the MMDiT ({} key(s) out of surface)",
-            report.merged, report.skipped_keys
-        );
+        // Discard the merge report — the silent twin (`candle-gen-z-image`'s
+        // `transformer_vb_with_adapters`) does the same; a mismatched adapter surface already errors
+        // inside `merge_adapters`, so library code stays quiet on stderr (sc-9035 / F-051).
+        crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
         Ok(VarBuilder::from_tensors(tensors, self.dtype, device))
     }
 

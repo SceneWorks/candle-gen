@@ -171,11 +171,10 @@ fn load_transformer(
         )?);
     }
     let mut tensors = load_transformer_tensors(root)?;
-    let report = crate::adapters::merge_adapters(&mut tensors, adapters)?;
-    eprintln!(
-        "qwen edit: merged {} adapter target(s) into the MMDiT ({} key(s) off-surface)",
-        report.merged, report.skipped_keys
-    );
+    // Discard the merge report — the silent twin (`candle-gen-z-image`'s
+    // `transformer_vb_with_adapters`) does the same; a non-matching adapter surface already errors
+    // inside `merge_adapters`, so library code stays quiet on stderr (sc-9035 / F-051).
+    crate::adapters::merge_adapters(&mut tensors, adapters)?;
     let vb = VarBuilder::from_tensors(tensors, dtype, device);
     Ok(QwenTransformer::new(&cfg, vb)?)
 }
