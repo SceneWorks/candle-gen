@@ -458,18 +458,18 @@ impl WanVae {
         let z = self.unnormalize(z)?;
         let t_lat = z.dim(2)?;
         self.reset_caches();
-        let mut out: Option<Tensor> = None;
+        // Collect the per-frame decoded chunks and `cat` once (sc-9037): cat-ing onto a growing
+        // accumulator each iteration re-copies every prior frame → O(T²) copy traffic and briefly
+        // holds old+new. A single `Tensor::cat` at the end is O(T) and equivalent (same frames, same
+        // order along the temporal axis).
+        let mut chunks: Vec<Tensor> = Vec::with_capacity(t_lat);
         for i in 0..t_lat {
             let zi = z.narrow(2, i, 1)?.contiguous()?;
-            let oi = self.decode_inner(&zi, &Ctx::streaming(i == 0))?;
-            out = Some(match out {
-                Some(o) => Tensor::cat(&[&o, &oi], 2)?,
-                None => oi,
-            });
+            chunks.push(self.decode_inner(&zi, &Ctx::streaming(i == 0))?);
         }
         self.reset_caches();
-        out.expect("decode needs >= 1 latent frame")
-            .clamp(-1f32, 1f32)
+        assert!(!chunks.is_empty(), "decode needs >= 1 latent frame");
+        Tensor::cat(&chunks, 2)?.clamp(-1f32, 1f32)
     }
 
     /// Single-pass decode over all frames (the original path). Retained for the streaming-parity test

@@ -391,18 +391,18 @@ impl WanVae16 {
         let z = self.unnormalize(z)?;
         let t_lat = z.dim(2)?;
         self.reset_caches();
-        let mut out: Option<Tensor> = None;
+        // Collect the per-frame decoded chunks and `cat` once (sc-9037): cat-ing onto a growing
+        // accumulator each iteration re-copies every prior frame → O(T²) copy traffic and briefly
+        // holds old+new. A single `Tensor::cat` at the end is O(T) and equivalent (same frames, same
+        // order along the temporal axis).
+        let mut chunks: Vec<Tensor> = Vec::with_capacity(t_lat);
         for i in 0..t_lat {
             let zi = z.narrow(2, i, 1)?.contiguous()?;
-            let oi = self.decode_inner(&zi, &Ctx::streaming(i == 0))?;
-            out = Some(match out {
-                Some(o) => Tensor::cat(&[&o, &oi], 2)?,
-                None => oi,
-            });
+            chunks.push(self.decode_inner(&zi, &Ctx::streaming(i == 0))?);
         }
         self.reset_caches();
-        out.expect("decode needs >= 1 latent frame")
-            .clamp(-1f32, 1f32)
+        assert!(!chunks.is_empty(), "decode needs >= 1 latent frame");
+        Tensor::cat(&chunks, 2)?.clamp(-1f32, 1f32)
     }
 
     /// Single-pass decode over all frames (the original path). Retained for the streaming-parity test;
@@ -437,7 +437,10 @@ impl WanVae16 {
         let t = video.dim(2)?;
         let num_chunks = 1 + (t - 1) / 4;
         encoder.reset_cache();
-        let mut out: Option<Tensor> = None;
+        // Collect the per-chunk encoded features and `cat` once (sc-9037): cat-ing onto a growing
+        // accumulator each iteration re-copies every prior chunk → O(T²) copy traffic. A single
+        // `Tensor::cat` at the end is O(T) and equivalent (same chunks, same temporal order).
+        let mut chunks: Vec<Tensor> = Vec::with_capacity(num_chunks);
         for i in 0..num_chunks {
             let chunk = if i == 0 {
                 video.narrow(2, 0, 1)?
@@ -445,16 +448,13 @@ impl WanVae16 {
                 video.narrow(2, 1 + 4 * (i - 1), 4)?
             }
             .contiguous()?;
-            let oi = encoder.forward(&chunk, &Ctx::streaming(i == 0))?;
-            out = Some(match out {
-                Some(o) => Tensor::cat(&[&o, &oi], 2)?,
-                None => oi,
-            });
+            chunks.push(encoder.forward(&chunk, &Ctx::streaming(i == 0))?);
         }
         encoder.reset_cache();
+        assert!(!chunks.is_empty(), "encode needs >= 1 frame");
+        let out = Tensor::cat(&chunks, 2)?;
         // quant_conv (1×1×1) over the full moments, take the mean (first z channels), normalize.
-        let moments =
-            quant_conv.forward(&out.expect("encode needs >= 1 frame"), &Ctx::single_pass())?;
+        let moments = quant_conv.forward(&out, &Ctx::single_pass())?;
         let mu = moments.narrow(1, 0, self.z_dim)?;
         mu.broadcast_sub(&self.mean)?.broadcast_div(&self.std)
     }
@@ -475,5 +475,89 @@ impl WanVae16 {
             ub.reset_cache();
         }
         self.conv_out.reset_cache();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! sc-9037 (F-053): the streaming decode/encode loops used to accumulate frame chunks by
+    //! `cat`-ing onto a growing accumulator each iteration — O(T²) copy traffic. The fix collects
+    //! the chunks into a `Vec<Tensor>` and does a single `Tensor::cat` at the end (O(T)). This must
+    //! be **bit-identical** to the old incremental accumulation (same frames, same temporal order,
+    //! no boundary blend — the streaming loops here are a plain temporal concatenation). These tests
+    //! pin that equivalence at the tensor level so the refactor is provably output-preserving
+    //! without needing real VAE weights.
+
+    use candle_gen::candle_core::{DType, Device, Tensor};
+
+    /// Old accumulator: `out = cat([out, chunk], dim)` folded over the chunk list (the pre-sc-9037
+    /// pattern). Returns `None` for an empty list (mirrors the old `Option<Tensor>` seed).
+    fn incremental_cat(chunks: &[Tensor], dim: usize) -> Option<Tensor> {
+        let mut out: Option<Tensor> = None;
+        for c in chunks {
+            out = Some(match out {
+                Some(o) => Tensor::cat(&[&o, c], dim).unwrap(),
+                None => c.clone(),
+            });
+        }
+        out
+    }
+
+    /// A known sequence of temporal chunks shaped like the streaming decode output
+    /// `[B, C, t_i, H, W]` with per-chunk frame counts mimicking `1 + (T-1)·4` (frame 0 → 1 output
+    /// frame, later latent frames → 4). Deterministic ascending values so any reorder/duplication
+    /// would change the bytes.
+    fn make_chunks(dev: &Device) -> Vec<Tensor> {
+        let (b, c, h, w) = (1usize, 3usize, 2usize, 2usize);
+        let per_chunk_frames = [1usize, 4, 4, 4, 4]; // 5 latent frames → 17 output frames
+        let mut base = 0f32;
+        let mut chunks = Vec::new();
+        for &tf in &per_chunk_frames {
+            let n = b * c * tf * h * w;
+            let data: Vec<f32> = (0..n).map(|k| base + k as f32).collect();
+            base += n as f32;
+            chunks.push(Tensor::from_vec(data, (b, c, tf, h, w), dev).unwrap());
+        }
+        chunks
+    }
+
+    /// The single-cat replacement is byte-for-byte identical to the incremental accumulator over a
+    /// realistic multi-frame chunk sequence (the decode temporal axis, dim 2).
+    #[test]
+    fn single_cat_matches_incremental_accumulation() {
+        let dev = Device::Cpu;
+        let chunks = make_chunks(&dev);
+
+        let single = Tensor::cat(&chunks, 2).unwrap();
+        let incremental = incremental_cat(&chunks, 2).expect("non-empty");
+
+        assert_eq!(single.dims(), incremental.dims(), "shape must match");
+        let a = single
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let b = incremental
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // Bit-identical (concatenation copies bytes verbatim — no arithmetic, no blend).
+        assert_eq!(a, b, "single-cat must be bit-identical to incremental cat");
+    }
+
+    /// The total output frame count along the temporal axis is `1 + (T-1)·4` — the streaming
+    /// contract — and is preserved by the single cat.
+    #[test]
+    fn single_cat_preserves_frame_count() {
+        let dev = Device::Cpu;
+        let chunks = make_chunks(&dev);
+        let single = Tensor::cat(&chunks, 2).unwrap();
+        let t_lat = chunks.len();
+        assert_eq!(single.dim(2).unwrap(), 1 + (t_lat - 1) * 4);
     }
 }
