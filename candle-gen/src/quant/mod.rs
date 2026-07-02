@@ -89,15 +89,26 @@ pub struct PackedConfig {
 
 impl PackedConfig {
     /// Parse the `quantization` block out of a component `config.json` value — `None` when the block
-    /// is absent (a dense component) or malformed. Detects a packed tier without touching the
-    /// safetensors: `PackedConfig::from_config(cfg).is_some()` ⇔ the loader should take the packed
-    /// path.
+    /// is absent (a dense component) or missing `bits` (nothing identifies it as packed). Detects a
+    /// packed tier without touching the safetensors: `PackedConfig::from_config(cfg).is_some()` ⇔ the
+    /// loader should take the packed path.
+    ///
+    /// **`group_size` absent ⇒ default to [`MLX_GROUP_SIZE`] (64), never silent dense (sc-9410).** A
+    /// packed component that carries `bits` but omits `group_size` is still packed — u32 codes that a
+    /// dense fallback would load as garbage. MLX's own default group size is 64 (the z-image/flux
+    /// tiers), so an absent `group_size` means "the default 64", not "dense". Returning `None` here
+    /// would silently degrade the whole component to the dense path over bit-packed nibbles.
     pub fn from_config(cfg: &serde_json::Value) -> Option<Self> {
         let q = cfg.get("quantization")?;
-        Some(Self {
-            bits: q.get("bits")?.as_i64()? as i32,
-            group_size: q.get("group_size")?.as_i64()? as i32,
-        })
+        let bits = q.get("bits")?.as_i64()? as i32;
+        // Present `quantization.bits` ⇒ packed; a missing `group_size` defaults to MLX's 64 rather
+        // than degrading the component to a dense read of u32 codes.
+        let group_size = q
+            .get("group_size")
+            .and_then(|g| g.as_i64())
+            .map(|g| g as i32)
+            .unwrap_or(MLX_GROUP_SIZE as i32);
+        Some(Self { bits, group_size })
     }
 }
 
@@ -625,6 +636,38 @@ mod tests {
         );
         let dense = serde_json::json!({ "hidden_size": 2048 });
         assert_eq!(PackedConfig::from_config(&dense), None);
+    }
+
+    /// **`quantization.bits` present but `group_size` absent ⇒ default to 64, NOT silent dense
+    /// (sc-9410).** A packed component missing `group_size` still stores u32 codes; degrading it to a
+    /// dense read would load garbage. The existing group-64 / group-32 behavior stays byte-identical —
+    /// only the *absent* case changed (it used to return `None`).
+    #[test]
+    fn packed_config_defaults_absent_group_size_to_64() {
+        let no_gs = serde_json::json!({ "quantization": { "bits": 4 } });
+        assert_eq!(
+            PackedConfig::from_config(&no_gs),
+            Some(PackedConfig {
+                bits: 4,
+                group_size: MLX_GROUP_SIZE as i32
+            }),
+            "absent group_size must default to the MLX group size (64), not degrade to dense"
+        );
+        // Explicit group sizes are unchanged.
+        assert_eq!(
+            PackedConfig::from_config(
+                &serde_json::json!({ "quantization": { "bits": 4, "group_size": 32 } })
+            ),
+            Some(PackedConfig {
+                bits: 4,
+                group_size: 32
+            })
+        );
+        // Still `None` when there is nothing marking it packed (no `bits`).
+        assert_eq!(
+            PackedConfig::from_config(&serde_json::json!({ "quantization": { "group_size": 64 } })),
+            None
+        );
     }
 
     // ---- packed-detect over a VarBuilder ------------------------------------------------------

@@ -26,7 +26,7 @@ use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::rotary_emb::rope;
 use candle_gen::candle_nn::{LayerNorm, Linear, Module};
 
-use crate::loader::{linear, Weights};
+use crate::loader::{linear_guard_dense, Weights};
 
 const LN_EPS: f64 = 1e-6;
 const ROPE_THETA: f32 = 10000.0;
@@ -104,10 +104,10 @@ impl Block {
         Ok(Self {
             norm1: layer_norm(w, &format!("{prefix}.norm1"))?,
             norm2: layer_norm(w, &format!("{prefix}.norm2"))?,
-            qkv: linear(w, &format!("{prefix}.attn.qkv"), true)?,
-            proj: linear(w, &format!("{prefix}.attn.proj"), true)?,
-            fc1: linear(w, &format!("{prefix}.mlp.linear_fc1"), true)?,
-            fc2: linear(w, &format!("{prefix}.mlp.linear_fc2"), true)?,
+            qkv: linear_guard_dense(w, &format!("{prefix}.attn.qkv"), true)?,
+            proj: linear_guard_dense(w, &format!("{prefix}.attn.proj"), true)?,
+            fc1: linear_guard_dense(w, &format!("{prefix}.mlp.linear_fc1"), true)?,
+            fc2: linear_guard_dense(w, &format!("{prefix}.mlp.linear_fc2"), true)?,
             num_heads: cfg.num_heads,
             head_dim,
             scale: (head_dim as f64).powf(-0.5),
@@ -169,8 +169,8 @@ impl Merger {
     fn load(w: &Weights, prefix: &str, postshuffle: bool, merged_dim: usize) -> Result<Self> {
         Ok(Self {
             norm: layer_norm(w, &format!("{prefix}.norm"))?,
-            fc1: linear(w, &format!("{prefix}.linear_fc1"), true)?,
-            fc2: linear(w, &format!("{prefix}.linear_fc2"), true)?,
+            fc1: linear_guard_dense(w, &format!("{prefix}.linear_fc1"), true)?,
+            fc2: linear_guard_dense(w, &format!("{prefix}.linear_fc2"), true)?,
             postshuffle,
             merged_dim,
         })
@@ -215,6 +215,17 @@ pub struct VisionTower {
 impl VisionTower {
     /// Build from the mllm weight set (`{prefix}.*`, e.g. `"model.visual"`), loaded f32.
     pub fn load(w: &Weights, cfg: VisionConfig, prefix: &str) -> Result<Self> {
+        // The vision tower is dense bf16 in every hosted boogu tier (incl. edit-q4, where MLX packed
+        // only `model.language_model.*` — see `loader::linear_guard_dense`). Guard the patch-embed
+        // conv too: a `.scales` sibling here would mean the tower got packed, which this dense fold
+        // can't read (sc-9410, Issue 1).
+        if w.packed().is_some() && w.contains(&format!("{prefix}.patch_embed.proj.scales")) {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "boogu: `{prefix}.patch_embed.proj` has a `.scales` sibling in a packed component — \
+                 the vision tower is bf16 in the hosted tiers; a packed vision tower is unsupported \
+                 by this dense conv fold (sc-9410)."
+            )));
+        }
         // Fold the Conv3d patch-embed weight `[embed, in, t, ph, pw]` → `[embed, in·t·ph·pw]` so the
         // full-kernel conv runs as a per-patch matmul; keep its bias.
         let conv = w.get(&format!("{prefix}.patch_embed.proj.weight"))?;

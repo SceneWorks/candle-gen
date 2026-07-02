@@ -13,6 +13,15 @@
 //! the `.scales` sibling and build the quantized module straight from the packed parts through the shared
 //! group-size-aware loaders (no dense staging — see [`crate::quant`]). Absent the block / `.scales`, the
 //! dense path is unchanged.
+//!
+//! **Vision tower is dense bf16 even in the packed tiers (sc-9410).** MLX packs the boogu `mllm/`
+//! component selectively: in `edit-q4` only `model.language_model.*` (the TE, 252 `.scales`) is
+//! packed; all 351 `model.visual.*` (the Qwen3-VL vision tower) stay BF16 (verified against the hosted
+//! `SceneWorks/boogu-image-mlx/edit-q4/mllm/model.safetensors` header — 0 `model.visual.*.scales`).
+//! The vision tower therefore loads dense via [`linear_guard_dense`], but it *shares* the `mllm/` dir
+//! (and so the packed `config.json` flag) with the packed TE — so a bare dense read here would be a
+//! **silent** skip if a future tier ever packed the tower. [`linear_guard_dense`] errors loudly on a
+//! stray `.scales` sibling instead.
 
 use std::path::{Path, PathBuf};
 
@@ -116,6 +125,30 @@ pub fn linear(w: &Weights, base: &str, bias: bool) -> Result<Linear> {
         None
     };
     Ok(Linear::new(weight, bias))
+}
+
+/// A **dense** [`Linear`] like [`linear`], but with a loud guard: if a `{base}.scales` sibling is
+/// present (i.e. this weight is actually MLX-packed u32 codes), it errors instead of silently reading
+/// the codes as bf16 garbage (sc-9410, Issue 1 branch c).
+///
+/// The Qwen3-VL **vision tower** (`model.visual.*`) is dense bf16 in *every* hosted boogu tier —
+/// including `edit-q4`, whose `mllm/config.json` DOES carry `quantization: { bits:4, group_size:32 }`
+/// but where MLX selectively packed **only** the language model (`model.language_model.*`, 252
+/// `.scales`) and left all 351 `model.visual.*` tensors BF16 (verified 2026-07-02 against the hosted
+/// `SceneWorks/boogu-image-mlx/edit-q4/mllm/model.safetensors` header: 0 `model.visual.*.scales`).
+/// So the dense path is correct today. But the vision tower shares the `mllm/` dir — hence the packed
+/// `config.json` flag — with the packed TE, so a bare dense [`linear`] here would be a *silent* skip
+/// if a future tier ever packs `model.visual.*`. This guard turns that latent silent-garbage into a
+/// hard load error. (Dense components with no packed config are unaffected: `packed()` is `None`.)
+pub fn linear_guard_dense(w: &Weights, base: &str, bias: bool) -> Result<Linear> {
+    if w.packed().is_some() && w.contains(&format!("{base}.scales")) {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "boogu: `{base}` has a `.scales` sibling in a packed component but is loaded dense — the \
+             vision tower is bf16 in the hosted tiers; a packed vision tower must route through \
+             `linear_detect` (sc-9410)."
+        )));
+    }
+    linear(w, base, bias)
 }
 
 /// **Packed-detecting** [`QLinear`] loader (sc-9410): when the component is a packed q4 tier *and*
@@ -277,6 +310,50 @@ mod tests {
         }
         let cos = dot / (na.sqrt() * nb.sqrt() + 1e-12);
         assert!(cos > 0.99999, "group-32 packed vs grid cosine {cos:.6}");
+
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
+    }
+
+    /// **The vision-tower dense guard errors loudly on a stray `.scales` (sc-9410, Issue 1 branch c).**
+    /// The Qwen3-VL vision tower is bf16 in every hosted boogu tier, so it loads dense via
+    /// `linear_guard_dense`. But it shares the packed `mllm/` config with the packed TE, so if a future
+    /// tier ever packed a `model.visual.*` weight, a bare dense read would silently load u32 codes as
+    /// garbage. The guard turns that into a hard load error instead. A dense sibling (no `.scales`)
+    /// still loads fine.
+    #[test]
+    fn linear_guard_dense_errors_on_packed_vision_weight() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (128usize, 256usize);
+        let (wq, s, b, _grid) = q4_packed(out_dim, in_dim);
+
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        // A hypothetically-packed vision weight (would be silent garbage under a bare dense read).
+        map.insert("blocks.0.attn.qkv.weight".into(), wq);
+        map.insert("blocks.0.attn.qkv.scales".into(), s);
+        map.insert("blocks.0.attn.qkv.biases".into(), b);
+        // A genuinely dense vision weight (the reality in the hosted tiers).
+        map.insert(
+            "blocks.0.attn.proj.weight".into(),
+            Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?,
+        );
+
+        let dir = std::env::temp_dir().join(format!("sc9410_guard_{}", std::process::id()));
+        write_component(&dir, map, true); // packed component config (quantization block present)
+        let w = Weights::from_dir(&dir, &dev, DType::F32)?;
+        assert!(w.packed().is_some(), "packed component config");
+
+        // Packed vision weight ⇒ loud error, never a silent dense read of u32 codes.
+        let err = linear_guard_dense(&w, "blocks.0.attn.qkv", false);
+        assert!(
+            err.is_err(),
+            "a `.scales` sibling on a dense-loaded vision weight must error, not silently load garbage"
+        );
+        // Genuinely-dense vision weight ⇒ loads fine.
+        assert!(
+            linear_guard_dense(&w, "blocks.0.attn.proj", false).is_ok(),
+            "a dense vision weight (no `.scales`) still loads"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
         Ok(())
