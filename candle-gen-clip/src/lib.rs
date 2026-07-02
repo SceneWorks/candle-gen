@@ -17,10 +17,11 @@
 //! from `candle-gen-sdxl` ([`ClipVisionEncoder`], [`VisionConfig::vit_l_14`], [`Weights`],
 //! [`preprocess_clip_image_sized`]); only the small pooling + projection head lives here.
 //!
-//! **mlx vs candle port note.** The math is identical to `mlx-gen-clip`; the differences are candle's
-//! NCHW conv layout (handled inside the reused tower, no transpose on load) and that candle's `Weights`
-//! loads from a single `.safetensors` *file* (resolved inside the snapshot dir) rather than the MLX
-//! sharded-dir loader.
+//! **mlx vs candle port note.** The math is identical to `mlx-gen-clip`; the difference is candle's
+//! NCHW conv layout (handled inside the reused tower, no transpose on load). Weight resolution prefers
+//! the snapshot's single `model.safetensors`, but falls back to merging *all* `*.safetensors` shards
+//! in deterministic order (via [`candle_gen::loader::sorted_safetensors`]) so a resharded upstream
+//! snapshot loads the full union of tensors, matching the MLX sharded-dir loader (F-037, sc-9021).
 
 use std::path::{Path, PathBuf};
 
@@ -167,11 +168,11 @@ impl ClipTextEmbedder {
     /// Load from an `openai/clip-vit-large-patch14` checkpoint dir: `text_model.*`,
     /// top-level `text_projection.weight`, and `tokenizer.json`.
     pub fn from_snapshot(root: &Path) -> Result<Self> {
-        let file = resolve_weights_file(root)?;
+        let files = resolve_weights_files(root)?;
         let device = candle_gen::default_device()?;
-        let vb = candle_gen::mmap_var_builder(std::slice::from_ref(&file), DType::F32, &device)?;
+        let vb = candle_gen::mmap_var_builder(&files, DType::F32, &device)?;
         let body = ClipTextTransformer::new(vb.pp("text_model"), &clip_text_config())?;
-        let weights = Weights::from_file(&file, &device, DType::F32)?;
+        let weights = Weights::from_files(&files, &device, DType::F32)?;
         let text_projection = Linear::new(weights.require("text_projection.weight")?, None);
         let tokenizer = Tokenizer::from_file(root.join("tokenizer.json"))
             .map_err(|e| CandleError::Msg(format!("clip_vit_l14_text: load tokenizer: {e}")))?;
@@ -239,27 +240,20 @@ fn clip_text_config() -> ClipTextConfig {
     }
 }
 
-/// Resolve the checkpoint file inside a snapshot dir: prefer `model.safetensors`, else the first
-/// `*.safetensors` present (the `openai/clip-vit-large-patch14` snapshot ships the full model in one
-/// `model.safetensors`).
-fn resolve_weights_file(root: &Path) -> Result<PathBuf> {
+/// Resolve the checkpoint safetensors file(s) inside a snapshot dir.
+///
+/// The `openai/clip-vit-large-patch14` snapshot ships the full model in a single `model.safetensors`,
+/// so when that named file is present we return it alone (unchanged fast path). Otherwise we fall
+/// back to **every** `*.safetensors` in the dir, in the shared deterministic lexical shard order
+/// ([`candle_gen::loader::sorted_safetensors`]) — a resharded upstream snapshot loads the *union* of
+/// its shards, not one arbitrary `read_dir` entry, and an empty dir errors explicitly with the
+/// crafted `clip_vit_l14`-prefixed message instead of silently picking nothing (F-037, sc-9021).
+fn resolve_weights_files(root: &Path) -> Result<Vec<PathBuf>> {
     let default = root.join(WEIGHTS_FILE);
     if default.is_file() {
-        return Ok(default);
+        return Ok(vec![default]);
     }
-    let found = std::fs::read_dir(root)
-        .map_err(|e| {
-            CandleError::Msg(format!(
-                "clip_vit_l14: cannot read weights dir {root:?}: {e}"
-            ))
-        })?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.extension().is_some_and(|x| x == "safetensors"));
-    found.ok_or_else(|| {
-        CandleError::Msg(format!(
-            "clip_vit_l14: no `model.safetensors` (or any `*.safetensors`) in {root:?}"
-        ))
-    })
+    candle_gen::loader::sorted_safetensors(root, "clip_vit_l14")
 }
 
 /// Load the embedder from a weights directory (the `openai/clip-vit-large-patch14` snapshot), onto the
@@ -274,9 +268,9 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn ImageEmbedder>> {
             ))
         }
     };
-    let file = resolve_weights_file(root)?;
+    let files = resolve_weights_files(root)?;
     let device = candle_gen::default_device()?;
-    let weights = Weights::from_file(&file, &device, DType::F32)?;
+    let weights = Weights::from_files(&files, &device, DType::F32)?;
     Ok(Box::new(ClipImageEmbedder::from_weights(&weights)?))
 }
 
@@ -456,6 +450,95 @@ mod tests {
         let v = embedder.embed(&img).unwrap();
         assert_eq!(v.len(), proj_dim);
         assert!(v.iter().all(|x| x.is_finite()), "embedding not finite");
+    }
+
+    /// Write a single-tensor f32 `.safetensors` at `path` holding `name -> [value]`.
+    fn write_st(path: &Path, name: &str, value: f32) {
+        let t = Tensor::new(&[value], &Device::Cpu).unwrap();
+        let mut m = HashMap::new();
+        m.insert(name.to_string(), t);
+        candle_core::safetensors::save(&m, path).unwrap();
+    }
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "candle_gen_clip_resolve_{tag}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The named-file fast path: when `model.safetensors` is present, resolve it alone (unchanged),
+    /// even if the dir also holds other stray `*.safetensors`.
+    #[test]
+    fn resolve_prefers_named_model_file() {
+        let dir = scratch_dir("named");
+        write_st(&dir.join(WEIGHTS_FILE), "w", 0.0);
+        write_st(&dir.join("extra.safetensors"), "w", 0.0);
+        let files = resolve_weights_files(&dir).unwrap();
+        assert_eq!(files, vec![dir.join(WEIGHTS_FILE)]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F-037 (sc-9021): with no `model.safetensors`, the fallback returns ALL shards in the shared
+    /// deterministic lexical order — not one arbitrary `read_dir` entry — so `Weights::from_files`
+    /// loads the UNION of a resharded snapshot's keys.
+    #[test]
+    fn resolve_fallback_returns_all_shards_sorted_and_merges_union() {
+        let dir = scratch_dir("shards");
+        // Deliberately create out of lexical order to prove the sort.
+        write_st(
+            &dir.join("model-00002-of-00002.safetensors"),
+            "b.weight",
+            2.0,
+        );
+        write_st(
+            &dir.join("model-00001-of-00002.safetensors"),
+            "a.weight",
+            1.0,
+        );
+
+        let files = resolve_weights_files(&dir).unwrap();
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "model-00001-of-00002.safetensors".to_string(),
+                "model-00002-of-00002.safetensors".to_string(),
+            ],
+            "fallback must be deterministically sorted, all shards"
+        );
+
+        // The merged map is the UNION of both shards' keys (the old first-file fallback would drop one).
+        let w = Weights::from_files(&files, &Device::Cpu, DType::F32).unwrap();
+        assert_eq!(
+            w.require("a.weight").unwrap().to_vec1::<f32>().unwrap(),
+            vec![1.0]
+        );
+        assert_eq!(
+            w.require("b.weight").unwrap().to_vec1::<f32>().unwrap(),
+            vec![2.0]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An empty snapshot dir errors explicitly with the crafted `clip_vit_l14` message (no silent
+    /// arbitrary pick), routed through the shared loader.
+    #[test]
+    fn resolve_errors_cleanly_on_empty_dir() {
+        let dir = scratch_dir("empty");
+        std::fs::write(dir.join("config.json"), b"{}").unwrap();
+        let err = resolve_weights_files(&dir).unwrap_err();
+        assert!(
+            matches!(&err, CandleError::Msg(m) if m.contains("clip_vit_l14") && m.contains("no .safetensors")),
+            "expected crafted empty-dir error, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Real-weights cross-backend parity (sc-6535): load the cached `openai/clip-vit-large-patch14`
