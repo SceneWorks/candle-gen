@@ -94,20 +94,7 @@ impl Pipeline {
 
     /// mmap an f32 [`VarBuilder`] over every `.safetensors` in `dir` (the DiT + VAE ship sharded).
     fn f32_vb(&self, dir: &Path) -> Result<VarBuilder<'static>> {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-            .map_err(|e| CandleError::Msg(format!("chroma: read {}: {e}", dir.display())))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(CandleError::Msg(format!(
-                "chroma: no .safetensors found in {} (expected a Chroma diffusers snapshot)",
-                dir.display()
-            )));
-        }
-        // SAFETY: mmap of read-only weight files; standard candle loading path.
-        Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::F32, &self.device)? })
+        candle_gen::load_sorted_mmap(dir, DType::F32, &self.device, "chroma")
     }
 
     /// Render `req` against pre-loaded `components`, emitting per-step progress and honoring

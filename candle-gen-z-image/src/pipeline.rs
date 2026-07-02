@@ -400,28 +400,16 @@ impl Pipeline {
                 self.root.display()
             )));
         }
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .map_err(|e| CandleError::Msg(format!("z-image: read {sub}/: {e}")))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(CandleError::Msg(format!(
-                "z-image: no .safetensors found in {sub}/ (at {})",
-                dir.display()
-            )));
-        }
-        Ok(files)
+        // Shared sorted-`.safetensors` resolver (sc-8999 / F-019); the crafted "missing dir" message
+        // above stays local (it names the expected diffusers snapshot).
+        candle_gen::sorted_safetensors(&dir, "z-image")
     }
 
     /// Build a [`VarBuilder`] over every `.safetensors` in the snapshot component subdir `sub`, at
     /// this pipeline's dtype/device (the stock mmap path; no adapters).
     fn component_vb(&self, sub: &str) -> Result<VarBuilder<'static>> {
         let files = self.component_files(sub)?;
-        // SAFETY: mmap of read-only weight files; standard candle loading path.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, self.dtype, &self.device)? };
-        Ok(vb)
+        candle_gen::mmap_var_builder(&files, self.dtype, &self.device)
     }
 
     /// Build the DiT [`VarBuilder`] with the LoRA/LoKr [`AdapterSpec`]s merged into its weights
@@ -448,8 +436,7 @@ impl Pipeline {
     /// generator), so the txt2img / Turbo path never pays for it.
     pub(crate) fn load_vae_encoder(&self) -> Result<VaeEncoder> {
         let files = self.component_files("vae")?;
-        // SAFETY: mmap of read-only weight files; standard candle loading path.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, ENC_DTYPE, &self.device)? };
+        let vb = candle_gen::mmap_var_builder(&files, ENC_DTYPE, &self.device)?;
         Ok(VaeEncoder::new(&VaeConfig::z_image(), vb.pp("encoder"))?)
     }
 

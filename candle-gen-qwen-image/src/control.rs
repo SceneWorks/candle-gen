@@ -14,7 +14,6 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
@@ -136,8 +135,7 @@ impl QwenControl {
         )?)?;
 
         let cn_file = resolve_controlnet_file(&paths.controlnet)?;
-        // SAFETY: mmap of a read-only weight file.
-        let cn_vb = unsafe { VarBuilder::from_mmaped_safetensors(&[cn_file], DIT_DTYPE, &device)? };
+        let cn_vb = candle_gen::mmap_var_builder(&[cn_file], DIT_DTYPE, &device)?;
         let controlnet = QwenControlNet::new(&dit_cfg, CONTROL_LAYERS, cn_vb)?;
 
         Ok(Self {

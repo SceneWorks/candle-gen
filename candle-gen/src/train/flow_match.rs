@@ -233,7 +233,8 @@ pub fn validate_flow_match_request(req: &TrainingRequest, label: &str) -> Result
 }
 
 /// Resolve the sorted `.safetensors` files in the snapshot component subdir `sub`. `label` prefixes the
-/// error text (e.g. `"lens trainer"`).
+/// error text (e.g. `"lens trainer"`). Thin wrapper over the shared [`crate::loader`] (sc-8999 /
+/// F-019) that keeps the "missing component dir" check naming the snapshot root.
 pub fn component_files(root: &Path, sub: &str, label: &str) -> Result<Vec<PathBuf>> {
     let dir = root.join(sub);
     if !dir.is_dir() {
@@ -242,23 +243,13 @@ pub fn component_files(root: &Path, sub: &str, label: &str) -> Result<Vec<PathBu
             root.display()
         )));
     }
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| CandleError::Msg(format!("{label}: read {sub}/: {e}")))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "{label}: no .safetensors in {sub}/ (at {})",
-            dir.display()
-        )));
-    }
-    Ok(files)
+    crate::loader::sorted_safetensors(&dir, label)
 }
 
 /// Build a [`VarBuilder`] over the snapshot component subdir `sub` at `dtype`. `label` prefixes the
-/// error text.
+/// error text. Delegates to the shared [`crate::loader::component_vb`] (the single audited unsafe-mmap
+/// surface, sc-8999 / F-019); the `(device, dtype)` arg order is kept for this trainer's existing
+/// callers.
 pub fn component_vb(
     root: &Path,
     sub: &str,
@@ -266,9 +257,7 @@ pub fn component_vb(
     dtype: DType,
     label: &str,
 ) -> Result<VarBuilder<'static>> {
-    let files = component_files(root, sub, label)?;
-    // SAFETY: mmap of read-only weight files; standard candle loading path.
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? })
+    crate::loader::component_vb(root, sub, dtype, device, label)
 }
 
 /// Write the adapter as a `.safetensors`: LoRA with the DiT's **bare** dotted keys (empty prefix — the

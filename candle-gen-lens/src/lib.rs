@@ -129,27 +129,15 @@ impl Pipeline {
                 self.root.display()
             )));
         }
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .map_err(|e| CandleError::Msg(format!("lens: read {sub}/: {e}")))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(CandleError::Msg(format!(
-                "lens: no .safetensors in {sub}/ (at {})",
-                dir.display()
-            )));
-        }
-        Ok(files)
+        // Shared sorted-`.safetensors` resolver (sc-8999 / F-019); the crafted "missing dir" message
+        // above stays local (it names the expected Lens snapshot).
+        candle_gen::sorted_safetensors(&dir, "lens")
     }
 
     /// A `VarBuilder` over the `.safetensors` of a snapshot sub-dir, mmapped at `dtype`.
     fn component_vb(&self, sub: &str, dtype: DType) -> CResult<VarBuilder<'static>> {
         let files = self.component_files(sub)?;
-        // SAFETY: mmap of read-only weight files; standard candle loading path.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &self.device)? };
-        Ok(vb)
+        candle_gen::mmap_var_builder(&files, dtype, &self.device)
     }
 
     /// The DiT `VarBuilder` with any [`AdapterSpec`]s merged into its weights (sc-5116). With no

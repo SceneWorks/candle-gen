@@ -367,27 +367,7 @@ fn component_vb(
     dtype: DType,
     device: &Device,
 ) -> Result<VarBuilder<'static>> {
-    let dir = root.join(sub);
-    if !dir.is_dir() {
-        return Err(CandleError::Msg(format!(
-            "z-image edit: snapshot is missing the {sub}/ dir (at {})",
-            root.display()
-        )));
-    }
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| CandleError::Msg(format!("z-image edit: read {sub}/: {e}")))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "z-image edit: no .safetensors in {sub}/ (at {})",
-            dir.display()
-        )));
-    }
-    // SAFETY: mmap of read-only weight files; standard candle loading path.
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? })
+    candle_gen::component_vb(root, sub, dtype, device, "z-image edit")
 }
 
 #[cfg(test)]

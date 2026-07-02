@@ -237,10 +237,7 @@ impl Sd3TextEncoders {
                 .map_err(|e| CandleError::Msg(format!("sd3: parse T5 config.json: {e}")))?
         };
         let t5_files = safetensors_in(&t5_dir)?;
-        // SAFETY: mmap of read-only weight files; standard candle loading path.
-        let t5_vb = unsafe {
-            candle_gen::candle_nn::VarBuilder::from_mmaped_safetensors(&t5_files, dtype, device)?
-        };
+        let t5_vb = candle_gen::mmap_var_builder(&t5_files, dtype, device)?;
         let t5 = T5EncoderModel::load(t5_vb, &t5_cfg)?;
 
         Ok(Self {
@@ -331,19 +328,9 @@ fn safetensors_in(dir: &Path) -> CandleResult<Vec<std::path::PathBuf>> {
             dir.display()
         )));
     }
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| CandleError::Msg(format!("sd3: read {}: {e}", dir.display())))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "sd3: no .safetensors found in {}",
-            dir.display()
-        )));
-    }
-    Ok(files)
+    // Shared sorted-`.safetensors` resolver (sc-8999 / F-019); the crafted "missing dir" message
+    // above stays local.
+    candle_gen::sorted_safetensors(dir, "sd3")
 }
 
 /// Load a CLIP `text_projection.weight` (no bias) from a CLIP checkpoint into a [`Linear`]. SD3.5's

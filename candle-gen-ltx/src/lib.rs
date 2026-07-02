@@ -42,7 +42,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, AudioTrack, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
     LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
@@ -164,19 +163,8 @@ impl Pipeline {
     }
 
     fn safetensors_in(dir: &Path) -> CResult<Vec<PathBuf>> {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-            .map_err(|e| CandleError::Msg(format!("ltx: read {}: {e}", dir.display())))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(CandleError::Msg(format!(
-                "ltx: no .safetensors in {}",
-                dir.display()
-            )));
-        }
-        Ok(files)
+        // Shared sorted-`.safetensors` resolver (sc-8999 / F-019).
+        candle_gen::sorted_safetensors(dir, "ltx")
     }
 
     fn load_components(&self) -> CResult<Components> {
@@ -185,15 +173,11 @@ impl Pipeline {
         let gemma_files = Self::safetensors_in(&gemma_dir)?;
 
         // Two builders over the single LTX file: bf16 (DiT + projection + connector), f32 (VAE).
-        // SAFETY: mmap of read-only weight files; standard candle loading path.
         let ltx_files = [ltx_file];
-        let vb_bf16 =
-            unsafe { VarBuilder::from_mmaped_safetensors(&ltx_files, DIT_DTYPE, &self.device)? };
-        let vb_f32 =
-            unsafe { VarBuilder::from_mmaped_safetensors(&ltx_files, VAE_DTYPE, &self.device)? };
-        let gemma_vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&gemma_files, DIT_DTYPE, &self.device)? }
-                .pp("language_model.model");
+        let vb_bf16 = candle_gen::mmap_var_builder(&ltx_files, DIT_DTYPE, &self.device)?;
+        let vb_f32 = candle_gen::mmap_var_builder(&ltx_files, VAE_DTYPE, &self.device)?;
+        let gemma_vb = candle_gen::mmap_var_builder(&gemma_files, DIT_DTYPE, &self.device)?
+            .pp("language_model.model");
 
         let dit_vb = vb_bf16.pp("model.diffusion_model");
         let avdit = AvDiT::new(dit_vb.clone(), &self.av_cfg)?;

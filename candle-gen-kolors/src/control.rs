@@ -124,20 +124,7 @@ impl Default for KolorsControlRequest {
 /// mmap an f32 [`VarBuilder`] over every `.safetensors` in `dir` (the ChatGLM3 encoder + UNet ship
 /// sharded or single-file) — mirrors the txt2img pipeline / IP-Adapter loaders.
 fn f32_vb(dir: &Path, device: &Device) -> Result<VarBuilder<'static>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| CandleError::Msg(format!("kolors-control: read {}: {e}", dir.display())))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "kolors-control: no .safetensors found in {} (expected a Kolors-diffusers snapshot)",
-            dir.display()
-        )));
-    }
-    // SAFETY: mmap of read-only weight files; the standard candle loading path.
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, DTYPE, device)? })
+    candle_gen::load_sorted_mmap(dir, DTYPE, device, "kolors-control")
 }
 
 /// Resolve the ControlNet weight **file** from a dir-or-file path (the diffusers `ControlNetModel`
@@ -205,8 +192,7 @@ impl KolorsControl {
 
         // Kolors ControlNet (a diffusers SDXL-family `ControlNetModel`) + its OWN `encoder_hid_proj`.
         let cn_file = resolve_controlnet_file(&paths.controlnet)?;
-        // SAFETY: mmap of a read-only weight file.
-        let cn_vb = unsafe { VarBuilder::from_mmaped_safetensors(&[cn_file], DTYPE, &device)? };
+        let cn_vb = candle_gen::mmap_var_builder(&[cn_file], DTYPE, &device)?;
         let cn_encoder_hid_proj = nn::linear(
             CONTEXT_DIM,
             CROSS_ATTENTION_DIM,

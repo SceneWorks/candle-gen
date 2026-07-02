@@ -22,7 +22,6 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
@@ -98,27 +97,9 @@ impl Default for QwenFunControlRequest {
 /// shards to mmap (the checkpoint is a single `Qwen-Image-2512-Fun-Controlnet-Union-….safetensors`,
 /// or a dir of shards).
 fn resolve_controlnet_files(path: &Path) -> Result<Vec<PathBuf>> {
-    if path.is_file() {
-        return Ok(vec![path.to_path_buf()]);
-    }
-    if path.is_dir() {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(path)
-            .map_err(|e| {
-                CandleError::Msg(format!("qwen fun-control: read {}: {e}", path.display()))
-            })?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        files.sort();
-        if !files.is_empty() {
-            return Ok(files);
-        }
-    }
-    Err(CandleError::Msg(format!(
-        "qwen fun-control: Qwen-Image-2512-Fun-Controlnet-Union weights not found at {} (expected a \
-         .safetensors file or a dir of shards)",
-        path.display()
-    )))
+    // Shared file-or-dir resolver (sc-8999 / F-019): single `.safetensors` → itself, a dir → its
+    // sorted shards, a missing path → the crafted `{label}: no .safetensors ...` error.
+    candle_gen::resolve_weight_files(path, "qwen fun-control")
 }
 
 /// The loaded Qwen-Image 2512-Fun control model: the reused base text encoder / DiT / VAE-decoder, plus
@@ -159,8 +140,7 @@ impl QwenFunControl {
         )?)?;
 
         let cn_files = resolve_controlnet_files(&paths.controlnet)?;
-        // SAFETY: mmap of read-only weight files.
-        let cn_vb = unsafe { VarBuilder::from_mmaped_safetensors(&cn_files, DIT_DTYPE, &device)? };
+        let cn_vb = candle_gen::mmap_var_builder(&cn_files, DIT_DTYPE, &device)?;
         let controlnet =
             QwenFunControlBranch::new(&dit_cfg, &CONTROL_LAYERS, CONTROL_IN_DIM, cn_vb)?;
 

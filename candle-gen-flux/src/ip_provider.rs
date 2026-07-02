@@ -142,26 +142,12 @@ fn mmap_vb(files: &[PathBuf], dtype: DType, device: &Device) -> Result<VarBuilde
             )));
         }
     }
-    // SAFETY: mmap of read-only weight files; standard candle loading path.
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(files, dtype, device)? };
-    Ok(vb)
+    candle_gen::mmap_var_builder(files, dtype, device)
 }
 
 /// Sorted list of every `.safetensors` in `dir` (sharded T5 checkpoints). Errors if none are found.
 fn safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| CandleError::Msg(format!("flux ip-adapter: read {}: {e}", dir.display())))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "flux ip-adapter: no .safetensors found in {}",
-            dir.display()
-        )));
-    }
-    Ok(files)
+    candle_gen::sorted_safetensors(dir, "flux ip-adapter")
 }
 
 /// The loaded FLUX IP-Adapter model: the reused FLUX text encoders + VAE, the forked IP DiT, the XLabs

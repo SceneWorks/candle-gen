@@ -86,21 +86,10 @@ impl Pipeline {
                 self.root.display()
             )));
         }
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .map_err(|e| CandleError::Msg(format!("wan-vace: read {sub}/: {e}")))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(CandleError::Msg(format!(
-                "wan-vace: no .safetensors in {sub}/ (at {})",
-                dir.display()
-            )));
-        }
-        // SAFETY: mmap of read-only weight files; standard candle loading path.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &self.device)? };
-        Ok(vb)
+        // Shared sorted-`.safetensors` → mmap (sc-8999 / F-019); the crafted "missing dir" message
+        // above stays local (it names the expected Wan VACE snapshot).
+        let files = candle_gen::sorted_safetensors(&dir, "wan-vace")?;
+        candle_gen::mmap_var_builder(&files, dtype, &self.device)
     }
 
     fn load_components(&self) -> CResult<Components> {

@@ -129,26 +129,13 @@ fn mmap_vb(files: &[PathBuf], dtype: DType, device: &Device) -> Result<VarBuilde
             )));
         }
     }
-    // SAFETY: mmap of read-only weight files; the standard candle loading path.
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(files, dtype, device)? };
-    Ok(vb)
+    candle_gen::mmap_var_builder(files, dtype, device)
 }
 
 /// Sorted list of every `.safetensors` in `dir` (the sharded T5 checkpoint). Errors if none are found.
 fn safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| CandleError::Msg(format!("pulid_flux: read {}: {e}", dir.display())))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "pulid_flux: no .safetensors found in {}",
-            dir.display()
-        )));
-    }
-    Ok(files)
+    // Shared sorted-`.safetensors` resolver (sc-8999 / F-019).
+    candle_gen::sorted_safetensors(dir, "pulid_flux")
 }
 
 /// The FLUX.1-dev flow-match time-shift `mu` for the curated scheduler axis (epic 7114, sc-7297) — the

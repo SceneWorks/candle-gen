@@ -41,7 +41,7 @@ pub fn load_instantid_unet(
     let unet_file = snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
     // One mmap'd VarBuilder feeds both the UNet body and the `add_embedding` head (both live in the
     // same `unet/` checkpoint). `VarBuilder` is Arc-backed, so the clone is cheap.
-    let vs = unsafe { VarBuilder::from_mmaped_safetensors(&[unet_file], dtype, device)? };
+    let vs = candle_gen::mmap_var_builder(&[unet_file], dtype, device)?;
     let unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
         .with_add_embedding(vs, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
     Ok(unet)
@@ -88,7 +88,7 @@ pub fn load_sdxl_vae(device: &Device, dtype: DType) -> Result<AutoEncoderKL> {
 /// (0.13025) — the launch-portable img2img/inpaint init latent (no sampling, no device RNG).
 pub fn load_sdxl_vae_encoder(device: &Device, dtype: DType) -> Result<VaeMomentsEncoder> {
     let vae_file = hf_get(VAE_FIX_REPO, VAE_FIX_FILE)?;
-    let vs = unsafe { VarBuilder::from_mmaped_safetensors(&[vae_file], dtype, device)? };
+    let vs = candle_gen::mmap_var_builder(&[vae_file], dtype, device)?;
     Ok(VaeMomentsEncoder::new(vs, VAE_SCALE)?)
 }
 
@@ -120,6 +120,6 @@ pub fn load_sdxl_controlnet(
             }
         }
     };
-    let vs = unsafe { VarBuilder::from_mmaped_safetensors(&[file], dtype, device)? };
+    let vs = candle_gen::mmap_var_builder(&[file], dtype, device)?;
     ControlNet::new(vs, &ControlNetConfig::sdxl())
 }

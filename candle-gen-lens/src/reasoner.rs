@@ -17,7 +17,6 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::quantized::GgmlDType;
 use candle_gen::candle_core::DType;
-use candle_gen::candle_nn::VarBuilder;
 use candle_gen::{CandleError, Result as CResult};
 
 use crate::text::{clean_reasoner_output, LensTokenizer};
@@ -49,8 +48,7 @@ impl LensReasoner {
         let tokenizer = LensTokenizer::from_file(root.join("tokenizer").join("tokenizer.json"))?;
         let device = candle_gen::default_device()?;
         let files = safetensors_files(&root.join("text_encoder"))?;
-        // SAFETY: mmap of read-only weight files; the standard candle loading path.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &device)? };
+        let vb = candle_gen::mmap_var_builder(&files, dtype, &device)?;
         let model = LensReasonerModel::new(&EncoderConfig::gpt_oss_20b(), vb, quant)?;
         Ok(Self { model, tokenizer })
     }
@@ -82,17 +80,7 @@ fn safetensors_files(dir: &Path) -> CResult<Vec<PathBuf>> {
             dir.display()
         )));
     }
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| CandleError::Msg(format!("lens reasoner: read {}: {e}", dir.display())))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "lens reasoner: no .safetensors in {}",
-            dir.display()
-        )));
-    }
-    Ok(files)
+    // Shared sorted-`.safetensors` resolver (sc-8999 / F-019); the crafted "missing dir" message
+    // above stays local.
+    candle_gen::sorted_safetensors(dir, "lens reasoner")
 }

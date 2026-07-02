@@ -129,29 +129,7 @@ impl Pipeline {
         sub: &str,
         device: &Device,
     ) -> CResult<VarBuilder<'static>> {
-        let dir = self.root.join(sub);
-        if !dir.is_dir() {
-            return Err(CandleError::Msg(format!(
-                "flux2 snapshot is missing the {sub}/ component dir (expected a FLUX.2 \
-                 diffusers snapshot at {})",
-                self.root.display()
-            )));
-        }
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .map_err(|e| CandleError::Msg(format!("flux2: read {sub}/: {e}")))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(CandleError::Msg(format!(
-                "flux2: no .safetensors in {sub}/ (at {})",
-                dir.display()
-            )));
-        }
-        // SAFETY: mmap of read-only weight files; standard candle loading path.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, self.dtype, device)? };
-        Ok(vb)
+        candle_gen::component_vb(&self.root, sub, self.dtype, device, "flux2")
     }
 
     /// Whether the snapshot component `sub/` is a **pre-quantized MLX-packed tier** — its `config.json`

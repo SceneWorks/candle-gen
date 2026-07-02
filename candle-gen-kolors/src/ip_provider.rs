@@ -134,20 +134,7 @@ impl Default for IpAdapterKolorsRequest {
 /// mmap an f32 [`VarBuilder`] over every `.safetensors` in `dir` (the ChatGLM3 encoder + UNet ship
 /// sharded or single-file) — mirrors the txt2img pipeline's loader.
 fn f32_vb(dir: &Path, device: &Device) -> Result<VarBuilder<'static>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| CandleError::Msg(format!("kolors-ip: read {}: {e}", dir.display())))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "kolors-ip: no .safetensors found in {} (expected a Kolors-diffusers snapshot)",
-            dir.display()
-        )));
-    }
-    // SAFETY: mmap of read-only weight files; the standard candle loading path.
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, DTYPE, device)? })
+    candle_gen::load_sorted_mmap(dir, DTYPE, device, "kolors-ip")
 }
 
 /// Resolve the CLIP image-encoder weight file from the IP-Adapter snapshot's `image_encoder/` dir:

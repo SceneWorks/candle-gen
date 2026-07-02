@@ -38,10 +38,7 @@ impl DistillLora {
     /// symbol not found"). CPU has every cast; [`DistillLora::merge_linear`] moves the resulting F32
     /// delta to the base weight's device before adding.
     pub fn from_file(path: &Path) -> Result<Self> {
-        // SAFETY: mmap of a read-only weight file; the standard candle loading path.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[path.to_path_buf()], DType::F32, &Device::Cpu)?
-        };
+        let vb = candle_gen::mmap_var_builder(&[path.to_path_buf()], DType::F32, &Device::Cpu)?;
         Ok(Self { vb })
     }
 

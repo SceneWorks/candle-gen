@@ -97,29 +97,7 @@ pub fn descriptor() -> ModelDescriptor {
 
 /// Load all `.safetensors` in the snapshot subdir `sub` as one f32 mmapped [`VarBuilder`].
 fn component_vb(root: &Path, device: &Device, sub: &str) -> CResult<VarBuilder<'static>> {
-    let dir = root.join(sub);
-    if !dir.is_dir() {
-        return Err(CandleError::Msg(format!(
-            "scail2 snapshot is missing the {sub}/ dir (expected text_encoder/ transformer/ vae/ \
-             clip/ tokenizer/ at {})",
-            root.display()
-        )));
-    }
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| CandleError::Msg(format!("scail2: read {sub}/: {e}")))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "scail2: no .safetensors in {sub}/ (at {})",
-            dir.display()
-        )));
-    }
-    // SAFETY: mmap of read-only weight files; standard candle loading path. All components run f32.
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::F32, device)? };
-    Ok(vb)
+    candle_gen::component_vb(root, sub, DType::F32, device, "scail2")
 }
 
 /// The loaded SCAIL-2 model: resolved config + snapshot dir, with the heavy components (DiT / VAE /
@@ -154,18 +132,7 @@ impl Scail2 {
             return component_vb(&self.root, &self.device, "transformer");
         }
         let dir = self.root.join("transformer");
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .map_err(|e| CandleError::Msg(format!("scail2: read transformer/: {e}")))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(CandleError::Msg(format!(
-                "scail2: no .safetensors in transformer/ (at {})",
-                dir.display()
-            )));
-        }
+        let files = candle_gen::sorted_safetensors(&dir, "scail2")?;
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
         for f in &files {
             let part = candle_gen::candle_core::safetensors::load(f, &Device::Cpu)?;

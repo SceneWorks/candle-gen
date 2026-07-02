@@ -428,7 +428,7 @@ fn resolve_target_paths(
 /// attention is off (non-differentiable; training uses the materialized math attention).
 fn build_unet(root: &Path, device: &Device, dtype: DType) -> Result<UNet2DConditionModel> {
     let path = snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[path], dtype, device)? };
+    let vb = candle_gen::mmap_var_builder(&[path], dtype, device)?;
     Ok(UNet2DConditionModel::new(
         vb,
         4,

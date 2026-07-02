@@ -304,8 +304,9 @@ fn f32_vb(root: &Path, device: &Device) -> Result<VarBuilder<'static>> {
             root.display()
         )));
     }
-    // SAFETY: mmap of read-only weight files; the standard candle loading path.
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::F32, device)? })
+    // Shared audited unsafe-mmap surface (sc-8999 / F-019). The distill-LoRA exclusion filter above
+    // is a genuine per-site variation, so the read_dir/sort stays local; only the mmap is shared.
+    candle_gen::mmap_var_builder(&files, DType::F32, device)
 }
 
 /// Build the dense f32 understanding model ([`T2iModel`]) + tokenizer for a SenseNova-U1-8B-MoT

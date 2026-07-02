@@ -290,9 +290,7 @@ impl Pipeline {
     /// mmap a [`VarBuilder`] over every `.safetensors` in the snapshot component subdir `sub`.
     fn component_vb(&self, sub: &str) -> Result<VarBuilder<'static>> {
         let files = self.component_files(sub)?;
-        // SAFETY: mmap of read-only weight files; standard candle loading path.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, self.dtype, &self.device)? };
-        Ok(vb)
+        candle_gen::mmap_var_builder(&files, self.dtype, &self.device)
     }
 
     /// Build a VAE [`VarBuilder`] for a packed tier by dequantizing the 8 packed mid-block attention
@@ -348,27 +346,13 @@ impl Pipeline {
                 )));
             }
         }
-        // SAFETY: mmap of read-only weight files; standard candle loading path.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(files, self.dtype, &self.device)? };
-        Ok(vb)
+        candle_gen::mmap_var_builder(files, self.dtype, &self.device)
     }
 
     /// Sorted list of every `.safetensors` in `dir` (sharded T5 checkpoints ship as
     /// `model-0000n-of-0000m.safetensors`). Errors if none are found.
     fn safetensors_in(&self, dir: &Path) -> Result<Vec<PathBuf>> {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-            .map_err(|e| CandleError::Msg(format!("flux: read {}: {e}", dir.display())))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(CandleError::Msg(format!(
-                "flux: no .safetensors found in {}",
-                dir.display()
-            )));
-        }
-        Ok(files)
+        candle_gen::sorted_safetensors(dir, "flux")
     }
 
     /// Encode `prompt` into FLUX's two conditioning tensors: the T5 sequence `(1, L, 4096)` and the

@@ -44,13 +44,7 @@ pub fn load_t5(root: &Path, device: &Device) -> Result<T5EncoderModel> {
     let files = safetensors_in(&dir)?;
     // f32: the Chroma DiT runs f32 activations and `context_embedder` requires an f32 input; loading
     // the bf16 checkpoint as f32 keeps the weight values (bf16) in f32 containers (mlx parity).
-    let vb = unsafe {
-        candle_gen::candle_nn::VarBuilder::from_mmaped_safetensors(
-            &files,
-            candle_gen::candle_core::DType::F32,
-            device,
-        )?
-    };
+    let vb = candle_gen::mmap_var_builder(&files, candle_gen::candle_core::DType::F32, device)?;
     T5EncoderModel::load(vb, &cfg).map_err(Into::into)
 }
 
@@ -77,17 +71,5 @@ pub fn encode_prompt(
 /// Sorted list of every `.safetensors` in `dir` (sharded T5 checkpoints ship as
 /// `model-0000n-of-0000m.safetensors`). Errors if none are found.
 fn safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| CandleError::Msg(format!("chroma: read {}: {e}", dir.display())))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "chroma: no .safetensors found in {} (expected the T5-XXL encoder)",
-            dir.display()
-        )));
-    }
-    Ok(files)
+    candle_gen::sorted_safetensors(dir, "chroma")
 }

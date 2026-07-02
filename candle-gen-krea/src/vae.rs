@@ -11,11 +11,11 @@
 //! De-normalization is **per-channel** `latents_mean`/`latents_std` (a 16-vector, NOT a scalar
 //! scale/shift), already baked into [`QwenVae::decode`] (`(z·std) + mean → post_quant_conv → decoder`).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::{CandleError, Result};
+use candle_gen::Result;
 
 pub use candle_gen_qwen_image::vae::QwenVae;
 
@@ -28,20 +28,7 @@ pub const VAE_CHANNELS: u32 = 16;
 /// Build a [`VarBuilder`] over every `.safetensors` in the snapshot's `vae/` dir at f32 (the decode is
 /// precision-sensitive; the published `vae/` is f32).
 fn vae_varbuilder(dir: &Path, device: &Device) -> Result<VarBuilder<'static>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| CandleError::Msg(format!("krea: read {}: {e}", dir.display())))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "krea: no .safetensors in {}",
-            dir.display()
-        )));
-    }
-    // SAFETY: read-only mmap of weight files; the standard candle loading path.
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, DType::F32, device)? })
+    candle_gen::load_sorted_mmap(dir, DType::F32, device, "krea")
 }
 
 /// Load the Qwen-Image VAE (decode) from a Krea snapshot's `vae/` dir. `root` is the **snapshot root**

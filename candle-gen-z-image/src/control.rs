@@ -434,9 +434,7 @@ impl ZImageControl {
             component_vb(&root, "transformer", DTYPE, &device)?,
         )?;
         let control_file = resolve_control_file(&paths.control)?;
-        // SAFETY: mmap of a read-only weight file.
-        let control_vb =
-            unsafe { VarBuilder::from_mmaped_safetensors(&[control_file], DTYPE, &device)? };
+        let control_vb = candle_gen::mmap_var_builder(&[control_file], DTYPE, &device)?;
         let transformer = ZImageControlTransformer::from_weights(base, &dit_cfg, control_vb)?;
 
         let vae_cfg = VaeConfig::z_image();
@@ -897,33 +895,14 @@ fn control_file_score(path: &Path) -> i32 {
 }
 
 /// mmap a [`VarBuilder`] over every `.safetensors` in `root/sub` at `dtype` (the txt2img loader).
+/// Delegates to the shared [`candle_gen::component_vb`] (sc-8999 / F-019).
 fn component_vb(
     root: &Path,
     sub: &str,
     dtype: DType,
     device: &Device,
 ) -> Result<VarBuilder<'static>> {
-    let dir = root.join(sub);
-    if !dir.is_dir() {
-        return Err(CandleError::Msg(format!(
-            "z-image control: snapshot is missing the {sub}/ dir (at {})",
-            root.display()
-        )));
-    }
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| CandleError::Msg(format!("z-image control: read {sub}/: {e}")))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "z-image control: no .safetensors in {sub}/ (at {})",
-            dir.display()
-        )));
-    }
-    // SAFETY: mmap of read-only weight files; standard candle loading path.
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? })
+    candle_gen::component_vb(root, sub, dtype, device, "z-image control")
 }
 
 #[cfg(test)]

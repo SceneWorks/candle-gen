@@ -16,7 +16,7 @@
 //! Per-sample `B = 1`; the DiT runs once per condition. Deterministic CPU-seeded initial noise
 //! (sc-3673 parity), exactly as the z-image/ideogram providers.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
@@ -101,21 +101,7 @@ pub(crate) fn load_components(root: &Path, device: &Device) -> Result<Components
 
 /// Build a [`VarBuilder`] over every `.safetensors` in the snapshot's `vae/` dir at the VAE dtype.
 fn vae_varbuilder(dir: &Path, device: &Device) -> Result<VarBuilder<'static>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| CandleError::Msg(format!("boogu: read {}: {e}", dir.display())))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "boogu: no .safetensors in {}",
-            dir.display()
-        )));
-    }
-    // SAFETY: read-only mmap of weight files; the standard candle loading path.
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, VAE_DTYPE, device)? };
-    Ok(vb)
+    candle_gen::load_sorted_mmap(dir, VAE_DTYPE, device, "boogu")
 }
 
 /// Render the **Base** (true-CFG) text-to-image path for `req`.

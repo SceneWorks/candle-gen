@@ -152,21 +152,10 @@ impl Pipeline {
                 self.root.display()
             )));
         }
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .map_err(|e| CandleError::Msg(format!("wan-14b: read {sub}/: {e}")))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(CandleError::Msg(format!(
-                "wan-14b: no .safetensors in {sub}/ (at {})",
-                dir.display()
-            )));
-        }
-        // SAFETY: mmap of read-only weight files; standard candle loading path.
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, &self.device)? };
-        Ok(vb)
+        // Shared sorted-`.safetensors` → mmap (sc-8999 / F-019); the crafted "missing dir" message
+        // above stays local (it names the expected Wan A14B snapshot + variant).
+        let files = candle_gen::sorted_safetensors(&dir, "wan-14b")?;
+        candle_gen::mmap_var_builder(&files, dtype, &self.device)
     }
 
     /// Build one expert from its `sub` dir, folding in any adapter whose [`AdapterSpec::moe_expert`]
@@ -204,18 +193,9 @@ impl Pipeline {
     /// the merge-ready form the adapter fold needs (vs the mmap `component_vb` fast path).
     fn load_component_map(&self, sub: &str) -> CResult<HashMap<String, Tensor>> {
         let dir = self.root.join(sub);
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .map_err(|e| CandleError::Msg(format!("wan-14b: read {sub}/: {e}")))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(CandleError::Msg(format!(
-                "wan-14b: no .safetensors in {sub}/ (at {})",
-                dir.display()
-            )));
-        }
+        // Shared sorted-`.safetensors` resolver (sc-8999 / F-019); this path then loads the shards
+        // into a CPU map for adapter merging (not the mmap fast path), so it keeps its own loop.
+        let files = candle_gen::sorted_safetensors(&dir, "wan-14b")?;
         let mut map: HashMap<String, Tensor> = HashMap::new();
         for f in &files {
             map.extend(cst::load(f, &Device::Cpu)?);

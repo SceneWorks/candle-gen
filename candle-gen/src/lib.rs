@@ -31,6 +31,16 @@ pub use gen_core::{
 pub use candle_core;
 pub use candle_nn;
 
+// Shared sorted-`.safetensors` → unsafe-mmap loader (sc-8999 / F-019): the single audited home for
+// the `list a snapshot component dir, sort deterministically, error-if-empty, unsafe-mmap into a
+// VarBuilder` idiom that was hand-copied ~34 times across the provider crates. Concentrates the
+// `unsafe` mmap surface (also aids F-062) and the SAFETY invariant in one place.
+pub mod loader;
+pub use loader::{
+    component_vb, load_path_mmap, load_sorted_mmap, mmap_var_builder, resolve_weight_files,
+    sorted_safetensors,
+};
+
 // Shared VRAM-budget probe (sc-9014 / F-030): the trusted-path `nvidia-smi` resolver the video-VAE
 // decode tilers (seedvr2/wan/ltx) route through, instead of each spawning a bare
 // `Command::new("nvidia-smi")` that Windows resolves via the process search order (a PATH-hijack

@@ -247,19 +247,9 @@ impl Pipeline {
                 self.root.display()
             )));
         }
-        let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-            .map_err(|e| CandleError::Msg(format!("sd3: read {sub}/: {e}")))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(CandleError::Msg(format!(
-                "sd3: no .safetensors found in {sub}/ (at {})",
-                dir.display()
-            )));
-        }
-        Ok(files)
+        // Shared sorted-`.safetensors` resolver (sc-8999 / F-019); the crafted "missing dir" message
+        // above stays local (it names the expected sd3 snapshot).
+        candle_gen::sorted_safetensors(&dir, "sd3")
     }
 
     /// Build a [`VarBuilder`] over every `.safetensors` in the snapshot component subdir `sub`, on the
@@ -273,8 +263,7 @@ impl Pipeline {
     /// projection weights never land on the GPU.
     fn component_vb_on(&self, sub: &str, device: &Device) -> Result<VarBuilder<'static>> {
         let files = self.component_files(sub)?;
-        // SAFETY: mmap of read-only weight files; standard candle loading path.
-        Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, self.dtype, device)? })
+        candle_gen::mmap_var_builder(&files, self.dtype, device)
     }
 
     /// Whether the `transformer/` component is a **pre-quantized MLX-packed tier** — its `config.json`

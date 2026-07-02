@@ -129,44 +129,18 @@ fn mmap_vb(files: &[PathBuf], dtype: DType, device: &Device) -> Result<VarBuilde
             )));
         }
     }
-    // SAFETY: mmap of read-only weight files; standard candle loading path.
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(files, dtype, device)? };
-    Ok(vb)
+    candle_gen::mmap_var_builder(files, dtype, device)
 }
 
 /// Sorted list of every `.safetensors` in `dir` (sharded T5 / a control overlay shipped as a dir).
 fn safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| CandleError::Msg(format!("flux1 control: read {}: {e}", dir.display())))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "flux1 control: no .safetensors found in {}",
-            dir.display()
-        )));
-    }
-    Ok(files)
+    candle_gen::sorted_safetensors(dir, "flux1 control")
 }
 
 /// Open a VarBuilder over the Shakker control checkpoint — a single `.safetensors` `File` or a `Dir`
 /// containing it — on `device` at `dtype`.
 fn control_var_builder(path: &Path, dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
-    let files = if path.is_dir() {
-        safetensors_in(path)?
-    } else {
-        if !path.is_file() {
-            return Err(CandleError::Msg(format!(
-                "flux1 control: control checkpoint not found at {} (expected the \
-                 FLUX.1-dev-ControlNet-Union-Pro-2.0 safetensors)",
-                path.display()
-            )));
-        }
-        vec![path.to_path_buf()]
-    };
-    mmap_vb(&files, dtype, device)
+    candle_gen::load_path_mmap(path, dtype, device, "flux1 control")
 }
 
 /// Resize `image` to `width`×`height` and convert to an NCHW `[1, 3, H, W]` tensor in `[-1, 1]` at

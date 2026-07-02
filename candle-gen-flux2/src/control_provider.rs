@@ -244,27 +244,7 @@ fn validate_request(req: &Flux2ControlRequest) -> Result<()> {
 /// Open a VarBuilder over the Fun-Controlnet-Union checkpoint — a single `.safetensors` `File` or a
 /// `Dir` containing the `.safetensors` shards — on `device` at `dtype`.
 fn control_var_builder(path: &Path, dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
-    let files: Vec<PathBuf> = if path.is_dir() {
-        let mut f: Vec<PathBuf> = std::fs::read_dir(path)
-            .map_err(|e| CandleError::Msg(format!("flux2 control: read {}: {e}", path.display())))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        f.sort();
-        f
-    } else {
-        vec![path.to_path_buf()]
-    };
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "flux2 control: no .safetensors at {} (expected the FLUX.2-dev-Fun-Controlnet-Union \
-             checkpoint)",
-            path.display()
-        )));
-    }
-    // SAFETY: mmap of read-only weight files; the standard candle loading path.
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? };
-    Ok(vb)
+    candle_gen::load_path_mmap(path, dtype, device, "flux2 control")
 }
 
 #[cfg(test)]

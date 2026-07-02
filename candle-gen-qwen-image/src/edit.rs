@@ -96,27 +96,7 @@ fn component_vb(
     dtype: DType,
     device: &Device,
 ) -> Result<VarBuilder<'static>> {
-    let dir = root.join(sub);
-    if !dir.is_dir() {
-        return Err(CandleError::Msg(format!(
-            "qwen edit: snapshot is missing the {sub}/ dir (at {})",
-            root.display()
-        )));
-    }
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| CandleError::Msg(format!("qwen edit: read {sub}/: {e}")))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "qwen edit: no .safetensors in {sub}/ (at {})",
-            dir.display()
-        )));
-    }
-    // SAFETY: mmap of read-only weight files; standard candle loading path.
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? })
+    candle_gen::component_vb(root, sub, dtype, device, "qwen edit")
 }
 
 /// Load every `.safetensors` in `root/transformer` into one CPU tensor map (native dtype). The eager
@@ -130,18 +110,9 @@ fn load_transformer_tensors(root: &Path) -> Result<HashMap<String, Tensor>> {
             root.display()
         )));
     }
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| CandleError::Msg(format!("qwen edit: read transformer/: {e}")))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "qwen edit: no .safetensors in transformer/ (at {})",
-            dir.display()
-        )));
-    }
+    // Shared sorted-`.safetensors` resolver (sc-8999 / F-019); this path loads into a CPU map for
+    // adapter merging (not the mmap fast path), so it keeps its own loop.
+    let files = candle_gen::sorted_safetensors(&dir, "qwen edit")?;
     let mut map = HashMap::new();
     for f in &files {
         let part = candle_gen::candle_core::safetensors::load(f, &Device::Cpu)?;

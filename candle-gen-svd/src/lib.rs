@@ -139,9 +139,9 @@ fn component_vb(
             dir.display()
         )));
     };
-    // SAFETY: mmap of read-only weight files; standard candle loading path.
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[path], dtype, device)? };
-    Ok(vb)
+    // Shared audited unsafe-mmap surface (sc-8999 / F-019). The `{stem}.fp16`/`.safetensors`
+    // resolution above is a genuine per-site variation, so only the mmap is shared.
+    candle_gen::mmap_var_builder(&[path], dtype, device)
 }
 
 /// Upper bound on a `Reference` image's dimensions (caps host allocations on the input buffer + the

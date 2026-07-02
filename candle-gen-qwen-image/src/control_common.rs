@@ -10,7 +10,7 @@
 //! These are byte-for-byte the previous per-lane private helpers; the only change is threading the
 //! `label` through the error messages, so both lanes' outputs are preserved exactly.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
@@ -30,27 +30,8 @@ pub(crate) fn component_vb(
     device: &Device,
     label: &str,
 ) -> Result<VarBuilder<'static>> {
-    let dir = root.join(sub);
-    if !dir.is_dir() {
-        return Err(CandleError::Msg(format!(
-            "{label}: snapshot is missing the {sub}/ dir (at {})",
-            root.display()
-        )));
-    }
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .map_err(|e| CandleError::Msg(format!("{label}: read {sub}/: {e}")))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-        .collect();
-    files.sort();
-    if files.is_empty() {
-        return Err(CandleError::Msg(format!(
-            "{label}: no .safetensors in {sub}/ (at {})",
-            dir.display()
-        )));
-    }
-    // SAFETY: mmap of read-only weight files; standard candle loading path.
-    Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, dtype, device)? })
+    // Shared sorted-`.safetensors` → mmap (sc-8999 / F-019).
+    candle_gen::component_vb(root, sub, dtype, device, label)
 }
 
 /// Tokenize + encode `prompt` → `prompt_embeds` `[1, seq, 3584]` at `dit_dtype` (bf16). Mirrors the

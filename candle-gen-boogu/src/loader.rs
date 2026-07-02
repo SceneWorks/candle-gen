@@ -23,7 +23,7 @@
 //! **silent** skip if a future tier ever packed the tower. [`linear_guard_dense`] errors loudly on a
 //! stray `.scales` sibling instead.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
@@ -49,20 +49,8 @@ impl Weights {
     /// mmap every `*.safetensors` in `dir` (sorted; later files win on name collision), reading the
     /// component `config.json`'s `quantization` block (if any) for the packed-tier path.
     pub fn from_dir(dir: &Path, device: &Device, dtype: DType) -> Result<Self> {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
-            .map_err(|e| {
-                candle_gen::candle_core::Error::Msg(format!("boogu: read {}: {e}", dir.display()))
-            })?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
-            .collect();
-        files.sort();
-        if files.is_empty() {
-            return Err(candle_gen::candle_core::Error::Msg(format!(
-                "boogu: no .safetensors in {}",
-                dir.display()
-            )));
-        }
+        let files = candle_gen::sorted_safetensors(dir, "boogu")
+            .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?;
         // SAFETY: read-only mmap of weight files; the standard candle loading path.
         let st = unsafe { MmapedSafetensors::multi(&files)? };
         Ok(Self {
