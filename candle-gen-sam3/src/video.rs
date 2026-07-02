@@ -278,6 +278,14 @@ impl Sam3VideoModel {
             self.remove_object(*oid);
         }
 
+        // F-015: bound the per-object memory bank. Every frame appends a `non_cond` `FrameMem` (~2.65 MB
+        // of device tensors per live object) but `gather_memory` never reads entries older than its
+        // `NUM_MASKMEM` / `MAX_OBJ_PTRS` windows, so a long clip's resident VRAM climbs without a ceiling
+        // (~2.4 GB for 300 frames × 3 objects). Evict everything those windows have slid past — after all
+        // this frame's writes (the `non_cond` inserts/fills + the recondition `non_cond`→`cond` move) so
+        // it never races the current frame's state. Mirrors the mlx twin's F-024 eviction.
+        self.evict_stale_memory(frame_idx);
+
         // --- build outputs ---
         self.build_outputs(
             &det,
@@ -362,6 +370,26 @@ impl Sam3VideoModel {
             }
         }
         (spatial, pointers, max_optr)
+    }
+
+    /// F-015: evict `non_cond` bank entries that no future `gather_memory` can read, derived from the
+    /// same `NUM_MASKMEM` / `MAX_OBJ_PTRS` windows `gather_memory` uses (single source of truth). After
+    /// processing `frame_idx` the next gather is at frame ≥ `frame_idx + 1`; heavy tensors are read back
+    /// to `(frame_idx+1) − (NUM_MASKMEM−1)` (the spatial fallback window) and object pointers back to
+    /// `(frame_idx+1) − (MAX_OBJ_PTRS−1)` (the pointer window), and both windows only slide forward — so
+    /// any entry older than that is dead for the rest of the session. `cond` **entries** are left intact
+    /// (the pointer loop reads their lightweight `object_pointer` at arbitrary keys), but their heavy
+    /// `maskmem_*` tensors are nulled by [`evict_stale_cond_heavy`] once they fall out of every future
+    /// spatial-read window, so a long clip's resident `cond` memory also stops climbing. For a clip
+    /// shorter than the windows every entry stays readable, so eviction is a no-op and output is
+    /// unchanged.
+    fn evict_stale_memory(&mut self, frame_idx: i32) {
+        let heavy_keep = frame_idx + 1 - (NUM_MASKMEM - 1);
+        let ptr_keep = frame_idx + 1 - (MAX_OBJ_PTRS - 1);
+        for bank in &mut self.banks {
+            evict_stale_bank(bank, heavy_keep, ptr_keep);
+            evict_stale_cond_heavy(bank, heavy_keep);
+        }
     }
 
     // ----- association (_associate_det_trk; mask-IoU, no Hungarian) -----
@@ -708,6 +736,55 @@ fn select_closest_cond_frames(
     (selected.into_iter().collect(), unselected)
 }
 
+/// Prune one object's `non_cond` bank to the future-readable window (F-015 eviction core, factored out
+/// as a free fn so the bound is unit-testable without a loaded model): entries older than `heavy_keep`
+/// have their heavy tensors nulled (gather short-circuits on `None`), and entries older than `ptr_keep`
+/// are dropped entirely (the object-pointer window has passed). `heavy_keep`/`ptr_keep` are the next
+/// gather's read floors; callers derive them from `NUM_MASKMEM`/`MAX_OBJ_PTRS`.
+fn evict_stale_bank(bank: &mut ObjectBank, heavy_keep: i32, ptr_keep: i32) {
+    for (&k, m) in bank.non_cond.iter_mut() {
+        if k < heavy_keep {
+            m.maskmem_features = None;
+            m.maskmem_pos_enc = None;
+        }
+    }
+    bank.non_cond.retain(|&k, _| k >= ptr_keep);
+}
+
+/// Bound the per-object **`cond`** bank's resident memory (the F-015 sibling): null the heavy
+/// `maskmem_*` tensors of conditioning frames that no future `gather_memory` can read for spatial
+/// memory, keeping the lightweight `object_pointer` (still read by the pointer loop) and the entry
+/// itself (so [`select_closest_cond_frames`] still sees the key — it just contributes nothing, exactly
+/// as for an unselected frame).
+///
+/// A cond frame at key `k` can be read for spatial memory by a future gather (frame_idx' ≥ `frame_idx`
+/// + 1) iff EITHER:
+///  - it is still *selectable* — fewer than [`MAX_COND_FRAME_NUM`] cond frames have a key `> k`. New
+///    cond frames only accrue (entries are never removed, only heavy-nulled), so once
+///    `MAX_COND_FRAME_NUM` newer keys exist `k` is never among the closest again (for any frame_idx' >
+///    all current keys the closest are the largest keys); OR
+///  - it is inside the spatial *fallback* window, `k >= heavy_keep` (`= frame_idx + 1 −
+///    (NUM_MASKMEM − 1)`), which only slides forward.
+///
+/// So the heavy tensors are dead exactly when BOTH fail: `k < heavy_keep` AND ≥ `MAX_COND_FRAME_NUM`
+/// cond keys exceed `k`. The newest `MAX_COND_FRAME_NUM` keys are therefore always protected.
+fn evict_stale_cond_heavy(bank: &mut ObjectBank, heavy_keep: i32) {
+    let n = bank.cond.len() as i32;
+    if n <= MAX_COND_FRAME_NUM {
+        return; // every cond frame is always selectable → nothing droppable
+    }
+    // BTreeMap iterates ascending, so index `i` has `n - 1 - i` newer keys; "at least
+    // MAX_COND_FRAME_NUM newer" is `i < n - MAX_COND_FRAME_NUM`. The newest MAX_COND_FRAME_NUM keys
+    // stay selectable and are never nulled.
+    let droppable_below = n - MAX_COND_FRAME_NUM;
+    for (i, (&k, m)) in bank.cond.iter_mut().enumerate() {
+        if (i as i32) < droppable_below && k < heavy_keep {
+            m.maskmem_features = None;
+            m.maskmem_pos_enc = None;
+        }
+    }
+}
+
 /// `_apply_non_overlapping_constraints` + `_suppress_shrinked_masks` per prompt group.
 #[allow(clippy::needless_range_loop)] // pixel-wise argmax over parallel grouped masks
 fn suppress_pw_area_shrinkage(masks: &[Vec<f32>], prompts: &[i32]) -> Vec<Vec<f32>> {
@@ -832,7 +909,218 @@ fn seq_first(a: &Tensor, bf16: bool) -> Result<Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::candle_core::Device;
     use std::path::Path;
+
+    fn dummy_fm() -> FrameMem {
+        let t = |v: f32| Tensor::from_vec(vec![v], (1, 1), &Device::Cpu).unwrap();
+        FrameMem {
+            maskmem_features: Some(t(0.0)),
+            maskmem_pos_enc: Some(t(0.0)),
+            object_pointer: t(0.0),
+            object_score: 0.0,
+        }
+    }
+
+    /// F-015: `evict_stale_bank` drops exactly the `non_cond` entries no future `gather_memory` can
+    /// read (older than the pointer window) and nulls the heavy tensors of those past the (tighter)
+    /// spatial window, while keeping the rest and never touching `cond`. Derived from frame_idx=20.
+    #[test]
+    fn evict_stale_bank_prunes_only_unreadable_entries() {
+        let mut bank = ObjectBank::default();
+        for k in 0..=20 {
+            bank.non_cond.insert(k, dummy_fm());
+        }
+        bank.cond.insert(3, dummy_fm()); // cond must be left intact
+
+        let frame_idx = 20;
+        let heavy_keep = frame_idx + 1 - (NUM_MASKMEM - 1);
+        let ptr_keep = frame_idx + 1 - (MAX_OBJ_PTRS - 1);
+        assert_eq!(
+            (heavy_keep, ptr_keep),
+            (15, 6),
+            "window floors for frame 20"
+        );
+        evict_stale_bank(&mut bank, heavy_keep, ptr_keep);
+
+        // keys < ptr_keep (0..=5): pointer window passed → entry dropped entirely.
+        for k in 0..ptr_keep {
+            assert!(!bank.non_cond.contains_key(&k), "key {k} must be evicted");
+        }
+        // keys in [ptr_keep, heavy_keep) (6..=14): kept, but heavy tensors nulled (object_pointer stays).
+        for k in ptr_keep..heavy_keep {
+            let m = bank
+                .non_cond
+                .get(&k)
+                .unwrap_or_else(|| panic!("key {k} must be kept"));
+            assert!(
+                m.maskmem_features.is_none() && m.maskmem_pos_enc.is_none(),
+                "heavy tensors must be nulled at key {k}"
+            );
+        }
+        // keys >= heavy_keep (15..=20): still spatially readable → heavy tensors retained.
+        for k in heavy_keep..=20 {
+            let m = bank.non_cond.get(&k).unwrap();
+            assert!(
+                m.maskmem_features.is_some() && m.maskmem_pos_enc.is_some(),
+                "heavy tensors must be kept at key {k}"
+            );
+        }
+        // cond is never touched by `evict_stale_bank` (its own heavy bound is `evict_stale_cond_heavy`).
+        assert!(bank.cond.contains_key(&3), "cond must be left intact");
+        let c = bank.cond.get(&3).unwrap();
+        assert!(
+            c.maskmem_features.is_some() && c.maskmem_pos_enc.is_some(),
+            "evict_stale_bank must not touch cond heavy tensors"
+        );
+    }
+
+    /// F-015: the fix must not change tracking output — it may only drop bank state that no future
+    /// `gather_memory` can read. This is the "short-video unchanged" guarantee: for a clip shorter than
+    /// the pointer window (`MAX_OBJ_PTRS`) no `non_cond` **entry** is ever dropped (so the pointer loop,
+    /// which reads `object_pointer` across the whole window, is byte-identical), and at every frame every
+    /// bank entry a future gather could still read keeps exactly the fields that read needs. Heavy-tensor
+    /// nulling outside the tighter spatial window (`NUM_MASKMEM`) is invisible to `gather_memory`, so it
+    /// is not a behavior change even though those tensors are freed. We assert against the exact read-set
+    /// `gather_memory` computes, so any regression that touched a live entry would trip.
+    #[test]
+    fn short_video_eviction_preserves_every_readable_entry() {
+        let num_frames = 12i32; // < MAX_OBJ_PTRS (16): a "short" clip
+        let mut bank = ObjectBank::default();
+        bank.cond.insert(0, dummy_fm()); // an initial seed conditioning frame
+        for frame_idx in 0..num_frames {
+            bank.non_cond.insert(frame_idx, dummy_fm());
+
+            // Eviction runs AFTER this frame's reads, so it may only affect frame_idx+1 onward. Compute
+            // exactly what the NEXT gather (frame_idx+1) reads from `non_cond` and assert eviction leaves
+            // all of it intact:
+            //  - spatial: heavy tensors at offsets [1, NUM_MASKMEM-1] → keys (frame_idx+1)-1 .. -6.
+            //  - pointers: object_pointer at offsets [1, max_optr-1] within the clip.
+            let next = frame_idx + 1;
+            let max_optr = num_frames.min(MAX_OBJ_PTRS);
+            let mut spatial_keys: std::collections::BTreeSet<i32> =
+                std::collections::BTreeSet::new();
+            for rel in 1..NUM_MASKMEM {
+                let k = next - rel;
+                if (0..num_frames).contains(&k) {
+                    spatial_keys.insert(k);
+                }
+            }
+            let mut ptr_keys: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
+            for t_diff in 1..max_optr {
+                let r = next - t_diff;
+                if (0..num_frames).contains(&r) {
+                    ptr_keys.insert(r);
+                }
+            }
+
+            let heavy_keep = frame_idx + 1 - (NUM_MASKMEM - 1);
+            let ptr_keep = frame_idx + 1 - (MAX_OBJ_PTRS - 1);
+            evict_stale_bank(&mut bank, heavy_keep, ptr_keep);
+            evict_stale_cond_heavy(&mut bank, heavy_keep);
+
+            for k in &spatial_keys {
+                let m = bank.non_cond.get(k).unwrap_or_else(|| {
+                    panic!("frame {frame_idx}: next spatial read of non_cond key {k} evicted")
+                });
+                assert!(
+                    m.maskmem_features.is_some() && m.maskmem_pos_enc.is_some(),
+                    "frame {frame_idx}: next spatial read of non_cond key {k} lost heavy tensors"
+                );
+            }
+            for k in &ptr_keys {
+                assert!(
+                    bank.non_cond.contains_key(k),
+                    "frame {frame_idx}: next pointer read of non_cond key {k} was evicted"
+                );
+            }
+        }
+        // For a clip shorter than the pointer window every seeded entry survives to the end — the
+        // pointer loop is byte-identical to the pre-fix behaviour.
+        assert_eq!(
+            bank.non_cond.len(),
+            num_frames as usize,
+            "no non_cond entry may be dropped for a clip shorter than MAX_OBJ_PTRS"
+        );
+        // The cond seed's key (and its object_pointer) is retained throughout.
+        assert!(
+            bank.cond.contains_key(&0),
+            "cond seed entry must be retained"
+        );
+    }
+
+    /// F-015: `evict_stale_cond_heavy` is a **strict no-op** for spatial memory — it only nulls cond
+    /// heavy tensors that no future `gather_memory` can read. Simulate a long clip (cond seeds +
+    /// reconditioning cadence), and at every frame assert the spatial read-set (the real
+    /// `select_closest_cond_frames` selection ++ the unselected-cond fallback window, exactly as
+    /// `gather_memory` reads) still has its heavy tensors present after all prior-frame evictions. Also
+    /// proves the bound actually bites (nulls something) so the bank stops growing without a ceiling.
+    #[test]
+    fn evict_stale_cond_heavy_never_nulls_a_readable_frame() {
+        let mut bank = ObjectBank::default();
+        // cond frames: an initial seed at 0, a second seed at 5, then reconditioning every
+        // RECONDITION_EVERY up to 160 — the long-clip pattern the cond leak comes from.
+        let mut cond_frames: Vec<i32> = vec![0, 5];
+        let mut f = RECONDITION_EVERY;
+        while f <= 160 {
+            cond_frames.push(f);
+            f += RECONDITION_EVERY;
+        }
+
+        let n_frames = 170;
+        let mut nulled_total = 0usize;
+        for frame_idx in 0..n_frames {
+            if cond_frames.contains(&frame_idx) {
+                bank.cond.insert(frame_idx, dummy_fm());
+            }
+            // Read-set exactly as `gather_memory`: selected cond (offset 0) ++ unselected cond in the
+            // `[frame_idx-(NUM_MASKMEM-1), frame_idx-1]` fallback window (no non_cond in this fixture).
+            let (selected, unselected) =
+                select_closest_cond_frames(frame_idx, &bank.cond, MAX_COND_FRAME_NUM);
+            let mut read_keys: std::collections::BTreeSet<i32> = selected.into_iter().collect();
+            for rel in 1..NUM_MASKMEM {
+                let prev = frame_idx - rel;
+                if unselected.contains(&prev) {
+                    read_keys.insert(prev);
+                }
+            }
+            for k in &read_keys {
+                let m = bank.cond.get(k).unwrap();
+                assert!(
+                    m.maskmem_features.is_some() && m.maskmem_pos_enc.is_some(),
+                    "frame {frame_idx}: cond key {k} is in the spatial read-set but its heavy \
+                     tensors were nulled by a prior eviction"
+                );
+            }
+            // Evict after the frame's reads, mirroring `evict_stale_memory`.
+            let heavy_keep = frame_idx + 1 - (NUM_MASKMEM - 1);
+            evict_stale_cond_heavy(&mut bank, heavy_keep);
+            nulled_total = bank
+                .cond
+                .values()
+                .filter(|m| m.maskmem_features.is_none())
+                .count();
+        }
+        // The eviction must actually bite (not a vacuous pass): old cond frames' heavy tensors are gone
+        // while every entry (and its object_pointer) is retained.
+        assert!(
+            nulled_total > 0,
+            "expected some cond heavy tensors to be nulled over a 170-frame clip"
+        );
+        assert_eq!(
+            bank.cond.len(),
+            cond_frames.len(),
+            "cond entries (object_pointer) must be retained, only heavy tensors nulled"
+        );
+        // The newest MAX_COND_FRAME_NUM cond frames are always protected.
+        for &k in cond_frames.iter().rev().take(MAX_COND_FRAME_NUM as usize) {
+            let m = bank.cond.get(&k).unwrap();
+            assert!(
+                m.maskmem_features.is_some(),
+                "newest cond frame {k} must keep its heavy tensors (always selectable)"
+            );
+        }
+    }
 
     /// Naive reference: read the WHOLE `[1,Q,288,288]` mask tensor to host, then filter — exactly
     /// the pre-F-014 behaviour. `select_detections` must match this bit-for-bit.
@@ -866,8 +1154,6 @@ mod tests {
     /// exact same detections (masks + scores + order) as the full-readback-then-filter path.
     #[test]
     fn on_device_selection_matches_full_readback() {
-        use candle_gen::candle_core::Device;
-
         let per = LOW_RES * LOW_RES;
         // A handful of queries: some below, some above `SCORE_THRESH_DET`, boundary at exactly the
         // threshold (kept iff strictly greater), interleaved so ordering is exercised.
@@ -898,7 +1184,6 @@ mod tests {
     /// No query passes the threshold → no host readback of masks, empty result.
     #[test]
     fn on_device_selection_empty_when_none_pass() {
-        use candle_gen::candle_core::Device;
         let per = LOW_RES * LOW_RES;
         let probs = [0.1f32, 0.2, SCORE_THRESH_DET, 0.0];
         let q = probs.len();
