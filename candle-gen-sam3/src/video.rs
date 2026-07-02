@@ -307,26 +307,11 @@ impl Sam3VideoModel {
             .iter()
             .map(|&s| s * presence)
             .collect();
-        let q = probs.len();
-        let masks_v = seg
-            .pred_masks
-            .reshape((q, LOW_RES * LOW_RES))?
-            .flatten_all()?
-            .to_dtype(DType::F32)?
-            .to_vec1::<f32>()?;
-        let per = LOW_RES * LOW_RES;
-        let mut dets = Vec::new();
-        for (qi, &p) in probs.iter().enumerate() {
-            if p <= SCORE_THRESH_DET {
-                continue;
-            }
-            let m = masks_v[qi * per..(qi + 1) * per].to_vec();
-            dets.push(Detection {
-                mask: m,
-                score: p,
-                prompt_id: 0,
-            });
-        }
+        // F-014: read back only the mask rows we actually keep. `pred_masks` is `[1,200,288,288]`
+        // (~16.6M f32 ≈ 66 MB) but only the handful of queries scoring above `SCORE_THRESH_DET`
+        // survive, so `index_select` the kept rows on-device first and read back just those — a
+        // synchronous PCIe transfer that now scales with detections, not `num_queries`.
+        let dets = select_detections(&seg.pred_masks, &probs)?;
         Ok(DetFrame { dets })
     }
 
@@ -792,6 +777,45 @@ fn to_vec(a: &Tensor) -> Result<Vec<f32>> {
     Ok(a.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?)
 }
 
+/// F-014: select the detections whose score exceeds `SCORE_THRESH_DET` from a `[1, Q, 288, 288]`
+/// mask tensor, reading back **only** the kept rows.
+///
+/// `pred_masks` carries all `Q` (=200) query masks (~66 MB) but only the handful passing the
+/// threshold are ever used, so we `index_select` the kept rows on-device and copy just those to
+/// the host — the transfer scales with detections, not `num_queries`. The kept queries are
+/// emitted in ascending query order, so the result is identical to reading the whole tensor back
+/// and filtering on the host.
+fn select_detections(pred_masks: &Tensor, probs: &[f32]) -> Result<Vec<Detection>> {
+    let kept: Vec<u32> = probs
+        .iter()
+        .enumerate()
+        .filter(|&(_, &p)| p > SCORE_THRESH_DET)
+        .map(|(qi, _)| qi as u32)
+        .collect();
+    if kept.is_empty() {
+        return Ok(Vec::new());
+    }
+    let per = LOW_RES * LOW_RES;
+    let q = pred_masks.dim(1)?;
+    let idx = Tensor::from_vec(kept.clone(), kept.len(), pred_masks.device())?;
+    // [1,Q,288,288] → [Q,288²]; select kept rows → [kept,288²]; single host readback.
+    let masks_v = pred_masks
+        .reshape((q, per))?
+        .index_select(&idx, 0)?
+        .to_dtype(DType::F32)?
+        .flatten_all()?
+        .to_vec1::<f32>()?;
+    let mut dets = Vec::with_capacity(kept.len());
+    for (row, &qi) in kept.iter().enumerate() {
+        dets.push(Detection {
+            mask: masks_v[row * per..(row + 1) * per].to_vec(),
+            score: probs[qi as usize],
+            prompt_id: 0,
+        });
+    }
+    Ok(dets)
+}
+
 /// Flatten the memory encoder's NHWC `[1,72,72,64]` output to seq-first `[5184,1,64]`. The reference
 /// stores `maskmem_features` as **bfloat16** (`bf16 = true`) but `maskmem_pos_enc` stays f32, so the
 /// two round-trip differently.
@@ -809,6 +833,83 @@ fn seq_first(a: &Tensor, bf16: bool) -> Result<Tensor> {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Naive reference: read the WHOLE `[1,Q,288,288]` mask tensor to host, then filter — exactly
+    /// the pre-F-014 behaviour. `select_detections` must match this bit-for-bit.
+    fn select_detections_full_readback(pred_masks: &Tensor, probs: &[f32]) -> Vec<Detection> {
+        let per = LOW_RES * LOW_RES;
+        let q = pred_masks.dim(1).unwrap();
+        let masks_v = pred_masks
+            .reshape((q, per))
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_dtype(DType::F32)
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let mut dets = Vec::new();
+        for (qi, &p) in probs.iter().enumerate() {
+            if p <= SCORE_THRESH_DET {
+                continue;
+            }
+            dets.push(Detection {
+                mask: masks_v[qi * per..(qi + 1) * per].to_vec(),
+                score: p,
+                prompt_id: 0,
+            });
+        }
+        dets
+    }
+
+    /// F-014: the on-device `index_select` selection reads back only the kept rows, yet yields the
+    /// exact same detections (masks + scores + order) as the full-readback-then-filter path.
+    #[test]
+    fn on_device_selection_matches_full_readback() {
+        use candle_gen::candle_core::Device;
+
+        let per = LOW_RES * LOW_RES;
+        // A handful of queries: some below, some above `SCORE_THRESH_DET`, boundary at exactly the
+        // threshold (kept iff strictly greater), interleaved so ordering is exercised.
+        let probs = [0.10f32, 0.90, SCORE_THRESH_DET, 0.51, 0.49, 0.999, 0.5001];
+        let q = probs.len();
+        // Distinct per-row mask values so a wrong row would be caught (row r ↦ value r + 0.5·col%7).
+        let mut data = Vec::with_capacity(q * per);
+        for r in 0..q {
+            for c in 0..per {
+                data.push(r as f32 + 0.5 * ((c % 7) as f32));
+            }
+        }
+        let pred_masks = Tensor::from_vec(data, (1, q, LOW_RES, LOW_RES), &Device::Cpu).unwrap();
+
+        let got = select_detections(&pred_masks, &probs).unwrap();
+        let want = select_detections_full_readback(&pred_masks, &probs);
+
+        assert_eq!(got.len(), want.len(), "kept count differs");
+        // exactly the strictly-greater-than-threshold queries: 0.90, 0.51, 0.999, 0.5001 → 4.
+        assert_eq!(got.len(), 4);
+        for (g, w) in got.iter().zip(&want) {
+            assert_eq!(g.score, w.score, "score mismatch");
+            assert_eq!(g.prompt_id, w.prompt_id);
+            assert_eq!(g.mask, w.mask, "mask bytes differ for score {}", g.score);
+        }
+    }
+
+    /// No query passes the threshold → no host readback of masks, empty result.
+    #[test]
+    fn on_device_selection_empty_when_none_pass() {
+        use candle_gen::candle_core::Device;
+        let per = LOW_RES * LOW_RES;
+        let probs = [0.1f32, 0.2, SCORE_THRESH_DET, 0.0];
+        let q = probs.len();
+        let pred_masks = Tensor::from_vec(
+            vec![1.0f32; q * per],
+            (1, q, LOW_RES, LOW_RES),
+            &Device::Cpu,
+        )
+        .unwrap();
+        assert!(select_detections(&pred_masks, &probs).unwrap().is_empty());
+    }
 
     /// F-028: the detector segmenter and the tracker must share **one** PE backbone instance (rather
     /// than each holding its own ~445M-param copy). Checks `Arc` pointer-identity of the two
