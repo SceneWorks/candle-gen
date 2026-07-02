@@ -50,10 +50,14 @@ impl Weights {
     }
 
     /// Load and MERGE every `.safetensors` file in `files` into one weight map, in the given order
-    /// (each tensor coerced to `dtype` exactly like [`from_file`](Self::from_file)). When a key
-    /// appears in more than one file the *last* file wins — matching candle's own
-    /// `from_mmaped_safetensors` shard semantics, so a `Weights` map and a `VarBuilder` over the same
-    /// sorted shard list resolve identical tensors.
+    /// (each tensor coerced to `dtype` exactly like [`from_file`](Self::from_file)).
+    ///
+    /// A key that appears in more than one shard is a HARD ERROR (naming the key + offending shard) —
+    /// not a silent last-file-wins overwrite. In a normal sharded checkpoint every tensor lives in
+    /// exactly one shard, so a cross-shard duplicate is abnormal (a mis-sharded / double-listed
+    /// checkpoint, or a stray `.safetensors` polluting the dir); letting a stray file shadow the real
+    /// weights with no diagnostic is exactly the footgun F-064 (sc-9050) closed for the sibling
+    /// `candle-gen-sam3` / `candle-gen-depth` loaders, so `from_files` mirrors that policy.
     ///
     /// Callers pass a deterministically sorted shard list (see
     /// [`candle_gen::loader::sorted_safetensors`]); this is the shard-aware path for snapshots that
@@ -61,9 +65,19 @@ impl Weights {
     pub fn from_files(files: &[impl AsRef<Path>], device: &Device, dtype: DType) -> Result<Self> {
         let mut map = HashMap::new();
         for path in files {
-            let raw = cst::load(path.as_ref(), device)?;
+            let path = path.as_ref();
+            let raw = cst::load(path, device)?;
             for (k, v) in raw {
-                map.insert(k, coerce_float(v, dtype)?);
+                let v = coerce_float(v, dtype)?;
+                if map.insert(k.clone(), v).is_some() {
+                    return Err(CandleError::Msg(format!(
+                        "duplicate tensor key {k:?} while merging shard {}: a checkpoint's tensors \
+                         must each live in exactly one .safetensors shard — this snapshot has {k:?} \
+                         in more than one file (mis-sharded checkpoint or a stray .safetensors in \
+                         the dir)",
+                        path.display()
+                    )));
+                }
             }
         }
         Ok(Self { map })
@@ -139,21 +153,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// When a key repeats across files the LAST file wins — matching candle's
-    /// `from_mmaped_safetensors`, so a `Weights` map and a `VarBuilder` over the same sorted list
-    /// resolve the identical tensor.
+    /// A key present in more than one shard is a HARD ERROR naming the key — not a silent
+    /// last-file-wins overwrite (align with the F-064 / sc-9050 duplicate-key policy that the sibling
+    /// sam3/depth loaders enforce). A stray or mis-sharded file must not silently shadow real weights.
     #[test]
-    fn from_files_last_shard_wins_on_duplicate_key() {
+    fn from_files_errors_on_duplicate() {
         let dir = scratch_dir("dup");
         let first = dir.join("a.safetensors");
         let last = dir.join("b.safetensors");
         write_st(&first, "shared", 10.0);
         write_st(&last, "shared", 20.0);
-        let w = Weights::from_files(&[first, last], &Device::Cpu, DType::F32).unwrap();
-        assert_eq!(
-            w.require("shared").unwrap().to_vec1::<f32>().unwrap(),
-            vec![20.0]
-        );
+        match Weights::from_files(&[first, last], &Device::Cpu, DType::F32) {
+            Err(CandleError::Msg(m)) => assert!(
+                m.contains("duplicate tensor key") && m.contains("shared"),
+                "expected a duplicate-key error naming the key, got: {m}"
+            ),
+            Err(e) => panic!("expected a duplicate-key CandleError::Msg, got: {e}"),
+            Ok(_) => panic!("expected a duplicate-key error, but from_files succeeded"),
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
