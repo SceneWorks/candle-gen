@@ -189,7 +189,14 @@ impl Pipeline {
             )?);
         }
         let mut map = self.load_component_map(sub)?;
-        crate::adapters::merge_adapters(&mut map, &specs)?;
+        // Surface the merge report at the call site (sc-9027 / F-043): a partially-matching community
+        // LoRA merges with weaker effect, and only the zero-match case errors inside `merge_adapters`.
+        // Log per-expert so a half-applied adapter is diagnosable, matching the scail2 sibling.
+        let report = crate::adapters::merge_adapters(&mut map, &specs)?;
+        eprintln!(
+            "[wan-14b] {} expert: merged {} adapter file(s): {} deltas applied, {} keys off-surface/skipped",
+            sub, specs.len(), report.merged, report.skipped_keys
+        );
         let vb = VarBuilder::from_tensors(map, DIT_DTYPE, &self.device);
         Ok(WanTransformer::new(&self.dit_cfg, vb)?)
     }

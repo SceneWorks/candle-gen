@@ -484,6 +484,38 @@ mod tests {
         assert!(diff < 1e-4, "merged lokr weight off by {diff}");
     }
 
+    /// sc-9027 / F-043: a partially-matching LoRA (one on-surface target + one off-surface) merges the
+    /// hit and reports the miss, so `build_expert` can surface `skipped_keys > 0` instead of letting the
+    /// partial match vanish silently.
+    #[test]
+    fn merge_lora_partial_match_reports_skipped() {
+        let mut map = base_map();
+        let down = t2(&[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0], 2, 4);
+        let up = t2(&[2.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 0.0], 4, 2);
+        let af = AdapterFile {
+            tensors: HashMap::from([
+                // On-surface: block 0 attn1.to_q exists in `base_map`.
+                (
+                    "blocks.0.attn1.to_q.lora_A.weight".to_string(),
+                    down.clone(),
+                ),
+                ("blocks.0.attn1.to_q.lora_B.weight".to_string(), up.clone()),
+                // Off-surface: block 99 is not in the base map — the miss must be counted, not dropped.
+                ("blocks.99.attn1.to_q.lora_A.weight".to_string(), down),
+                ("blocks.99.attn1.to_q.lora_B.weight".to_string(), up),
+            ]),
+            meta: HashMap::new(),
+        };
+        let table = build_kohya_table(&map);
+        let mut report = MergeReport::default();
+        merge_lora_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
+        assert_eq!(report.merged, 1, "the on-surface target merges");
+        assert!(
+            report.skipped_keys >= 1,
+            "the off-surface target is surfaced as skipped, not silently dropped"
+        );
+    }
+
     /// A non-empty spec list that matches nothing surfaces as zero-merged (the public entry then errors).
     #[test]
     fn merge_lora_nothing_matched_is_zero() {
