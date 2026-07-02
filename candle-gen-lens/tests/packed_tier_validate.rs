@@ -13,8 +13,8 @@
 //! quant-independent (it fires on the `.scales` sibling, not on the requested `Quant`).
 //!
 //! `#[ignore]`d (needs a real GPU + the cached packed tier). On the Windows/Blackwell box (v143 vcvars
-//! + CUDA on PATH), point at the **tier subdir** (the packed snapshot nests `bf16/`, `q4/`, `q8/`, each
-//! a full diffusers snapshot with `tokenizer/ text_encoder/ transformer/ vae/`):
+//! and CUDA on PATH), point at the **tier subdir** — the packed snapshot nests `bf16/`, `q4/`, `q8/`,
+//! each a full diffusers snapshot with `tokenizer/ text_encoder/ transformer/ vae/`:
 //!
 //! ```text
 //! set LENS_PACKED_Q4=D:\.cache\huggingface\hub\models--SceneWorks--lens-turbo-mlx\snapshots\<hash>\q4

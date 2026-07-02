@@ -1393,10 +1393,11 @@ mod tests {
     /// **Packed-detect fires on the 3-D affine expert layout, and the packed MoE reproduces the affine
     /// grid (sc-9457).** Feeds `SparseMoe::new` a VarBuilder mimicking the `lens-mlx` `text_encoder`
     /// expert keys — the `experts.{gate_up_proj,down_proj}` affine triple (`.weight`/`.scales`/`.biases`)
-    /// + the separate dense `_bias` — and asserts: (1) the `.scales` sibling routes every expert to the
-    /// packed `Quant` arm (not a silent MXFP4 miss), and (2) the packed MoE tracks a dense MoE built from
-    /// the exact affine grids the pack represents (the Q4→Q4_1 repack is lossless; the residual is only
-    /// the `forward_via_f16` weight cast). `quant = None` proves the packed load is quant-independent.
+    /// plus the separate dense `_bias` — and asserts two things. First, the `.scales` sibling routes
+    /// every expert to the packed `Quant` arm (not a silent MXFP4 miss). Second, the packed MoE tracks a
+    /// dense MoE built from the exact affine grids the pack represents (the Q4→Q4_1 repack is lossless;
+    /// the residual is only the `forward_via_f16` weight cast). `quant = None` here also proves the packed
+    /// load is quant-independent.
     #[test]
     fn packed_experts_detect_and_grid_parity() {
         use std::collections::HashMap;
