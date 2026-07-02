@@ -32,15 +32,16 @@
 //! skips this entirely — the shared repack builds the `QTensor` straight from the packed parts on the
 //! DiT device.
 //!
-//! **Text encoder & VAE.** This seam is the **DiT** only. The gpt-oss text encoder ([`crate::text_encoder`])
-//! currently loads its experts from the dense MXFP4 `SceneWorks/Lens` diffusers snapshot and transcodes
-//! them via its own fused-expert quant path (sc-5111); it is not touched here, and the Flux.2 VAE stays
-//! f32. Note the hosted `SceneWorks/lens-mlx` tier packs its `text_encoder/` experts in a *3-D* MLX
-//! affine format (`model.layers.*.mlp.experts.{gate_up_proj,down_proj}` + `.scales`/`.biases`), which is
-//! **not** the 2-D `Linear` shape the shared loaders consume — so a dedicated packed 3-D fused-expert
-//! encoder loader (which would let the encoder read the packed `lens-mlx` experts directly, matching the
-//! DiT's packed tier) is deferred and tracked in Shortcut story **sc-9457**. Until it lands, the DiT here
-//! loads packed while the encoder still loads from the dense `SceneWorks/Lens` snapshot's MXFP4 experts.
+//! **Text encoder & VAE.** This seam is the **DiT** only. The gpt-oss text encoder
+//! ([`crate::text_encoder`]) has its own expert quant seam, and the Flux.2 VAE stays f32. The hosted
+//! `SceneWorks/lens-mlx` tier packs its `text_encoder/` experts in a *3-D* per-expert MLX affine format
+//! (`model.layers.*.mlp.experts.{gate_up_proj,down_proj}` + `.scales`/`.biases`), which is **not** the
+//! 2-D `Linear` shape the shared loaders consume — so the encoder carries a dedicated 3-D fused-expert
+//! packed loader ([`crate::text_encoder::GptOssTextEncoder::new_quant`], sc-9457) that slices each
+//! expert and delegates the Q4→`Q4_1` / Q8→`Q8_0` repack to the shared
+//! [`candle_gen::quant::repack_packed_weight`] seam. With that landed, a pure `lens-mlx` snapshot now
+//! loads packed **end-to-end** (DiT + encoder + VAE) — the encoder no longer needs the dense
+//! `SceneWorks/Lens` MXFP4 snapshot (which stays the load path for the dense diffusers tier).
 
 use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
