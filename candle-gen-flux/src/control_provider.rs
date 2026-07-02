@@ -10,7 +10,8 @@
 //! parity-proven dev DiT ([`crate::ip_dit::IpFlux`]) plus the control branch
 //! ([`crate::control::FluxControlNet`]): 6 per-block residuals are computed once and added into the base
 //! image stream after base double blocks at `interval = ceil(19/6) = 4`, scaled by `control_scale`
-//! (Shakker README sweet spot ≈ 0.7). dev is guidance-distilled — a single embedded-guidance forward,
+//! (Shakker README sweet spot ≈ 0.7; absent → that default, an explicit `Some(0.0)` = control off).
+//! dev is guidance-distilled — a single embedded-guidance forward,
 //! no true-CFG / negative pass.
 //!
 //! **Compose-readiness:** the denoise routes through [`FluxControlTransformer::forward_composed`], which
@@ -62,9 +63,11 @@ const MAX_SHIFT: f64 = 1.15;
 /// FLUX latent geometry requires both image dims to be multiples of 16 for a clean 2×2 pack.
 const SIZE_MULTIPLE: u32 = 16;
 
-/// Default control-conditioning scale — the Shakker Union-Pro-2.0 README recommends ≈ 0.7. The request's
-/// `control_scale` wins when non-zero; a 0 falls back to this (a request that supplied a control but left
-/// the scale unset still steers, mirroring the mlx provider).
+/// Default control-conditioning scale — the Shakker Union-Pro-2.0 README recommends ≈ 0.7. Used only when
+/// the request leaves `control_scale` **absent** (`None`); an explicit `Some(x)` always wins, including
+/// `Some(0.0)` (which the engine proves is byte-identical to the base forward — "control off"). See
+/// sc-9024 / F-040: an explicit 0.0 must NOT be remapped to the default (0.0 is a valid value, not
+/// "unset").
 pub const DEFAULT_CONTROL_SCALE: f32 = 0.7;
 
 /// Paths to the FLUX.1-dev control checkpoints: the dev snapshot dir + the Shakker Fun-Controlnet-Union
@@ -88,8 +91,10 @@ pub struct Flux1ControlRequest {
     pub steps: usize,
     /// Embedded guidance scale (dev default ≈ 3.5).
     pub guidance: f32,
-    /// `control_scale` — how strongly the control branch locks the base (≈ 0.7).
-    pub control_scale: f32,
+    /// `control_scale` — how strongly the control branch locks the base (≈ 0.7). `None` = absent → the
+    /// [`DEFAULT_CONTROL_SCALE`]; `Some(x)` is honored verbatim, including `Some(0.0)` for "control off"
+    /// (byte-identical to the base forward). sc-9024: an explicit 0.0 is a valid value, not "unset".
+    pub control_scale: Option<f32>,
     /// The control kind (pose / canny / depth). Input-agnostic — used only to validate the accepted set;
     /// it does NOT branch the forward (Union-Pro-2.0 dropped the discrete mode index).
     pub control_kind: String,
@@ -106,7 +111,7 @@ impl Default for Flux1ControlRequest {
             height: 1024,
             steps: 25,
             guidance: 3.5,
-            control_scale: DEFAULT_CONTROL_SCALE,
+            control_scale: None,
             control_kind: "pose".into(),
             seed: 0,
             cancel: CancelFlag::default(),
@@ -367,13 +372,12 @@ impl Flux1DevControl {
         if req.steps == 0 {
             return Err(CandleError::Msg("flux1 control: steps must be >= 1".into()));
         }
-        // A request that left `control_scale` at 0 still steers (map to the Shakker default), mirroring
-        // the mlx provider — an explicit non-zero wins.
-        let control_scale = if req.control_scale == 0.0 {
-            DEFAULT_CONTROL_SCALE as f64
-        } else {
-            req.control_scale as f64
-        };
+        // sc-9024 (F-040): distinguish "absent" from an explicit 0.0. Only an ABSENT scale (`None`) falls
+        // back to the Shakker default; an explicit `Some(x)` is honored verbatim — including `Some(0.0)`,
+        // which the engine proves is byte-identical to the base forward ("control off"). The old code
+        // treated 0.0 as "unset" and silently steered at 0.7, contradicting the engine's own ablation
+        // semantics (scale 0 ≡ base; see `control_parity` / `control_real_weights`).
+        let control_scale = req.control_scale.unwrap_or(DEFAULT_CONTROL_SCALE) as f64;
 
         // Conditioning (seed-independent): text (T5 seq + CLIP pooled) + the packed control latent.
         let (t5_emb, clip_emb) = encode_text(
@@ -490,17 +494,47 @@ impl Flux1DevControl {
 mod tests {
     use super::*;
 
-    /// The request defaults match the dev control production knobs (1024², 25 steps, guidance 3.5,
-    /// control scale 0.7, pose).
+    /// The request defaults match the dev control production knobs (1024², 25 steps, guidance 3.5, pose).
+    /// `control_scale` defaults to `None` (absent) — resolved to [`DEFAULT_CONTROL_SCALE`] at generate
+    /// time (sc-9024: absent ≠ an explicit 0.0).
     #[test]
     fn request_defaults() {
         let r = Flux1ControlRequest::default();
         assert_eq!((r.width, r.height), (1024, 1024));
         assert_eq!(r.steps, 25);
         assert_eq!(r.guidance, 3.5);
-        assert_eq!(r.control_scale, DEFAULT_CONTROL_SCALE);
+        assert_eq!(r.control_scale, None);
         assert_eq!(r.control_kind, "pose");
         assert!(!r.cancel.is_cancelled());
+    }
+
+    /// sc-9024 (F-040): the `control_scale` resolution honors an explicit `Some(0.0)` as "control off"
+    /// (byte-identical to the base forward — see `control_parity`) and only substitutes the Shakker
+    /// default (0.7) when the scale is truly absent (`None`). A genuine 0.0 must NOT be remapped to 0.7.
+    #[test]
+    fn control_scale_resolution_honors_explicit_zero() {
+        // The generate-time resolution: `req.control_scale.unwrap_or(DEFAULT_CONTROL_SCALE)`.
+        let resolve = |cs: Option<f32>| cs.unwrap_or(DEFAULT_CONTROL_SCALE) as f64;
+
+        // Absent → the default (0.7): a request that supplied a control but left the scale unset steers.
+        assert_eq!(
+            resolve(None),
+            DEFAULT_CONTROL_SCALE as f64,
+            "absent (None) must fall back to the Shakker default"
+        );
+        // Explicit 0.0 → 0.0 (NOT 0.7): the caller asked for control off; honor it (0 ≡ base forward).
+        assert_eq!(
+            resolve(Some(0.0)),
+            0.0,
+            "explicit Some(0.0) must be honored, not remapped to the default"
+        );
+        // Explicit non-zero → verbatim (compare at the same f32→f64 widening the code performs).
+        assert_eq!(
+            resolve(Some(0.35)),
+            0.35f32 as f64,
+            "explicit Some(x) is honored verbatim"
+        );
+        assert_eq!(resolve(Some(1.0)), 1.0);
     }
 
     /// The control checkpoint resolver: a missing path errors loudly; a direct file is used as-is.

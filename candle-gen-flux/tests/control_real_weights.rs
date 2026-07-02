@@ -126,7 +126,7 @@ fn real_weight_control() {
         height: 1024,
         steps: 20,
         guidance: 3.5,
-        control_scale: 0.7,
+        control_scale: Some(0.7),
         control_kind: kind.clone(),
         seed: 12345,
         cancel: CancelFlag::new(),
