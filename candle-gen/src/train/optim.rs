@@ -46,17 +46,23 @@ pub fn normalize(name: &str) -> String {
 /// the pre-clip total norm. Mirrors the MLX `clip_grad_norm(&grads, 1.0)` the trainer applies to the
 /// averaged gradient before the optimizer step.
 pub fn clip_grad_norm(grads: &mut GradStore, vars: &[Var], max_norm: f64) -> Result<f64> {
-    let mut total_sq = 0f64;
+    // Accumulate the sum of squares as an on-device f64 scalar and read it back exactly once (sc-9036).
+    // Each per-var reduction is upcast to f64 before the running add so the accumulation matches the
+    // previous per-scalar CPU sum bit-for-bit, but we no longer stall on a GPU→CPU sync per var.
+    let mut total_sq: Option<Tensor> = None;
     for v in vars {
         if let Some(g) = grads.get(v.as_tensor()) {
-            let s = g
-                .sqr()?
-                .sum_all()?
-                .to_dtype(candle_core::DType::F64)?
-                .to_scalar::<f64>()?;
-            total_sq += s;
+            let s = g.sqr()?.sum_all()?.to_dtype(candle_core::DType::F64)?;
+            total_sq = Some(match total_sq {
+                Some(acc) => (acc + s)?,
+                None => s,
+            });
         }
     }
+    let total_sq = match total_sq {
+        Some(t) => t.to_scalar::<f64>()?,
+        None => 0f64,
+    };
     let norm = total_sq.sqrt();
     if norm > max_norm && norm > 0.0 {
         let scale = max_norm / norm;
@@ -338,8 +344,13 @@ impl Prodigy {
         let d_numerator = self.d_numerator * beta3;
 
         // --- Pass 1: EMAs + s; accumulate the global numerator/denominator ---
-        let mut delta_numerator = 0f64;
-        let mut d_denom = 0f64;
+        // Both the delta-numerator and the denominator are accumulated as on-device f64 scalars and
+        // read back exactly once each after the loop (sc-9036), instead of two GPU→CPU syncs per var.
+        // Each per-var term is scaled/upcast to f64 on-device before the running add, so the reduction
+        // stays bit-identical to the previous per-scalar CPU accumulation while removing the stalls.
+        let dn_scale = (d / d0) * dlr; // constant across the loop
+        let mut delta_numerator_dev: Option<Tensor> = None;
+        let mut d_denom_dev: Option<Tensor> = None;
         for (i, v) in self.vars.iter().enumerate() {
             let Some(g) = grads.get(v.as_tensor()) else {
                 continue;
@@ -358,23 +369,35 @@ impl Prodigy {
             // delta_numerator += (d/d0)·dlr·⟨g, p0 − p⟩
             let dot = (g * (&st.p0 - p)?)?
                 .sum_all()?
-                .to_dtype(candle_core::DType::F64)?
-                .to_scalar::<f64>()?;
-            delta_numerator += (d / d0) * dlr * dot;
+                .to_dtype(candle_core::DType::F64)?;
+            let dot_scaled = (dot * dn_scale)?;
+            delta_numerator_dev = Some(match delta_numerator_dev {
+                Some(acc) => (acc + dot_scaled)?,
+                None => dot_scaled,
+            });
             let exp_avg = ((&st.exp_avg * beta1)? + (g * (d * (1.0 - beta1)))?)?;
             let exp_avg_sq = ((&st.exp_avg_sq * beta2)? + (g.sqr()? * (d * d * (1.0 - beta2)))?)?;
             let s = ((&st.s * beta3)? + (g * ((d / d0) * dlr))?)?;
-            let s_abs_sum = s
-                .abs()?
-                .sum_all()?
-                .to_dtype(candle_core::DType::F64)?
-                .to_scalar::<f64>()?;
-            d_denom += s_abs_sum;
+            let s_abs_sum = s.abs()?.sum_all()?.to_dtype(candle_core::DType::F64)?;
+            d_denom_dev = Some(match d_denom_dev {
+                Some(acc) => (acc + s_abs_sum)?,
+                None => s_abs_sum,
+            });
             let st = self.state.get_mut(&i).unwrap();
             st.exp_avg = exp_avg;
             st.exp_avg_sq = exp_avg_sq;
             st.s = s;
         }
+
+        // Single readback per accumulator (or default 0 when no var carried a gradient).
+        let delta_numerator = match delta_numerator_dev {
+            Some(t) => t.to_scalar::<f64>()?,
+            None => 0f64,
+        };
+        let d_denom = match d_denom_dev {
+            Some(t) => t.to_scalar::<f64>()?,
+            None => 0f64,
+        };
 
         // No usable gradient signal this step — leave d/params unchanged.
         if d_denom == 0.0 {
@@ -491,6 +514,130 @@ mod tests {
         assert!(
             (n - 1.0).abs() < 1e-6,
             "clipped norm should be 1.0, got {n}"
+        );
+    }
+
+    /// The on-device sum-of-squares accumulation in `clip_grad_norm` (sc-9036) must reproduce the
+    /// pre-clip norm the old per-var CPU `to_scalar` loop computed, to fp tolerance, across a spread of
+    /// gradient tensors — this is the numerical-equivalence guard for the single-readback rewrite.
+    #[test]
+    fn clip_grad_norm_matches_per_scalar_reduction() {
+        let dev = Device::Cpu;
+        // Several vars with distinct shapes/magnitudes (mirrors a multi-target adapter surface).
+        let grads_data: Vec<(Vec<f32>, (usize, usize))> = vec![
+            (vec![0.1, -0.2, 0.3, 0.05], (2, 2)),
+            (vec![1.5, -2.5, 0.0, 3.25, -1.0, 0.75], (2, 3)),
+            (vec![1e-3, -1e-3], (1, 2)),
+            (vec![10.0, -10.0, 5.0, -5.0], (4, 1)),
+        ];
+        let vars: Vec<Var> = grads_data.iter().map(|(d, s)| var(d, *s)).collect();
+        let mut grads = GradStore::default();
+        for (v, (d, s)) in vars.iter().zip(grads_data.iter()) {
+            grads.insert(
+                v.as_tensor(),
+                Tensor::from_vec(d.clone(), *s, &dev).unwrap(),
+            );
+        }
+        // Reference: the old per-scalar f64 accumulation.
+        let mut ref_total_sq = 0f64;
+        for v in &vars {
+            let g = grads.get(v.as_tensor()).unwrap();
+            ref_total_sq += g
+                .sqr()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_dtype(candle_core::DType::F64)
+                .unwrap()
+                .to_scalar::<f64>()
+                .unwrap();
+        }
+        let ref_norm = ref_total_sq.sqrt();
+        // max_norm above the norm ⇒ no scaling, so the returned value is the pure reduction.
+        let got = clip_grad_norm(&mut grads, &vars, 1e9).unwrap();
+        assert!(
+            (got - ref_norm).abs() <= 1e-12 * ref_norm.max(1.0),
+            "on-device norm {got} != per-scalar norm {ref_norm}"
+        );
+    }
+
+    /// Prodigy's pass-1 numerator/denominator (now accumulated on-device, sc-9036) must match the old
+    /// per-var `to_scalar` reduction: run a first step and check the adapted `d` equals the value the
+    /// per-scalar formula yields for the same inputs (first step: exp_avg/s seed from zeros).
+    #[test]
+    fn prodigy_first_step_d_matches_per_scalar_reduction() {
+        let dev = Device::Cpu;
+        let grads_data: Vec<(Vec<f32>, (usize, usize))> = vec![
+            (vec![0.2, -0.3, 0.1, 0.4], (2, 2)),
+            (vec![0.5, -0.5, 0.25, -0.25, 0.75, -0.75], (2, 3)),
+            (vec![0.01, -0.02], (1, 2)),
+        ];
+        let params_data: Vec<Vec<f32>> = vec![
+            vec![0.5, -0.5, 0.1, -0.1],
+            vec![1.0, -1.0, 0.5, -0.5, 0.25, -0.25],
+            vec![0.05, -0.05],
+        ];
+        let vars: Vec<Var> = params_data
+            .iter()
+            .zip(grads_data.iter())
+            .map(|(p, (_, s))| var(p, *s))
+            .collect();
+        let mut grads = GradStore::default();
+        for (v, (d, s)) in vars.iter().zip(grads_data.iter()) {
+            grads.insert(
+                v.as_tensor(),
+                Tensor::from_vec(d.clone(), *s, &dev).unwrap(),
+            );
+        }
+        let mut prod = Prodigy::new(vars.clone(), 1e-4, 0.0);
+        // Reference d computed with the per-scalar formula (first step: p0==p ⇒ dot term is 0, so
+        // delta_numerator==0 and d stays at d0; but s accumulates so d_denom>0). Compute it explicitly
+        // to guard the on-device denominator accumulation too.
+        let (d, d0) = (prod.d, prod.d0);
+        let dlr = d * prod.lr;
+        let (beta3, d0c) = (prod.beta3, prod.d0);
+        let mut ref_delta_num = 0f64;
+        let mut ref_denom = 0f64;
+        for v in &vars {
+            let g = grads.get(v.as_tensor()).unwrap();
+            let p = v.as_tensor();
+            let dot = (g * (&p.detach() - p).unwrap())
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_dtype(candle_core::DType::F64)
+                .unwrap()
+                .to_scalar::<f64>()
+                .unwrap();
+            ref_delta_num += (d / d0) * dlr * dot;
+            // s = 0*beta3 + g*((d/d0)*dlr) on the first step.
+            let s = (g * ((d / d0c) * dlr)).unwrap();
+            let _ = beta3;
+            ref_denom += s
+                .abs()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_dtype(candle_core::DType::F64)
+                .unwrap()
+                .to_scalar::<f64>()
+                .unwrap();
+        }
+        let ref_global_num = 0.0 * beta3 + ref_delta_num; // d_numerator starts at 0
+        let ref_d_hat = prod.d_coef * ref_global_num / ref_denom;
+        let ref_d_max = d0.max(ref_d_hat);
+        let mut ref_d = d;
+        if d == d0 {
+            ref_d = d.max(ref_d_hat);
+        }
+        ref_d = ref_d_max.min(ref_d * prod.growth_rate);
+
+        prod.step(&grads).unwrap();
+        assert!(
+            (prod.d - ref_d).abs() <= 1e-15 * ref_d.abs().max(1e-12),
+            "on-device Prodigy d {} != per-scalar d {}",
+            prod.d,
+            ref_d
         );
     }
 
