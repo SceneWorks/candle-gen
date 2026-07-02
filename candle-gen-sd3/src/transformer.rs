@@ -30,7 +30,7 @@ use candle_gen::candle_nn::{self, Linear, RmsNorm, VarBuilder};
 use candle_gen::gen_core::Quant;
 
 use crate::config::Sd3Config;
-use crate::quant::{conv2d_to, linear_to, rms_norm_to, QLinear};
+use crate::quant::{conv2d_to, linear_detect_dense, linear_to, rms_norm_to, QLinear};
 
 /// Affine-free LayerNorm eps (diffusers `elementwise_affine=False, eps=1e-6` on the AdaLN norms).
 const LN_EPS: f64 = 1e-6;
@@ -91,10 +91,14 @@ struct MlpEmbed {
 }
 
 impl MlpEmbed {
+    /// **Packed-detecting** (sc-9414): on a packed MLX tier the two embedder linears carry a `.scales`
+    /// sibling and are dequantized to full-precision dense `Linear`s via [`linear_detect_dense`]; on a
+    /// dense tier they are plain dense reads (unchanged). Kept dense either way — these are small
+    /// leaves the legacy fold never enumerates.
     fn new(in_dim: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            linear_1: candle_nn::linear(in_dim, hidden, vb.pp("linear_1"))?,
-            linear_2: candle_nn::linear(hidden, hidden, vb.pp("linear_2"))?,
+            linear_1: linear_detect_dense(in_dim, hidden, &vb, "linear_1", true)?,
+            linear_2: linear_detect_dense(hidden, hidden, &vb, "linear_2", true)?,
         })
     }
 
@@ -240,7 +244,10 @@ struct AdaLayerNormZero {
 impl AdaLayerNormZero {
     fn new(inner: usize, n_chunks: usize, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            linear: candle_nn::linear(inner, n_chunks * inner, vb.pp("linear"))?,
+            // Packed-detecting dense (sc-9414): on a packed tier `linear.{scales,biases}` is present
+            // (the converter packs every DiT Linear) and dequantized to a dense leaf; on a dense tier a
+            // plain read. Kept dense — the chaos-sensitive modulation linear stays full precision.
+            linear: linear_detect_dense(inner, n_chunks * inner, &vb, "linear", true)?,
             n_chunks,
         })
     }
@@ -322,22 +329,31 @@ impl JointAttention {
         } else {
             (None, None, None, None)
         };
+        // Packed-detecting (sc-9414): each projection loads `Packed` straight from the MLX tier when its
+        // `.scales` sibling is present (no dense staging), else dense (unchanged). `base` is the full
+        // dotted prefix so `.scales`/`.biases` survive the `to_out.0` nesting (the key-remap trap).
         // The image-stream output projection lives at `to_out.0`.
-        let to_out = QLinear::linear(inner, inner, vb.pp("to_out").pp("0"))?;
+        let to_out = QLinear::linear_detect(inner, inner, &vb, "to_out.0", true)?;
         // The text-stream output projection is absent on the `context_pre_only` (final) block.
         let to_add_out = if context_pre_only {
             None
         } else {
-            Some(QLinear::linear(inner, inner, vb.pp("to_add_out"))?)
+            Some(QLinear::linear_detect(
+                inner,
+                inner,
+                &vb,
+                "to_add_out",
+                true,
+            )?)
         };
         Ok(Self {
-            to_q: QLinear::linear(inner, inner, vb.pp("to_q"))?,
-            to_k: QLinear::linear(inner, inner, vb.pp("to_k"))?,
-            to_v: QLinear::linear(inner, inner, vb.pp("to_v"))?,
+            to_q: QLinear::linear_detect(inner, inner, &vb, "to_q", true)?,
+            to_k: QLinear::linear_detect(inner, inner, &vb, "to_k", true)?,
+            to_v: QLinear::linear_detect(inner, inner, &vb, "to_v", true)?,
             to_out,
-            add_q: QLinear::linear(inner, inner, vb.pp("add_q_proj"))?,
-            add_k: QLinear::linear(inner, inner, vb.pp("add_k_proj"))?,
-            add_v: QLinear::linear(inner, inner, vb.pp("add_v_proj"))?,
+            add_q: QLinear::linear_detect(inner, inner, &vb, "add_q_proj", true)?,
+            add_k: QLinear::linear_detect(inner, inner, &vb, "add_k_proj", true)?,
+            add_v: QLinear::linear_detect(inner, inner, &vb, "add_v_proj", true)?,
             to_add_out,
             norm_q,
             norm_k,
@@ -465,10 +481,11 @@ impl SelfAttention {
             (None, None)
         };
         Ok(Self {
-            to_q: QLinear::linear(inner, inner, vb.pp("to_q"))?,
-            to_k: QLinear::linear(inner, inner, vb.pp("to_k"))?,
-            to_v: QLinear::linear(inner, inner, vb.pp("to_v"))?,
-            to_out: QLinear::linear(inner, inner, vb.pp("to_out").pp("0"))?,
+            // Packed-detecting `attn2` projections (sc-9414); `to_out.0` base preserves the nested key.
+            to_q: QLinear::linear_detect(inner, inner, &vb, "to_q", true)?,
+            to_k: QLinear::linear_detect(inner, inner, &vb, "to_k", true)?,
+            to_v: QLinear::linear_detect(inner, inner, &vb, "to_v", true)?,
+            to_out: QLinear::linear_detect(inner, inner, &vb, "to_out.0", true)?,
             norm_q,
             norm_k,
             heads: cfg.num_heads,
@@ -518,9 +535,10 @@ struct FeedForward {
 impl FeedForward {
     fn new(in_dim: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
         // diffusers FeedForward nests the input projection at `net.0.proj` and the output at `net.2`.
+        // Packed-detecting (sc-9414): the full dotted bases keep `.scales`/`.biases` under the nesting.
         Ok(Self {
-            proj: QLinear::linear(in_dim, hidden, vb.pp("net").pp("0").pp("proj"))?,
-            out: QLinear::linear(hidden, in_dim, vb.pp("net").pp("2"))?,
+            proj: QLinear::linear_detect(in_dim, hidden, &vb, "net.0.proj", true)?,
+            out: QLinear::linear_detect(hidden, in_dim, &vb, "net.2", true)?,
         })
     }
 
@@ -731,7 +749,9 @@ impl AdaLayerNormContinuous {
     fn new(inner: usize, vb: VarBuilder) -> Result<Self> {
         // diffusers `norm_out.norm` is an affine-free LayerNorm, so there are no norm weights to
         // load — `forward` runs the parameterless `layer_norm` then applies the AdaLN scale/shift.
-        let linear = candle_nn::linear(inner, 2 * inner, vb.pp("linear"))?;
+        // Packed-detecting dense (sc-9414): dequantized to a dense leaf on a packed tier, plain read
+        // otherwise; kept dense (the chaos-sensitive AdaLN-continuous head).
+        let linear = linear_detect_dense(inner, 2 * inner, &vb, "linear", true)?;
         Ok(Self { linear })
     }
 
@@ -782,14 +802,18 @@ impl Sd3Transformer {
         Ok(Self {
             pos_embed: PatchEmbed::new(cfg, vb.pp("pos_embed"))?,
             time_text_embed: CombinedTimestepTextEmbed::new(cfg, vb.pp("time_text_embed"))?,
-            context_embedder: QLinear::linear(
+            // Packed-detecting (sc-9414): `context_embedder` / `proj_out` load `Packed` on a packed
+            // tier (no dense staging), else dense (unchanged).
+            context_embedder: QLinear::linear_detect(
                 cfg.joint_attention_dim,
                 inner,
-                vb.pp("context_embedder"),
+                &vb,
+                "context_embedder",
+                true,
             )?,
             blocks,
             norm_out: AdaLayerNormContinuous::new(inner, vb.pp("norm_out"))?,
-            proj_out: QLinear::linear(inner, cfg.patch_dim(), vb.pp("proj_out"))?,
+            proj_out: QLinear::linear_detect(inner, cfg.patch_dim(), &vb, "proj_out", true)?,
             cfg: cfg.clone(),
         })
     }

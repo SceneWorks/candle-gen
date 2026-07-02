@@ -193,8 +193,27 @@ impl Pipeline {
         // (`merge_adapters`) before the build; otherwise the stock mmap build (byte-identical to the
         // pre-sc-7881 path). The merge always runs **before** quantization so Q4/Q8 folds the adapted
         // weights. `dit_vb_on(device)` returns the right source on the requested device.
+        // Whether `transformer/` is a pre-quantized MLX-packed tier (`config.json` carries a
+        // `quantization` block). Adapters merge into *dense* `transformer/` keys, so an adapter merge is
+        // incompatible with a packed tier — fall back to the dense CPU-stage path when adapters are
+        // present (the hosted packed tiers ship no LoRA-mergeable dense keys anyway).
+        let packed_tier = self.adapters.is_empty() && self.transformer_is_packed();
         let transformer = match self.quant {
-            // sc-8504 CPU-stage path: build the dense MMDiT on a **CPU** VarBuilder, then
+            // sc-9414 packed path: build the MMDiT **directly on the GPU** from the MLX-packed tier —
+            // each projection packed-detects its `.scales` sibling and lands its Q4_1/Q8_0 footprint
+            // straight on the device (no dense bf16 staging, no load-then-quantize). The post-load
+            // `quantize_onto` pass is a no-op on the already-packed projections and only re-migrates the
+            // dense-kept leaves (already on the GPU). The AdaLN/embedder leaves are dequantized to dense
+            // full-precision leaves inside `new` (see `quant::linear_detect_dense`). TE + VAE stay dense.
+            Some(q) if packed_tier => {
+                let mut transformer = Sd3Transformer::new(
+                    &self.cfg,
+                    self.component_vb_on("transformer", &self.device)?,
+                )?;
+                transformer.quantize_onto(q, &self.device)?;
+                transformer
+            }
+            // sc-8504 CPU-stage path (dense tier): build the dense MMDiT on a **CPU** VarBuilder, then
             // `quantize_onto` the compute device — the quantized projections land directly on the GPU
             // (the dense projection weight never touches it) and the dense-kept leaves migrate
             // alongside. This drops the in-place dense-build transient (sc-7879 built dense on-device
@@ -256,6 +275,22 @@ impl Pipeline {
         let files = self.component_files(sub)?;
         // SAFETY: mmap of read-only weight files; standard candle loading path.
         Ok(unsafe { VarBuilder::from_mmaped_safetensors(&files, self.dtype, device)? })
+    }
+
+    /// Whether the `transformer/` component is a **pre-quantized MLX-packed tier** — its `config.json`
+    /// carries a `quantization` block ([`candle_gen::quant::PackedConfig`]), which the `sd3.5-*-mlx`
+    /// convert job writes for the packed DiT. On a packed tier the loader builds each Linear directly
+    /// from the packed parts on the GPU (sc-9414, no dense CPU staging); on a dense tier it falls back to
+    /// the CPU-stage → quantize-onto-GPU path. Absent/unreadable config → not packed (dense path), so a
+    /// fixture with no `config.json` still loads. (The SD3.5 tier packs at the MLX default group size 64,
+    /// which the shared loaders assume, so only the packed *presence* is consulted here.)
+    fn transformer_is_packed(&self) -> bool {
+        let path = self.root.join("transformer").join("config.json");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
+            .is_some()
     }
 
     /// The DiT [`VarBuilder`] on `device`: the stock mmap build when no adapters are present, else the
