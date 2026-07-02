@@ -19,26 +19,43 @@ use crate::{CandleError, Result};
 /// The optimizer names the worker may request (mirrors the MLX `SUPPORTED_OPTIMIZERS`).
 pub const SUPPORTED_OPTIMIZERS: [&str; 4] = ["adamw", "adam", "rose", "prodigy"];
 
-/// Collapse an optimizer name to its canonical form (`"AdamW"`/`"adamw8bit"` → `"adamw"`,
-/// `"prodigy-opt"` → `"prodigy"`, `"rose_opt"` → `"rose"`). Unknown names pass through (and then fail
-/// [`TrainOptimizer::from_config`]).
+/// Recognized optimizer aliases → canonical form, matched **exactly** after lowercasing and stripping
+/// non-alphanumerics (so `"AdamW"`, `"adamw-8bit"`, `"prodigy_opt"` all reach the same key). Mirrors
+/// the MLX `build_optimizer` alias set (`training_adapters.py`): `adamw8bit`/`adam8bit` collapse to
+/// full-precision `adamw` (candle has no bitsandbytes 8-bit optimizer, same as the MLX bnb-unavailable
+/// fallback), and `prodigyopt`/`roseopt` are the pip-package spellings. Anything NOT listed here is
+/// rejected by [`normalize`] rather than silently coerced to a default — a typo like `"adamaxx"` or an
+/// unsupported optimizer like `"lion"` must fail validation, not train as the wrong optimizer.
+const OPTIMIZER_ALIASES: [(&str, &str); 8] = [
+    ("adamw", "adamw"),
+    ("adamw8bit", "adamw"),
+    ("adam8bit", "adamw"),
+    ("adam", "adam"),
+    ("rose", "rose"),
+    ("roseopt", "rose"),
+    ("prodigy", "prodigy"),
+    ("prodigyopt", "prodigy"),
+];
+
+/// Collapse a recognized optimizer alias to its canonical form (`"AdamW"`/`"adamw8bit"` → `"adamw"`,
+/// `"prodigy-opt"` → `"prodigy"`, `"rose_opt"` → `"rose"`) via **exact** (separator-insensitive,
+/// case-insensitive) matching against [`OPTIMIZER_ALIASES`].
+///
+/// Unknown names pass through **unchanged** (the separator-stripped, lowercased form) so they fail
+/// [`TrainOptimizer::from_config`] with a clear error listing the supported set — unlike the previous
+/// substring matching, a near-miss (`"adamax"`, `"radam"`, `"nadam"`, `"adamw8bit_typo"`) no longer
+/// silently trains as plain Adam/AdamW.
 pub fn normalize(name: &str) -> String {
     let s: String = name
         .to_ascii_lowercase()
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect();
-    if s.contains("prodigy") {
-        "prodigy".into()
-    } else if s.contains("rose") {
-        "rose".into()
-    } else if s.contains("adamw") {
-        "adamw".into()
-    } else if s.contains("adam") {
-        "adam".into()
-    } else {
-        s
-    }
+    OPTIMIZER_ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == s)
+        .map(|(_, canonical)| (*canonical).to_string())
+        .unwrap_or(s)
 }
 
 /// Global L2-norm gradient clipping over `vars`' gradients in `grads` (candle ships no built-in). If
@@ -448,22 +465,110 @@ mod tests {
         Var::from_tensor(&Tensor::from_vec(data.to_vec(), shape, &Device::Cpu).unwrap()).unwrap()
     }
 
+    /// Every recognized alias (case/separator variants + the pip-package spellings) resolves to its
+    /// canonical optimizer, and each canonical form is one of `SUPPORTED_OPTIMIZERS`.
     #[test]
     fn normalize_collapses_aliases() {
+        // adamw family (incl. the 8-bit spellings that collapse to full-precision AdamW).
+        assert_eq!(normalize("adamw"), "adamw");
         assert_eq!(normalize("AdamW"), "adamw");
-        assert_eq!(normalize("prodigy-opt"), "prodigy");
-        assert_eq!(normalize("rose_opt"), "rose");
         assert_eq!(normalize("adamw8bit"), "adamw");
+        assert_eq!(normalize("AdamW-8bit"), "adamw");
+        assert_eq!(normalize("adamw_8bit"), "adamw");
+        assert_eq!(normalize("adam8bit"), "adamw");
+        // plain adam stays adam (weight-decay-free).
         assert_eq!(normalize("adam"), "adam");
+        assert_eq!(normalize("Adam"), "adam");
+        // rose + pip spelling.
+        assert_eq!(normalize("rose"), "rose");
+        assert_eq!(normalize("Rose"), "rose");
+        assert_eq!(normalize("rose_opt"), "rose");
+        assert_eq!(normalize("rose-opt"), "rose");
+        assert_eq!(normalize("roseopt"), "rose");
+        // prodigy + pip spelling.
+        assert_eq!(normalize("prodigy"), "prodigy");
+        assert_eq!(normalize("Prodigy"), "prodigy");
+        assert_eq!(normalize("prodigy-opt"), "prodigy");
+        assert_eq!(normalize("prodigyopt"), "prodigy");
+        // every canonical target is a supported optimizer.
+        for (_, canonical) in OPTIMIZER_ALIASES {
+            assert!(
+                SUPPORTED_OPTIMIZERS.contains(&canonical),
+                "alias target {canonical:?} not in SUPPORTED_OPTIMIZERS"
+            );
+        }
         assert!(TrainOptimizer::is_supported("Prodigy"));
         assert!(TrainOptimizer::is_supported("rose"));
         assert!(!TrainOptimizer::is_supported("lion"));
     }
 
+    /// The exact-match fix (sc-9017 / F-033): names that the previous `contains` matching silently
+    /// mis-mapped now pass through unchanged and are NOT recognized as any supported optimizer. Under
+    /// substring matching `adamax`/`radam`/`nadam` all matched `"adam"` and `adamw8bittypo` matched
+    /// `"adamw"`; each must now be rejected.
+    #[test]
+    fn normalize_rejects_substring_near_misses() {
+        for name in [
+            "adamax",
+            "radam",
+            "nadam",
+            "adamwww",
+            "prodigyx",
+            "rosewater",
+        ] {
+            let n = normalize(name);
+            // Passes through as the stripped form; crucially not coerced to a canonical optimizer.
+            assert!(
+                !SUPPORTED_OPTIMIZERS.contains(&n.as_str()),
+                "{name:?} should NOT normalize to a supported optimizer, got {n:?}"
+            );
+            assert!(
+                !TrainOptimizer::is_supported(name),
+                "{name:?} must not be treated as supported"
+            );
+        }
+    }
+
+    /// An unrecognized optimizer name fails `from_config` with an error that lists the supported set.
     #[test]
     fn from_config_rejects_unsupported() {
-        let v = vec![var(&[1.0], (1, 1))];
-        assert!(TrainOptimizer::from_config("lion", v, 1e-4, 0.0).is_err());
+        for name in ["lion", "adamax", "radam", "nadam"] {
+            let v = vec![var(&[1.0], (1, 1))];
+            let msg = match TrainOptimizer::from_config(name, v, 1e-4, 0.0) {
+                Ok(_) => panic!("unrecognized optimizer {name:?} must error"),
+                Err(e) => e.to_string(),
+            };
+            for opt in SUPPORTED_OPTIMIZERS {
+                assert!(
+                    msg.contains(opt),
+                    "error for {name:?} should list supported optimizer {opt:?}: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Every recognized alias actually constructs its optimizer (existing configs keep working).
+    #[test]
+    fn from_config_accepts_all_aliases() {
+        for name in [
+            "adamw",
+            "AdamW",
+            "adamw8bit",
+            "adam8bit",
+            "adam",
+            "rose",
+            "rose_opt",
+            "roseopt",
+            "prodigy",
+            "prodigy-opt",
+            "prodigyopt",
+        ] {
+            let v = vec![var(&[1.0, 2.0], (1, 2))];
+            assert!(
+                TrainOptimizer::from_config(name, v, 1e-4, 0.0).is_ok(),
+                "alias {name:?} should construct an optimizer"
+            );
+        }
     }
 
     /// Rose 2-D, centralize + stabilize OFF: θ -= lr · g / (|max_row| − min_row), per row.
