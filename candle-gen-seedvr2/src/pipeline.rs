@@ -128,11 +128,17 @@ impl Seedvr2Pipeline {
         let vae_path = dir.join("ema_vae_fp16.safetensors");
         let dit_path = dir.join(dit_file);
         let weights_bytes = resident_weight_bytes(&[vae_path.as_path(), dit_path.as_path()], dt);
+        // Stream each checkpoint one at a time and convert+cast tensor-by-tensor: the raw fp16 map is
+        // consumed (moved into `convert_*`) and each raw tensor drops as its `dt` cast is produced, so
+        // the raw set and the cast copy never both live for all weights (peak load memory ~1× rather
+        // than 2×/3× — sc-9042/F-058). VAE is fully built (and its raw map freed) before the 7B DiT is
+        // read, bounding peak further. Loaded values are identical to the prior two-phase convert+cast.
         let vae_raw = Weights::from_file(&vae_path, device)?;
-        let dit_raw = Weights::from_file(&dit_path, device)?;
-        let vae_w = convert::convert_vae(&vae_raw)?.cast(dt)?;
-        let dit_w = convert::convert_dit(&dit_raw)?.cast(dt)?;
+        let vae_w = convert::convert_vae(vae_raw, dt)?;
         let vae = Seedvr2Vae::from_weights(&vae_w)?;
+        drop(vae_w);
+        let dit_raw = Weights::from_file(&dit_path, device)?;
+        let dit_w = convert::convert_dit(dit_raw, dt)?;
         let transformer = Seedvr2Transformer::from_weights(&dit_w, cfg)?;
         let neg_embed = load_neg_embed(dt, device)?;
         let mut p = Self::from_parts(vae, transformer, neg_embed, dt, device.clone());

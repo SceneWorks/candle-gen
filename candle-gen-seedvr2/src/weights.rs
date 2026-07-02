@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use candle_gen::candle_core::{DType, Device, Tensor};
+use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::{CandleError, Result as CResult};
 
 /// An owned `name → Tensor` table.
@@ -47,12 +47,10 @@ impl Weights {
         self.map.keys().map(String::as_str)
     }
 
-    /// A copy with every tensor cast to `dt` (the load-time dense precision).
-    pub fn cast(&self, dt: DType) -> CResult<Self> {
-        let mut out = Weights::empty();
-        for (k, v) in &self.map {
-            out.insert(k.clone(), v.to_dtype(dt)?);
-        }
-        Ok(out)
+    /// Drain `self` into `(key, tensor)` pairs, consuming the map so each raw tensor can be dropped by
+    /// the caller as it is cast (streaming convert+cast keeps peak load memory to ~1× rather than
+    /// holding the whole raw fp16 set and the whole cast copy at once — sc-9042/F-058).
+    pub fn into_iter_entries(self) -> impl Iterator<Item = (String, Tensor)> {
+        self.map.into_iter()
     }
 }
