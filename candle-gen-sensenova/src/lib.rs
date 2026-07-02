@@ -68,6 +68,11 @@ const DEFAULT_GUIDANCE: f32 = 4.0;
 /// Distilled defaults (`docs/base_vs_distill.md`): 8 NFE at CFG 1.0 (guidance off).
 const DEFAULT_STEPS_FAST: u32 = 8;
 const DEFAULT_GUIDANCE_FAST: f32 = 1.0;
+/// The product inference timestep-shift for the t2i path when the request doesn't override it
+/// (`req.scheduler_shift`). This is the *pipeline* shift the reference `t2i_generate` applies at
+/// sampling time — deliberately **3.0**, which is distinct from the checkpoint's config-declared
+/// `timestep_shift` (`NeoChatConfig::timestep_shift`, `1.0` for the shipped 8B-MoT). See
+/// [`NeoChatConfig::inference_timestep_shift`] for why the config field does *not* feed inference.
 const DEFAULT_TIMESTEP_SHIFT: f32 = 3.0;
 /// Cell = patch·merge: every side must be a multiple of this (the patchify grid).
 pub const SIZE_MULTIPLE: u32 = 32;
@@ -132,6 +137,9 @@ fn descriptor_for(id: &'static str) -> ModelDescriptor {
 struct Components {
     tokenizer: Arc<SenseNovaTokenizer>,
     model: Arc<T2iModel>,
+    /// The parsed checkpoint config, kept so `options` can resolve the inference timestep shift from
+    /// the checkpoint's own `timestep_shift` rather than always the product default (sc-9029).
+    cfg: Arc<NeoChatConfig>,
 }
 
 /// A loaded candle SenseNova-U1 generator. Loading is **lazy**: `load` does no file I/O (registry
@@ -178,13 +186,18 @@ impl SenseNovaGenerator {
         let comps = Components {
             tokenizer: Arc::new(tokenizer),
             model: Arc::new(model),
+            cfg: Arc::new(cfg),
         };
         *guard = Some(comps.clone());
         Ok(comps)
     }
 
     /// Map a request to [`T2iOptions`] (distilled vs base defaults; explicit request values win).
-    fn options(&self, req: &GenerationRequest, seed: u64) -> T2iOptions {
+    ///
+    /// `cfg` is the loaded checkpoint config: the timestep shift is resolved through
+    /// [`NeoChatConfig::inference_timestep_shift`] so a future checkpoint variant that declares its
+    /// own inference shift is honored instead of being shadowed by the product default (sc-9029).
+    fn options(&self, req: &GenerationRequest, cfg: &NeoChatConfig, seed: u64) -> T2iOptions {
         let (def_steps, def_guidance) = if self.fast {
             (DEFAULT_STEPS_FAST, DEFAULT_GUIDANCE_FAST)
         } else {
@@ -193,7 +206,12 @@ impl SenseNovaGenerator {
         T2iOptions {
             cfg_scale: req.guidance.unwrap_or(def_guidance),
             num_steps: req.steps.unwrap_or(def_steps) as usize,
-            timestep_shift: req.scheduler_shift.unwrap_or(DEFAULT_TIMESTEP_SHIFT),
+            // Precedence: explicit request wins; else the checkpoint's own inference shift if it
+            // declares one; else the product default (3.0). Reads the parsed config so the field is
+            // no longer a silent shadow (sc-9029 / F-045).
+            timestep_shift: req
+                .scheduler_shift
+                .unwrap_or_else(|| cfg.inference_timestep_shift(DEFAULT_TIMESTEP_SHIFT)),
             seed,
             ..Default::default()
         }
@@ -216,7 +234,7 @@ impl SenseNovaGenerator {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
-            let opts = self.options(req, base_seed.wrapping_add(i as u64));
+            let opts = self.options(req, &comps.cfg, base_seed.wrapping_add(i as u64));
             let img = comps.model.generate(
                 &comps.tokenizer,
                 &req.prompt,
@@ -453,6 +471,42 @@ mod tests {
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
+    }
+
+    /// sc-9029 / F-045: `options` must route the timestep shift through the checkpoint config, not a
+    /// hardcoded 3.0. Pins the resolved `T2iOptions.timestep_shift` against request/config precedence.
+    #[test]
+    fn options_resolves_timestep_shift_from_request_then_config() {
+        let gen = SenseNovaGenerator {
+            descriptor: descriptor(),
+            root: "/nonexistent".into(),
+            device: candle_gen::default_device().unwrap(),
+            fast: false,
+            components: Mutex::new(None),
+        };
+        let req = GenerationRequest {
+            prompt: "a cat".into(),
+            width: 512,
+            height: 512,
+            ..Default::default()
+        };
+
+        // Shipped 8B-MoT (config timestep_shift = 1.0 identity) → product default 3.0, unchanged render.
+        let shipped = crate::config::mot_8b();
+        assert_eq!(gen.options(&req, &shipped, 0).timestep_shift, 3.0);
+
+        // An explicit request scheduler_shift wins over everything.
+        let req_shift = GenerationRequest {
+            scheduler_shift: Some(2.5),
+            ..req.clone()
+        };
+        assert_eq!(gen.options(&req_shift, &shipped, 0).timestep_shift, 2.5);
+
+        // A checkpoint variant declaring its own inference shift is honored (no longer shadowed).
+        let variant = crate::config::variant_with_timestep_shift(7.0);
+        assert_eq!(gen.options(&req, &variant, 0).timestep_shift, 7.0);
+        // ...but an explicit request still overrides the variant's config value.
+        assert_eq!(gen.options(&req_shift, &variant, 0).timestep_shift, 2.5);
     }
 
     #[test]
