@@ -362,7 +362,10 @@ impl Prodigy {
                     exp_avg: p.zeros_like()?,
                     exp_avg_sq: p.zeros_like()?,
                     s: p.zeros_like()?,
-                    p0: p.detach(),
+                    // Snapshot the initial params with a genuine copy: `detach()` only Arc-clones the
+                    // storage, which `Var::set` later mutates in place (pass 2), so an aliased `p0`
+                    // would always equal the live param and zero out ⟨g, p0 − p⟩ every step (sc-9036).
+                    p0: p.detach().copy()?,
                 });
             }
             let st = self.state.get(&i).unwrap();
@@ -562,8 +565,11 @@ mod tests {
     }
 
     /// Prodigy's pass-1 numerator/denominator (now accumulated on-device, sc-9036) must match the old
-    /// per-var `to_scalar` reduction: run a first step and check the adapted `d` equals the value the
-    /// per-scalar formula yields for the same inputs (first step: exp_avg/s seed from zeros).
+    /// per-var `to_scalar` reduction. Step 1 seeds exp_avg/s from zeros with `p0 == p` (dot term 0);
+    /// step 2 — after pass-2 has MOVED the params — has `p0 != p`, so `⟨g, p0 − p⟩ ≠ 0` and the
+    /// delta-numerator is exercised for real. This second step is the guard against the p0-snapshot
+    /// aliasing bug (F-052): `detach()` alone Arc-clones storage that `Var::set` mutates in place, so
+    /// an aliased p0 would leave the dot term identically 0 on step 2 too and `d` would never adapt.
     #[test]
     fn prodigy_first_step_d_matches_per_scalar_reduction() {
         let dev = Device::Cpu;
@@ -638,6 +644,70 @@ mod tests {
             "on-device Prodigy d {} != per-scalar d {}",
             prod.d,
             ref_d
+        );
+
+        // --- Second step: pass-2 of step 1 moved every param, so now p0 != p. Recompute the
+        // reference per-scalar delta_numerator/denominator against the CAPTURED post-step-1 state
+        // (p0 snapshot + accumulated s + carried d_numerator) and confirm the on-device reduction
+        // still matches. With an aliased p0 the dot term below would be identically 0 (bug), so this
+        // asserts the numerator is genuinely non-zero AND numerically exact.
+        let d1 = prod.d;
+        let d0_1 = prod.d0;
+        let dlr1 = d1 * prod.lr;
+        let d_num_start = prod.d_numerator; // carried from step 1
+        let mut ref_delta_num2 = 0f64;
+        let mut ref_denom2 = 0f64;
+        for (i, v) in vars.iter().enumerate() {
+            let g = grads.get(v.as_tensor()).unwrap();
+            let p = v.as_tensor();
+            let st = prod.state.get(&i).unwrap();
+            // p0 is the ORIGINAL param snapshot; p is the moved value ⇒ non-zero displacement.
+            let dot = (g * (&st.p0 - p).unwrap())
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_dtype(candle_core::DType::F64)
+                .unwrap()
+                .to_scalar::<f64>()
+                .unwrap();
+            ref_delta_num2 += (d1 / d0_1) * dlr1 * dot;
+            // s_new = s_old·beta3 + g·((d/d0)·dlr), reading the s accumulated on step 1.
+            let s = ((&st.s * prod.beta3).unwrap() + (g * ((d1 / d0_1) * dlr1)).unwrap()).unwrap();
+            ref_denom2 += s
+                .abs()
+                .unwrap()
+                .sum_all()
+                .unwrap()
+                .to_dtype(candle_core::DType::F64)
+                .unwrap()
+                .to_scalar::<f64>()
+                .unwrap();
+        }
+        assert!(
+            ref_delta_num2.abs() > 1e-12,
+            "step-2 dot term must be non-zero once params have moved (p0 snapshot fix); got {ref_delta_num2}"
+        );
+        let ref_global_num2 = d_num_start * prod.beta3 + ref_delta_num2;
+        let ref_d_hat2 = prod.d_coef * ref_global_num2 / ref_denom2;
+        let ref_d_max2 = prod.d_max.max(ref_d_hat2);
+        let mut ref_d2 = d1;
+        if d1 == d0_1 {
+            ref_d2 = d1.max(ref_d_hat2);
+        }
+        ref_d2 = ref_d_max2.min(ref_d2 * prod.growth_rate);
+
+        prod.step(&grads).unwrap();
+        assert!(
+            (prod.d_numerator - ref_global_num2).abs() <= 1e-15 * ref_global_num2.abs().max(1e-12),
+            "on-device Prodigy d_numerator {} != per-scalar {}",
+            prod.d_numerator,
+            ref_global_num2
+        );
+        assert!(
+            (prod.d - ref_d2).abs() <= 1e-15 * ref_d2.abs().max(1e-12),
+            "on-device Prodigy d {} != per-scalar d {} (step 2)",
+            prod.d,
+            ref_d2
         );
     }
 
