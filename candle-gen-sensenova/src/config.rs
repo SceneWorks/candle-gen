@@ -110,7 +110,20 @@ pub struct NeoChatConfig {
     pub patch_size: usize,
 
     // ---- flow-matching image generation ----
+    /// The checkpoint's config-declared flow-match timestep shift. **Reference/training metadata**,
+    /// not the inference sampler shift the pipeline applies by default: for the shipped 8B-MoT this is
+    /// `1.0` while the t2i pipeline samples at the product default `3.0`
+    /// (`candle_gen_sensenova::DEFAULT_TIMESTEP_SHIFT`). Use [`inference_timestep_shift`] to resolve
+    /// the shift the sampler should use rather than reading this field directly.
+    ///
+    /// [`inference_timestep_shift`]: NeoChatConfig::inference_timestep_shift
     pub timestep_shift: f32,
+    /// Whether `config.json` explicitly declared `timestep_shift` (vs. the parser's default). A future
+    /// checkpoint variant that ships its own inference shift is detected via this flag so its value is
+    /// honored instead of the product default; see [`inference_timestep_shift`] (sc-9029 / F-045).
+    ///
+    /// [`inference_timestep_shift`]: NeoChatConfig::inference_timestep_shift
+    pub timestep_shift_declared: bool,
     pub time_schedule: String,
     pub time_shift_type: String,
     pub base_shift: f32,
@@ -163,6 +176,7 @@ impl NeoChatConfig {
             downsample_ratio: get_f32(v, "downsample_ratio", 0.5),
             patch_size: get_usize(v, "patch_size", 16),
             timestep_shift: get_f32(v, "timestep_shift", 1.0),
+            timestep_shift_declared: v.get("timestep_shift").and_then(Value::as_f64).is_some(),
             time_schedule: get_str(v, "time_schedule", "standard"),
             time_shift_type: get_str(v, "time_shift_type", "exponential"),
             base_shift: get_f32(v, "base_shift", 0.5),
@@ -193,6 +207,33 @@ impl NeoChatConfig {
         let v: Value = serde_json::from_str(&text)
             .map_err(|e| CandleError::Msg(format!("sensenova: parsing {}: {e}", path.display())))?;
         Self::from_config_json(&v)
+    }
+
+    /// Resolve the flow-match timestep shift the t2i sampler should use, given the pipeline's
+    /// `product_default` (the reference `t2i_generate` shift, `3.0`).
+    ///
+    /// Fixes the sc-9029 / F-045 shadow: the parsed [`timestep_shift`](Self::timestep_shift) field was
+    /// silently ignored, so a future checkpoint variant declaring its own inference shift would still
+    /// have rendered at the hardcoded `3.0`. Precedence now honors the checkpoint:
+    ///
+    /// * If `config.json` **declares** a `timestep_shift` that is a genuine inference override — i.e.
+    ///   present and not the identity `1.0` the shipped 8B-MoT carries — use it. This is how a variant
+    ///   opts into a different sampler shift.
+    /// * Otherwise fall back to `product_default`.
+    ///
+    /// The shipped 8B-MoT declares `timestep_shift: 1.0` (a training-config artifact / identity shift)
+    /// while its reference inference pipeline samples at `3.0`; that `1.0` is deliberately *not* an
+    /// inference override, so it correctly falls through to the product default — preserving the
+    /// existing render for that checkpoint while no longer shadowing the field for other checkpoints.
+    pub fn inference_timestep_shift(&self, product_default: f32) -> f32 {
+        // The reference identity shift (`apply_time_schedule(t, 1.0)` is the untouched linspace); a
+        // checkpoint carrying it has declared no special inference shift, so the product default wins.
+        const IDENTITY_SHIFT: f32 = 1.0;
+        if self.timestep_shift_declared && self.timestep_shift != IDENTITY_SHIFT {
+            self.timestep_shift
+        } else {
+            product_default
+        }
     }
 }
 
@@ -296,6 +337,18 @@ pub(crate) fn mot_8b() -> NeoChatConfig {
         .expect("8B-MoT fixture has llm_config + vision_config")
 }
 
+/// An 8B-MoT-shaped fixture that declares a custom (non-identity) inference `timestep_shift` — a
+/// stand-in for a future checkpoint variant. Shared with the lib `options` test (sc-9029).
+#[cfg(test)]
+pub(crate) fn variant_with_timestep_shift(shift: f32) -> NeoChatConfig {
+    let json = MOT_8B_CONFIG.replace(
+        "\"timestep_shift\": 1.0,",
+        &format!("\"timestep_shift\": {shift},"),
+    );
+    NeoChatConfig::from_config_json(&serde_json::from_str(&json).unwrap())
+        .expect("variant fixture parses")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,5 +394,38 @@ mod tests {
 
         let ok: Value = serde_json::from_str(r#"{"llm_config":{},"vision_config":{}}"#).unwrap();
         assert!(NeoChatConfig::from_config_json(&ok).is_ok());
+    }
+
+    /// sc-9029 / F-045: `inference_timestep_shift` must actually read the parsed config, not silently
+    /// shadow it with the product default — while still preserving the shipped 8B-MoT's render.
+    #[test]
+    fn inference_timestep_shift_honors_declared_override() {
+        // Shipped 8B-MoT declares `timestep_shift: 1.0` (identity / training artifact), so the
+        // pipeline default (3.0) wins — the historical render is unchanged.
+        let shipped = mot_8b();
+        assert!(shipped.timestep_shift_declared);
+        assert_eq!(shipped.timestep_shift, 1.0);
+        assert_eq!(
+            shipped.inference_timestep_shift(3.0),
+            3.0,
+            "identity shift 1.0 falls through to the product default"
+        );
+
+        // A future checkpoint variant declaring a real inference shift is honored, not shadowed.
+        let variant = variant_with_timestep_shift(5.0);
+        assert!(variant.timestep_shift_declared);
+        assert_eq!(
+            variant.inference_timestep_shift(3.0),
+            5.0,
+            "a declared non-identity shift overrides the product default"
+        );
+
+        // A config that omits the field entirely falls through to the product default and is flagged
+        // as not-declared.
+        let json = MOT_8B_CONFIG.replace("\"timestep_shift\": 1.0,", "");
+        let absent =
+            NeoChatConfig::from_config_json(&serde_json::from_str(&json).unwrap()).unwrap();
+        assert!(!absent.timestep_shift_declared);
+        assert_eq!(absent.inference_timestep_shift(3.0), 3.0);
     }
 }
