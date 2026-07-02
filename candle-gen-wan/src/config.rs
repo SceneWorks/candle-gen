@@ -212,13 +212,15 @@ pub const T2V_14B_FLOW_SHIFT: f64 = 12.0;
 pub const T2V_14B_GUIDANCE_LOW: f32 = 3.0;
 pub const T2V_14B_GUIDANCE_HIGH: f32 = 4.0;
 
-/// I2V-A14B MoE knobs: boundary `0.900·1000`; flow-shift 5.0; per-expert CFG (both 3.5). Max-area cap
-/// 704×1280 (aspect-preserving grid-aligned fit), like the 5B.
+/// I2V-A14B MoE knobs: boundary `0.900·1000`; flow-shift 5.0; per-expert CFG (both 3.5).
 pub const I2V_14B_BOUNDARY: f64 = 0.900;
 pub const I2V_14B_FLOW_SHIFT: f64 = 5.0;
 pub const I2V_14B_GUIDANCE_LOW: f32 = 3.5;
 pub const I2V_14B_GUIDANCE_HIGH: f32 = 3.5;
-/// Resolution cap for I2V (and the 5B): the long edge × short edge must fit `704·1280`.
+/// Resolution envelope for the A14B MoE (both T2V and I2V): `width × height` must not exceed
+/// `704·1280` (901 120 px). Both variants keep two resident 14B experts, so an over-area request is a
+/// far-over-envelope run that would otherwise fail opaquely (OOM). Enforced in
+/// [`crate::wan14b`]'s `validate` — a request past the cap is rejected with an actionable message.
 pub const MAX_AREA_14B: usize = 704 * 1280;
 
 // ===========================================================================================

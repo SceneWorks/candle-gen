@@ -36,7 +36,7 @@ use candle_gen::{CandleError, Result as CResult};
 use crate::config::{
     TextEncoderConfig, TransformerConfig, Vae16Config, DEFAULT_FPS_14B, DEFAULT_FRAMES_14B,
     DEFAULT_STEPS_14B, I2V_14B_BOUNDARY, I2V_14B_FLOW_SHIFT, I2V_14B_GUIDANCE_HIGH,
-    I2V_14B_GUIDANCE_LOW, MODEL_ID_I2V_14B, MODEL_ID_T2V_14B, NEGATIVE_FALLBACK,
+    I2V_14B_GUIDANCE_LOW, MAX_AREA_14B, MODEL_ID_I2V_14B, MODEL_ID_T2V_14B, NEGATIVE_FALLBACK,
     NUM_TRAIN_TIMESTEPS, SIZE_MULTIPLE_14B, T2V_14B_BOUNDARY, T2V_14B_FLOW_SHIFT,
     T2V_14B_GUIDANCE_HIGH, T2V_14B_GUIDANCE_LOW, VAE16_STRIDE_SPATIAL, VAE16_STRIDE_TEMPORAL,
 };
@@ -556,6 +556,16 @@ impl Generator for Wan14bGenerator {
                 req.width, req.height
             )));
         }
+        // The A14B MoE keeps two resident 14B experts; an over-area request is a far-over-envelope run
+        // that fails opaquely (OOM). Reject past the documented cap with an actionable message (sc-9028).
+        let area = req.width as usize * req.height as usize;
+        if area > MAX_AREA_14B {
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_14B} px \
+                 (704×1280); reduce the resolution",
+                req.width, req.height
+            )));
+        }
         if let Some(f) = req.frames {
             if f == 0 || f % 4 != 1 {
                 return Err(gen_core::Error::Msg(format!(
@@ -801,6 +811,15 @@ mod tests {
                 sampler: Some("dpmpp2m".into()),
                 ..Default::default()
             },
+            // over the MAX_AREA_14B envelope — 1280×1280 (both grid-aligned) is 2.2× the cap (sc-9028)
+            GenerationRequest {
+                prompt: "x".into(),
+                width: 1280,
+                height: 1280,
+                frames: Some(17),
+                sampler: Some("uni_pc".into()),
+                ..Default::default()
+            },
         ] {
             assert!(t2v.validate(&bad).is_err(), "should reject: {bad:?}");
         }
@@ -808,6 +827,55 @@ mod tests {
         // I2V rejects a request with no Reference image.
         let i2v = registry::load(MODEL_ID_I2V_14B, &spec).unwrap();
         assert!(i2v.validate(&ok).is_err(), "i2v needs a reference image");
+    }
+
+    /// The documented `MAX_AREA_14B` cap is actually enforced: an at-cap request passes and a
+    /// grid-aligned over-cap request is rejected with an actionable message (sc-9028 / F-044).
+    #[test]
+    fn validate_enforces_max_area() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let t2v = registry::load(MODEL_ID_T2V_14B, &spec).unwrap();
+        let base = GenerationRequest {
+            prompt: "a cat walking across a sunny garden".into(),
+            frames: Some(17),
+            sampler: Some("uni_pc".into()),
+            ..Default::default()
+        };
+
+        // Exactly at the cap (704×1280 = 901 120 px, both multiples of 16) is accepted.
+        assert_eq!(704 * 1280, MAX_AREA_14B);
+        assert!(t2v
+            .validate(&GenerationRequest {
+                width: 1280,
+                height: 704,
+                ..base.clone()
+            })
+            .is_ok());
+
+        // Over the cap while both edges stay within the per-edge range (1280×1024 = 1 310 720 px,
+        // both grid-aligned and ≤ 1280) is rejected specifically by the area check, with an
+        // actionable message that names the cap.
+        let err = t2v
+            .validate(&GenerationRequest {
+                width: 1280,
+                height: 1024,
+                ..base.clone()
+            })
+            .expect_err("over-area request must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("max area"), "actionable message: {msg}");
+
+        // The same cap applies to the I2V variant (both keep two resident 14B experts).
+        let i2v = registry::load(MODEL_ID_I2V_14B, &spec).unwrap();
+        assert!(
+            i2v.validate(&GenerationRequest {
+                width: 1280,
+                height: 1024,
+                ..base
+            })
+            .is_err(),
+            "i2v enforces the same max-area cap"
+        );
     }
 
     #[test]
