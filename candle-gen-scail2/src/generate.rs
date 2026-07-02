@@ -155,23 +155,48 @@ fn apply_clean_history(latent: &Tensor, history: Option<&Tensor>) -> CResult<Ten
     Ok(Tensor::cat(&[&head, &tail], 1)?)
 }
 
-/// Segment plan over `total` driving frames (upstream `build_segments`): a single VAE-aligned segment
-/// when the clip fits, else overlapping `segment_len` windows striding by `len − overlap`.
-fn build_segments(total: usize, len: usize, overlap: usize) -> Vec<(usize, usize)> {
-    if total <= len {
-        let keep = ((total - 1) / TEMPORAL_STRIDE) * TEMPORAL_STRIDE + 1;
-        return vec![(0, keep)];
+/// Round `n` down to the VAE temporal grid the z16 encoder needs: a `4k + 1` frame count (one latent
+/// frame per [`TEMPORAL_STRIDE`] pixel frames, plus the leading key frame). `n == 0` maps to `0`.
+fn vae_align(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        ((n - 1) / TEMPORAL_STRIDE) * TEMPORAL_STRIDE + 1
     }
-    let mut segs = Vec::new();
+}
+
+/// Segment plan over `total` driving frames (upstream `build_segments`): a single VAE-aligned segment
+/// when the clip fits, else overlapping `segment_len` windows striding by `len − overlap`, **including a
+/// final shortened window that reaches the end of the clip** so no trailing driving frames are dropped.
+///
+/// Callers must guarantee `overlap < len` (validated in [`generate`]); a `len == 0` clip yields no
+/// segments. The tail window keeps the same `overlap` join with its predecessor as every interior
+/// window, so the fixed `keep_from = overlap` stitch in [`generate`] stays correct.
+fn build_segments(total: usize, len: usize, overlap: usize) -> Vec<(usize, usize)> {
+    if total == 0 || len == 0 || overlap >= len {
+        // Defensive: `generate` rejects these, but never underflow `len - overlap` for a direct
+        // engine consumer who built a pathological `Scail2Job` (all fields are `pub`).
+        return Vec::new();
+    }
+    if total <= len {
+        return vec![(0, vae_align(total))];
+    }
     let stride = len - overlap;
+    let mut segs = Vec::new();
     let mut start = 0;
-    while start < total {
-        let end = start + len;
-        if end > total {
-            break;
-        }
-        segs.push((start, end));
+    while start + len <= total {
+        segs.push((start, start + len));
         start += stride;
+    }
+    // Trailing partial: `start` now points just past the last full window's stride step, so frames
+    // `[start, total)` are uncovered. Emit one more window that overlaps the previous by `overlap`
+    // (i.e. begins at the same `start`) and extends to the clip end, VAE-aligned. Skip it only when
+    // the remainder is shorter than a single latent frame (nothing decodable is lost).
+    if start < total {
+        let tail_len = vae_align(total - start);
+        if tail_len > overlap {
+            segs.push((start, start + tail_len));
+        }
     }
     segs
 }
@@ -226,6 +251,17 @@ pub fn generate(
             "scail2: driving_masks ({}) must match driving_frames ({})",
             job.driving_masks.len(),
             job.driving_frames.len()
+        )));
+    }
+    if job.segment_len == 0 {
+        return Err(CandleError::Msg("scail2: segment_len must be > 0".into()));
+    }
+    if job.segment_overlap >= job.segment_len {
+        // Guards the `stride = segment_len − segment_overlap` subtraction (a direct engine consumer can
+        // build a `Scail2Job` with any `pub` field values) and keeps clean-history overlap well-defined.
+        return Err(CandleError::Msg(format!(
+            "scail2: segment_overlap ({}) must be < segment_len ({})",
+            job.segment_overlap, job.segment_len
         )));
     }
     let dev = comps.dit.device();
@@ -409,4 +445,138 @@ pub fn generate(
         fps: job.fps,
         audio: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_segments, vae_align, TEMPORAL_STRIDE};
+
+    // Shipped defaults (see `pipeline.rs`).
+    const LEN: usize = 81;
+    const OVERLAP: usize = 5;
+
+    /// Every emitted window is VAE-temporal-aligned (`4k + 1`) so the z16 encoder accepts it, and non
+    /// empty.
+    fn assert_windows_valid(segs: &[(usize, usize)]) {
+        for &(s, e) in segs {
+            assert!(e > s, "empty/backwards window ({s}, {e})");
+            let n = e - s;
+            assert_eq!(
+                n % TEMPORAL_STRIDE,
+                1 % TEMPORAL_STRIDE,
+                "window len {n} is not 4k+1"
+            );
+        }
+    }
+
+    #[test]
+    fn vae_align_rounds_down_to_4k_plus_1() {
+        assert_eq!(vae_align(0), 0);
+        assert_eq!(vae_align(1), 1);
+        assert_eq!(vae_align(4), 1);
+        assert_eq!(vae_align(5), 5);
+        assert_eq!(vae_align(8), 5);
+        assert_eq!(vae_align(9), 9);
+        assert_eq!(vae_align(81), 81); // a full window is already aligned
+        assert_eq!(vae_align(200), 197);
+    }
+
+    #[test]
+    fn single_segment_when_clip_fits() {
+        // total <= len: one VAE-aligned window.
+        let segs = build_segments(50, LEN, OVERLAP);
+        assert_eq!(segs, vec![(0, 49)]); // vae_align(50) = 49
+        assert_windows_valid(&segs);
+    }
+
+    #[test]
+    fn single_frame_and_tiny_clips_do_not_panic() {
+        assert_eq!(build_segments(1, LEN, OVERLAP), vec![(0, 1)]);
+        assert_eq!(build_segments(2, LEN, OVERLAP), vec![(0, 1)]); // vae_align(2) = 1
+        assert_eq!(build_segments(5, LEN, OVERLAP), vec![(0, 5)]);
+    }
+
+    #[test]
+    fn empty_clip_yields_no_segments() {
+        assert!(build_segments(0, LEN, OVERLAP).is_empty());
+    }
+
+    /// The core F-006 regression: a clip a bit longer than one window must NOT silently drop most of its
+    /// tail. With len=81, overlap=5, stride=76 the old code emitted only `[0,81)` and dropped frames
+    /// 81..120 (39 frames). The tail may still lose up to `TEMPORAL_STRIDE-1` frames to VAE alignment —
+    /// the same unavoidable rounding the single-segment path applies — but no more.
+    #[test]
+    fn trailing_frames_are_not_dropped_just_over_one_window() {
+        let total = 120;
+        let segs = build_segments(total, LEN, OVERLAP);
+        assert_windows_valid(&segs);
+        // Full window then a shortened tail.
+        assert_eq!(segs.first().copied(), Some((0, 81)));
+        let (_, last_end) = *segs.last().unwrap();
+        // Covers to the clip end, modulo VAE alignment (≤ 3 frames lost, not a whole window).
+        assert_eq!(last_end, vae_align(total));
+        assert!(total - last_end < TEMPORAL_STRIDE);
+    }
+
+    /// A long clip (the review's motivating case): frames must be covered essentially end-to-end (only
+    /// the ≤3-frame VAE-alignment tail is dropped) and every interior join must be exactly `overlap`
+    /// frames wide so the fixed `keep_from = overlap` stitch is correct.
+    #[test]
+    fn long_clip_covers_all_frames_with_uniform_overlap() {
+        let total = 200;
+        let segs = build_segments(total, LEN, OVERLAP);
+        assert_windows_valid(&segs);
+        assert!(segs.len() >= 3, "expected multiple windows, got {segs:?}");
+
+        // Coverage: windows start at 0 and each next window starts before the previous ends, with the
+        // join exactly `overlap` frames wide.
+        assert_eq!(segs[0].0, 0);
+        for pair in segs.windows(2) {
+            let (prev_start, prev_end) = pair[0];
+            let (next_start, _) = pair[1];
+            assert!(next_start < prev_end, "gap between windows (no overlap)");
+            assert!(next_start > prev_start);
+            let overlap = prev_end - next_start;
+            assert_eq!(overlap, OVERLAP, "join overlap must equal segment_overlap");
+        }
+        // The last window reaches the VAE-aligned clip end: at most TEMPORAL_STRIDE-1 frames lost.
+        let (_, last_end) = *segs.last().unwrap();
+        assert_eq!(last_end, vae_align(total));
+        assert!(total - last_end < TEMPORAL_STRIDE);
+    }
+
+    /// Exact tiling: when the windows land flush on the clip end there must be no spurious zero/duplicate
+    /// tail window.
+    #[test]
+    fn exact_multiple_boundary_has_no_spurious_tail() {
+        // stride = 76. Two windows: [0,81) and [76,157). total = 157 → second window ends exactly at
+        // total, remainder is 0, no tail appended.
+        let total = 157;
+        let segs = build_segments(total, LEN, OVERLAP);
+        assert_windows_valid(&segs);
+        assert_eq!(segs, vec![(0, 81), (76, 157)]);
+        assert_eq!(segs.last().unwrap().1, total);
+    }
+
+    /// Remainder smaller than the overlap contributes nothing new (it lives entirely inside the previous
+    /// window's tail), so no degenerate tail window is emitted.
+    #[test]
+    fn tiny_remainder_within_overlap_is_not_appended() {
+        // total = 159: after [0,81),[76,157) the remainder is frames 157..159 (2 frames), vae_align = 1
+        // which is < overlap(5) → skipped.
+        let total = 159;
+        let segs = build_segments(total, LEN, OVERLAP);
+        assert_windows_valid(&segs);
+        assert_eq!(segs, vec![(0, 81), (76, 157)]);
+    }
+
+    /// Underflow guard: a pathological direct-consumer job with `overlap >= len` must not underflow
+    /// `len - overlap` (panic in debug / wrap in release) — it returns no segments and `generate`
+    /// rejects it up front.
+    #[test]
+    fn overlap_ge_len_does_not_underflow() {
+        assert!(build_segments(200, 81, 81).is_empty());
+        assert!(build_segments(200, 81, 200).is_empty());
+        assert!(build_segments(200, 0, 0).is_empty());
+    }
 }
