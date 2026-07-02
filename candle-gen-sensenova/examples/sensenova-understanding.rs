@@ -46,6 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::slice::from_ref(&img),
         64,
         Sampler::Greedy,
+        None,
     )?;
     eprintln!("VQA answer: {answer:?}");
     assert!(!answer.trim().is_empty(), "VQA answer should be non-empty");
