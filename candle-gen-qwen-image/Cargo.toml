@@ -11,12 +11,6 @@ categories = ["science"]
 [dependencies]
 candle-gen = { path = "../candle-gen" }
 inventory = { workspace = true }
-# Qwen-Image has NO candle-transformers reference: the dual-stream MMDiT, the causal-Conv3d VAE, and
-# the Qwen2.5-VL prompt-embeds path are all written here on candle-core/candle-nn.
-candle-transformers = { workspace = true }
-# Qwen2.5-VL tokenizer.json loading; the QwenImage T2I chat template comes from gen-core's
-# `TextTokenizer` (re-exported through `candle_gen::gen_core`).
-tokenizers = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673 parity).
 rand = { workspace = true }
 rand_distr = { workspace = true }
@@ -28,9 +22,9 @@ safetensors = "0.7"
 
 [features]
 default = []
-metal = ["candle-gen/metal", "candle-transformers/metal"]
-cuda = ["candle-gen/cuda", "candle-transformers/cuda"]
-flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn"]
+metal = ["candle-gen/metal"]
+cuda = ["candle-gen/cuda"]
+flash-attn = ["candle-gen/flash-attn"]
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }
