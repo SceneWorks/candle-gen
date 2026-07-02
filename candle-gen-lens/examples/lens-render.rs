@@ -15,6 +15,14 @@
 //! `--snapshot` (or `LENS_SNAPSHOT`) is the Lens-Turbo snapshot root (text_encoder/ transformer/ vae/
 //! tokenizer/). `--quant q4|q8|dense` (default q4). Exits non-zero if the render is degenerate
 //! (constant/black image) — the failure mode of the unfixed quant kernels.
+//!
+//! **sc-9413 packed-tier acceptance.** Also drives the packed-load path: point `--snapshot` at a
+//! `SceneWorks/lens-mlx` / `lens-turbo-mlx` q4 snapshot whose `transformer/` carries the MLX packed
+//! triple (`{base}.weight` u32 + `.scales` + `.biases`) — the DiT then loads **straight from the packed
+//! parts** (no dense bf16 staging, no load-then-quantize pass; `LensTransformer::quantize` no-ops over
+//! the already-packed weights). With `--quant q4` the gpt-oss MXFP4 encoder still transcodes to Q4 as
+//! before (the packed-encoder tier is a separate story — the encoder here loads its MXFP4 experts from
+//! the assembled snapshot). A coherent render proves the packed DiT denoises end-to-end on sm_120.
 
 use std::path::PathBuf;
 

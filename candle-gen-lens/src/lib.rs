@@ -180,8 +180,12 @@ impl Pipeline {
             self.quant.map(quant::ggml_dtype),
         )?;
         let mut transformer = LensTransformer::new(&LensDitConfig::lens(), self.transformer_vb()?)?;
-        // Q4/Q8 transcode the DiT's compute-heavy linears after the dense weights (and any merged
-        // adapter delta) have loaded — `apply_adapters → quantize` ordering (sc-5117).
+        // Q4/Q8 the DiT's compute-heavy linears. Two routes compose (sc-9413): a packed MLX tier
+        // (`SceneWorks/lens-mlx`, `.scales` present) already loaded each projection straight from the
+        // packed parts inside `LensTransformer::new` (no dense staging), so this pass is a **no-op**
+        // over those; a dense bf16 tier loaded dense (and any merged adapter delta), so this pass folds
+        // it to `Q4_0`/`Q8_0` in place — the `apply_adapters → quantize` ordering (sc-5117). The
+        // per-`QLinear` `quantize` no-ops on an already-packed weight, so the two never double-quantize.
         if let Some(quant) = self.quant {
             transformer.quantize(quant)?;
         }
