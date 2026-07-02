@@ -7,6 +7,14 @@
 //! `.weight`-less variants), namespace `ns` ∈ {`diffusion_model.`, `transformer.`, `model.`, none}
 //! (sd-scripts / ai-toolkit exports). The `module` path (e.g. `layers.0.attention.qkv`) matches the
 //! DiT's safetensors keys directly. An optional `{module}.alpha` applies `alpha/rank` scaling.
+//!
+//! **Packed-base compose (sc-9412).** On the `SceneWorks/ideogram-4-mlx` (q4/q8) tier the targeted
+//! DiT weights are MLX-packed u32 codes, not a dense grid. The merge reconstructs the dense f32 base
+//! from the packed triple ([`Weights::get_cpu_merge_base`]) before folding the delta, then installs the
+//! merged **dense** weight in the override — so [`crate::loader::linear_detect`] loads that projection
+//! dense while every untargeted projection stays packed (the packed base and the adapter compose). The
+//! whole merge runs on the CPU (matching the CPU-loaded LoRA factors); the override's `get` moves the
+//! result to the compute device on read.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -54,8 +62,11 @@ pub fn merge_turbo_lora(w: &mut Weights, lora_path: &Path, scale: f32) -> Result
             skipped += 1;
             continue;
         }
-        let down = lora.load(name, w.device())?.to_dtype(DType::F32)?; // [r, in]
-        let up = lora.load(&up_name, w.device())?.to_dtype(DType::F32)?; // [out, r]
+        // Reconstruct the delta + base on the CPU: on a packed tier `get_cpu_merge_base` dequantizes
+        // the MLX-packed triple to its dense f32 grid (the mergeable base); on a dense tier it returns
+        // the on-disk weight. Both the base and the LoRA factors live on the CPU so the fold matches.
+        let down = lora.load(name, &Device::Cpu)?.to_dtype(DType::F32)?; // [r, in]
+        let up = lora.load(&up_name, &Device::Cpu)?.to_dtype(DType::F32)?; // [out, r]
         if down.rank() != 2 || up.rank() != 2 {
             return Err(Error::Msg(format!(
                 "ideogram turbo: LoRA {name} is not a 2D Linear adapter (rank {}/{})",
@@ -69,7 +80,7 @@ pub fn merge_turbo_lora(w: &mut Weights, lora_path: &Path, scale: f32) -> Result
                 .map(|a| a as f64 / rank as f64)
                 .unwrap_or(1.0);
         let delta = up.contiguous()?.matmul(&down.contiguous()?)?; // [out, in]
-        let base = w.get_f32(&weight_key)?;
+        let base = w.get_cpu_merge_base(&weight_key)?; // dense grid (packed → dequantized, dense → as-is)
         let merged_w = (base + (delta * eff)?)?.to_dtype(w.dtype())?;
         w.insert_override(weight_key, merged_w);
         merged += 1;

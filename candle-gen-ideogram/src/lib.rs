@@ -24,6 +24,7 @@ pub mod adapters;
 pub mod config;
 pub mod loader;
 pub mod pipeline;
+pub mod quant;
 pub mod scheduler;
 pub mod text_encoder;
 pub mod transformer;
