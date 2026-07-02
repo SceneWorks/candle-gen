@@ -243,10 +243,12 @@ struct GateMlp {
 
 impl GateMlp {
     fn new(inner: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
+        // Packed-detect each projection (sc-9413): a `SceneWorks/lens-mlx` q4/q8 tier loads straight
+        // from the packed parts, a dense tier loads dense (then optionally folded by `quantize`).
         Ok(Self {
-            w1: QLinear::linear_no_bias(inner, hidden, vb.pp("w1"))?,
-            w2: QLinear::linear_no_bias(hidden, inner, vb.pp("w2"))?,
-            w3: QLinear::linear_no_bias(inner, hidden, vb.pp("w3"))?,
+            w1: QLinear::linear_detect(inner, hidden, &vb, "w1", false)?,
+            w2: QLinear::linear_detect(hidden, inner, &vb, "w2", false)?,
+            w3: QLinear::linear_detect(inner, hidden, &vb, "w3", false)?,
         })
     }
 
@@ -286,10 +288,12 @@ impl JointAttention {
         let inner = cfg.inner_dim;
         let hd = cfg.head_dim;
         Ok(Self {
-            img_qkv: QLinear::linear(inner, 3 * inner, vb.pp("img_qkv"))?,
-            txt_qkv: QLinear::linear(inner, 3 * inner, vb.pp("txt_qkv"))?,
-            to_out: QLinear::linear(inner, inner, vb.pp("to_out").pp("0"))?,
-            to_add_out: QLinear::linear(inner, inner, vb.pp("to_add_out"))?,
+            // Packed-detect each projection (sc-9413). `to_out.0` is threaded as one base string so the
+            // `.scales`/`.biases` siblings survive the `.0` nesting (never `.pp("0")` past the sibling).
+            img_qkv: QLinear::linear_detect(inner, 3 * inner, &vb, "img_qkv", true)?,
+            txt_qkv: QLinear::linear_detect(inner, 3 * inner, &vb, "txt_qkv", true)?,
+            to_out: QLinear::linear_detect(inner, inner, &vb, "to_out.0", true)?,
+            to_add_out: QLinear::linear_detect(inner, inner, &vb, "to_add_out", true)?,
             norm_q: rms_norm(hd, EPS, vb.pp("norm_q"))?,
             norm_k: rms_norm(hd, EPS, vb.pp("norm_k"))?,
             norm_added_q: rms_norm(hd, EPS, vb.pp("norm_added_q"))?,
@@ -520,16 +524,19 @@ impl LensTransformer {
             )?);
         }
         Ok(Self {
-            img_in: QLinear::linear(cfg.in_channels, inner, vb.pp("img_in"))?,
+            // Packed-detect the three top-level projections (sc-9413).
+            img_in: QLinear::linear_detect(cfg.in_channels, inner, &vb, "img_in", true)?,
             txt_norm,
-            txt_in: QLinear::linear(cfg.txt_in_dim(), inner, vb.pp("txt_in"))?,
+            txt_in: QLinear::linear_detect(cfg.txt_in_dim(), inner, &vb, "txt_in", true)?,
             time_embed: TimeEmbed::new(cfg, vb.pp("time_text_embed"))?,
             blocks,
             norm_out: NormOut::new(cfg, vb.pp("norm_out"))?,
-            proj_out: QLinear::linear(
+            proj_out: QLinear::linear_detect(
                 inner,
                 cfg.patch_size * cfg.patch_size * cfg.out_channels,
-                vb.pp("proj_out"),
+                &vb,
+                "proj_out",
+                true,
             )?,
             rope: LensRope::new(cfg.rope_theta, cfg.axes_dims_rope),
             cfg: *cfg,
@@ -544,6 +551,11 @@ impl LensTransformer {
     /// precision-sensitive). Call **after** any adapter merge — the merge folds `W += δ` into the dense
     /// weight before the DiT is built, so quantizing here transcodes the already-adapted base. Mirrors
     /// `mlx-gen-lens::dit::LensTransformer::quantize` (sc-3175).
+    ///
+    /// **No-op over a packed tier (sc-9413).** When the DiT loaded from a packed `SceneWorks/lens-mlx`
+    /// tier, each projection is already `QLinear::Packed` (loaded straight from the packed parts), and
+    /// the per-`QLinear` `quantize` no-ops on it — no dense staging, no re-quantize. This pass then only
+    /// folds the dense-tier path (`SceneWorks/Lens` bf16 + optional adapter delta); the two compose.
     ///
     /// **Uniform** `Q4_0`/`Q8_0` across every quantized linear — including the SwiGLU MLP. Uniform Q4
     /// once rendered solid black; sc-7702 traced that to candle's int8 `QMatMul` activation-quant path
