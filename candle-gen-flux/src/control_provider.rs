@@ -22,8 +22,9 @@
 //! Bespoke provider (NOT gen-core-registered), worker-invoked by name — the candle pattern for
 //! conditioned surfaces (mirrors [`crate::ip_provider`] / the FLUX.2 control provider). The
 //! `flux1_dev_control` worker lane is a separate Phase-B step (sc-8304/sc-8246), not this crate.
-//! Determinism is the candle-lane contract (sc-3673): seeded CPU init noise; the control encode seeds
-//! the device RNG so the (sampled) control latent is reproducible per render seed.
+//! Determinism is the candle-lane contract (sc-3673): seeded CPU init noise; the control encode uses
+//! the VAE posterior MEAN (no sampling, no device RNG — sc-8988), so the control latent is fully
+//! deterministic and launch-portable.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -31,7 +32,7 @@ use std::sync::Mutex;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::clip::text_model::ClipTextTransformer;
-use candle_transformers::models::flux::autoencoder::AutoEncoder;
+use candle_transformers::models::flux::autoencoder::{AutoEncoder, DiagonalGaussian, Encoder};
 use candle_transformers::models::flux::sampling::{get_schedule, State};
 use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
 use rand::{rngs::StdRng, SeedableRng};
@@ -193,6 +194,28 @@ fn preprocess_control(
     nchw.to_dtype(dtype).map_err(Into::into)
 }
 
+/// Deterministic control-image VAE encoder (sc-8988): the FLUX [`Encoder`] + the posterior MEAN
+/// (`DiagonalGaussian` with `sample = false`) + the BFL shift/scale. The upstream
+/// [`AutoEncoder::encode`] *samples* the posterior with device `randn` — per-launch-deterministic at
+/// best and never launch-portable, violating the sc-3673 determinism contract the rest of this
+/// provider maintains (CPU-seeded `StdRng` everywhere). The mean encode is RNG-free (matching
+/// `Flux2Vae::encode_packed` and the boogu edit precedent) and needs no seed at all.
+struct MeanVaeEncoder {
+    encoder: Encoder,
+    shift_factor: f64,
+    scale_factor: f64,
+}
+
+impl MeanVaeEncoder {
+    /// Encode `nchw` (`[1, 3, H, W]` in `[-1, 1]`) to the posterior-MEAN latent `[1, 16, H/8, W/8]`,
+    /// shift/scale-normalized exactly like [`AutoEncoder::encode`] — minus the sampling.
+    fn encode(&self, nchw: &Tensor) -> Result<Tensor> {
+        let moments = nchw.apply(&self.encoder)?; // [1, 2·z, H/8, W/8] = (mean ‖ logvar)
+        let mean = moments.apply(&DiagonalGaussian::new(false, 1)?)?;
+        ((mean - self.shift_factor)? * self.scale_factor).map_err(Into::into)
+    }
+}
+
 /// A loaded FLUX.1-dev control model: the reused FLUX text encoders + VAE, the dev DiT wrapped in its
 /// control branch ([`FluxControlTransformer`]). `generate` takes `&self` (no per-call mutation), so one
 /// load serves many renders.
@@ -207,6 +230,10 @@ pub struct Flux1DevControl {
     t5: Mutex<T5EncoderModel>,
     transformer: FluxControlTransformer,
     vae: AutoEncoder,
+    /// The deterministic (posterior-MEAN) control-image encoder — sc-8988. A second `Encoder` instance
+    /// over the same `ae.safetensors` (the upstream `AutoEncoder`'s encoder is private and its `encode`
+    /// samples); ~34M params of duplicated encoder weights, negligible next to the dev DiT.
+    control_encoder: MeanVaeEncoder,
 }
 
 impl Flux1DevControl {
@@ -254,9 +281,16 @@ impl Flux1DevControl {
         let dit_vb = mmap_vb(&[root.join(variant.transformer_file())], dtype, &device)?;
         let base = IpFlux::new(&flux_config(variant), dit_vb)?;
 
-        // FLUX AutoEncoder (`ae.safetensors`).
+        // FLUX AutoEncoder (`ae.safetensors`) for decode, plus a separate posterior-MEAN encoder over the
+        // same weights for the deterministic control encode (sc-8988).
+        let ae_cfg = ae_config(variant);
         let vae_vb = mmap_vb(&[root.join("ae.safetensors")], dtype, &device)?;
-        let vae = AutoEncoder::new(&ae_config(variant), vae_vb)?;
+        let vae = AutoEncoder::new(&ae_cfg, vae_vb.clone())?;
+        let control_encoder = MeanVaeEncoder {
+            encoder: Encoder::new(&ae_cfg, vae_vb.pp("encoder"))?,
+            shift_factor: ae_cfg.shift_factor,
+            scale_factor: ae_cfg.scale_factor,
+        };
 
         // The Shakker control overlay (diffusers layout, un-prefixed keys). The branch shares the base
         // FLUX config's dims (hidden / heads / RoPE) so its residuals align with the base image tokens.
@@ -276,6 +310,7 @@ impl Flux1DevControl {
             t5: Mutex::new(t5),
             transformer,
             vae,
+            control_encoder,
         })
     }
 
@@ -350,8 +385,7 @@ impl Flux1DevControl {
             &self.t5,
             &req.prompt,
         )?;
-        let control_latent =
-            self.encode_control_latent(control_image, req.width, req.height, req.seed)?;
+        let control_latent = self.encode_control_latent(control_image, req.width, req.height)?;
 
         // candle's get_noise geometry: latent is /8 of a multiple-of-16 request.
         let lat_h = (req.height as usize).div_ceil(16) * 2;
@@ -384,24 +418,16 @@ impl Flux1DevControl {
     }
 
     /// VAE-encode + 2×2-pack the control hint into the packed control latent `[1, seq, 64]` (constant
-    /// across steps). Uses the same VAE + pack (`State::new`'s patchify) as the noise latents, so the
-    /// control latent aligns 1:1 with the base image tokens. The control encode seeds the device RNG with
-    /// the render seed so the (sampled) latent is reproducible per render (the candle determinism
-    /// contract, sc-3673); the latent is identical across steps and across the batch.
-    fn encode_control_latent(
-        &self,
-        image: &Image,
-        width: u32,
-        height: u32,
-        seed: u64,
-    ) -> Result<Tensor> {
+    /// across steps). Uses the same VAE weights + pack (`State::new`'s patchify) as the noise latents, so
+    /// the control latent aligns 1:1 with the base image tokens. The encode takes the posterior MEAN
+    /// (sc-8988) — no sampling, no device RNG — so the latent is fully deterministic and launch-portable
+    /// (the candle determinism contract, sc-3673), identical across steps and across the batch.
+    fn encode_control_latent(&self, image: &Image, width: u32, height: u32) -> Result<Tensor> {
         let nchw = preprocess_control(image, width, height, &self.device, self.dtype)?;
-        // Reproducible VAE sample (the candle AutoEncoder's `reg` samples; seed it for determinism).
-        let _ = self.device.set_seed(seed);
-        let encoded = self.vae.encode(&nchw)?; // [1, 16, H/8, W/8]
-                                               // Reuse the candle State patchify to 2×2-pack to [1, seq, 64] — identical geometry to the noise
-                                               // pack. `State::new` needs a t5/clip embed only to fill txt/vec (unused here), so feed tiny
-                                               // placeholders and take only `.img` (the packed latent).
+        let encoded = self.control_encoder.encode(&nchw)?; // [1, 16, H/8, W/8]
+                                                           // Reuse the candle State patchify to 2×2-pack to [1, seq, 64] — identical geometry to the noise
+                                                           // pack. `State::new` needs a t5/clip embed only to fill txt/vec (unused here), so feed tiny
+                                                           // placeholders and take only `.img` (the packed latent).
         let dummy_t5 = Tensor::zeros((1, 1, 4096), self.dtype, &self.device)?;
         let dummy_clip = Tensor::zeros((1, 768), self.dtype, &self.device)?;
         let packed = State::new(&dummy_t5, &dummy_clip, &encoded)?;
@@ -486,5 +512,96 @@ mod tests {
         // A nonexistent path errors.
         assert!(control_var_builder(&dir.join("nope.safetensors"), DTYPE, &dev).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    use candle_nn::VarMap;
+    use candle_transformers::models::flux::autoencoder::Config as AeCfg;
+
+    /// A tiny FLUX AE config (real BFL shift/scale, `ch = 32` — the AE's `group_norm(32, ·)` floor).
+    fn tiny_ae_cfg() -> AeCfg {
+        AeCfg {
+            resolution: 16,
+            in_channels: 3,
+            ch: 32,
+            out_ch: 3,
+            ch_mult: vec![1],
+            num_res_blocks: 1,
+            z_channels: 2,
+            scale_factor: 0.3611,
+            shift_factor: 0.1159,
+        }
+    }
+
+    /// Build a tiny random-weight [`MeanVaeEncoder`] on CPU. VarMap zero-init is randomized (a zero
+    /// encoder emits constant moments, which would make the mean-vs-sample distinction vacuous).
+    fn tiny_mean_encoder(dev: &Device) -> MeanVaeEncoder {
+        let cfg = tiny_ae_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, dev);
+        let encoder = Encoder::new(&cfg, vb).expect("tiny encoder");
+        let mut rng = StdRng::seed_from_u64(8988);
+        for var in vm.data().lock().unwrap().values() {
+            let n = var.shape().elem_count();
+            let data: Vec<f32> = (0..n)
+                .map(|_| {
+                    let v: f32 = StandardNormal.sample(&mut rng);
+                    v * 0.05
+                })
+                .collect();
+            let t = Tensor::from_vec(data, var.shape(), dev).expect("randomize");
+            var.set(&t).expect("set var");
+        }
+        MeanVaeEncoder {
+            encoder,
+            shift_factor: cfg.shift_factor,
+            scale_factor: cfg.scale_factor,
+        }
+    }
+
+    /// A fixed (RNG-free) `[1, 3, 16, 16]` input in `[-1, 1]`.
+    fn fixed_input(dev: &Device) -> Tensor {
+        let n = 3 * 16 * 16;
+        let data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin()).collect();
+        Tensor::from_vec(data, (1, 3, 16, 16), dev).expect("input")
+    }
+
+    /// sc-8988: the control encode is bit-identical across calls and independent of the device RNG
+    /// stream — the old sampled path (`AutoEncoder::encode` + `set_seed`) drew device `randn` and
+    /// diverged when the RNG state moved between calls.
+    #[test]
+    fn control_encode_mean_is_deterministic_and_rng_free() {
+        let dev = Device::Cpu;
+        let enc = tiny_mean_encoder(&dev);
+        let img = fixed_input(&dev);
+        let a = enc.encode(&img).expect("encode a");
+        // Churn the device RNG between calls — a sampled encode would change; the mean must not.
+        let _ = Tensor::randn(0f32, 1f32, (16,), &dev).expect("rng churn");
+        let b = enc.encode(&img).expect("encode b");
+        // ch_mult = [1] ⇒ a single level with no downsample: the tiny latent stays at H×W.
+        assert_eq!(a.dims(), &[1, 2, 16, 16], "z=2 latent");
+        let (av, bv) = (
+            a.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            b.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        assert!(av.iter().all(|v| v.is_finite()), "finite latent");
+        assert_eq!(av, bv, "mean encode must be bit-identical across calls");
+    }
+
+    /// sc-8988: the encode is the shift/scale-normalized posterior MEAN — the first `z_channels` chunk
+    /// of the encoder moments, exactly as `AutoEncoder::encode` normalizes, minus the sampling.
+    #[test]
+    fn control_encode_takes_the_posterior_mean() {
+        let dev = Device::Cpu;
+        let enc = tiny_mean_encoder(&dev);
+        let img = fixed_input(&dev);
+        let got = enc.encode(&img).expect("encode");
+        let moments = img.apply(&enc.encoder).expect("moments"); // [1, 2·z, 2, 2]
+        let mean = moments.chunk(2, 1).expect("chunk")[0].clone();
+        let want = ((mean - enc.shift_factor).unwrap() * enc.scale_factor).unwrap();
+        let (g, w) = (
+            got.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            want.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+        );
+        assert_eq!(g, w, "encode must equal (posterior_mean - shift) * scale");
     }
 }
