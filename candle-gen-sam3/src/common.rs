@@ -67,7 +67,21 @@ impl Weights {
                     .to_dtype(DType::F32)?
                     .to_device(device)?,
             };
-            map.insert(k, v);
+            // A key that already exists means TWO shards define the same tensor. In a normal sharded
+            // safetensors checkpoint every key lives in exactly one shard, so a cross-shard duplicate is
+            // abnormal — a mis-sharded or double-listed checkpoint, or a stray `.safetensors` polluting
+            // the snapshot dir. Silently overwriting (the old `insert`) would let a stray file shadow the
+            // real weights with no diagnostic, so we hard-error naming the key and the offending shard
+            // rather than emit a bare library warning (F-064 / sc-9050; cf. the F-051 no-stderr policy —
+            // this is a genuine load fault, surfaced through the crate's normal `Result` channel).
+            if map.insert(k.clone(), v).is_some() {
+                return Err(CandleError::Msg(format!(
+                    "duplicate tensor key {k:?} while merging shard {}: a checkpoint's tensors must \
+                     each live in exactly one .safetensors shard — this snapshot has {k:?} in more \
+                     than one file (mis-sharded checkpoint or a stray .safetensors in the dir)",
+                    path.display()
+                )));
+            }
         }
         Ok(())
     }
@@ -385,6 +399,85 @@ mod tests {
     /// A linear whose contraction is not a multiple of 32 (in=20) stays dense (the reference
     /// predicate that keeps SAM3's `2→256` / `4→256` / `258→256` projections full-precision), and
     /// `quantize` is idempotent on an already-quantized linear.
+    /// Write a single-tensor `.safetensors` file (`name -> [value]`, f32) at `path`.
+    fn write_shard(path: &Path, name: &str, value: f32) {
+        let t = Tensor::new(&[value], &Device::Cpu).unwrap();
+        let mut m = HashMap::new();
+        m.insert(name.to_string(), t);
+        safetensors::save(&m, path).unwrap();
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "candle_gen_sam3_common_{tag}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Two shards with DISJOINT keys merge cleanly into the full key union (no false positive) — the
+    /// normal sharded-checkpoint path is preserved byte-for-byte (F-064 / sc-9050).
+    #[test]
+    fn from_dir_merges_disjoint_shards_into_key_union() {
+        let dir = scratch_dir("union");
+        write_shard(
+            &dir.join("model-00001-of-00002.safetensors"),
+            "a.weight",
+            1.0,
+        );
+        write_shard(
+            &dir.join("model-00002-of-00002.safetensors"),
+            "b.weight",
+            2.0,
+        );
+
+        let w = Weights::from_dir(&dir, &Device::Cpu).unwrap();
+        assert_eq!(
+            w.require("a.weight").unwrap().to_vec1::<f32>().unwrap(),
+            vec![1.0]
+        );
+        assert_eq!(
+            w.require("b.weight").unwrap().to_vec1::<f32>().unwrap(),
+            vec![2.0]
+        );
+        assert!(w.get("missing").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two shards that BOTH define the same key are detected and surfaced as a descriptive error naming
+    /// the offending key and shard file, instead of silently overwriting (F-064 / sc-9050).
+    #[test]
+    fn from_dir_errors_on_cross_shard_duplicate_key() {
+        let dir = scratch_dir("dup");
+        write_shard(
+            &dir.join("model-00001-of-00002.safetensors"),
+            "dup.weight",
+            1.0,
+        );
+        // A stray / mis-sharded second file redefines the same key.
+        write_shard(
+            &dir.join("model-00002-of-00002.safetensors"),
+            "dup.weight",
+            2.0,
+        );
+
+        match Weights::from_dir(&dir, &Device::Cpu) {
+            Err(CandleError::Msg(m)) => {
+                assert!(m.contains("duplicate tensor key"), "got: {m}");
+                assert!(m.contains("dup.weight"), "must name the key, got: {m}");
+                assert!(
+                    m.contains("model-00002-of-00002.safetensors"),
+                    "must name the shard, got: {m}"
+                );
+            }
+            Err(other) => panic!("expected a crafted duplicate-key Msg error, got: {other:?}"),
+            Ok(_) => panic!("expected an error on a cross-shard duplicate key, got Ok"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn quantize_skips_odd_contraction_and_is_idempotent() {
         let dev = Device::Cpu;
