@@ -36,6 +36,9 @@ rand_distr = { workspace = true }
 # merge needs) at inference-side load (sc-5166 adapter merge). Candle's own version (0.7), matching
 # candle-gen, so the `View` impl candle-core provides for `Tensor` is the same one.
 safetensors = "0.7"
+# Detect a pre-quantized MLX-packed tier by the `quantization` block in a component's `config.json`
+# (sc-9408 packed-load — `candle_gen::quant::PackedConfig::from_config`). Same dep flux2 uses (sc-9087).
+serde_json = "1"
 
 [features]
 # Pass the backend selection through to the core crate AND candle-transformers so a downstream

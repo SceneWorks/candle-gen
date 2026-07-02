@@ -34,11 +34,19 @@
 //!   `gen_core::Image` (RGB8) — the worker owns asset writes.
 //!
 //! **First-slice surface (sc-3693), matching the SDXL slice (sc-3675):** txt2img only. img2img
-//! (the mlx provider's `Reference` conditioning), LoRA/LoKr, and whole-model Q4/Q8 quantization are
-//! NOT wired here — they are rejected loudly (the worker routes them to the Python fallback) rather
-//! than silently dropped. Component caching across calls is a follow-up (the mlx provider holds all
-//! components resident too); peak-VRAM staging is the Z-Image analogue of SDXL's sc-4987 and is left
-//! to a later slice.
+//! (the mlx provider's `Reference` conditioning) is NOT wired on the registered path and is rejected
+//! loudly (the worker routes it to the Python fallback). LoRA/LoKr merge into the dense DiT at load
+//! (sc-5166).
+//!
+//! **Packed Q4/Q8 tiers (sc-9408, sc-9089 umbrella).** [`Pipeline::load_components`] auto-detects a
+//! pre-quantized MLX-packed tier (`SceneWorks/z-image-turbo-mlx`) by the `quantization` block in a
+//! component's `config.json` ([`Pipeline::component_is_packed`]) and loads the TE + DiT + VAE **straight
+//! from the packed parts** through the shared [`candle_gen::quant`] packed-detect (the vendored
+//! [`crate::packed_dit`] / [`crate::packed_te`] models) — no dense bf16 CPU staging. A dense
+//! `Tongyi-MAI/Z-Image-Turbo` snapshot takes the stock `candle-transformers` path unchanged (byte-exact
+//! parity, pinned by the vendored models' `parity_tests`). On-the-fly quant of a *dense* tier is still
+//! not done (only the pre-packed tier is a quantized path). Component caching across calls is handled by
+//! the generator's `components` cache.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -64,6 +72,51 @@ use candle_transformers::models::z_image::transformer::{
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder, VaeConfig};
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
+
+use crate::packed_dit::ZImageTransformer2DModel as PackedDit;
+use crate::packed_te::ZImageTextEncoder as PackedTe;
+
+/// The DiT, loaded **dense** (the stock `candle-transformers` model — a dense bf16 tier or the
+/// adapter-merged path) or **packed** (the vendored [`PackedDit`] built straight from an MLX-packed tier
+/// — sc-9408). Both expose the same `forward(x, t, cap_feats, cap_mask)` → raw velocity, so the render
+/// loops are unchanged.
+pub(crate) enum DiT {
+    // Boxed to keep the two arms comparably sized (`large_enum_variant`) — both models are heavy and
+    // the enum lives behind an `Arc` regardless.
+    Dense(Box<ZImageTransformer2DModel>),
+    Packed(Box<PackedDit>),
+}
+
+impl DiT {
+    pub(crate) fn forward(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        cap_feats: &Tensor,
+        cap_mask: &Tensor,
+    ) -> candle_gen::candle_core::Result<Tensor> {
+        match self {
+            Self::Dense(m) => m.forward(x, t, cap_feats, cap_mask),
+            Self::Packed(m) => m.forward(x, t, cap_feats, cap_mask),
+        }
+    }
+}
+
+/// The Qwen3 text encoder, dense (stock) or packed (vendored [`PackedTe`], sc-9408). Same
+/// `forward(input_ids)` → layer[-2] hidden states contract.
+pub(crate) enum TextEnc {
+    Dense(Box<ZImageTextEncoder>),
+    Packed(Box<PackedTe>),
+}
+
+impl TextEnc {
+    pub(crate) fn forward(&self, input_ids: &Tensor) -> candle_gen::candle_core::Result<Tensor> {
+        match self {
+            Self::Dense(m) => m.forward(input_ids),
+            Self::Packed(m) => m.forward(input_ids),
+        }
+    }
+}
 
 /// Z-Image-Turbo is guidance-distilled to a fixed 4-step schedule; used when a request omits
 /// `steps`. Matches `mlx-gen-z-image`'s `DEFAULT_STEPS`.
@@ -191,8 +244,8 @@ pub(crate) struct Pipeline {
 /// read fixed configs; latent dims come from the request), so one set serves every request size.
 #[derive(Clone)]
 pub(crate) struct Components {
-    text_encoder: Arc<ZImageTextEncoder>,
-    transformer: Arc<ZImageTransformer2DModel>,
+    text_encoder: Arc<TextEnc>,
+    transformer: Arc<DiT>,
     vae: Arc<AutoEncoderKL>,
 }
 
@@ -219,27 +272,126 @@ impl Pipeline {
     /// attention dispatch (CUDA flash-attn / Metal SDPA); on a build without those features the
     /// reference falls back to the backend-agnostic manual path, so this is inert there.
     pub(crate) fn load_components(&self, use_accelerated_attn: bool) -> Result<Components> {
-        let te_vb = self.component_vb("text_encoder")?;
-        let text_encoder = ZImageTextEncoder::new(&TextEncoderConfig::z_image(), te_vb)?;
+        // A pre-quantized MLX-packed tier (`SceneWorks/z-image-turbo-mlx` q4/q8) carries a
+        // `quantization` block in each component's `config.json`; on detection the TE + DiT + VAE load
+        // **straight from the packed parts** (sc-9408, no dense bf16 staging). A dense snapshot
+        // (`Tongyi-MAI/Z-Image-Turbo`, no `quantization` block) takes the stock path unchanged. Adapters
+        // (LoRA/LoKr) are a dense-only path (they merge into dense DiT weights), so a packed tier is not
+        // combined with adapters — `load` rejects that combination.
+        let packed = self.component_is_packed("transformer");
+
+        // A packed tier is a dense-free load; LoRA/LoKr merge into *dense* DiT weights, so the two are
+        // incompatible. Reject loudly rather than silently ignore the adapters on the packed path.
+        if packed && !self.adapters.is_empty() {
+            return Err(CandleError::Msg(
+                "z-image: LoRA/LoKr adapters are not supported on a pre-quantized (packed) tier — \
+                 use a dense bf16 snapshot for adapter merge"
+                    .into(),
+            ));
+        }
+
+        let text_encoder = if self.component_is_packed("text_encoder") {
+            let vb = self.component_vb("text_encoder")?;
+            TextEnc::Packed(Box::new(PackedTe::new(&TextEncoderConfig::z_image(), vb)?))
+        } else {
+            let vb = self.component_vb("text_encoder")?;
+            TextEnc::Dense(Box::new(ZImageTextEncoder::new(
+                &TextEncoderConfig::z_image(),
+                vb,
+            )?))
+        };
 
         let mut dit_cfg = DitConfig::z_image_turbo();
         dit_cfg.set_use_accelerated_attn(use_accelerated_attn);
-        let dit_vb = if self.adapters.is_empty() {
-            // No adapters: the stock mmap build — byte-identical to the pre-sc-5166 path.
-            self.component_vb("transformer")?
+        let transformer = if packed {
+            // Packed tier: build the vendored packed-detect DiT straight from the packed parts. Adapters
+            // are incompatible with a packed tier (rejected at load), so no merge path here.
+            let vb = self.component_vb("transformer")?;
+            DiT::Packed(Box::new(PackedDit::new(&dit_cfg, vb)?))
         } else {
-            self.transformer_vb_with_adapters()?
+            let dit_vb = if self.adapters.is_empty() {
+                // No adapters: the stock mmap build — byte-identical to the pre-sc-5166 path.
+                self.component_vb("transformer")?
+            } else {
+                self.transformer_vb_with_adapters()?
+            };
+            DiT::Dense(Box::new(ZImageTransformer2DModel::new(&dit_cfg, dit_vb)?))
         };
-        let transformer = ZImageTransformer2DModel::new(&dit_cfg, dit_vb)?;
 
-        let vae_vb = self.component_vb("vae")?;
-        let vae = AutoEncoderKL::new(&VaeConfig::z_image(), vae_vb)?;
+        // The VAE packs only its 8 tiny (512×64) mid-block attention projections; rather than vendor the
+        // whole 685-line `AutoEncoderKL` for negligible weights, a packed VAE dequantizes those 8 to
+        // dense (from the packed parts — no dense tier downloaded) and feeds the STOCK VAE. A dense VAE
+        // mmaps as before.
+        let vae = if self.component_is_packed("vae") {
+            AutoEncoderKL::new(&VaeConfig::z_image(), self.vae_vb_dequantized()?)?
+        } else {
+            AutoEncoderKL::new(&VaeConfig::z_image(), self.component_vb("vae")?)?
+        };
 
         Ok(Components {
             text_encoder: Arc::new(text_encoder),
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
         })
+    }
+
+    /// Whether the snapshot component `sub/` is a **pre-quantized MLX-packed tier** — its `config.json`
+    /// carries a `quantization` block ([`candle_gen::quant::PackedConfig`]) that the install-time convert
+    /// job writes for a packed component. Absent/unreadable config → not packed (dense path), so a
+    /// fixture with no `config.json` still loads. Mirrors flux2's `component_is_packed` (sc-9087).
+    pub(crate) fn component_is_packed(&self, sub: &str) -> bool {
+        let path = self.root.join(sub).join("config.json");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
+            .is_some()
+    }
+
+    /// Build a VAE [`VarBuilder`] for a **packed** tier by dequantizing the 8 packed mid-block attention
+    /// projections (`{encoder,decoder}.mid_block.attentions.0.{to_q,to_k,to_v,to_out.0}`) to dense and
+    /// passing every other (already-dense) tensor through unchanged — so the stock `AutoEncoderKL` loads
+    /// without seeing a `.weight` u32/`.scales`/`.biases` triple it can't read. The dequant is ~2 MB of
+    /// one-time work (the sc-9408 pragmatic VAE path — see [`crate::quant::dequant_packed_to_dense`]).
+    fn vae_vb_dequantized(&self) -> Result<VarBuilder<'static>> {
+        use candle_gen::candle_core::safetensors::MmapedSafetensors;
+        let files = self.component_files("vae")?;
+        // SAFETY: mmap of read-only weight files; standard candle loading path.
+        let st = unsafe { MmapedSafetensors::multi(&files)? };
+        let src = VarBuilder::from_backend(Box::new(st), self.dtype, self.device.clone());
+
+        // Collect every tensor, dequantizing the packed attention triples and dropping their
+        // `.scales`/`.biases` siblings; pass all other tensors through at their native dtype.
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        // SAFETY: same file set; read the raw header to enumerate keys.
+        let st2 = unsafe { MmapedSafetensors::multi(&files)? };
+        let packed_bases: std::collections::HashSet<String> = st2
+            .tensors()
+            .iter()
+            .filter_map(|(k, _)| k.strip_suffix(".scales").map(|b| b.to_string()))
+            .collect();
+        for (key, _) in st2.tensors() {
+            // Skip the packed-triple siblings — they're folded into the dequantized dense `.weight`.
+            if key.ends_with(".scales") || key.ends_with(".biases") {
+                continue;
+            }
+            if let Some(base) = key.strip_suffix(".weight") {
+                if packed_bases.contains(base) {
+                    let dense = crate::quant::dequant_packed_to_dense(
+                        &src,
+                        base,
+                        &self.device,
+                        self.dtype,
+                    )?;
+                    tensors.insert(key.clone(), dense);
+                    continue;
+                }
+            }
+            // Dense tensor — load it through at its stored dtype/device.
+            let t = st2.load(&key, &self.device)?;
+            tensors.insert(key.clone(), t.to_dtype(self.dtype)?);
+        }
+        Ok(VarBuilder::from_tensors(tensors, self.dtype, &self.device))
     }
 
     /// Resolve the sorted list of `.safetensors` files in the snapshot component subdir `sub`
@@ -347,7 +499,7 @@ impl Pipeline {
     /// Token `ids` → `cap_feats` `(seq, 2560)` at the compute dtype: run the Qwen3 encoder and squeeze
     /// the batch axis. The reference `prepare_inputs` does the SEQ_MULTI_OF padding + attention mask
     /// downstream, so every id here is a valid token (no padding at this seam).
-    fn encode_cap(&self, te: &ZImageTextEncoder, ids: &[i32]) -> Result<Tensor> {
+    fn encode_cap(&self, te: &TextEnc, ids: &[i32]) -> Result<Tensor> {
         // candle embeddings index with u32; the chat-template ids are small non-negative Qwen ids.
         let ids: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
         let len = ids.len();
@@ -358,7 +510,7 @@ impl Pipeline {
 
     /// Prompt → `cap_feats` `(seq, 2560)`. Tokenizes with the Qwen chat template (gen-core's
     /// [`TextTokenizer`]) and runs the Qwen3 encoder.
-    pub(crate) fn text_embeddings(&self, te: &ZImageTextEncoder, prompt: &str) -> Result<Tensor> {
+    pub(crate) fn text_embeddings(&self, te: &TextEnc, prompt: &str) -> Result<Tensor> {
         let out = self
             .tokenizer()?
             .tokenize(prompt)
@@ -384,11 +536,7 @@ impl Pipeline {
     /// assistant\n` — which tokenizes to the non-empty role-marker sequence the reference
     /// `mlx-gen-z-image::model_base` feeds its uncond branch. A non-empty negative prompt takes the
     /// ordinary `text_embeddings` path.
-    pub(crate) fn uncond_embeddings(
-        &self,
-        te: &ZImageTextEncoder,
-        negative_prompt: &str,
-    ) -> Result<Tensor> {
+    pub(crate) fn uncond_embeddings(&self, te: &TextEnc, negative_prompt: &str) -> Result<Tensor> {
         if !negative_prompt.is_empty() {
             return self.text_embeddings(te, negative_prompt);
         }
@@ -717,6 +865,40 @@ fn preprocess_source(image: &Image, width: u32, height: u32, device: &Device) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `component_is_packed` detects the `quantization` block a packed MLX tier writes into a component
+    /// `config.json` (sc-9408) and returns false for a dense config or a missing file — the seam that
+    /// routes `load_components` to the packed vs stock models. GPU-free (only reads a small JSON file).
+    #[test]
+    fn component_is_packed_detects_quantization_block() {
+        let dir = std::env::temp_dir().join(format!("sc9408_pipe_{}", std::process::id()));
+        let packed = dir.join("transformer");
+        let dense = dir.join("vae");
+        std::fs::create_dir_all(&packed).unwrap();
+        std::fs::create_dir_all(&dense).unwrap();
+        std::fs::write(
+            packed.join("config.json"),
+            r#"{"dim": 3840, "quantization": {"bits": 4, "group_size": 64}}"#,
+        )
+        .unwrap();
+        std::fs::write(dense.join("config.json"), r#"{"latent_channels": 16}"#).unwrap();
+
+        let pipe = Pipeline::load(&dir, &Device::Cpu, DType::F32, &[]);
+        assert!(
+            pipe.component_is_packed("transformer"),
+            "a `quantization` block ⇒ packed tier"
+        );
+        assert!(
+            !pipe.component_is_packed("vae"),
+            "no `quantization` block ⇒ dense"
+        );
+        assert!(
+            !pipe.component_is_packed("text_encoder"),
+            "missing config.json ⇒ dense (fixture still loads)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Parity anchors against `mlx-gen-z-image`: the distilled 4-step default and the /8 16-channel
     /// latent geometry. GPU-free (asserts constants directly).
