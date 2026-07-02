@@ -46,7 +46,6 @@ use candle_gen::candle_core::{DType, Device, Tensor, Var};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
@@ -148,6 +147,10 @@ fn compute_loss_grads(
 
 /// Tokenize + UMT5-encode `caption` → `[1, 512, 4096]` (f32, zero-padded to 512 — the same context
 /// surface inference feeds; see [`crate::wan14b`]'s `encode`).
+///
+/// Shared Wan text-encode routine (sc-9000 / F-020). The trainer loads the UMT5 encoder at **bf16**
+/// (unlike the inference providers' f32), so it passes `out_dtype = F32` to reproduce its prior
+/// `.to_dtype(F32)` upcast of the bf16 embeds exactly.
 fn encode_caption(
     root: &Path,
     te_cfg: &TextEncoderConfig,
@@ -155,40 +158,15 @@ fn encode_caption(
     caption: &str,
     device: &Device,
 ) -> Result<Tensor> {
-    let tok = TextTokenizer::from_file(
-        root.join("tokenizer/tokenizer.json"),
-        TokenizerConfig {
-            max_length: te_cfg.max_length,
-            pad_token_id: te_cfg.pad_token_id,
-            chat_template: ChatTemplate::None,
-            pad_to_max_length: false,
-        },
+    crate::text_encode::umt5_encode_padded(
+        root,
+        te_cfg,
+        te,
+        caption,
+        device,
+        DType::F32,
+        "wan trainer",
     )
-    .map_err(|e| CandleError::Msg(format!("wan trainer: load tokenizer: {e}")))?;
-    let out = tok
-        .tokenize(caption)
-        .map_err(|e| CandleError::Msg(format!("wan trainer: tokenize: {e}")))?;
-    let mut ids: Vec<u32> = out.ids.iter().map(|&i| i as u32).collect();
-    if ids.is_empty() {
-        // Empty caption → zero ids → a degenerate `(1,1)` tensor (the old `.max(1)` padded the
-        // shape, not the data) whose 0-element f32 embedding gather reads out of bounds on CUDA
-        // (`CUDA_ERROR_ILLEGAL_ADDRESS`, surfacing as a misleading cublas failure). Emit one pad
-        // token so a 0-length sequence never reaches the gather. (sc-7078)
-        ids.push(te_cfg.pad_token_id as u32);
-    }
-    let len = ids.len();
-    let input_ids = Tensor::from_vec(ids, (1, len), device)?;
-    let embeds = te.encode(&input_ids)?.to_dtype(DType::F32)?; // [1, L, 4096]
-    let max_len = te_cfg.max_length;
-    let dim = embeds.dim(2)?;
-    match len.cmp(&max_len) {
-        std::cmp::Ordering::Less => {
-            let pad = Tensor::zeros((1, max_len - len, dim), DType::F32, device)?;
-            Ok(Tensor::cat(&[&embeds, &pad], 1)?)
-        }
-        std::cmp::Ordering::Greater => Ok(embeds.narrow(1, 0, max_len)?),
-        std::cmp::Ordering::Equal => Ok(embeds),
-    }
 }
 
 /// Insert `.{suffix}` before the extension of `file_name` (`a.safetensors` → `a.high_noise.safetensors`).

@@ -27,6 +27,7 @@ pub mod model_vace;
 pub mod pipeline;
 pub mod rope;
 pub mod scheduler;
+mod text_encode;
 pub mod text_encoder;
 pub mod training;
 pub mod transformer;
@@ -40,7 +41,6 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
     ModelDescriptor, Progress, Quant, WeightsSource,
@@ -91,18 +91,15 @@ impl Pipeline {
     }
 
     fn component_vb(&self, sub: &str, dtype: DType) -> CResult<VarBuilder<'static>> {
-        let dir = self.root.join(sub);
-        if !dir.is_dir() {
-            return Err(CandleError::Msg(format!(
-                "wan snapshot is missing the {sub}/ dir (expected a Wan2.2-TI2V-5B diffusers \
-                 snapshot at {})",
-                self.root.display()
-            )));
-        }
-        // Shared sorted-`.safetensors` → mmap (sc-8999 / F-019); the crafted "missing dir" message
-        // above stays local (it names the expected Wan snapshot).
-        let files = candle_gen::sorted_safetensors(&dir, "wan")?;
-        candle_gen::mmap_var_builder(&files, dtype, &self.device)
+        // Shared Wan component loader (sc-9000 / F-020); the crafted snapshot description stays local.
+        text_encode::component_vb(
+            &self.root,
+            sub,
+            dtype,
+            &self.device,
+            "wan",
+            "Wan2.2-TI2V-5B diffusers",
+        )
     }
 
     fn load_components(&self) -> CResult<Components> {
@@ -116,49 +113,19 @@ impl Pipeline {
         })
     }
 
-    /// Tokenize + UMT5-encode `prompt` → `[1, S, 4096]` (f32).
+    /// Tokenize + UMT5-encode `prompt` → `[1, 512, 4096]` (f32, zero-padded to `max_length`). Shared
+    /// Wan text-encode routine (sc-9000 / F-020); ENC_DTYPE (= f32) output is byte-identical to the
+    /// pre-consolidation copy.
     fn encode(&self, te: &Umt5Encoder, prompt: &str) -> CResult<Tensor> {
-        let tok = TextTokenizer::from_file(
-            self.root.join("tokenizer/tokenizer.json"),
-            TokenizerConfig {
-                max_length: self.te_cfg.max_length,
-                pad_token_id: self.te_cfg.pad_token_id,
-                chat_template: ChatTemplate::None,
-                pad_to_max_length: false,
-            },
+        text_encode::umt5_encode_padded(
+            &self.root,
+            &self.te_cfg,
+            te,
+            prompt,
+            &self.device,
+            ENC_DTYPE,
+            "wan",
         )
-        .map_err(|e| CandleError::Msg(format!("wan: load tokenizer: {e}")))?;
-        let out = tok
-            .tokenize(prompt)
-            .map_err(|e| CandleError::Msg(format!("wan: tokenize: {e}")))?;
-        let mut ids: Vec<u32> = out.ids.iter().map(|&i| i as u32).collect();
-        if ids.is_empty() {
-            // The gen_core tokenizer short-circuits an empty prompt to zero ids, but UMT5/T5 encode
-            // the empty string as a single token. A 0-length sequence here would build a degenerate
-            // `(1,1)` tensor (the old `.max(1)` padded the *shape* but not the data), and the f32
-            // embedding gather over zero indices is a 0-element CUDA `index_select` that reads out of
-            // bounds → `CUDA_ERROR_ILLEGAL_ADDRESS` (it surfaces deferred at the next cublas call as a
-            // misleading `CUBLAS_STATUS_EXECUTION_FAILED`). Emit one pad token so a 0-length sequence
-            // never reaches the gather. (sc-7078)
-            ids.push(self.te_cfg.pad_token_id as u32);
-        }
-        let len = ids.len();
-        let input_ids = Tensor::from_vec(ids, (1, len), &self.device)?;
-        let embeds = te.encode(&input_ids)?; // [1, S, 4096]
-
-        // The Wan DiT cross-attends over a context **zero-padded to `max_length` (512)** — the
-        // reference `WanPipeline` pads the UMT5 embeds to 512 before the transformer (the model was
-        // trained that way). Feeding only the real tokens silently breaks conditioning. (sc-3697)
-        let max_len = self.te_cfg.max_length;
-        let dim = embeds.dim(2)?;
-        match len.cmp(&max_len) {
-            std::cmp::Ordering::Less => {
-                let pad = Tensor::zeros((1, max_len - len, dim), embeds.dtype(), &self.device)?;
-                Ok(Tensor::cat(&[&embeds, &pad], 1)?)
-            }
-            std::cmp::Ordering::Greater => Ok(embeds.narrow(1, 0, max_len)?),
-            std::cmp::Ordering::Equal => Ok(embeds),
-        }
     }
 
     fn render(
