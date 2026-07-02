@@ -387,6 +387,13 @@ impl VisionTransformer {
     pub fn new(vb: VarBuilder, cfg: &VisionConfig) -> Result<Self> {
         let device = vb.device().clone();
         let visual = vb.pp("visual");
+        // Multi-modal guard (sc-9415): the Qwen-Image MLX tiers keep the vision tower **dense bf16**
+        // (the convert job packs only the DiT; the q4/q8 TE index carries 0 `.scales` across all 390
+        // `visual.*` keys). This loader therefore reads `visual.*.weight` as f32. If a future tier ever
+        // packed the vision tower, its u32 codes would be silently read as bf16 garbage — so error
+        // loudly on an unexpected `.scales` sibling (a representative attn projection) rather than
+        // render noise. A packed vision tower must add a real packed path, not fall through.
+        crate::quant::guard_dense(&visual, "blocks.0.attn.qkv")?;
         let patch_embed = VisionPatchEmbed::new(visual.pp("patch_embed"), cfg)?;
         let blocks_vb = visual.pp("blocks");
         let blocks = (0..cfg.depth)

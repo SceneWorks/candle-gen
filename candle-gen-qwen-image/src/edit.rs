@@ -135,19 +135,28 @@ fn load_transformer(
     device: &Device,
 ) -> Result<QwenTransformer> {
     let cfg = TransformerConfig::qwen_image();
+    // The DiT packed-detects each `Linear`: an MLX-packed edit tier (`SceneWorks/qwen-image-edit-2511
+    // -mlx` q4/q8) loads straight from the packed parts at the `group_size` read from
+    // `transformer/config.json` (64); a dense Edit snapshot loads unchanged (the group size is inert on
+    // the dense path). See `crate::transformer_group_size`.
+    let gs = crate::transformer_group_size(&root.join("transformer"));
     if adapters.is_empty() {
-        return Ok(QwenTransformer::new(
+        return Ok(QwenTransformer::new_gs(
             &cfg,
             component_vb(root, "transformer", dtype, device)?,
+            gs,
         )?);
     }
+    // Adapter-merge path: a LoRA/LoKr overlay implies a **dense** base checkpoint (the deltas are f32
+    // and can't fold into u32 packed codes), so the merged VarBuilder is dense and packed-detect takes
+    // the dense path for every projection. Group size stays the default (inert here).
     let mut tensors = load_transformer_tensors(root)?;
     // Discard the merge report — the silent twin (`candle-gen-z-image`'s
     // `transformer_vb_with_adapters`) does the same; a non-matching adapter surface already errors
     // inside `merge_adapters`, so library code stays quiet on stderr (sc-9035 / F-051).
     crate::adapters::merge_adapters(&mut tensors, adapters)?;
     let vb = VarBuilder::from_tensors(tensors, dtype, device);
-    Ok(QwenTransformer::new(&cfg, vb)?)
+    Ok(QwenTransformer::new_gs(&cfg, vb, gs)?)
 }
 
 /// `transformer/config.json` `zero_cond_t` (Edit-2511 = true; the original Edit / 2509 omit it).

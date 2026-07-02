@@ -47,6 +47,11 @@ pub mod control_fun;
 pub mod edit;
 pub mod image_processor;
 pub mod pipeline;
+// Qwen-Image DiT packed-load seam (sc-9415, sc-9089 umbrella): route every DiT `Linear` through the
+// shared `candle_gen::quant` packed-detect so the pre-quantized MLX tiers (`SceneWorks/qwen-image-mlx`
+// + `qwen-image-edit-2511-mlx` q4/q8) load straight from the packed parts. The fused Qwen2.5-VL text
+// encoder (LM + vision tower) and the VAE stay dense in every tier (see the module docs).
+pub mod quant;
 pub mod rope;
 pub mod text_encoder;
 pub mod transformer;
@@ -143,9 +148,18 @@ impl Pipeline {
     }
 
     fn load_components(&self) -> CResult<Components> {
+        // The fused Qwen2.5-VL text encoder (LM + vision tower) ships DENSE bf16 in every tier — the
+        // MLX convert job quantizes only the transformer — so the TE loader is unchanged (it guards
+        // against an unexpected `.scales`; see `text_encoder`). The DiT packed-detects: read the packed
+        // `group_size` from `transformer/config.json` (default 64 when dense/absent, never silent dense
+        // — `candle_gen::quant::PackedConfig` resolves a missing group_size to 64).
         let te = QwenTextEncoder::new(&self.te_cfg, self.component_vb("text_encoder", ENC_DTYPE)?)?;
-        let transformer =
-            QwenTransformer::new(&self.dit_cfg, self.component_vb("transformer", DIT_DTYPE)?)?;
+        let gs = transformer_group_size(&self.root.join("transformer"));
+        let transformer = QwenTransformer::new_gs(
+            &self.dit_cfg,
+            self.component_vb("transformer", DIT_DTYPE)?,
+            gs,
+        )?;
         let vae = QwenVae::new(self.component_vb("vae", ENC_DTYPE)?)?;
         Ok(Components {
             te: Arc::new(te),
@@ -245,6 +259,21 @@ impl Pipeline {
         }
         Ok(images)
     }
+}
+
+/// The MLX packed `group_size` for the DiT, read from `transformer/config.json`'s `quantization`
+/// block (a packed tier — `SceneWorks/qwen-image-mlx` + `qwen-image-edit-2511-mlx` ship group 64).
+/// Absent config / no `quantization` block (a dense diffusers snapshot) ⇒ the shared default 64
+/// ([`candle_gen::quant::PackedConfig`] already resolves a missing/absent `group_size` to 64, so a
+/// packed tier with only `bits` still loads packed — never a silent dense read of u32 codes). The
+/// group size is inert on the dense path, so a dense snapshot is byte-identical regardless.
+pub(crate) fn transformer_group_size(dit_dir: &Path) -> usize {
+    std::fs::read_to_string(dit_dir.join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
+        .map(|pc| pc.group_size as usize)
+        .unwrap_or(candle_gen::quant::MLX_GROUP_SIZE)
 }
 
 fn to_image(decoded: &Tensor) -> CResult<Image> {
@@ -423,6 +452,53 @@ mod tests {
         assert_eq!(g.descriptor().id, MODEL_ID);
         assert_eq!(g.descriptor().family, "qwen-image");
         assert_eq!(g.descriptor().backend, "candle");
+    }
+
+    /// `transformer_group_size` reads the packed `transformer/config.json`'s `quantization.group_size`
+    /// (the `SceneWorks/qwen-image-mlx` tiers ship 64), defaults a `bits`-only block to the shared 64
+    /// (never a silent dense read of u32 codes), and defaults a dense/absent config to 64. This is the
+    /// group size threaded into `QwenTransformer::new_gs` for the packed-detect load (sc-9415).
+    #[test]
+    fn transformer_group_size_reads_quantization_block() {
+        let tmp = std::env::temp_dir().join(format!("sc9415_gscfg_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // The real qwen-image-mlx tier: bits 4, group 64.
+        std::fs::write(
+            tmp.join("config.json"),
+            r#"{ "num_layers": 60, "quantization": { "bits": 4, "group_size": 64 } }"#,
+        )
+        .unwrap();
+        assert_eq!(transformer_group_size(&tmp), 64);
+
+        // A non-64 packed tier is honored end to end.
+        std::fs::write(
+            tmp.join("config.json"),
+            r#"{ "quantization": { "bits": 4, "group_size": 32 } }"#,
+        )
+        .unwrap();
+        assert_eq!(transformer_group_size(&tmp), 32);
+
+        // `bits`-only (no group_size) ⇒ the shared default 64 (PackedConfig resolves it), NOT a dense
+        // read of packed nibbles.
+        std::fs::write(
+            tmp.join("config.json"),
+            r#"{ "quantization": { "bits": 8 } }"#,
+        )
+        .unwrap();
+        assert_eq!(transformer_group_size(&tmp), 64);
+
+        // A dense snapshot (no `quantization` block) ⇒ default 64 (inert on the dense path).
+        std::fs::write(tmp.join("config.json"), r#"{ "num_layers": 60 }"#).unwrap();
+        assert_eq!(transformer_group_size(&tmp), 64);
+
+        // A genuinely-absent config ⇒ default 64.
+        assert_eq!(
+            transformer_group_size(&tmp.join("missing")),
+            candle_gen::quant::MLX_GROUP_SIZE
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

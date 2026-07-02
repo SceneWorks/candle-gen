@@ -13,11 +13,10 @@
 //! the sinusoid; all the other Linears are **biased**.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
-use candle_gen::candle_nn::{
-    linear, linear_no_bias, ops::softmax_last_dim, rms_norm, Linear, Module, RmsNorm, VarBuilder,
-};
+use candle_gen::candle_nn::{ops::softmax_last_dim, rms_norm, Module, RmsNorm, VarBuilder};
 
 use crate::config::TransformerConfig;
+use crate::quant::QLinear;
 use crate::rope::{apply_rope, QwenRope};
 
 const EPS: f64 = 1e-6;
@@ -172,18 +171,25 @@ fn to_heads(x: &Tensor, heads: usize, head_dim: usize, norm: Option<&RmsNorm>) -
 }
 
 struct TimeEmbed {
-    linear_1: Linear,
-    linear_2: Linear,
+    linear_1: QLinear,
+    linear_2: QLinear,
     channels: usize,
 }
 
 impl TimeEmbed {
-    fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &TransformerConfig, vb: VarBuilder, gs: usize) -> Result<Self> {
         let inner = cfg.inner_dim();
         let te = vb.pp("timestep_embedder");
         Ok(Self {
-            linear_1: linear(cfg.timestep_channels, inner, te.pp("linear_1"))?,
-            linear_2: linear(inner, inner, te.pp("linear_2"))?,
+            linear_1: QLinear::linear_detect_gs(
+                cfg.timestep_channels,
+                inner,
+                &te,
+                "linear_1",
+                true,
+                gs,
+            )?,
+            linear_2: QLinear::linear_detect_gs(inner, inner, &te, "linear_2", true, gs)?,
             channels: cfg.timestep_channels,
         })
     }
@@ -197,15 +203,17 @@ impl TimeEmbed {
 
 /// GELU-tanh feed-forward (`net.0.proj → gelu → net.2`).
 struct FeedForward {
-    proj_in: Linear,
-    proj_out: Linear,
+    proj_in: QLinear,
+    proj_out: QLinear,
 }
 
 impl FeedForward {
-    fn new(inner: usize, hidden: usize, vb: VarBuilder) -> Result<Self> {
+    fn new(inner: usize, hidden: usize, vb: VarBuilder, gs: usize) -> Result<Self> {
         Ok(Self {
-            proj_in: linear(inner, hidden, vb.pp("net").pp("0").pp("proj"))?,
-            proj_out: linear(hidden, inner, vb.pp("net").pp("2"))?,
+            // `net.0.proj` and `net.2` nest under the ff base — pass the full dotted base so the
+            // `.scales`/`.biases` siblings survive the key remap (never `.pp()` past a scales sibling).
+            proj_in: QLinear::linear_detect_gs(inner, hidden, &vb, "net.0.proj", true, gs)?,
+            proj_out: QLinear::linear_detect_gs(hidden, inner, &vb, "net.2", true, gs)?,
         })
     }
 
@@ -215,14 +223,14 @@ impl FeedForward {
 }
 
 struct JointAttention {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
-    add_q: Linear,
-    add_k: Linear,
-    add_v: Linear,
-    to_add_out: Linear,
+    to_q: QLinear,
+    to_k: QLinear,
+    to_v: QLinear,
+    to_out: QLinear,
+    add_q: QLinear,
+    add_k: QLinear,
+    add_v: QLinear,
+    to_add_out: QLinear,
     norm_q: RmsNorm,
     norm_k: RmsNorm,
     norm_added_q: RmsNorm,
@@ -232,18 +240,20 @@ struct JointAttention {
 }
 
 impl JointAttention {
-    fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &TransformerConfig, vb: VarBuilder, gs: usize) -> Result<Self> {
         let inner = cfg.inner_dim();
         let hd = cfg.head_dim;
+        let lin = |base: &str| QLinear::linear_detect_gs(inner, inner, &vb, base, true, gs);
         Ok(Self {
-            to_q: linear(inner, inner, vb.pp("to_q"))?,
-            to_k: linear(inner, inner, vb.pp("to_k"))?,
-            to_v: linear(inner, inner, vb.pp("to_v"))?,
-            to_out: linear(inner, inner, vb.pp("to_out").pp("0"))?,
-            add_q: linear(inner, inner, vb.pp("add_q_proj"))?,
-            add_k: linear(inner, inner, vb.pp("add_k_proj"))?,
-            add_v: linear(inner, inner, vb.pp("add_v_proj"))?,
-            to_add_out: linear(inner, inner, vb.pp("to_add_out"))?,
+            to_q: lin("to_q")?,
+            to_k: lin("to_k")?,
+            to_v: lin("to_v")?,
+            // `to_out` nests at `to_out.0` — the full base keeps the `.scales`/`.biases` siblings.
+            to_out: lin("to_out.0")?,
+            add_q: lin("add_q_proj")?,
+            add_k: lin("add_k_proj")?,
+            add_v: lin("add_v_proj")?,
+            to_add_out: lin("to_add_out")?,
             norm_q: rms_norm(hd, EPS, vb.pp("norm_q"))?,
             norm_k: rms_norm(hd, EPS, vb.pp("norm_k"))?,
             norm_added_q: rms_norm(hd, EPS, vb.pp("norm_added_q"))?,
@@ -308,23 +318,24 @@ impl JointAttention {
 }
 
 struct Block {
-    img_mod: Linear,
-    txt_mod: Linear,
+    img_mod: QLinear,
+    txt_mod: QLinear,
     attn: JointAttention,
     img_ff: FeedForward,
     txt_ff: FeedForward,
 }
 
 impl Block {
-    fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &TransformerConfig, vb: VarBuilder, gs: usize) -> Result<Self> {
         let inner = cfg.inner_dim();
         let ff_hidden = inner * 4;
         Ok(Self {
-            img_mod: linear(inner, 6 * inner, vb.pp("img_mod").pp("1"))?,
-            txt_mod: linear(inner, 6 * inner, vb.pp("txt_mod").pp("1"))?,
-            attn: JointAttention::new(cfg, vb.pp("attn"))?,
-            img_ff: FeedForward::new(inner, ff_hidden, vb.pp("img_mlp"))?,
-            txt_ff: FeedForward::new(inner, ff_hidden, vb.pp("txt_mlp"))?,
+            // `img_mod`/`txt_mod` nest the projection at `.1` — pass the full dotted base.
+            img_mod: QLinear::linear_detect_gs(inner, 6 * inner, &vb, "img_mod.1", true, gs)?,
+            txt_mod: QLinear::linear_detect_gs(inner, 6 * inner, &vb, "txt_mod.1", true, gs)?,
+            attn: JointAttention::new(cfg, vb.pp("attn"), gs)?,
+            img_ff: FeedForward::new(inner, ff_hidden, vb.pp("img_mlp"), gs)?,
+            txt_ff: FeedForward::new(inner, ff_hidden, vb.pp("txt_mlp"), gs)?,
         })
     }
 
@@ -382,15 +393,15 @@ impl Block {
 /// AdaLayerNorm-Continuous output head: `silu(temb) → linear (bias-less) → (scale, shift)`, then
 /// `(1+scale)·LN(x) + shift`.
 struct NormOut {
-    linear: Linear,
+    linear: QLinear,
 }
 
 impl NormOut {
-    fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &TransformerConfig, vb: VarBuilder, gs: usize) -> Result<Self> {
         let inner = cfg.inner_dim();
-        // The checkpoint ships a bias, but the fork loads this bias-less.
+        // The checkpoint ships a bias, but the fork loads this bias-less (packed-detect bias-less too).
         Ok(Self {
-            linear: linear_no_bias(inner, 2 * inner, vb.pp("linear"))?,
+            linear: QLinear::linear_detect_gs(inner, 2 * inner, &vb, "linear", false, gs)?,
         })
     }
 
@@ -407,34 +418,55 @@ impl NormOut {
 
 /// The Qwen-Image MMDiT.
 pub struct QwenTransformer {
-    img_in: Linear,
+    img_in: QLinear,
     txt_norm: RmsNorm,
-    txt_in: Linear,
+    txt_in: QLinear,
     time_embed: TimeEmbed,
     blocks: Vec<Block>,
     norm_out: NormOut,
-    proj_out: Linear,
+    proj_out: QLinear,
     rope: QwenRope,
     device: Device,
     dtype: DType,
 }
 
 impl QwenTransformer {
+    /// Build the MMDiT from a `transformer/` VarBuilder at the default MLX group size 64. A **dense**
+    /// diffusers snapshot (no `.scales`) loads unchanged; a pre-quantized MLX tier at group 64 loads
+    /// packed. Callers that read the packed `group_size` from `transformer/config.json` (a non-64 tier)
+    /// use [`Self::new_gs`].
     pub fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
+        Self::new_gs(cfg, vb, candle_gen::quant::MLX_GROUP_SIZE)
+    }
+
+    /// Build the MMDiT at an explicit MLX `group_size` (sc-9415), read from the packed
+    /// `transformer/config.json`'s `quantization.group_size` (`SceneWorks/qwen-image-mlx` +
+    /// `qwen-image-edit-2511-mlx` ship group 64). Every DiT `Linear` packed-**detects** its `.scales`
+    /// sibling and loads straight from the packed parts when present, else the dense path unchanged —
+    /// so a dense diffusers snapshot and a q4/q8 packed snapshot both load through this one call. The
+    /// only quantized weights in the tier are the DiT projections; the RMSNorm weights stay dense.
+    pub fn new_gs(cfg: &TransformerConfig, vb: VarBuilder, gs: usize) -> Result<Self> {
         let inner = cfg.inner_dim();
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
-            blocks.push(Block::new(cfg, vb.pp("transformer_blocks").pp(i))?);
+            blocks.push(Block::new(cfg, vb.pp("transformer_blocks").pp(i), gs)?);
         }
         Ok(Self {
-            img_in: linear(cfg.in_channels, inner, vb.pp("img_in"))?,
+            img_in: QLinear::linear_detect_gs(cfg.in_channels, inner, &vb, "img_in", true, gs)?,
             txt_norm: rms_norm(cfg.joint_attention_dim, cfg.eps, vb.pp("txt_norm"))?,
-            txt_in: linear(cfg.joint_attention_dim, inner, vb.pp("txt_in"))?,
-            time_embed: TimeEmbed::new(cfg, vb.pp("time_text_embed"))?,
+            txt_in: QLinear::linear_detect_gs(
+                cfg.joint_attention_dim,
+                inner,
+                &vb,
+                "txt_in",
+                true,
+                gs,
+            )?,
+            time_embed: TimeEmbed::new(cfg, vb.pp("time_text_embed"), gs)?,
             blocks,
-            norm_out: NormOut::new(cfg, vb.pp("norm_out"))?,
+            norm_out: NormOut::new(cfg, vb.pp("norm_out"), gs)?,
             // proj_out maps to the packed velocity (patch²·out_channels = 64 = in_channels).
-            proj_out: linear(inner, cfg.in_channels, vb.pp("proj_out"))?,
+            proj_out: QLinear::linear_detect_gs(inner, cfg.in_channels, &vb, "proj_out", true, gs)?,
             rope: QwenRope::new(cfg),
             device: vb.device().clone(),
             dtype: vb.dtype(),
@@ -619,15 +651,15 @@ fn build_modulate_index(
 /// at `interval = ceil(60/5) = 12` (see [`QwenTransformer::forward_control`]). The block math is the
 /// **same** [`Block`] as the base (identical on-disk keys), so the loader reuses it.
 pub struct QwenControlNet {
-    img_in: Linear,
+    img_in: QLinear,
     txt_norm: RmsNorm,
-    txt_in: Linear,
+    txt_in: QLinear,
     time_embed: TimeEmbed,
     /// Zero-init projection of the packed control latent (`64 → inner`), added to `img_in(x)`.
-    x_embedder: Linear,
+    x_embedder: QLinear,
     blocks: Vec<Block>,
     /// Zero-init per-block residual projections (`inner → inner`).
-    controlnet_blocks: Vec<Linear>,
+    controlnet_blocks: Vec<QLinear>,
     rope: QwenRope,
     device: Device,
     dtype: DType,
@@ -636,20 +668,49 @@ pub struct QwenControlNet {
 impl QwenControlNet {
     /// Load the control branch (`num_layers` blocks — 5 for the InstantX Union) from its single-file
     /// checkpoint (the base block keys + `controlnet_x_embedder` + `controlnet_blocks.{i}`).
+    ///
+    /// The InstantX `Qwen-Image-ControlNet-Union` checkpoint is a **separate dense** artifact — it is
+    /// not part of the `SceneWorks/qwen-image-mlx` packed tiers, so it carries no `.scales` and every
+    /// projection here packed-**detects** to the dense path unchanged (a packed control tier is deferred
+    /// to sc-9517). The default group size is inert on the dense path; it is threaded only so the seam
+    /// composes with the base DiT if a packed control tier ever ships.
     pub fn new(cfg: &TransformerConfig, num_layers: usize, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.inner_dim();
+        let gs = candle_gen::quant::MLX_GROUP_SIZE;
         let mut blocks = Vec::with_capacity(num_layers);
         let mut controlnet_blocks = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
-            blocks.push(Block::new(cfg, vb.pp("transformer_blocks").pp(i))?);
-            controlnet_blocks.push(linear(inner, inner, vb.pp("controlnet_blocks").pp(i))?);
+            blocks.push(Block::new(cfg, vb.pp("transformer_blocks").pp(i), gs)?);
+            let cb = vb.pp("controlnet_blocks");
+            controlnet_blocks.push(QLinear::linear_detect_gs(
+                inner,
+                inner,
+                &cb,
+                &i.to_string(),
+                true,
+                gs,
+            )?);
         }
         Ok(Self {
-            img_in: linear(cfg.in_channels, inner, vb.pp("img_in"))?,
+            img_in: QLinear::linear_detect_gs(cfg.in_channels, inner, &vb, "img_in", true, gs)?,
             txt_norm: rms_norm(cfg.joint_attention_dim, cfg.eps, vb.pp("txt_norm"))?,
-            txt_in: linear(cfg.joint_attention_dim, inner, vb.pp("txt_in"))?,
-            time_embed: TimeEmbed::new(cfg, vb.pp("time_text_embed"))?,
-            x_embedder: linear(cfg.in_channels, inner, vb.pp("controlnet_x_embedder"))?,
+            txt_in: QLinear::linear_detect_gs(
+                cfg.joint_attention_dim,
+                inner,
+                &vb,
+                "txt_in",
+                true,
+                gs,
+            )?,
+            time_embed: TimeEmbed::new(cfg, vb.pp("time_text_embed"), gs)?,
+            x_embedder: QLinear::linear_detect_gs(
+                cfg.in_channels,
+                inner,
+                &vb,
+                "controlnet_x_embedder",
+                true,
+                gs,
+            )?,
             blocks,
             controlnet_blocks,
             rope: QwenRope::new(cfg),
@@ -721,13 +782,13 @@ impl QwenControlNet {
 /// reuses [`Block::new`].
 pub struct QwenFunControlBranch {
     /// `control_img_in`: 132 → inner. Biased patch embedder for the packed 132-ch control context.
-    control_img_in: Linear,
+    control_img_in: QLinear,
     /// The `N` control blocks (same math as the base dual-stream block; reuse the base RoPE / temb).
     blocks: Vec<Block>,
     /// Zero-init per-block hint projection (`inner → inner`), one per control block (`after_proj`).
-    after_proj: Vec<Linear>,
+    after_proj: Vec<QLinear>,
     /// Zero-init `before_proj` on control block 0 (`inner → inner`): `c = before_proj(c) + img_embed`.
-    before_proj: Linear,
+    before_proj: QLinear,
     /// Base block indices each control hint injects into (`control_layers`); `places[n]` is the base
     /// index for hint `n`.
     places: Vec<usize>,
@@ -744,20 +805,42 @@ impl QwenFunControlBranch {
         vb: VarBuilder,
     ) -> Result<Self> {
         let inner = cfg.inner_dim();
+        // The alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` checkpoint is a **separate dense**
+        // artifact — not part of the MLX packed tiers, so every projection here packed-detects to the
+        // dense path unchanged (a packed Fun-control tier is deferred to sc-9517). Group size is inert
+        // on the dense path; threaded only so the seam composes if a packed tier ever ships.
+        let gs = candle_gen::quant::MLX_GROUP_SIZE;
         let n = control_layers.len();
         let mut blocks = Vec::with_capacity(n);
         let mut after_proj = Vec::with_capacity(n);
         for i in 0..n {
             let blk = vb.pp("control_blocks").pp(i);
-            blocks.push(Block::new(cfg, blk.clone())?);
-            after_proj.push(linear(inner, inner, blk.pp("after_proj"))?);
+            blocks.push(Block::new(cfg, blk.clone(), gs)?);
+            after_proj.push(QLinear::linear_detect_gs(
+                inner,
+                inner,
+                &blk,
+                "after_proj",
+                true,
+                gs,
+            )?);
         }
         Ok(Self {
-            control_img_in: linear(control_in_dim, inner, vb.pp("control_img_in"))?,
-            before_proj: linear(
+            control_img_in: QLinear::linear_detect_gs(
+                control_in_dim,
+                inner,
+                &vb,
+                "control_img_in",
+                true,
+                gs,
+            )?,
+            before_proj: QLinear::linear_detect_gs(
                 inner,
                 inner,
-                vb.pp("control_blocks").pp(0).pp("before_proj"),
+                &vb.pp("control_blocks").pp(0),
+                "before_proj",
+                true,
+                gs,
             )?,
             blocks,
             after_proj,
@@ -958,8 +1041,13 @@ mod tests {
             candle_gen::candle_core::bail!("RandomBackend requires a shape; use get")
         }
 
-        fn contains_tensor(&self, _name: &str) -> bool {
-            true
+        fn contains_tensor(&self, name: &str) -> bool {
+            // A **dense** random backend: it synthesizes a `{base}.weight`/`.bias` for any key via
+            // `get`, but has **no** MLX-packed `.scales`/`.biases` sibling. So report `false` for the
+            // packed-detect markers — otherwise `QLinear::linear_detect_gs` would take the packed path
+            // and call `get_unchecked_dtype` (unsupported here). This keeps the no-weights control
+            // wiring tests on the dense path (the InstantX / 2512-Fun control checkpoints are dense).
+            !(name.ends_with(".scales") || name.ends_with(".biases"))
         }
     }
 

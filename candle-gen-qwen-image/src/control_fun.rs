@@ -128,9 +128,13 @@ impl QwenFunControl {
             &te_cfg,
             control_common::component_vb(&root, "text_encoder", ENC_DTYPE, &device, LABEL)?,
         )?;
-        let transformer = QwenTransformer::new(
+        // The base 2512 MMDiT packed-detects (a packed MLX base tier loads straight from the packed
+        // parts; a dense base snapshot unchanged) at the `group_size` read from `transformer/config.json`.
+        let gs = crate::transformer_group_size(&root.join("transformer"));
+        let transformer = QwenTransformer::new_gs(
             &dit_cfg,
             control_common::component_vb(&root, "transformer", DIT_DTYPE, &device, LABEL)?,
+            gs,
         )?;
         let vae = QwenVae::new(control_common::component_vb(
             &root, "vae", ENC_DTYPE, &device, LABEL,

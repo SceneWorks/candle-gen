@@ -182,6 +182,16 @@ impl QwenTextEncoder {
     /// Build under the `model.*` prefix.
     pub fn new(cfg: &TextEncoderConfig, vb: VarBuilder) -> Result<Self> {
         let model = vb.pp("model");
+        // Multi-modal guard (sc-9415): the Qwen-Image MLX tiers keep the whole Qwen2.5-VL **language
+        // model dense bf16** (the convert job packs only the DiT; the q4/q8 TE index carries 0
+        // `.scales` across all 729 keys, incl. `model.embed_tokens` and every `model.layers.*`). This
+        // loader reads those weights as f32. If a future tier ever packed the LM, its u32 codes /
+        // embedding table would be silently read as bf16 garbage — so error loudly on an unexpected
+        // `.scales` sibling (a representative attn projection + the token embedding) rather than render
+        // noise. A packed LM must add a real packed path (`candle_gen::quant::{lin,embedding}`), not
+        // fall through.
+        crate::quant::guard_dense(&model, "layers.0.self_attn.q_proj")?;
+        crate::quant::guard_dense(&model, "embed_tokens")?;
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, model.pp("embed_tokens"))?;
         let mut layers = Vec::with_capacity(cfg.n_layers);
         let vb_layers = model.pp("layers");
