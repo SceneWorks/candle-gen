@@ -732,10 +732,21 @@ mod tests {
         assert_eq!(a.pixels, b.pixels, "same seed + weights must reproduce");
     }
 
-    /// sc-8993: at `cfg_scale == 1.0` the CFG blend `uncond + 1·(cond − uncond)` is exactly `cond`, so
-    /// running the uncond forward is pure waste. This pins the equivalence the `conditioning` gate
-    /// relies on: render_core with `Some(uncond)` at cfg 1.0 is byte-identical to the cond-only path
-    /// (`None`) — proving skipping the uncond branch when guidance is disabled cannot change output.
+    /// sc-8993: at `cfg_scale == 1.0` the CFG blend `uncond + 1·(cond − uncond)` is exactly `cond`
+    /// in exact arithmetic, so running the uncond forward is pure waste. This pins the equivalence
+    /// the `conditioning` gate relies on: render_core with `Some(uncond)` at cfg 1.0 is
+    /// numerically equivalent to the cond-only path (`None`) — proving skipping the uncond branch
+    /// when guidance is disabled cannot change the output.
+    ///
+    /// We compare with a tiny per-pixel tolerance rather than byte-exact equality. The `Some(uncond)`
+    /// path evaluates `v_uncond + (v_cond − v_uncond)·1.0`, whose reduction to `v_cond` is only exact
+    /// in real arithmetic: floating-point add/sub is non-associative and platforms differ in FMA
+    /// contraction and rounding (x86-64 Linux vs macOS/Windows), so the recombined velocity can differ
+    /// from the direct `v_cond` in the last ULP. That sub-ULP difference propagates through the
+    /// sampler + VAE decode and can flip a boundary pixel by ±1 after the u8 quantization — a byte-exact
+    /// assertion is therefore not portable. A tolerance of ≤1 (u8) is still fully discriminating: a real
+    /// CFG regression at cfg=1.0 (e.g. dropping the cond term, or a sign/scale error in the blend) shifts
+    /// the image by far more than one gray level across many pixels.
     #[test]
     fn cfg_scale_one_equals_cond_only_path() {
         let device = Device::Cpu;
@@ -766,8 +777,21 @@ mod tests {
         let with_uncond = render(Some(&uncond));
         let cond_only = render(None);
         assert_eq!(
-            with_uncond.pixels, cond_only.pixels,
-            "cfg_scale 1.0 blend must equal cond-only; skipping the uncond branch is a no-op"
+            with_uncond.pixels.len(),
+            cond_only.pixels.len(),
+            "both paths must decode to the same-shaped image"
+        );
+        let max_abs_diff = with_uncond
+            .pixels
+            .iter()
+            .zip(cond_only.pixels.iter())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_abs_diff <= 1,
+            "cfg_scale 1.0 blend must equal cond-only (skipping the uncond branch is a no-op); \
+             max per-pixel abs diff was {max_abs_diff} (>1 u8 => not just FP non-associativity)"
         );
     }
 
@@ -903,12 +927,29 @@ mod tests {
             )
             .unwrap()
         };
-        // (1) cfg 1.0: the wasted-uncond path == cond-only, bit-for-bit, ON THE GPU.
+        // (1) cfg 1.0: the wasted-uncond path == cond-only ON THE GPU, within a sub-ULP tolerance.
+        // The `Some(uncond)` path recombines `v_uncond + (v_cond − v_uncond)·1.0`, whose reduction to
+        // `v_cond` is exact only in real arithmetic; FP non-associativity can flip a boundary pixel by
+        // ±1 after u8 quantization (see the CPU `cfg_scale_one_equals_cond_only_path` test). ≤1 (u8) is
+        // still fully discriminating — a real CFG regression shifts many pixels by far more.
         let with_uncond_1 = render(Some(&uncond), 1.0);
         let cond_only = render(None, 1.0);
         assert_eq!(
-            with_uncond_1.pixels, cond_only.pixels,
-            "sc-8993: cfg 1.0 with uncond must equal cond-only on CUDA"
+            with_uncond_1.pixels.len(),
+            cond_only.pixels.len(),
+            "sc-8993: both cfg 1.0 paths must decode to the same-shaped image"
+        );
+        let max_abs_diff = with_uncond_1
+            .pixels
+            .iter()
+            .zip(cond_only.pixels.iter())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_abs_diff <= 1,
+            "sc-8993: cfg 1.0 with uncond must equal cond-only on CUDA; max per-pixel abs diff was \
+             {max_abs_diff} (>1 u8 => not just FP non-associativity)"
         );
         // (2) guided (cfg 4.0) still renders and is a distinct, untouched code path.
         let guided = render(Some(&uncond), 4.0);
