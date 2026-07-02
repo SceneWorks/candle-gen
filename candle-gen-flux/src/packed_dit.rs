@@ -12,8 +12,13 @@
 //! q4/q8 load straight from the packed parts (no dense staging), while a dense diffusers snapshot (bf16,
 //! no `.scales`) loads through the same code unchanged. Numerically this is the diffusers formulation of
 //! the same FLUX.1 forward the stock BFL model computes (both consume the same VAE-packed latents / T5
-//! context / CLIP pooled vector and emit the same velocity); the CI parity test pins a dense build of
-//! this DiT against the stock `candle-transformers` `Flux` at 1e-4 on shared weights.
+//! context / CLIP pooled vector and emit the same velocity). Coverage for this vendored DiT is
+//! indirect: (a) the shared-module packed-vs-dense projection parity unit tests (the [`crate::quant`]
+//! `QLinear` seam every `Linear` here is built through) and (b) a coherent q4 GPU render end-to-end,
+//! plus the local shape/finite forward smoke below. There is **no** stock-vs-vendored DiT numeric
+//! parity test at present — that (a dense build of this DiT pinned against the stock
+//! `candle-transformers` `Flux` at 1e-4 on shared weights, mirroring the CLIP/T5 encoder parity tests
+//! in [`crate::packed_te`]) is deferred and tracked in Shortcut story sc-9443.
 //!
 //! The RoPE / SDPA / timestep-embedding helpers are **reused** from [`crate::ip_dit`] (the same FLUX
 //! RoPE the BFL model and the control branch use), so this file adds no numerics of its own beyond the
