@@ -171,13 +171,10 @@ impl Scail2 {
             let part = candle_gen::candle_core::safetensors::load(f, &Device::Cpu)?;
             tensors.extend(part);
         }
-        let report = crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
-        eprintln!(
-            "[scail2] merged {} adapter file(s): {} weight/bias deltas applied, {} keys off-surface/skipped",
-            self.adapters.len(),
-            report.merged,
-            report.skipped_keys
-        );
+        // Discard the merge report — the silent twin (`candle-gen-z-image`'s
+        // `transformer_vb_with_adapters`) does the same; a mismatched adapter surface already errors
+        // inside `merge_adapters`, so library code stays quiet on stderr (sc-9035 / F-051).
+        crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
         // Cast host-side so `from_tensors` does no GPU-side bf16→f32 staging (see the doc note above).
         for v in tensors.values_mut() {
             if v.dtype() != DType::F32 {
