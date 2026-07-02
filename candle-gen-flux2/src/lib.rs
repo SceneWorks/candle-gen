@@ -154,27 +154,83 @@ impl Pipeline {
         Ok(vb)
     }
 
-    fn load_components(&self) -> CResult<Components> {
-        let (te, transformer) = match self.quant {
-            // Quant path (dev 32B): stage the TE + DiT dense in CPU RAM (~105 GB; the box has 512),
-            // then quantize each projection onto the GPU and move the small dense leaves there too —
-            // the dense weights never land on the GPU. The VAE is small and loads directly on-device.
-            Some(q) => {
-                let cpu = Device::Cpu;
-                let mut te =
-                    Qwen3TextEncoder::new(&self.cfg, self.component_vb_on("text_encoder", &cpu)?)?;
-                te.quantize(q, &self.device)?;
-                let mut transformer =
-                    Flux2Transformer::new(&self.cfg, self.component_vb_on("transformer", &cpu)?)?;
-                transformer.quantize(q, &self.device)?;
-                (te, transformer)
+    /// Whether the snapshot component `sub/` is a **pre-quantized MLX-packed tier** — its `config.json`
+    /// carries a `quantization` block (`candle_gen::quant::PackedConfig`), which an install-time convert
+    /// job writes for a packed component. On a packed tier the loader builds each Linear/embedding
+    /// **directly from the packed parts** on the GPU (sc-9087, no dense CPU staging); on a dense tier it
+    /// falls back to the CPU-stage → quantize-onto-GPU path. Absent/unreadable config → not packed
+    /// (dense path), so a fixture with no `config.json` still loads.
+    pub(crate) fn component_is_packed(&self, sub: &str) -> bool {
+        let path = self.root.join(sub).join("config.json");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
+            .is_some()
+    }
+
+    /// Load the TE + DiT, routing each through the **packed** path (build straight from an MLX-packed
+    /// tier on the GPU — sc-9087, no ~105 GB dense CPU staging) or the legacy **dense** path (stage
+    /// dense in system RAM, then quantize each projection onto the GPU) per [`Self::component_is_packed`]
+    /// and `self.quant`. Shared by txt2img, `Flux2Edit::load_dev`, and `Flux2Control` (they load the same
+    /// quantizable pair; the callers add the VAE / control overlay). `mk_te` / `mk_dit` build the module
+    /// from a component VarBuilder (`Qwen3TextEncoder::new` / `Flux2Transformer::new`).
+    pub(crate) fn load_quantizable(
+        &self,
+        mk_te: impl Fn(&Flux2Config, VarBuilder) -> CResult<Qwen3TextEncoder>,
+        mk_dit: impl Fn(&Flux2Config, VarBuilder) -> CResult<Flux2Transformer>,
+    ) -> CResult<(Qwen3TextEncoder, Flux2Transformer)> {
+        let te = self.load_one_quantizable(
+            "text_encoder",
+            |vb| mk_te(&self.cfg, vb),
+            |m, q, d| Ok(m.quantize(q, d)?),
+        )?;
+        let dit = self.load_one_quantizable(
+            "transformer",
+            |vb| mk_dit(&self.cfg, vb),
+            |m, q, d| Ok(m.quantize(q, d)?),
+        )?;
+        Ok((te, dit))
+    }
+
+    /// Load one quantizable component (`sub`). Three regimes:
+    /// - **packed tier + quant**: build directly on the GPU from the packed parts (`.scales` detected
+    ///   inside each `linear_detect`); no dense weight is ever materialized (sc-9087). The post-load
+    ///   `quantize` pass is still called — it is a no-op on the already-packed projections and only
+    ///   carries the dense leaves (RMSNorms, a dense token embedding) to the GPU.
+    /// - **dense tier + quant**: stage dense in CPU RAM, then `quantize` folds each projection onto the
+    ///   GPU (the legacy ~105 GB path, retained for dense tiers / large fixtures).
+    /// - **no quant**: load dense on-device (klein, small dev fixtures).
+    fn load_one_quantizable<M>(
+        &self,
+        sub: &str,
+        build: impl FnOnce(VarBuilder) -> CResult<M>,
+        quantize: impl FnOnce(&mut M, Quant, &Device) -> CResult<()>,
+    ) -> CResult<M> {
+        match self.quant {
+            Some(q) if self.component_is_packed(sub) => {
+                // Build straight on the GPU from the packed tier — the packed footprint (≈ Q4: ¼ bf16)
+                // lands directly; no dense staging.
+                let mut m = build(self.component_vb_on(sub, &self.device)?)?;
+                // No-op on the packed projections; moves the dense leaves to the GPU.
+                quantize(&mut m, q, &self.device)?;
+                Ok(m)
             }
-            // Dense path (klein, and dev on a fixture small enough to fit): load on-device directly.
-            None => (
-                Qwen3TextEncoder::new(&self.cfg, self.component_vb("text_encoder")?)?,
-                Flux2Transformer::new(&self.cfg, self.component_vb("transformer")?)?,
-            ),
-        };
+            Some(q) => {
+                // Dense tier: stage dense in CPU RAM, then quantize each projection onto the GPU.
+                let mut m = build(self.component_vb_on(sub, &Device::Cpu)?)?;
+                quantize(&mut m, q, &self.device)?;
+                Ok(m)
+            }
+            None => build(self.component_vb(sub)?),
+        }
+    }
+
+    fn load_components(&self) -> CResult<Components> {
+        let (te, transformer) = self.load_quantizable(
+            |cfg, vb| Ok(Qwen3TextEncoder::new(cfg, vb)?),
+            |cfg, vb| Ok(Flux2Transformer::new(cfg, vb)?),
+        )?;
         let vae = Flux2Vae::new(self.component_vb("vae")?)?;
         Ok(Components {
             te: Arc::new(te),
@@ -666,6 +722,40 @@ mod tests {
         // succeeds without touching the (nonexistent) weights.
         let dev_quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
         assert!(load_dev(&dev_quant).is_ok());
+    }
+
+    /// The loader's packed/dense routing decision (sc-9087): a component whose `config.json` carries a
+    /// `quantization` block is a packed MLX tier (build directly on the GPU, no dense CPU staging); a
+    /// component with a plain config, or none, is dense (the CPU-stage → quantize-onto path). Drives
+    /// `Pipeline::load_one_quantizable`'s device choice.
+    #[test]
+    fn component_is_packed_reads_quantization_block() {
+        let dir = std::env::temp_dir().join(format!("sc9087_pkg_{}", std::process::id()));
+        let pipe = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu);
+
+        let packed = dir.join("transformer");
+        std::fs::create_dir_all(&packed).unwrap();
+        std::fs::write(
+            packed.join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+        )
+        .unwrap();
+        assert!(
+            pipe.component_is_packed("transformer"),
+            "a `quantization` block ⇒ packed tier"
+        );
+
+        let dense = dir.join("text_encoder");
+        std::fs::create_dir_all(&dense).unwrap();
+        std::fs::write(dense.join("config.json"), r#"{"hidden_size": 5120}"#).unwrap();
+        assert!(
+            !pipe.component_is_packed("text_encoder"),
+            "no `quantization` block ⇒ dense tier"
+        );
+        // A component with no config.json at all → dense (fixtures still load).
+        assert!(!pipe.component_is_packed("vae"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

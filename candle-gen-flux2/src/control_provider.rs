@@ -100,24 +100,13 @@ impl Flux2Control {
         let device = candle_gen::default_device()?;
         let pipe = Pipeline::load(Flux2Variant::Dev, quant, &paths.root, &device);
 
-        // Base DiT + Mistral TE: the dev quant path stages them dense in CPU RAM and quantizes each
-        // projection onto the GPU (the dense 32B never lands on the GPU); the dense path loads on-device.
-        let (te, base) = match quant {
-            Some(q) => {
-                let cpu = Device::Cpu;
-                let mut te =
-                    Qwen3TextEncoder::new(&pipe.cfg, pipe.component_vb_on("text_encoder", &cpu)?)?;
-                te.quantize(q, &device)?;
-                let mut base =
-                    Flux2Transformer::new(&pipe.cfg, pipe.component_vb_on("transformer", &cpu)?)?;
-                base.quantize(q, &device)?;
-                (te, base)
-            }
-            None => (
-                Qwen3TextEncoder::new(&pipe.cfg, pipe.component_vb("text_encoder")?)?,
-                Flux2Transformer::new(&pipe.cfg, pipe.component_vb("transformer")?)?,
-            ),
-        };
+        // Base DiT + Mistral TE. Packed MLX tier → build directly on the GPU from the packed parts
+        // (sc-9087, no ~105 GB dense CPU staging); dense tier → stage dense in CPU RAM and quantize each
+        // projection onto the GPU. Shared with txt2img / edit.
+        let (te, base) = pipe.load_quantizable(
+            |cfg, vb| Ok(Qwen3TextEncoder::new(cfg, vb)?),
+            |cfg, vb| Ok(Flux2Transformer::new(cfg, vb)?),
+        )?;
 
         // The control overlay is small (~8 GB bf16) and fits on the GPU; load it dense on-device and
         // quantize in place (the 260-ch `control_img_in` stays dense — 260 ∤ 32).
