@@ -271,16 +271,33 @@ impl KolorsUNet {
         })
     }
 
-    /// Predict `eps` for one denoise step.
+    /// Project the raw ChatGLM3 context `[B, S, 4096]` to the cross-attention width `[B, S, 2048]`
+    /// via the Kolors `encoder_hid_proj`.
+    ///
+    /// This projection is **step-invariant** (it depends only on the prompt embeddings, not the
+    /// timestep), so callers should hoist it out of the per-step denoise loop and feed the result to
+    /// [`Self::forward_projected`] — matching the pose-control / IP-Adapter providers, which project
+    /// once up front (`control.rs`, `ip_provider.rs`) before the vendored `forward_instantid`.
+    pub fn project_context(&self, context: &Tensor) -> Result<Tensor> {
+        self.encoder_hid_proj.forward(context)
+    }
+
+    /// Predict `eps` for one denoise step from an **already-projected** context.
     /// - `xs`: latents `[B, 4, H/8, W/8]`.
     /// - `timestep`: the (leading) float timestep, broadcast to the batch.
-    /// - `context`: the ChatGLM3 cross-attention context `[B, S, 4096]` (projected here to 2048).
+    /// - `encoder_hidden_states`: the 2048-wide cross-attention context, i.e. the output of
+    ///   [`Self::project_context`], computed ONCE before the denoise loop (NOT the raw 4096-wide
+    ///   ChatGLM3 context — the `encoder_hid_proj` projection is step-invariant and hoisted out).
     /// - `pooled`: the pooled ChatGLM3 add-embedding `[B, 4096]`; `time_ids`: micro-conditioning `[B, 6]`.
-    pub fn forward(
+    ///
+    /// Splitting the projection out of the forward avoids recomputing the step-invariant
+    /// `encoder_hid_proj` every denoise step, and matches the pose-control / IP-Adapter providers
+    /// (`control.rs`, `ip_provider.rs`), which likewise project up front (sc-9040 / F-056).
+    pub fn forward_projected(
         &self,
         xs: &Tensor,
         timestep: f64,
-        context: &Tensor,
+        encoder_hidden_states: &Tensor,
         pooled: &Tensor,
         time_ids: &Tensor,
     ) -> Result<Tensor> {
@@ -304,9 +321,6 @@ impl KolorsUNet {
         let aug_emb = self.add_embedding.forward(&add_in)?;
         let emb = (emb + aug_emb)?;
 
-        // Kolors: project the ChatGLM3 context to the cross-attention width, once up front.
-        let encoder_hidden_states = self.encoder_hid_proj.forward(context)?;
-
         // 2. pre-process.
         let xs = self.conv_in.forward(xs)?;
 
@@ -317,7 +331,7 @@ impl KolorsUNet {
             let (out, res_xs) = match down_block {
                 DownBlock::Basic(b) => b.forward(&xs, Some(&emb))?,
                 DownBlock::CrossAttn(b) => {
-                    b.forward(&xs, Some(&emb), Some(&encoder_hidden_states))?
+                    b.forward(&xs, Some(&emb), Some(encoder_hidden_states))?
                 }
             };
             down_block_res_xs.extend(res_xs);
@@ -327,7 +341,7 @@ impl KolorsUNet {
         // 4. mid.
         let mut xs = self
             .mid_block
-            .forward(&xs, Some(&emb), Some(&encoder_hidden_states))?;
+            .forward(&xs, Some(&emb), Some(encoder_hidden_states))?;
 
         // 5. up.
         let mut upsample_size = None;
@@ -348,7 +362,7 @@ impl KolorsUNet {
                     &res_xs,
                     Some(&emb),
                     upsample_size,
-                    Some(&encoder_hidden_states),
+                    Some(encoder_hidden_states),
                 )?,
             };
         }
@@ -357,5 +371,53 @@ impl KolorsUNet {
         let xs = self.conv_norm_out.forward(&xs)?;
         let xs = nn::ops::silu(&xs)?;
         self.conv_out.forward(&xs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use candle_gen::candle_core::{DType, Device, Tensor};
+    use candle_gen::candle_nn::{self as nn, Module, VarBuilder};
+
+    /// The `encoder_hid_proj` projection (ChatGLM3 4096 → cross-attention 2048) is **step-invariant**:
+    /// it depends only on the prompt context, not the timestep. This is the property that lets
+    /// `Pipeline::render` hoist it out of the denoise loop (compute once via `project_context`, feed
+    /// `forward_projected` each step) instead of re-projecting inside `forward` every step
+    /// (sc-9040 / F-056). Assert that projecting once and reusing across N steps is BIT-IDENTICAL to
+    /// re-projecting per step, so the hoist cannot change any pixel.
+    #[test]
+    fn encoder_hid_proj_is_step_invariant_bit_identical() -> candle_gen::candle_core::Result<()> {
+        let dev = Device::Cpu;
+        // A tiny stand-in for the 4096→2048 projection with fixed, deterministic weights + bias,
+        // built exactly as `KolorsUNet::new` builds `encoder_hid_proj` (`nn::linear`, with bias).
+        let (in_dim, out_dim) = (8usize, 4usize);
+        let w =
+            Tensor::arange(0f32, (out_dim * in_dim) as f32, &dev)?.reshape((out_dim, in_dim))?;
+        let b = Tensor::arange(0f32, out_dim as f32, &dev)?;
+        let mut ts = std::collections::HashMap::new();
+        ts.insert("proj.weight".to_string(), w);
+        ts.insert("proj.bias".to_string(), b);
+        let vb = VarBuilder::from_tensors(ts, DType::F32, &dev);
+        let proj = nn::linear(in_dim, out_dim, vb.pp("proj"))?;
+
+        // A [B=2, S=3, 4096-analog] context, like the CFG-batched ChatGLM3 hidden states.
+        let context = Tensor::randn(0f32, 1f32, (2, 3, in_dim), &dev)?;
+
+        // Hoisted: project ONCE up front.
+        let hoisted = proj.forward(&context)?;
+
+        // Per-step: re-project every "step"; each result must be byte-identical to the hoisted one.
+        for _step in 0..5 {
+            let per_step = proj.forward(&context)?;
+            let diff = (&per_step - &hoisted)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+            assert_eq!(
+                diff, 0f32,
+                "encoder_hid_proj must be step-invariant (bit-identical)"
+            );
+        }
+        Ok(())
     }
 }

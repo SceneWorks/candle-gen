@@ -192,6 +192,12 @@ impl Pipeline {
         let batch = if use_guide { 2 } else { 1 };
         let time_ids = self.build_time_ids(batch, h, w)?;
 
+        // The Kolors `encoder_hid_proj` (ChatGLM3 4096 → cross-attention 2048) is step-invariant, so
+        // project the CFG-batched context ONCE here rather than every denoise step (sc-9040 / F-056),
+        // matching the pose-control / IP-Adapter providers. The projected result feeds
+        // `KolorsUNet::forward_projected`.
+        let encoder_hidden_states = components.unet.project_context(&context)?;
+
         let (lat_h, lat_w) = ((h / 8) as usize, (w / 8) as usize);
         let total = sampler.num_steps() as u32;
         let mut images = Vec::with_capacity(req.count as usize);
@@ -205,7 +211,7 @@ impl Pipeline {
                     name,
                     &noise,
                     components,
-                    &context,
+                    &encoder_hidden_states,
                     &pooled,
                     &time_ids,
                     steps,
@@ -226,10 +232,10 @@ impl Pipeline {
                     } else {
                         scaled
                     };
-                    let eps = components.unet.forward(
+                    let eps = components.unet.forward_projected(
                         &model_in,
                         sampler.timestep(i) as f64,
-                        &context,
+                        &encoder_hidden_states,
                         &pooled,
                         &time_ids,
                     )?;
@@ -274,7 +280,7 @@ impl Pipeline {
         sampler: &str,
         init: &Tensor,
         components: &Components,
-        context: &Tensor,
+        encoder_hidden_states: &Tensor,
         pooled: &Tensor,
         time_ids: &Tensor,
         steps: usize,
@@ -306,9 +312,13 @@ impl Pipeline {
                 } else {
                     x_in.clone()
                 };
-                let eps = components
-                    .unet
-                    .forward(&model_in, t as f64, context, pooled, time_ids)?;
+                let eps = components.unet.forward_projected(
+                    &model_in,
+                    t as f64,
+                    encoder_hidden_states,
+                    pooled,
+                    time_ids,
+                )?;
                 let eps = if use_guide {
                     let ch = eps.chunk(2, 0)?;
                     let (uncond, cond) = (&ch[0], &ch[1]);
