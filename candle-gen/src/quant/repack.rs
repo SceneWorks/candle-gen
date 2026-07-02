@@ -1,5 +1,8 @@
-//! MLX-packed → GGML repack seam (sc-9085 spike; grows into the shared packed-load module,
-//! sc-9086, epic 9083).
+//! MLX-packed → GGML **repack** primitives (sc-9085 spike; the byte-level half of the shared
+//! packed-load module, sc-9086, epic 9083). The packed-**detect** loaders that call these to build a
+//! [`QLinear`](super::QLinear) / [`QEmbedding`](super::QEmbedding) live in the parent [`super`]
+//! module; this file owns only the pure MLX-triple → GGML-`Q4_1` / dequant conversions and their
+//! order-sensitivity unit tests.
 //!
 //! The hosted quant tiers (epic 8506, e.g. `SceneWorks/z-image-turbo-mlx`) store each quantized
 //! Linear as the MLX packed triple `{base}.weight` (u32 codes) + `{base}.scales` + `{base}.biases`:

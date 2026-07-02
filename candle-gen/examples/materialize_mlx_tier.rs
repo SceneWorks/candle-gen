@@ -1,10 +1,13 @@
-//! sc-9085 spike render harness: materialize a DENSE bf16 diffusers turnkey from a hosted
-//! MLX-packed quant tier (epic 8506), routing every packed triple through the repack seam
-//! (`candle_gen::quant`) — Q4 via the lossless `Q4_1` repack + dequant, Q8 via the exact-grid
-//! dequant. The output tree feeds the standard per-model txt2img examples, so a coherent render
-//! proves the seam reconstructs every component's quantized values end-to-end through real model
-//! math. (Production keeps the QTensor RESIDENT and dequantizes per forward — sc-9086; this
-//! materializer is spike scaffolding, not a load path.)
+//! sc-9085 / sc-9086 render harness: materialize a DENSE bf16 diffusers turnkey from a hosted
+//! MLX-packed quant tier (epic 8506) by routing every packed triple through the **shared packed-load
+//! module** `candle_gen::quant` — each packed base is built into a resident [`QLinear`]
+//! (`QLinear::from_packed`: Q4 → lossless `Q4_1` repack, Q8 → exact-grid dequant + `Q8_0` re-quant)
+//! and then dequantized to the dense weight, exactly the reconstruction the production per-forward
+//! path performs. The output tree feeds the standard per-model txt2img examples, so a coherent render
+//! proves the shared module reconstructs every component's quantized values end-to-end through real
+//! model math (the sc-9086 real-crate render check). Production keeps the QTensor RESIDENT and
+//! dequantizes per forward; this materializer just snapshots the same values to disk so an unmodified
+//! z-image loader can render them (no per-crate loader conversion needed — that's the umbrella story).
 //!
 //! ```text
 //! cargo run --release --example materialize_mlx_tier -- \
@@ -16,12 +19,12 @@ use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Tensor};
-use candle_gen::quant::{dequant_mlx_q8, mlx_packed_bits, repack_mlx_q4_to_q4_1};
+use candle_gen::quant::QLinear;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Convert one component's `model.safetensors`: packed triples → dense bf16 `{base}.weight`,
-/// everything else passed through untouched.
+/// Convert one component's `model.safetensors`: packed triples → dense bf16 `{base}.weight` via the
+/// shared `QLinear::from_packed` reconstruction, everything else passed through untouched.
 fn convert_file(src: &Path, dst: &Path) -> Result<(usize, usize)> {
     // SAFETY: HF-cache blobs are immutable while we read them.
     let st = unsafe { MmapedSafetensors::new(src)? };
@@ -40,11 +43,12 @@ fn convert_file(src: &Path, dst: &Path) -> Result<(usize, usize)> {
             let wq = st.load(name, &cpu)?;
             let scales = st.load(&scales_key, &cpu)?;
             let biases = st.load(&format!("{base}.biases"), &cpu)?;
-            let bits = mlx_packed_bits(wq.dims2()?.1, scales.dims2()?.1);
-            let grid = match bits {
-                4 => repack_mlx_q4_to_q4_1(&wq, &scales, &biases, &cpu)?.dequantize(&cpu)?,
-                8 => dequant_mlx_q8(&wq, &scales, &biases)?,
-                b => return Err(format!("{base}: unsupported packed bit-width {b}").into()),
+            // Build the same resident QLinear the production packed-load path builds, then dequantize
+            // it to the dense weight (Q4 lossless, Q8 the accepted re-quant) — the shared module owns
+            // the bit-width dispatch, so this example carries no repack logic of its own.
+            let grid = match QLinear::from_packed(&wq, &scales, &biases, None, &cpu)? {
+                QLinear::Quantized { weight, .. } => weight.dequantize(&cpu)?,
+                QLinear::Dense(_) => unreachable!("from_packed always yields Quantized"),
             };
             out.insert(name.clone(), grid.to_dtype(DType::BF16)?);
             packed += 1;

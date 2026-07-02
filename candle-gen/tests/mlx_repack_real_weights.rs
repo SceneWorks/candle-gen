@@ -9,6 +9,10 @@
 //! cargo test -p candle-gen --test mlx_repack_real_weights -- --ignored --nocapture
 //! ```
 //!
+//! (The sc-9086 shared-load test `shared_qlinear_packed_load_matches_grid_on_real_tier` reuses the
+//! required `SC9085_Q4` env and drives the shared `candle_gen::quant::lin` packed-detect loader over
+//! the real tier — see its own docstring.)
+//!
 //! Three claims, in order of strength:
 //! 1. **Lossless**: candle dequant of the repacked `Q4_1` tensor == the MLX affine grid
 //!    (`f16(scale)·q + f16(bias)`), element-exact, every packed tensor. Plus a census of
@@ -188,5 +192,73 @@ fn q8_requant_error_study() -> Result<()> {
         sum_rel / n as f64,
         worst_rel
     );
+    Ok(())
+}
+
+/// **sc-9086 shared packed-load, real tier.** The shared `candle_gen::quant::lin` packed-DETECT
+/// loader, driven over the real z-image q4 `transformer/` tier through a `VarBuilder` (exactly how a
+/// per-crate loader will call it), must:
+///   1. route every `.scales`-bearing base to the packed path (`QLinear::is_quantized`), and
+///   2. produce a `QLinear` whose forward is **bit-exact** to a dense linear built from the same MLX
+///      affine grid — proving the shared QLinear reconstructs the real tier weights losslessly (the
+///      packed forward and the dense-grid forward both dequant-to-dense-matmul, so any repack/detect
+///      bug shows as a nonzero deviation).
+///
+/// Runs on `SC9085_Q4` (the same required env as the lossless test); the `#[cfg(feature = "cuda")]`
+/// leg repeats one base on the GPU so the QTensor upload + dequant is exercised on Blackwell.
+#[test]
+#[ignore = "needs the hosted z-image q4 tier on disk (SC9085_Q4 env)"]
+fn shared_qlinear_packed_load_matches_grid_on_real_tier() -> Result<()> {
+    use candle_gen::candle_nn::{Linear, VarBuilder};
+    use candle_gen::quant::{dequant_mlx_q4_reference, lin, QLinear};
+
+    let q4_path = std::env::var("SC9085_Q4").expect("SC9085_Q4 not set");
+    // SAFETY: immutable HF-cache blob.
+    let st = unsafe { MmapedSafetensors::new(&q4_path)? };
+    let bases = packed_bases(&st);
+    assert!(!bases.is_empty(), "no packed triples in {q4_path}");
+
+    let run = |dev: &Device, tag: &str| -> Result<()> {
+        // SAFETY: immutable HF-cache blob; a fresh mmap per VarBuilder.
+        let st2 = unsafe { MmapedSafetensors::new(&q4_path)? };
+        let vb = VarBuilder::from_backend(Box::new(st2), DType::F32, dev.clone());
+        // Sample a spread of bases (loading every one on the GPU is wasteful; a stride covers the
+        // full key namespace — attn/mlp/mod projections — cheaply).
+        let stride = (bases.len() / 8).max(1);
+        let mut worst = 0f32;
+        let mut n = 0usize;
+        for base in bases.iter().step_by(stride) {
+            let (wq, scales, biases) = load_triple(&st, base)?;
+            let (out_dim, in_dim) = (wq.dims2()?.0, scales.dims2()?.1 * MLX_GROUP_SIZE);
+
+            // Shared packed-detect loader: `.scales` present ⇒ packed QLinear, built on `dev`.
+            let ql = lin(&vb, base, in_dim, out_dim, false)?;
+            assert!(
+                ql.is_quantized(),
+                "{tag} {base}: `.scales` present but detect took the dense path"
+            );
+
+            // Reference: a dense linear over the exact MLX grid the pack represents.
+            let grid = dequant_mlx_q4_reference(&wq, &scales, &biases)?.to_device(dev)?;
+            let dense = QLinear::Dense(Linear::new(grid, None));
+
+            let x = Tensor::randn(0f32, 1f32, (2, in_dim), dev)?;
+            let got = ql.forward(&x)?;
+            let want = dense.forward(&x)?;
+            let dev_max = (got.sub(&want)?).abs()?.max_all()?.to_scalar::<f32>()?;
+            worst = worst.max(dev_max);
+            n += 1;
+        }
+        println!("[{tag}] shared QLinear packed-load over {n} real bases: max |packed − dense-grid| forward deviation {worst}");
+        assert_eq!(
+            worst, 0.0,
+            "{tag}: packed QLinear forward deviates from the dense grid"
+        );
+        Ok(())
+    };
+
+    run(&Device::Cpu, "cpu")?;
+    #[cfg(feature = "cuda")]
+    run(&Device::new_cuda(0)?, "cuda")?;
     Ok(())
 }
