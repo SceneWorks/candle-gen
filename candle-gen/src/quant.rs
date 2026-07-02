@@ -151,10 +151,11 @@ pub fn repack_mlx_q4_to_q4_1(
         }
     }
 
-    // MUST be `Cow::Borrowed`: candle's `as_t_slice` takes the Cow by value and returns a slice
-    // borrowed from it, so an `Owned` cow's backing Vec is dropped before `from_data` copies the
-    // blocks out — a use-after-free that reads freed memory (garbage weights, found in the sc-9085
-    // spike). Borrowed keeps `bytes` alive across the call; `from_data` clones into its own Vec.
+    // `Cow::Borrowed` deliberately: on candle revs before `c1e6756a89` (upstream PR #3493),
+    // `from_data` with an `Owned` cow was a use-after-free (`as_t_slice` took the Cow by value and
+    // returned a slice borrowed from it → the Vec dropped before the blocks were copied — garbage
+    // weights, found in the sc-9085 spike). Our pin now carries the fix, but Borrowed costs nothing
+    // (`from_data` clones into its own Vec either way) and stays safe across pin bumps.
     let storage = QStorage::from_data(Cow::Borrowed(&bytes), device, GgmlDType::Q4_1)?;
     QTensor::new(storage, (out_dim, in_dim))
 }
