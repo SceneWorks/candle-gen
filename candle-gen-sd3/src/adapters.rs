@@ -314,7 +314,7 @@ fn merge_lora_file(
                 modules.entry(stem.to_string()).or_default().up = Some(t.clone())
             }
             Some((stem, Role::Alpha)) => {
-                modules.entry(stem.to_string()).or_default().alpha = Some(read_scalar(t)?)
+                modules.entry(stem.to_string()).or_default().alpha = Some(read_scalar(key, t)?)
             }
             None => report.skipped_keys += 1,
         }

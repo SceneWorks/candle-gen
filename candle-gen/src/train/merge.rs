@@ -20,8 +20,9 @@
 //!   `rank`/`alpha` live in), plus [`AdapterFile::declares_lokr`].
 //! - [`merge_into`] — fold one `[out,in]` f32 delta into `{key}` (`W += δ` in f32), a missing or
 //!   shape-mismatched base surfaced as skipped.
-//! - [`read_scalar`] / [`read_scalar_opt`] — a per-target `.alpha` scalar (panicking vs the
-//!   size-0-tolerant F-009/sc-8989 form for third-party files).
+//! - [`read_scalar`] / [`read_scalar_opt`] — a per-target `.alpha` scalar, hardened against
+//!   malformed third-party files (F-009 / sc-8989): a bad tensor is a typed `Err` naming the key,
+//!   never a panic; `read_scalar_opt` additionally tolerates a size-0 tensor as `None`.
 //! - [`build_kohya_table`] — the `flattened → dotted` disambiguation table from the base key set.
 //! - The whole **third-party LyCORIS** engine: [`ThirdPartyLokr`] / [`ThirdPartyLoha`] (per-module
 //!   lycoris-scale reconstruction) + [`parse_lokr_thirdparty`] / [`parse_loha_thirdparty`] +
@@ -108,25 +109,44 @@ pub fn read_adapter(path: &Path) -> Result<AdapterFile> {
     Ok(AdapterFile { tensors, meta })
 }
 
-/// Read a scalar tensor (`[]` or `[1]`) as `f32` — the per-target `.alpha` read. **Panics** on an
-/// empty tensor (the trainer / kohya format always writes a 1-element `.alpha`); third-party files
-/// use [`read_scalar_opt`] for the size-0-tolerant read.
-pub fn read_scalar(t: &Tensor) -> Result<f32> {
-    Ok(t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?[0])
+/// Read a scalar tensor (`[]` or `[1]`) as `f32` — the per-target `.alpha` read. A well-formed
+/// trainer / kohya `.alpha` is always a finite 1-element tensor; a **malformed / truncated
+/// third-party** adapter can ship a degenerate one (F-009 / sc-8989). Rather than panicking on the
+/// old `to_vec1()[0]` index (a library-runtime crash triggerable by an untrusted file), this returns
+/// a descriptive typed error naming `key` and what was wrong (empty, multi-element, or non-finite).
+/// Any dtype is accepted — the value is read after casting to f32. Callers with a size-0-tolerant
+/// path use [`read_scalar_opt`] instead.
+pub fn read_scalar(key: &str, t: &Tensor) -> Result<f32> {
+    read_scalar_opt(key, t)?.ok_or_else(|| {
+        CandleError::Msg(format!(
+            "adapter key `{key}`: `.alpha` tensor is empty (0 elements); expected a finite scalar"
+        ))
+    })
 }
 
 /// Read a per-module `.alpha` scalar as `f32`, returning `None` for a size-0 (malformed) tensor
 /// rather than panicking (F-009 / sc-8989) — third-party adapters store `alpha` in their compute
-/// dtype and may ship a degenerate tensor. The candle twin of mlx-gen's `scalar_alpha`.
-pub fn read_scalar_opt(t: &Tensor) -> Result<Option<f32>> {
+/// dtype and may ship a degenerate tensor. A **non-empty but malformed** tensor (more than one
+/// element, or a non-finite value) is a descriptive typed error naming `key`, never a panic or a
+/// silently-wrong scale. The candle twin of mlx-gen's `scalar_alpha`.
+pub fn read_scalar_opt(key: &str, t: &Tensor) -> Result<Option<f32>> {
     if t.elem_count() == 0 {
         return Ok(None);
     }
-    Ok(t.to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?
-        .first()
-        .copied())
+    let vals = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
+    if vals.len() != 1 {
+        return Err(CandleError::Msg(format!(
+            "adapter key `{key}`: `.alpha` has {} elements, expected a scalar",
+            vals.len()
+        )));
+    }
+    let v = vals[0];
+    if !v.is_finite() {
+        return Err(CandleError::Msg(format!(
+            "adapter key `{key}`: `.alpha` is non-finite ({v})"
+        )));
+    }
+    Ok(Some(v))
 }
 
 /// Merge `delta` (`[out, in]`, expected f32) into the base weight at `key`, computing `W += δ` in f32
@@ -303,7 +323,7 @@ pub fn parse_lokr_thirdparty(af: &AdapterFile) -> Result<BTreeMap<String, ThirdP
     let mut groups: BTreeMap<String, ThirdPartyLokr> = BTreeMap::new();
     for (key, t) in &af.tensors {
         if let Some(raw) = key.strip_suffix(".alpha") {
-            if let Some(a) = read_scalar_opt(t)? {
+            if let Some(a) = read_scalar_opt(key, t)? {
                 groups.entry(raw.to_string()).or_default().alpha = Some(a);
             }
             continue;
@@ -330,7 +350,7 @@ pub fn parse_loha_thirdparty(af: &AdapterFile) -> Result<BTreeMap<String, ThirdP
     let mut groups: BTreeMap<String, ThirdPartyLoha> = BTreeMap::new();
     for (key, t) in &af.tensors {
         if let Some(raw) = key.strip_suffix(".alpha") {
-            if let Some(a) = read_scalar_opt(t)? {
+            if let Some(a) = read_scalar_opt(key, t)? {
                 groups.entry(raw.to_string()).or_default().alpha = Some(a);
             }
             continue;
@@ -552,14 +572,62 @@ mod tests {
         assert_eq!(with_conv.get("conv").map(String::as_str), Some("conv"));
     }
 
-    /// `read_scalar_opt` tolerates a size-0 tensor (F-009 / sc-8989) where `read_scalar` would panic.
+    /// A well-formed 1-element `.alpha` reads the exact stored value, byte-for-byte, through both the
+    /// panicking-free `read_scalar` and the size-0-tolerant `read_scalar_opt` (regression guard: the
+    /// F-009 / sc-8989 hardening must NOT change values for good adapters). A scalar-shaped (`[]`)
+    /// tensor reads identically to a `[1]` one.
     #[test]
-    fn read_scalar_opt_tolerates_empty() {
-        let one = t2(&[7.0], 1, 1);
-        assert_eq!(read_scalar_opt(&one).unwrap(), Some(7.0));
-        assert_eq!(read_scalar(&one).unwrap(), 7.0);
+    fn read_scalar_well_formed_exact() {
+        let one = t2(&[7.5], 1, 1);
+        assert_eq!(read_scalar("m.alpha", &one).unwrap(), 7.5);
+        assert_eq!(read_scalar_opt("m.alpha", &one).unwrap(), Some(7.5));
+        // A rank-0 scalar tensor (`[]`) — the other well-formed on-disk shape.
+        let scalar = Tensor::new(3.25f32, &Device::Cpu).unwrap();
+        assert_eq!(read_scalar("m.alpha", &scalar).unwrap(), 3.25);
+        // Non-f32 dtype (e.g. a compute-dtype alpha) casts cleanly, no panic.
+        let as_i64 = Tensor::new(4i64, &Device::Cpu).unwrap();
+        assert_eq!(read_scalar("m.alpha", &as_i64).unwrap(), 4.0);
+    }
+
+    /// A malformed `.alpha` from an untrusted third-party file yields a clean, descriptive `Err`
+    /// naming the offending key — never a panic (F-009 / sc-8989). Covers size-0, multi-element, and
+    /// non-finite. `read_scalar_opt` still maps size-0 → `None` (its size-0-tolerant contract) but
+    /// rejects the other two.
+    #[test]
+    fn read_scalar_malformed_errs_not_panics() {
+        // Size-0: `read_scalar` errors (naming the key); `read_scalar_opt` tolerates it as None.
         let empty = Tensor::from_vec(Vec::<f32>::new(), (0,), &Device::Cpu).unwrap();
-        assert_eq!(read_scalar_opt(&empty).unwrap(), None);
+        let err = read_scalar("blk.0.alpha", &empty).unwrap_err().to_string();
+        assert!(
+            err.contains("blk.0.alpha") && err.contains("empty"),
+            "got: {err}"
+        );
+        assert_eq!(read_scalar_opt("blk.0.alpha", &empty).unwrap(), None);
+
+        // Multi-element: both variants error (a scalar was expected).
+        let two = t2(&[1.0, 2.0], 1, 2);
+        for got in [
+            read_scalar("blk.0.alpha", &two).unwrap_err().to_string(),
+            read_scalar_opt("blk.0.alpha", &two)
+                .unwrap_err()
+                .to_string(),
+        ] {
+            assert!(
+                got.contains("blk.0.alpha") && got.contains("2 elements"),
+                "got: {got}"
+            );
+        }
+
+        // Non-finite (NaN / Inf): both variants error rather than merge a poisoned scale.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let t = t2(&[bad], 1, 1);
+            let got = read_scalar("blk.0.alpha", &t).unwrap_err().to_string();
+            assert!(
+                got.contains("blk.0.alpha") && got.contains("non-finite"),
+                "got: {got}"
+            );
+            assert!(read_scalar_opt("blk.0.alpha", &t).is_err());
+        }
     }
 
     /// `declares_lokr` reads the `networkType=lokr` stamp via the wmeta helper; an untagged file is not
