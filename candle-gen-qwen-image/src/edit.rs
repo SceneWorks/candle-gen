@@ -14,9 +14,10 @@
 //! A bespoke provider driven **directly** by the worker (like [`crate::control::QwenControl`] and
 //! `candle_gen_sdxl::SdxlEdit`) — the registered `qwen_image` descriptor stays txt2img-only.
 //!
-//! NB: candle's CUDA attention indexes scores with i32, so a joint sequence whose
-//! `heads · seq² > i32::MAX` (~2.1B; reached around 2048² output) would silently corrupt — keep the
-//! output ≤ ~1536² until the shared `JointAttention` gains query-row chunking (the FLUX.2 fix).
+//! NB: candle's CUDA attention indexes scores with i32, so a joint sequence whose scores tensor
+//! exceeds `i32::MAX` elements (~2.1B) would silently corrupt — the shared `JointAttention` guards
+//! this by chunking over query rows once the scores exceed `ATTN_SCORES_BUDGET` (sc-6217), and the
+//! `edit_validate` high-res run confirms a coherent 1536² edit through that chunked path.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
