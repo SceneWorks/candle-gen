@@ -25,6 +25,7 @@ pub mod config;
 pub mod convert;
 pub mod loader;
 pub mod pipeline;
+pub mod quant;
 pub mod schedule;
 pub mod text_encoder;
 pub mod tokenizer;

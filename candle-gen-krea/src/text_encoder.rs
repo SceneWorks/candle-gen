@@ -20,9 +20,9 @@ use std::path::Path;
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::rotary_emb::rope;
-use candle_gen::candle_nn::{Embedding, Linear, Module};
 
-use crate::loader::{linear, rmsnorm, Weights};
+use crate::loader::{embedding_detect, linear_detect, rmsnorm, Weights};
+use crate::quant::{QEmbedding, QLinear};
 
 /// Qwen3-VL-4B text-tower architecture (verified from the published `text_encoder/config.json`:
 /// `qwen3_vl_text`, hidden 2560, 36 layers, GQA 32/8, head_dim 128, FFN 9728, eps 1e-6) + the Krea
@@ -177,10 +177,10 @@ impl Rotary {
 }
 
 struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: QLinear,
+    k_proj: QLinear,
+    v_proj: QLinear,
+    o_proj: QLinear,
     q_norm: Tensor,
     k_norm: Tensor,
     n_heads: usize,
@@ -192,10 +192,10 @@ struct Attention {
 impl Attention {
     fn load(w: &Weights, prefix: &str, cfg: &KreaTeConfig) -> Result<Self> {
         Ok(Self {
-            q_proj: linear(w, &format!("{prefix}.q_proj"), false)?,
-            k_proj: linear(w, &format!("{prefix}.k_proj"), false)?,
-            v_proj: linear(w, &format!("{prefix}.v_proj"), false)?,
-            o_proj: linear(w, &format!("{prefix}.o_proj"), false)?,
+            q_proj: linear_detect(w, &format!("{prefix}.q_proj"), false)?,
+            k_proj: linear_detect(w, &format!("{prefix}.k_proj"), false)?,
+            v_proj: linear_detect(w, &format!("{prefix}.v_proj"), false)?,
+            o_proj: linear_detect(w, &format!("{prefix}.o_proj"), false)?,
             q_norm: w.get(&format!("{prefix}.q_norm.weight"))?,
             k_norm: w.get(&format!("{prefix}.k_norm.weight"))?,
             n_heads: cfg.num_heads,
@@ -249,17 +249,17 @@ fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
 }
 
 struct Mlp {
-    gate: Linear,
-    up: Linear,
-    down: Linear,
+    gate: QLinear,
+    up: QLinear,
+    down: QLinear,
 }
 
 impl Mlp {
     fn load(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
-            gate: linear(w, &format!("{prefix}.gate_proj"), false)?,
-            up: linear(w, &format!("{prefix}.up_proj"), false)?,
-            down: linear(w, &format!("{prefix}.down_proj"), false)?,
+            gate: linear_detect(w, &format!("{prefix}.gate_proj"), false)?,
+            up: linear_detect(w, &format!("{prefix}.up_proj"), false)?,
+            down: linear_detect(w, &format!("{prefix}.down_proj"), false)?,
         })
     }
 
@@ -298,7 +298,7 @@ impl DecoderLayer {
 
 /// The Krea Qwen3-VL-4B text-path condition encoder.
 pub struct KreaTextEncoder {
-    embed_tokens: Embedding,
+    embed_tokens: QEmbedding,
     layers: Vec<DecoderLayer>,
     rotary: Rotary,
     /// 0-indexed decoder-layer OUTPUT indices to capture (= `select_hidden[i] - 1`), in stack order.
@@ -330,9 +330,7 @@ impl KreaTextEncoder {
             )));
         }
 
-        let embed_weight = w.get(&format!("{prefix}.embed_tokens.weight"))?;
-        let hidden = embed_weight.dim(1)?;
-        let embed_tokens = Embedding::new(embed_weight, hidden);
+        let embed_tokens = embedding_detect(w, &format!("{prefix}.embed_tokens"))?;
 
         let mut layers = Vec::with_capacity(max_layer + 1);
         for i in 0..=max_layer {

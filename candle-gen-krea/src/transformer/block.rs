@@ -13,7 +13,8 @@ use candle_gen::candle_nn::ops::{sigmoid, softmax_last_dim};
 use candle_gen::candle_nn::{Linear, Module};
 
 use super::rope::apply_interleaved_rope;
-use crate::loader::{linear, rms_scale, rms_scale_weight, Weights};
+use crate::loader::{linear, linear_detect, rms_scale, rms_scale_weight, Weights};
+use crate::quant::QLinear;
 
 /// Join a module prefix with a leaf name.
 fn join(prefix: &str, name: &str) -> String {
@@ -70,11 +71,11 @@ impl RmsScale {
 
 // ── Sigmoid-gated GQA attention (reference `Attention`) ─────────────────────────────────────
 pub struct GatedAttention {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    gate: Linear,
-    o: Linear,
+    q: QLinear,
+    k: QLinear,
+    v: QLinear,
+    gate: QLinear,
+    o: QLinear,
     norm_q: RmsScale,
     norm_k: RmsScale,
     heads: usize,
@@ -93,11 +94,11 @@ impl GatedAttention {
         eps: f64,
     ) -> Result<Self> {
         Ok(Self {
-            q: linear(w, &join(prefix, "to_q"), false)?,
-            k: linear(w, &join(prefix, "to_k"), false)?,
-            v: linear(w, &join(prefix, "to_v"), false)?,
-            gate: linear(w, &join(prefix, "to_gate"), false)?,
-            o: linear(w, &join(prefix, "to_out.0"), false)?,
+            q: linear_detect(w, &join(prefix, "to_q"), false)?,
+            k: linear_detect(w, &join(prefix, "to_k"), false)?,
+            v: linear_detect(w, &join(prefix, "to_v"), false)?,
+            gate: linear_detect(w, &join(prefix, "to_gate"), false)?,
+            o: linear_detect(w, &join(prefix, "to_out.0"), false)?,
             norm_q: RmsScale::load(w, &join(prefix, "norm_q.weight"), eps)?,
             norm_k: RmsScale::load(w, &join(prefix, "norm_k.weight"), eps)?,
             heads,
@@ -146,17 +147,17 @@ impl GatedAttention {
 
 // ── SwiGLU feed-forward (reference `SwiGLU`: `down(silu(gate(x)) * up(x))`) ──────────────────
 pub struct SwiGlu {
-    gate: Linear,
-    up: Linear,
-    down: Linear,
+    gate: QLinear,
+    up: QLinear,
+    down: QLinear,
 }
 
 impl SwiGlu {
     pub fn load(w: &Weights, prefix: &str) -> Result<Self> {
         Ok(Self {
-            gate: linear(w, &join(prefix, "gate"), false)?,
-            up: linear(w, &join(prefix, "up"), false)?,
-            down: linear(w, &join(prefix, "down"), false)?,
+            gate: linear_detect(w, &join(prefix, "gate"), false)?,
+            up: linear_detect(w, &join(prefix, "up"), false)?,
+            down: linear_detect(w, &join(prefix, "down"), false)?,
         })
     }
 
