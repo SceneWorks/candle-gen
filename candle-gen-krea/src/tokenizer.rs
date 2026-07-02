@@ -82,13 +82,63 @@ impl KreaTokenizer {
 
     /// Encode the templated prompt → `input_ids` `[1, L]` u32. The encoder drops the leading
     /// [`PREFIX_TOKENS`] from the resulting conditioning.
-    pub fn encode_prompt(&self, prompt: &str) -> Result<Tensor> {
+    ///
+    /// `max_tokens` is the RoPE-table cap the condition encoder is sized for
+    /// ([`crate::pipeline::MAX_TEXT_TOKENS`]); an over-length prompt is rejected up front with a clear
+    /// length error, rather than failing deep in `Rotary::text`'s `narrow` with an opaque candle
+    /// shape error mid-generate (sc-9047). Mirrors the sibling ideogram Qwen3-VL port's policy.
+    pub fn encode_prompt(&self, prompt: &str, max_tokens: usize) -> Result<Tensor> {
         let ids = self.ids(prompt)?;
-        if ids.is_empty() {
-            return Err(CandleError::Msg("krea: empty token sequence".into()));
-        }
+        check_len(ids.len(), max_tokens)?;
         let ids: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
         let len = ids.len();
         Ok(Tensor::from_vec(ids, (1, len), &self.device)?)
+    }
+}
+
+/// Validate a templated-prompt token count against the RoPE-table cap (sc-9047): an empty sequence or
+/// one longer than `max_tokens` returns a clear, actionable length error naming the cap and the actual
+/// length — instead of an opaque `narrow` tensor-shape error deep in the condition encoder. Pure so it
+/// is unit-testable without a real snapshot tokenizer.
+fn check_len(len: usize, max_tokens: usize) -> Result<()> {
+    if len == 0 {
+        return Err(CandleError::Msg("krea: empty token sequence".into()));
+    }
+    if len > max_tokens {
+        return Err(CandleError::Msg(format!(
+            "krea: prompt has {len} tokens (incl. the {PREFIX_TOKENS}-token template prefix), \
+             exceeds max_text_tokens={max_tokens}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_len_rejects_over_cap_with_clear_message() {
+        // An over-length prompt returns an actionable length error naming the cap and the actual
+        // length — NOT an opaque tensor `narrow` error mid-generate (sc-9047).
+        let err = check_len(1025, 1024).unwrap_err().to_string();
+        assert!(err.contains("1025"), "names the actual length: {err}");
+        assert!(err.contains("max_text_tokens=1024"), "names the cap: {err}");
+        assert!(!err.contains("narrow"), "not an opaque tensor error: {err}");
+    }
+
+    #[test]
+    fn check_len_accepts_at_and_below_cap() {
+        // At-limit and below-limit prompts pass validation.
+        assert!(check_len(1024, 1024).is_ok());
+        assert!(check_len(1, 1024).is_ok());
+    }
+
+    #[test]
+    fn check_len_rejects_empty() {
+        assert!(check_len(0, 1024)
+            .unwrap_err()
+            .to_string()
+            .contains("empty"));
     }
 }

@@ -49,17 +49,26 @@ fn render_chat_with_images(system: &str, user: &str, num_image_tokens: &[usize])
 pub struct BooguTokenizer {
     inner: TextTokenizer,
     device: Device,
+    /// The RoPE-table cap the condition encoder is sized for
+    /// ([`crate::pipeline::MAX_TEXT_TOKENS`]); every encode path rejects a longer sequence up front.
+    max_tokens: usize,
 }
 
 impl BooguTokenizer {
-    /// Load from a snapshot's `mllm/tokenizer.json`.
-    pub fn from_snapshot(root: impl AsRef<Path>, device: &Device) -> Result<Self> {
+    /// Load from a snapshot's `mllm/tokenizer.json`. `max_tokens` is the RoPE-table cap the condition
+    /// encoder is sized for; every encode path rejects an over-length sequence up front with a clear
+    /// length error rather than failing deep in `Rotary::text`'s `narrow` (sc-9047).
+    pub fn from_snapshot(
+        root: impl AsRef<Path>,
+        device: &Device,
+        max_tokens: usize,
+    ) -> Result<Self> {
         let inner = TextTokenizer::from_file(
             root.as_ref().join("mllm").join("tokenizer.json"),
             TokenizerConfig {
                 // We render the chat string ourselves and call `encode_ids` directly, so the config
                 // template/padding are unused; keep them inert.
-                max_length: 1280,
+                max_length: max_tokens,
                 pad_token_id: 151643, // Qwen <|endoftext|>; unused (no padding on this path)
                 chat_template: ChatTemplate::None,
                 pad_to_max_length: false,
@@ -69,18 +78,20 @@ impl BooguTokenizer {
         Ok(Self {
             inner,
             device: device.clone(),
+            max_tokens,
         })
     }
 
     /// Encode a rendered chat string to a `[1, L]` u32 `input_ids` tensor (`add_special_tokens=false`).
+    /// An over-length sequence (incl. any spliced `<|image_pad|>` blocks) is rejected up front with a
+    /// clear length error naming the cap and the actual length, rather than an opaque tensor-shape
+    /// error deep in the condition encoder (sc-9047). Mirrors the sibling ideogram Qwen3-VL port.
     fn encode(&self, text: &str) -> Result<Tensor> {
         let ids = self
             .inner
             .encode_ids(text, false)
             .map_err(|e| CandleError::Msg(format!("boogu: tokenize: {e}")))?;
-        if ids.is_empty() {
-            return Err(CandleError::Msg("boogu: empty token sequence".into()));
-        }
+        check_len(ids.len(), self.max_tokens)?;
         let ids: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
         let len = ids.len();
         Ok(Tensor::from_vec(ids, (1, len), &self.device)?)
@@ -132,9 +143,50 @@ impl BooguTokenizer {
     }
 }
 
+/// Validate a rendered-chat token count against the RoPE-table cap (sc-9047): an empty sequence or one
+/// longer than `max_tokens` (incl. any spliced `<|image_pad|>` blocks) returns a clear, actionable
+/// length error naming the cap and the actual length — instead of an opaque `narrow` tensor-shape error
+/// deep in the condition encoder. Pure so it is unit-testable without a real snapshot tokenizer.
+fn check_len(len: usize, max_tokens: usize) -> Result<()> {
+    if len == 0 {
+        return Err(CandleError::Msg("boogu: empty token sequence".into()));
+    }
+    if len > max_tokens {
+        return Err(CandleError::Msg(format!(
+            "boogu: prompt has {len} tokens, exceeds max_text_tokens={max_tokens}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_len_rejects_over_cap_with_clear_message() {
+        // An over-length prompt returns an actionable length error naming the cap and the actual
+        // length — NOT an opaque tensor `narrow` error mid-generate (sc-9047).
+        let err = check_len(1281, 1280).unwrap_err().to_string();
+        assert!(err.contains("1281"), "names the actual length: {err}");
+        assert!(err.contains("max_text_tokens=1280"), "names the cap: {err}");
+        assert!(!err.contains("narrow"), "not an opaque tensor error: {err}");
+    }
+
+    #[test]
+    fn check_len_accepts_at_and_below_cap() {
+        // At-limit and below-limit prompts pass validation.
+        assert!(check_len(1280, 1280).is_ok());
+        assert!(check_len(1, 1280).is_ok());
+    }
+
+    #[test]
+    fn check_len_rejects_empty() {
+        assert!(check_len(0, 1280)
+            .unwrap_err()
+            .to_string()
+            .contains("empty"));
+    }
 
     #[test]
     fn multi_image_template_emits_one_block_per_reference() {
