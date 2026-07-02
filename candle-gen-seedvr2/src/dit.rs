@@ -133,11 +133,11 @@ fn arange_f32(n: usize, dev: &Device) -> Result<Tensor> {
     Tensor::from_vec((0..n).map(|i| i as f32).collect::<Vec<_>>(), n, dev)
 }
 
-/// fast RMSNorm with a unit (`ones`) weight — the block pre-norms have no learnable scale.
-fn rms_plain(x: &Tensor, eps: f64) -> Result<Tensor> {
-    let dim = *x.dims().last().unwrap();
-    let ones = Tensor::ones(dim, DType::F32, x.device())?;
-    nn::rms_norm(x, &ones, eps)
+/// fast RMSNorm with a unit (`ones`) weight — the block pre-norms have no learnable scale. The
+/// `ones` weight is built once per block at load (`Block::ones`) and passed in, rather than
+/// re-allocated on every call inside the per-step hot loop (sc-9039).
+fn rms_plain(x: &Tensor, ones: &Tensor, eps: f64) -> Result<Tensor> {
+    nn::rms_norm(x, ones, eps)
 }
 
 // ---------------------------------------------------------------------------
@@ -798,12 +798,21 @@ struct Block {
     shared: bool,
     is_last: bool,
     eps: f64,
+    /// Unit (`ones`) weight for the parameter-free pre-norms, built once at load and reused across
+    /// steps rather than re-allocated on every `rms_plain` call in the hot loop (sc-9039). Both the
+    /// vid and txt streams share `vid_dim`, so a single weight serves all pre-norms in the block.
+    ones: Tensor,
 }
 impl Block {
     fn load(w: &Weights, idx: usize, cfg: &DitConfig) -> CResult<Self> {
         let prefix = format!("blocks.{idx}");
         let shared = idx >= cfg.mm_layers;
         let is_last = cfg.last_layer_vid_only && idx == cfg.num_layers - 1;
+        let device = w
+            .require(&format!("{prefix}.attn.norm_q_vid.weight"))?
+            .device();
+        // Unit weight for the parameter-free pre-norms (sc-9039); vid/txt both live in `vid_dim`.
+        let ones = Tensor::ones(cfg.vid_dim, DType::F32, device)?;
         let attn = MMAttention::load(w, &format!("{prefix}.attn"), cfg)?;
         let (mlp_vid, mlp_txt, mlp_all) = if shared {
             (
@@ -852,6 +861,7 @@ impl Block {
             shared,
             is_last,
             eps: cfg.norm_eps,
+            ones,
         })
     }
 
@@ -897,18 +907,18 @@ impl Block {
     ) -> Result<(Tensor, Tensor)> {
         let av = self.ada_v();
         let vid_attn_in = modulate_in(
-            &rms_plain(vid, self.eps)?,
+            &rms_plain(vid, &self.ones, self.eps)?,
             emb,
             0,
             &av.attn_shift,
             &av.attn_scale,
         )?;
         let txt_attn_in = if self.is_last {
-            rms_plain(txt, self.eps)?
+            rms_plain(txt, &self.ones, self.eps)?
         } else {
             let at = self.ada_t();
             modulate_in(
-                &rms_plain(txt, self.eps)?,
+                &rms_plain(txt, &self.ones, self.eps)?,
                 emb,
                 0,
                 &at.attn_shift,
@@ -924,7 +934,7 @@ impl Block {
         };
 
         let vid_mlp_in = modulate_in(
-            &rms_plain(&vid, self.eps)?,
+            &rms_plain(&vid, &self.ones, self.eps)?,
             emb,
             1,
             &av.mlp_shift,
@@ -937,7 +947,7 @@ impl Block {
         } else {
             let at = self.ada_t();
             let txt_mlp_in = modulate_in(
-                &rms_plain(&txt, self.eps)?,
+                &rms_plain(&txt, &self.ones, self.eps)?,
                 emb,
                 1,
                 &at.mlp_shift,
@@ -1159,5 +1169,38 @@ mod quant_tests {
         lin.quantize(Quant::Q8).unwrap();
         lin.quantize(Quant::Q8).unwrap(); // no-op, must not error
         assert!(matches!(lin, Linear::Quant { b: None, .. }));
+    }
+
+    /// sc-9039: the block pre-norms now reuse a single `ones` weight cached at load rather than
+    /// allocating a fresh `Tensor::ones` on every `rms_plain` call in the hot loop. This must be
+    /// bit-identical — `nn::rms_norm` is deterministic given (weight, eps), and a cached unit weight
+    /// equals a freshly-allocated one exactly.
+    #[test]
+    fn rms_plain_cached_ones_is_bit_identical() {
+        let dev = Device::Cpu;
+        let dim = 2560usize; // 3B vid_dim
+        let eps = 1e-6;
+        let x = Tensor::randn(0f32, 1f32, (1usize, 4usize, dim), &dev).unwrap();
+
+        // Cached unit weight (built once, as `Block::ones` is at load).
+        let ones = Tensor::ones(dim, DType::F32, &dev).unwrap();
+        let cached = rms_plain(&x, &ones, eps).unwrap();
+
+        // A freshly-allocated unit weight — the old per-call behaviour.
+        let fresh_ones = Tensor::ones(dim, DType::F32, &dev).unwrap();
+        let fresh = rms_plain(&x, &fresh_ones, eps).unwrap();
+
+        let diff = (cached - fresh)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(
+            diff, 0.0,
+            "cached-ones rms_plain must match a fresh one exactly"
+        );
     }
 }

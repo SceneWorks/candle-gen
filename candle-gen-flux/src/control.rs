@@ -277,6 +277,10 @@ struct JointBlock {
     attn: JointAttention,
     ff: FeedForward,
     ff_context: FeedForward,
+    /// The diffusers `norm2` — a parameter-free LayerNorm shared by both streams (same hidden dim).
+    /// Built once at load so the hot per-step FF path reuses it instead of re-allocating the device
+    /// `ones` weight every invocation (sc-9039).
+    norm2: LayerNorm,
 }
 
 impl JointBlock {
@@ -287,6 +291,7 @@ impl JointBlock {
             attn: JointAttention::new(d, vb.pp("attn"))?,
             ff: FeedForward::new(false, d, vb.pp("ff"))?,
             ff_context: FeedForward::new(true, d, vb.pp("ff_context"))?,
+            norm2: layer_norm_no_affine(d.hidden, vb.dtype(), vb.device())?,
         })
     }
 
@@ -304,7 +309,14 @@ impl JointBlock {
             self.norm1_context.forward_six(encoder, emb)?;
         let (attn_img, attn_txt) = self.attn.forward(&norm_hidden, &norm_encoder, pe)?;
         let hidden = apply_norm_ff(
-            hidden, &attn_img, &gate_msa, &shift_mlp, &scale_mlp, &gate_mlp, &self.ff,
+            hidden,
+            &attn_img,
+            &gate_msa,
+            &shift_mlp,
+            &scale_mlp,
+            &gate_mlp,
+            &self.ff,
+            &self.norm2,
         )?;
         let encoder = apply_norm_ff(
             encoder,
@@ -314,6 +326,7 @@ impl JointBlock {
             &c_scale_mlp,
             &c_gate_mlp,
             &self.ff_context,
+            &self.norm2,
         )?;
         Ok((encoder, hidden))
     }
@@ -330,11 +343,11 @@ fn apply_norm_ff(
     scale_mlp: &Tensor,
     gate_mlp: &Tensor,
     ff: &FeedForward,
+    norm: &LayerNorm,
 ) -> Result<Tensor> {
     let hidden = (hidden + attn.broadcast_mul(&gate_msa.unsqueeze(1)?)?)?;
-    // A fresh parameter-free LayerNorm (the diffusers `norm2`, elementwise-affine = False).
-    let dim = hidden.dim(D::Minus1)?;
-    let norm = layer_norm_no_affine(dim, hidden.dtype(), hidden.device())?;
+    // The diffusers `norm2` (parameter-free, elementwise-affine = False), built once at load and
+    // reused here rather than re-allocated each call (sc-9039).
     let normed = norm
         .forward(&hidden)?
         .broadcast_mul(&(scale_mlp.unsqueeze(1)? + 1.0)?)?
@@ -739,6 +752,36 @@ mod tests {
                 "zero-init controlnet_blocks ⇒ all-zero residual, got max {max}"
             );
         }
+        Ok(())
+    }
+
+    /// sc-9039: hoisting the parameter-free `norm2` out of the per-step FF hot loop must be
+    /// bit-identical to constructing it fresh each call. A no-affine LayerNorm is deterministic
+    /// given (dim, eps), so a norm built once at load equals one built per invocation, byte-for-byte.
+    #[test]
+    fn hoisted_norm2_is_bit_identical_to_fresh() -> Result<()> {
+        let dev = Device::Cpu;
+        let dtype = DType::F32;
+        let dim = 16usize;
+        let x = Tensor::randn(0f32, 1f32, (1, 4, dim), &dev)?;
+
+        // The hoisted norm: built once (as `JointBlock::norm2` is at load).
+        let hoisted = layer_norm_no_affine(dim, dtype, &dev)?;
+        let out_hoisted = hoisted.forward(&x)?;
+
+        // The old behaviour: a fresh norm constructed inside the call.
+        let fresh = layer_norm_no_affine(dim, dtype, &dev)?;
+        let out_fresh = fresh.forward(&x)?;
+
+        // Byte-for-byte equal (no tolerance): identical eps + unit weight ⇒ identical output.
+        let diff = (out_hoisted - out_fresh)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert_eq!(
+            diff, 0.0,
+            "hoisted no-affine LayerNorm must match a fresh one exactly"
+        );
         Ok(())
     }
 }
