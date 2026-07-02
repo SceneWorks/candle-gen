@@ -5,15 +5,17 @@
 use candle_gen::candle_core::{DType, Result, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 
-/// `[out,in]`-weight dense layer: `y = x·Wᵀ (+ b)`. Flattens all leading dims into one 2-D GEMM and
-/// reshapes back — candle's `matmul` rejects the non-contiguous broadcasted rhs that `broadcast_matmul`
-/// produces for a high-rank `x` (e.g. the 5-D patchified tokens), and the flattened GEMM is faster.
-pub fn linear(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
-    let wt = w.t()?.contiguous()?; // [in, out]
-    let (in_dim, out_dim) = (wt.dim(0)?, wt.dim(1)?);
+/// Dense layer `y = x·Wᵀ (+ b)` given the weight **already transposed** to `[in, out]` (the callers
+/// transpose the loaded `[out,in]` weight once at construction — sc-8997/F-017; re-transposing per
+/// forward materialized a fresh contiguous copy of the whole weight every call). Flattens all leading
+/// dims into one 2-D GEMM and reshapes back — candle's `matmul` rejects the non-contiguous broadcasted
+/// rhs that `broadcast_matmul` produces for a high-rank `x` (e.g. the 5-D patchified tokens), and the
+/// flattened GEMM is faster.
+pub fn linear(x: &Tensor, wt: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
+    let (in_dim, out_dim) = (wt.dim(0)?, wt.dim(1)?); // [in, out]
     let dims = x.dims().to_vec();
     let lead: usize = dims[..dims.len() - 1].iter().product();
-    let y = x.contiguous()?.reshape((lead, in_dim))?.matmul(&wt)?; // [lead, out]
+    let y = x.contiguous()?.reshape((lead, in_dim))?.matmul(wt)?; // [lead, out]
     let mut out_shape = dims[..dims.len() - 1].to_vec();
     out_shape.push(out_dim);
     let y = y.reshape(out_shape)?;
@@ -21,6 +23,12 @@ pub fn linear(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
         Some(b) => y.broadcast_add(b),
         None => Ok(y),
     }
+}
+
+/// Pre-transpose a loaded `[out,in]` weight to the contiguous `[in,out]` layout [`linear`] consumes,
+/// so the per-forward GEMM has no transpose/copy (sc-8997/F-017).
+pub fn transpose_weight(w: &Tensor) -> Result<Tensor> {
+    w.t()?.contiguous()
 }
 
 /// GroupNorm over `[N, C, *spatial]` (channels in dim 1, any trailing rank), computed in f32 with a
@@ -79,6 +87,56 @@ pub fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
 mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
+
+    /// The old `linear` re-derived `[in,out]` inside the forward via `w.t()?.contiguous()?`. The
+    /// sc-8997/F-017 refactor moves that transpose to load time (`transpose_weight`) so the per-forward
+    /// matmul is a plain GEMM. This asserts the two are **bit-identical** for a high-rank (5-D, like the
+    /// patchified DiT tokens) input across every leading dim, so the perf refactor changed nothing
+    /// numerically. It also structurally checks `transpose_weight` produces exactly `[in,out]` from a
+    /// `[out,in]` weight (the "transposed exactly once, at load" invariant).
+    fn linear_old(x: &Tensor, w: &Tensor, b: Option<&Tensor>) -> Result<Tensor> {
+        let wt = w.t()?.contiguous()?; // [in, out] — the pre-fix per-forward transpose+copy
+        let (in_dim, out_dim) = (wt.dim(0)?, wt.dim(1)?);
+        let dims = x.dims().to_vec();
+        let lead: usize = dims[..dims.len() - 1].iter().product();
+        let y = x.contiguous()?.reshape((lead, in_dim))?.matmul(&wt)?;
+        let mut out_shape = dims[..dims.len() - 1].to_vec();
+        out_shape.push(out_dim);
+        let y = y.reshape(out_shape)?;
+        match b {
+            Some(b) => y.broadcast_add(b),
+            None => Ok(y),
+        }
+    }
+
+    #[test]
+    fn linear_pretransposed_matches_pre_fix_bit_identical() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (7usize, 5usize);
+        // torch-native `[out, in]` weight, as loaded from the checkpoint.
+        let w = Tensor::randn(0f32, 1.0, (out_dim, in_dim), &dev)?;
+        let b = Tensor::randn(0f32, 1.0, out_dim, &dev)?;
+        // 5-D input (B, T, H, W, in) — the same high-rank shape the DiT patchify feeds the linear.
+        let x = Tensor::randn(0f32, 1.0, (2usize, 3usize, 2usize, 2usize, in_dim), &dev)?;
+
+        // `transpose_weight` is exactly `[in, out]` (transposed exactly once, at load).
+        let wt = transpose_weight(&w)?;
+        assert_eq!(wt.dims(), &[in_dim, out_dim]);
+
+        for bias in [None, Some(&b)] {
+            let old = linear_old(&x, &w, bias)?.flatten_all()?.to_vec1::<f32>()?;
+            let new = linear(&x, &wt, bias)?.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(old.len(), new.len());
+            for (o, n) in old.iter().zip(new.iter()) {
+                assert_eq!(
+                    o.to_bits(),
+                    n.to_bits(),
+                    "linear output changed: {o} vs {n}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     /// Brute-force GroupNorm over NCTHW (joint over c/g, T, H, W) — confirms the reshape groups
     /// channels correctly and fully normalizes at T>1 (a mis-grouped reshape would under-normalize

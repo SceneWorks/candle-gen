@@ -15,20 +15,22 @@ use crate::weights::Weights;
 
 type CResult<T> = candle_gen::Result<T>;
 
-/// `[out,in]`-weight dense layer (the VAE attention projections).
+/// `[out,in]`-weight dense layer (the VAE attention projections). Stores the weight pre-transposed to
+/// `[in,out]` so the per-forward matmul has no transpose/copy (sc-8997/F-017).
 struct Linear {
-    w: Tensor,
+    wt: Tensor,
     b: Tensor,
 }
 impl Linear {
     fn load(w: &Weights, prefix: &str) -> CResult<Self> {
+        let weight = w.require(&format!("{prefix}.weight"))?; // [out, in]
         Ok(Self {
-            w: w.require(&format!("{prefix}.weight"))?.clone(),
+            wt: nn::transpose_weight(weight)?, // [in, out], once at load (sc-8997/F-017)
             b: w.require(&format!("{prefix}.bias"))?.clone(),
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        nn::linear(x, &self.w, Some(&self.b))
+        nn::linear(x, &self.wt, Some(&self.b))
     }
 }
 

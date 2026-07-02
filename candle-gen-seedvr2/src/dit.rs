@@ -32,7 +32,10 @@ type CResult<T> = candle_gen::Result<T>;
 /// surrounding DiT keeps flowing bf16 exactly as the dense path does.
 enum Linear {
     Dense {
-        w: Tensor,
+        /// Pre-transposed `[in, out]`, contiguous — the per-forward matmul is a plain `[lead,in]@[in,out]`
+        /// with no transpose/copy (sc-8997/F-017). [`Self::quantize`] transposes it back to `[out,in]`
+        /// once to fold the GGUF blocks.
+        wt: Tensor,
         b: Option<Tensor>,
     },
     Quant {
@@ -45,8 +48,9 @@ enum Linear {
 }
 impl Linear {
     fn load(w: &Weights, prefix: &str, bias: bool) -> CResult<Self> {
+        let weight = w.require(&format!("{prefix}.weight"))?; // [out, in]
         Ok(Self::Dense {
-            w: w.require(&format!("{prefix}.weight"))?.clone(),
+            wt: nn::transpose_weight(weight)?, // [in, out], once at load (sc-8997/F-017)
             b: if bias {
                 Some(w.require(&format!("{prefix}.bias"))?.clone())
             } else {
@@ -56,7 +60,7 @@ impl Linear {
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
-            Self::Dense { w, b } => nn::linear(x, w, b.as_ref()),
+            Self::Dense { wt, b } => nn::linear(x, wt, b.as_ref()),
             Self::Quant {
                 matmul,
                 b,
@@ -91,16 +95,24 @@ impl Linear {
     /// its original device (`QTensor::quantize_onto`); the bias is promoted to f32 for the post-matmul
     /// add. The dense copy is dropped, so the steady-state footprint is the quantized one.
     fn quantize(&mut self, quant: Quant) -> CResult<()> {
-        let Self::Dense { w, b } = self else {
+        let Self::Dense { wt, b } = self else {
             return Ok(());
         };
-        let in_dim = w.dim(1)?;
-        let out_dim = w.dim(0)?;
+        // `wt` is the pre-transposed `[in, out]` weight (sc-8997/F-017); transpose back once here to
+        // recover the `[out, in]` layout GGUF quantization expects. This runs at most once per Linear
+        // (the quant cascade folds each Dense in place), not per forward.
+        let in_dim = wt.dim(0)?;
+        let out_dim = wt.dim(1)?;
         if !in_dim.is_multiple_of(quant::QUANT_BLOCK) {
             return Ok(());
         }
-        let device = w.device().clone();
-        let w_cpu = w.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        let device = wt.device().clone();
+        // recover the torch-native `[out, in]` weight (we store the transpose), quantize on CPU.
+        let w_cpu = wt
+            .t()?
+            .contiguous()?
+            .to_device(&Device::Cpu)?
+            .to_dtype(DType::F32)?;
         let qtensor = QTensor::quantize_onto(&w_cpu, quant::ggml_dtype(quant), &device)?;
         let matmul = QMatMul::from_qtensor(qtensor)?;
         let b = match b {
@@ -1086,7 +1098,10 @@ mod quant_tests {
         let (in_dim, out_dim) = (64usize, 96usize); // in=64 = two Q4_0/Q8_0 blocks per row
         let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
         let b = Tensor::randn(0f32, 1f32, out_dim, &dev).unwrap();
-        let mut lin = Linear::Dense { w, b: Some(b) };
+        let mut lin = Linear::Dense {
+            wt: nn::transpose_weight(&w).unwrap(),
+            b: Some(b),
+        };
         // a 3-D activation (B,S,in) exercises the leading-dim flatten in the quant forward.
         let x = Tensor::randn(0f32, 1f32, (2usize, 5usize, in_dim), &dev).unwrap();
         let dense = lin.forward(&x).unwrap();
@@ -1120,7 +1135,10 @@ mod quant_tests {
     fn quantize_skips_indivisible_in_features() {
         let dev = Device::Cpu;
         let w = Tensor::randn(0f32, 1f32, (64usize, 132usize), &dev).unwrap();
-        let mut lin = Linear::Dense { w, b: None };
+        let mut lin = Linear::Dense {
+            wt: nn::transpose_weight(&w).unwrap(),
+            b: None,
+        };
         lin.quantize(Quant::Q8).unwrap();
         assert!(
             matches!(lin, Linear::Dense { .. }),
@@ -1134,7 +1152,10 @@ mod quant_tests {
     fn quantize_is_idempotent() {
         let dev = Device::Cpu;
         let w = Tensor::randn(0f32, 1f32, (64usize, 32usize), &dev).unwrap();
-        let mut lin = Linear::Dense { w, b: None };
+        let mut lin = Linear::Dense {
+            wt: nn::transpose_weight(&w).unwrap(),
+            b: None,
+        };
         lin.quantize(Quant::Q8).unwrap();
         lin.quantize(Quant::Q8).unwrap(); // no-op, must not error
         assert!(matches!(lin, Linear::Quant { b: None, .. }));
