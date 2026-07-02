@@ -78,12 +78,12 @@ Write-Host "[package-cuda] worker : $binName"
 # Resolve + copy each redist DLL. Exclude the .alt fallback from the nvrtc glob explicitly.
 $copied = New-Object System.Collections.Generic.List[string]
 foreach ($pattern in $DllPatterns) {
-    $matches = Get-ChildItem -LiteralPath $cudaBin -Filter $pattern -File |
+    $dlls = Get-ChildItem -LiteralPath $cudaBin -Filter $pattern -File |
         Where-Object { $_.Name -notlike "*.alt.dll" }
-    if ($matches.Count -eq 0) {
+    if ($dlls.Count -eq 0) {
         throw "Required redist DLL '$pattern' not found in $cudaBin. Is this a CUDA 12.9 toolkit install?"
     }
-    foreach ($dll in $matches) {
+    foreach ($dll in $dlls) {
         Copy-Item -LiteralPath $dll.FullName -Destination (Join-Path $OutDir $dll.Name) -Force
         $copied.Add($dll.Name)
         Write-Host "[package-cuda] redist : $($dll.Name)"
