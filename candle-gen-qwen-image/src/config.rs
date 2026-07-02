@@ -6,9 +6,15 @@ pub const MODEL_ID: &str = "qwen_image";
 
 pub const DEFAULT_WIDTH: u32 = 1024;
 pub const DEFAULT_HEIGHT: u32 = 1024;
-/// Fork-verbatim default; production callers pass ~20–50 (Qwen-Image T2I is not distilled — the
-/// distilled Lightning path is deferred).
-pub const DEFAULT_STEPS: u32 = 4;
+/// Default sampling steps for the **non-distilled** Qwen-Image base T2I model (sc-9046 / F-076).
+/// Qwen-Image base is a 20B undistilled flow-match model — 4 steps is a distilled/Lightning count and
+/// yields a visibly broken render, so the engine default must be a production step count. 30 matches
+/// the sibling non-distilled paths in this crate ([`edit::QwenEditRequest`], [`control::QwenControlRequest`],
+/// [`control_fun::QwenControlFunRequest`]) and sits inside the diffusers `QwenImagePipeline` range
+/// (20–50). An explicit caller-supplied `steps` is always honored — only this default changed. (The
+/// few-step distilled Lightning path lives on the Edit surface, gated by `QwenEditRequest::lightning`,
+/// and keeps its own low step count.)
+pub const DEFAULT_STEPS: u32 = 30;
 /// True-CFG guidance scale default.
 pub const DEFAULT_GUIDANCE: f32 = 4.0;
 /// Single space — the negative prompt used when a CFG request omits one.
@@ -140,6 +146,20 @@ mod tests {
         assert_eq!(e.n_layers, 28);
         assert_eq!(e.n_heads / e.n_kv_heads, 7);
         assert_eq!(e.hidden_size, t.joint_attention_dim);
+    }
+
+    /// sc-9046 (F-076): the base txt2img default must be a production step count for the
+    /// **non-distilled** 20B Qwen-Image base — not the 4-step distilled/Lightning count. 30 matches
+    /// the sibling non-distilled paths (edit/control) and sits in the diffusers 20–50 range.
+    #[test]
+    fn default_steps_is_a_production_count_for_the_undistilled_base() {
+        // 30 is a production count (matches edit/control siblings, inside diffusers' 20–50 range) and
+        // is decisively out of few-step distilled/Lightning territory — never revert to 4 on the base.
+        assert_eq!(
+            DEFAULT_STEPS, 30,
+            "Qwen-Image base T2I is not distilled — the engine default must be a production step \
+             count (a 4-step default renders garbage)"
+        );
     }
 
     /// sc-8647 (parity with mlx-gen sc-8271): `Qwen/Qwen-Image-2512` is architecturally identical to

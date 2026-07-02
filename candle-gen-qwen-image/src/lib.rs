@@ -187,10 +187,7 @@ impl Pipeline {
         comps: &Components,
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<Vec<Image>> {
-        let steps = req
-            .steps
-            .map(|s| s as usize)
-            .unwrap_or(DEFAULT_STEPS as usize);
+        let steps = resolve_steps(req.steps);
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
@@ -332,6 +329,16 @@ impl Generator for QwenImageGenerator {
         let images = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Images(images))
     }
+}
+
+/// Resolve the sampling step count for a base txt2img render: honor a caller-supplied `steps`,
+/// otherwise fall back to [`DEFAULT_STEPS`]. The base Qwen-Image is a non-distilled 20B flow-match
+/// model, so the default is a production count (sc-9046 / F-076) — the few-step distilled/Lightning
+/// count lives only on the gated Edit path.
+fn resolve_steps(requested: Option<u32>) -> usize {
+    requested
+        .map(|s| s as usize)
+        .unwrap_or(DEFAULT_STEPS as usize)
 }
 
 /// Qwen-Image txt2img descriptor — the surface sc-3696 wires: true-CFG txt2img with a negative
@@ -480,6 +487,24 @@ mod tests {
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
+    }
+
+    /// sc-9046 (F-076): the base txt2img path is a non-distilled 20B model, so an omitted `steps`
+    /// must resolve to the production [`DEFAULT_STEPS`] (not the old 4-step distilled count), while an
+    /// explicit caller-supplied count is always honored verbatim.
+    #[test]
+    fn resolve_steps_defaults_to_production_and_honors_explicit() {
+        // Omitted → production default (currently 30), never the few-step distilled count.
+        assert_eq!(resolve_steps(None), DEFAULT_STEPS as usize);
+        assert!(
+            resolve_steps(None) >= 20,
+            "base default must be a production step count, not a distilled few-step count"
+        );
+        // Explicit values pass through untouched — including a legitimate low count if a caller
+        // deliberately asks for it (e.g. a merged Lightning adapter, wired elsewhere).
+        assert_eq!(resolve_steps(Some(4)), 4);
+        assert_eq!(resolve_steps(Some(50)), 50);
+        assert_eq!(resolve_steps(Some(1)), 1);
     }
 
     #[test]
