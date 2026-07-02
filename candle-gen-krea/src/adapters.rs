@@ -36,11 +36,19 @@
 //! into the 2-D Linear projections).
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
 
-use candle_gen::candle_core::{safetensors as cst, DType, Device, Tensor};
+use candle_gen::candle_core::Tensor;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta};
+// The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report primitives
+// this crate previously hand-copied. Only the Krea-specific key→module resolution (ai-toolkit native
+// rename + the bespoke file-meta-or-lycoris LoKr grouping) stays local below.
+use candle_gen::train::merge::{
+    build_kohya_table, merge_into, no_target_matched, read_adapter, read_scalar, AdapterFile,
+    LoraTriple, Role,
+};
+// Re-exported so `candle_gen_krea::MergeReport` (the crate's public surface) keeps resolving.
+pub use candle_gen::train::merge::MergeReport;
 use candle_gen::{CandleError, Result};
 
 use crate::config::Krea2Config;
@@ -70,47 +78,6 @@ const LOKR_SUFFIXES: [&str; 6] = [
     ".lokr_w2_b",
     ".lokr_w2",
 ];
-
-/// Outcome of merging the adapter specs into the base DiT tensor map: how many base weights were
-/// updated, and how many keys fell outside the merge surface (text-encoder / conv-shaped / unresolved
-/// — surfaced, not silently dropped).
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct MergeReport {
-    pub merged: usize,
-    pub skipped_keys: usize,
-}
-
-#[derive(Clone, Copy)]
-enum Role {
-    Down,
-    Up,
-    Alpha,
-}
-
-#[derive(Default)]
-struct LoraTriple {
-    down: Option<Tensor>, // A: [rank, in]
-    up: Option<Tensor>,   // B: [out, rank]
-    alpha: Option<f32>,
-}
-
-/// A loaded adapter file: its tensors (CPU, native dtype) and the safetensors header metadata.
-struct AdapterFile {
-    tensors: HashMap<String, Tensor>,
-    meta: HashMap<String, String>,
-}
-
-/// Read an adapter `.safetensors` once: tensors via candle's loader, metadata via the safetensors
-/// header reader (candle's `load` drops the header `__metadata__`, which LoKr's `rank`/`alpha` live in).
-fn read_adapter(path: &Path) -> Result<AdapterFile> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| CandleError::Msg(format!("read adapter {}: {e}", path.display())))?;
-    let tensors = cst::load_buffer(&bytes, &Device::Cpu)?;
-    let (_, md) = safetensors::SafeTensors::read_metadata(&bytes)
-        .map_err(|e| CandleError::Msg(format!("read adapter metadata {}: {e}", path.display())))?;
-    let meta = md.metadata().clone().unwrap_or_default();
-    Ok(AdapterFile { tensors, meta })
-}
 
 /// Strip the longest matching PEFT prefix, or return the key unchanged (bare dotted path).
 fn strip_peft_prefix(key: &str) -> &str {
@@ -148,18 +115,6 @@ fn normalize_native_krea_path(path: &str) -> String {
         .replace(".attn.wo", ".attn.to_out.0")
         .replace(".attn.gate", ".attn.to_gate");
     p
-}
-
-/// Build the kohya `flattened → dotted` lookup table from the base DiT's 2-D Linear weight keys
-/// (`{dotted}.weight`). The `_`-flattening is ambiguous (diffusers names contain `_`), so resolving
-/// against the real key set is what disambiguates a kohya stem.
-fn build_kohya_table(base: &HashMap<String, Tensor>) -> BTreeMap<String, String> {
-    base.iter()
-        .filter_map(|(k, t)| {
-            let dotted = k.strip_suffix(".weight")?;
-            (t.dims().len() == 2).then(|| (dotted.replace('.', "_"), dotted.to_string()))
-        })
-        .collect()
 }
 
 /// Map one LoRA key to `(dit_dotted_path, role)`, or `None` if outside the DiT merge surface. kohya
@@ -226,36 +181,6 @@ fn has_lokr_keys(af: &AdapterFile) -> bool {
     af.tensors
         .keys()
         .any(|k| LOKR_SUFFIXES.iter().any(|s| k.ends_with(s)))
-}
-
-fn read_scalar(t: &Tensor) -> Result<f32> {
-    Ok(t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?[0])
-}
-
-/// Merge `delta` (`[out, in]` f32) into the base weight at `key`, computing `W += δ` in f32 (the stored
-/// f32 sum is cast to the DiT load dtype when [`Weights::get`](crate::loader::Weights::get) serves it).
-/// A missing key or a shape-mismatched base (e.g. a 4-D conv weight) is surfaced as skipped, never a
-/// hard error.
-fn merge_into(
-    base: &mut HashMap<String, Tensor>,
-    key: &str,
-    delta: &Tensor,
-    report: &mut MergeReport,
-) -> Result<()> {
-    let merged = {
-        let Some(w) = base.get(key) else {
-            report.skipped_keys += 1;
-            return Ok(());
-        };
-        if w.dims() != delta.dims() {
-            report.skipped_keys += 1;
-            return Ok(());
-        }
-        (w.to_dtype(DType::F32)? + delta)?
-    };
-    base.insert(key.to_string(), merged);
-    report.merged += 1;
-    Ok(())
 }
 
 /// Merge one LoRA file into `base` at `scale`: classify every key, fold complete `(down, up)` pairs
@@ -418,11 +343,6 @@ fn merge_lokr_file(
     Ok(())
 }
 
-/// Whether the adapter file declares LoKr in its `networkType` metadata.
-fn declares_lokr(af: &AdapterFile) -> bool {
-    af.meta.get("networkType").map(String::as_str) == Some("lokr")
-}
-
 /// Fold every adapter spec in `specs` into the base DiT tensor `map` (CPU, native dtype) at each spec's
 /// `scale` — LoRA and LoKr, merged into the dense weights (`W += δ`). Returns the [`MergeReport`];
 /// errors if a non-empty spec list matches **no** target (a format / prefix misconfiguration — the
@@ -434,7 +354,7 @@ pub fn merge_adapters(
     if specs.is_empty() {
         return Ok(MergeReport::default());
     }
-    let table = build_kohya_table(map);
+    let table = build_kohya_table(map, &[2]);
     let mut report = MergeReport::default();
     for spec in specs {
         let af = read_adapter(&spec.path)?;
@@ -443,7 +363,7 @@ pub fn merge_adapters(
             AdapterKind::Lora => {
                 // The file metadata is authoritative — a Lora-declared LoKr file has no lora_A/B keys
                 // and would merge nothing; surface the mismatch loudly rather than no-op.
-                if declares_lokr(&af) {
+                if af.declares_lokr() {
                     return Err(CandleError::Msg(format!(
                         "krea: adapter {} declared Lora but its metadata says networkType=lokr",
                         spec.path.display()
@@ -461,15 +381,15 @@ pub fn merge_adapters(
         }
     }
     if report.merged == 0 {
-        return Err(CandleError::Msg(format!(
-            "krea: no adapter target modules matched across {} file(s) — expected bare/PEFT \
-             `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` (LoKr — declared \
-             networkType=lokr OR sniffed by key) over the DiT attention (to_q|to_k|to_v|to_gate|\
-             to_out.0) and SwiGLU FFN (ff.gate|ff.up|ff.down) projections across the single-stream \
-             transformer_blocks and text_fusion blocks. Conv-layer / text-encoder adapters are out \
-             of surface",
-            specs.len()
-        )));
+        return Err(no_target_matched(
+            "krea",
+            "expected bare/PEFT `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` (LoKr — \
+             declared networkType=lokr OR sniffed by key) over the DiT attention (to_q|to_k|to_v|\
+             to_gate|to_out.0) and SwiGLU FFN (ff.gate|ff.up|ff.down) projections across the \
+             single-stream transformer_blocks and text_fusion blocks. Conv-layer / text-encoder \
+             adapters are out of surface",
+            specs.len(),
+        ));
     }
     Ok(report)
 }
@@ -537,6 +457,7 @@ mod tests {
     use super::*;
     use crate::train_dit::KREA_ATTN_TARGETS;
     use candle_gen::candle_core::safetensors::save as save_tensors;
+    use candle_gen::candle_core::{DType, Device};
 
     /// A tiny stand-in for the base DiT tensor map: two attention Linears + one conv (4-D) weight.
     fn base_map() -> HashMap<String, Tensor> {
@@ -575,7 +496,7 @@ mod tests {
     /// dotted DiT path.
     #[test]
     fn classify_lora_resolves_bare_peft_and_kohya() {
-        let table = build_kohya_table(&base_map());
+        let table = build_kohya_table(&base_map(), &[2]);
         // bare dotted (what `save_lora_peft(set, "", …)` writes for the DiT).
         let (p, _) =
             classify_lora_key("transformer_blocks.0.attn.to_q.lora_A.weight", &table).unwrap();
@@ -619,7 +540,7 @@ mod tests {
     /// `mlp` → `ff` — and the normalizer must be a no-op on already-diffusers paths (our own LoRAs).
     #[test]
     fn classify_lora_normalizes_native_aitoolkit_naming() {
-        let table = build_kohya_table(&base_map());
+        let table = build_kohya_table(&base_map(), &[2]);
         let cases = [
             (
                 "diffusion_model.blocks.0.attn.wq.lora_A.weight",
@@ -684,7 +605,7 @@ mod tests {
             ]),
             meta: HashMap::new(),
         };
-        let table = build_kohya_table(&map);
+        let table = build_kohya_table(&map, &[2]);
         let mut report = MergeReport::default();
         // scale 1.0; alpha 4, rank 2 ⇒ effective 2.0. ΔW = 2.0·(B·A).
         merge_lora_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
@@ -718,7 +639,7 @@ mod tests {
                 r#"{"lora_alpha": 16, "r": 8}"#.to_string(),
             )]),
         };
-        let table = build_kohya_table(&map);
+        let table = build_kohya_table(&map, &[2]);
         let mut report = MergeReport::default();
         merge_lora_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
         assert_eq!(report.merged, 1);
@@ -755,7 +676,7 @@ mod tests {
             ]),
             meta: HashMap::new(),
         };
-        let table = build_kohya_table(&map);
+        let table = build_kohya_table(&map, &[2]);
         let mut report = MergeReport::default();
         merge_lora_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
         assert_eq!(report.merged, 0);
@@ -785,7 +706,7 @@ mod tests {
                 ("alpha".to_string(), "2".to_string()),
             ]),
         };
-        let table = build_kohya_table(&map);
+        let table = build_kohya_table(&map, &[2]);
         let mut report = MergeReport::default();
         merge_lokr_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
         assert_eq!(report.merged, 1);
@@ -934,7 +855,7 @@ mod tests {
             ]),
             meta: HashMap::new(), // no networkType / rank / alpha
         };
-        let table = build_kohya_table(&map);
+        let table = build_kohya_table(&map, &[2]);
         let mut report = MergeReport::default();
         merge_lokr_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
         assert_eq!(report.merged, 1);
@@ -991,7 +912,7 @@ mod tests {
             )]),
             meta: HashMap::new(),
         };
-        let table = build_kohya_table(&map);
+        let table = build_kohya_table(&map, &[2]);
         let mut report = MergeReport::default();
         merge_lora_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
         assert_eq!(report.merged, 0);

@@ -48,15 +48,22 @@
 //! text-encoder `lora_te*` keys (UNet-only merge) and any factor that resolves to no UNet module.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
 
-use candle_gen::candle_core::{safetensors as cst, DType, Device, Tensor};
+use candle_gen::candle_core::Tensor;
 use candle_gen::gen_core::weightsmeta as wmeta;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
 use candle_gen::train::lora::{
-    conv_lora_delta, reconstruct_loha_delta, reconstruct_lokr_delta, reconstruct_lora_delta,
-    LoraAdapterMeta,
+    conv_lora_delta, reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta,
 };
+// The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report + third-party
+// LyCORIS engine this crate previously hand-copied. Only the SDXL-specific key→module resolution
+// (kohya `lora_unet_` + original-SD/A1111 translation + the 4-D conv-LoRA surface) stays local below.
+use candle_gen::train::merge::{
+    build_kohya_table, merge_into, merge_one_thirdparty, no_target_matched, parse_loha_thirdparty,
+    parse_lokr_thirdparty, read_adapter, read_scalar, AdapterFile, LoraTriple, Role,
+};
+// Re-exported so `candle_gen_sdxl::MergeReport` (the crate's public surface) keeps resolving.
+pub use candle_gen::train::merge::MergeReport;
 use candle_gen::{CandleError, Result};
 
 /// PEFT key prefix the candle SDXL trainer (and `peft.save_pretrained()`) write. Optional on read —
@@ -74,66 +81,6 @@ const LOKR_SUFFIXES: [&str; 6] = [
     ".lokr_w2_b",
     ".lokr_w2",
 ];
-
-/// Outcome of merging the adapter specs into the base UNet tensor map: how many base weights were
-/// updated, and how many keys fell outside the merge surface (text-encoder keys, a conv-targeting
-/// LoKr/LoHa on the Linear-only surface, or an unresolved module — surfaced, not silently dropped).
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct MergeReport {
-    pub merged: usize,
-    pub skipped_keys: usize,
-}
-
-#[derive(Clone, Copy)]
-enum Role {
-    Down,
-    Up,
-    Alpha,
-}
-
-#[derive(Default)]
-struct LoraTriple {
-    down: Option<Tensor>, // A: [rank, in]
-    up: Option<Tensor>,   // B: [out, rank]
-    alpha: Option<f32>,
-}
-
-/// A loaded adapter file: its tensors (CPU, native dtype) and the safetensors header metadata.
-struct AdapterFile {
-    tensors: HashMap<String, Tensor>,
-    meta: HashMap<String, String>,
-}
-
-/// Read an adapter `.safetensors` once: tensors via candle's loader, metadata via the safetensors
-/// header reader (candle's `load` drops the header `__metadata__`, which LoKr's `rank`/`alpha` live in).
-fn read_adapter(path: &Path) -> Result<AdapterFile> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| CandleError::Msg(format!("read adapter {}: {e}", path.display())))?;
-    let tensors = cst::load_buffer(&bytes, &Device::Cpu)?;
-    let (_, md) = safetensors::SafeTensors::read_metadata(&bytes)
-        .map_err(|e| CandleError::Msg(format!("read adapter metadata {}: {e}", path.display())))?;
-    let meta = md.metadata().clone().unwrap_or_default();
-    Ok(AdapterFile { tensors, meta })
-}
-
-/// Build the kohya `flattened → dotted` lookup table from the base UNet's adaptable weight keys
-/// (`{dotted}.weight`). The `_`-flattening diffusers uses is ambiguous (its own names contain `_`), so
-/// resolving against the real key set — the candle analog of the vendored `named_modules()` walk —
-/// is what disambiguates a kohya stem. Both **2-D Linear** weights (attention/proj/ff) and **4-D conv**
-/// weights (resnet convs, samplers, `conv_in`/`conv_out`) are included (sc-5225): a kohya conv key
-/// (`lora_unet_..._conv1`, `..._downsamplers_0_conv`, `conv_in`, …) then resolves to its dotted path and
-/// reaches the conv merge. The two surfaces share no flattened stem (distinct module paths), so adding
-/// convs introduces no collision; a tagged/third-party LoKr that resolves a conv stem still skips it at
-/// the Linear-only shape gate.
-fn build_kohya_table(base: &HashMap<String, Tensor>) -> BTreeMap<String, String> {
-    base.iter()
-        .filter_map(|(k, t)| {
-            let dotted = k.strip_suffix(".weight")?;
-            let nd = t.dims().len();
-            (nd == 2 || nd == 4).then(|| (dotted.replace('.', "_"), dotted.to_string()))
-        })
-        .collect()
-}
 
 /// Map one LoRA key to `(diffusers_dotted_path, role)`, or `None` if outside the UNet merge surface.
 /// kohya (`lora_unet_<flat>…`) resolves the flattened stem via `table` — directly for a diffusers-named
@@ -187,49 +134,6 @@ fn classify_lokr_key(
         }
     }
     None
-}
-
-fn read_scalar(t: &Tensor) -> Result<f32> {
-    Ok(t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?[0])
-}
-
-/// Read a per-module `.alpha` scalar as `f32`, regardless of on-disk dtype or shape (`[]` or `[1]`),
-/// returning `None` for a size-0 (malformed) tensor rather than panicking — the candle twin of
-/// mlx-gen's `scalar_alpha`. Third-party adapters store `alpha` in their compute dtype.
-fn read_scalar_opt(t: &Tensor) -> Result<Option<f32>> {
-    if t.elem_count() == 0 {
-        return Ok(None);
-    }
-    Ok(t.to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?
-        .first()
-        .copied())
-}
-
-/// Merge `delta` (`[out, in]` f32) into the base weight at `key`, computing `W += δ` in f32 (the stored
-/// f32 sum is cast to the UNet load dtype when the VarBuilder serves it). A missing key or a
-/// shape-mismatched base (e.g. a 4-D conv weight) is surfaced as skipped, never a hard error.
-fn merge_into(
-    base: &mut HashMap<String, Tensor>,
-    key: &str,
-    delta: &Tensor,
-    report: &mut MergeReport,
-) -> Result<()> {
-    let merged = {
-        let Some(w) = base.get(key) else {
-            report.skipped_keys += 1;
-            return Ok(());
-        };
-        if w.dims() != delta.dims() {
-            report.skipped_keys += 1;
-            return Ok(());
-        }
-        (w.to_dtype(DType::F32)? + delta)?
-    };
-    base.insert(key.to_string(), merged);
-    report.merged += 1;
-    Ok(())
 }
 
 /// Merge one LoRA file into `base` at `scale`: classify every key (PEFT + kohya), fold complete
@@ -367,207 +271,6 @@ fn merge_lokr_file(
     Ok(())
 }
 
-/// Whether the adapter file declares LoKr in its `networkType` metadata (the SceneWorks/PEFT stamp the
-/// candle trainer writes). A third-party LyCORIS LoKr has the `lokr_*` factors but **no** stamp — see
-/// [`merge_lokr_thirdparty`].
-fn declares_lokr(af: &AdapterFile) -> bool {
-    wmeta::is_lokr_network_type(af.meta.get("networkType").map(String::as_str))
-}
-
-// ---- Third-party LyCORIS LoKr / LoHa (sc-5225) ---------------------------------------------------
-//
-// kohya / ai-toolkit / lycoris-lib LoKr (`lokr_*`) and LoHa (`hada_*`) files ship the decomposition
-// factors but NOT the `networkType=lokr` stamp `declares_lokr` keys off, and derive rank/alpha/scale
-// **per module** (vs the PEFT path's one global pair). We reuse `gen_core::weightsmeta` for all the
-// string/metadata logic (key detection, suffix tables, flattened→dotted resolution) and port only the
-// per-module factor grouping + the lycoris scale rule here; the delta is reconstructed with the shared
-// f32 math. **Linear-only** to match mlx-gen (`merge_one_lokr_thirdparty` / `merge_one_loha_thirdparty`
-// resolve only Linear targets): a factor that resolves to a 4-D conv weight — including the lycoris
-// conv/tucker (`lokr_t2`/`hada_t1`/`hada_t2`) forms — is surfaced as skipped, never mis-merged.
-
-/// One module's third-party LoKr factors (full `w1`/`w2`, low-rank `_a`/`_b`, optional per-module
-/// `.alpha`). The tucker `lokr_t2` factor is conv-only and out of the Linear surface, so it is ignored.
-#[derive(Default)]
-struct ThirdPartyLokr {
-    w1: Option<Tensor>,
-    w1_a: Option<Tensor>,
-    w1_b: Option<Tensor>,
-    w2: Option<Tensor>,
-    w2_a: Option<Tensor>,
-    w2_b: Option<Tensor>,
-    alpha: Option<f32>,
-}
-
-impl ThirdPartyLokr {
-    /// The factorization rank (`lora_dim`), derived from whichever decomposed factor is present:
-    /// `lokr_w1_a` is `[shape0, dim]`; else the non-tucker `lokr_w2_a` is `[shape0, dim]`. `None` when
-    /// **both** factors are full — lycoris then forces `alpha = lora_dim` ⇒ scale 1, so rank is unused.
-    fn rank(&self) -> Option<f32> {
-        if let Some(a) = &self.w1_a {
-            return Some(a.dims()[1] as f32);
-        }
-        self.w2_a.as_ref().map(|a| a.dims()[1] as f32)
-    }
-
-    /// LyCORIS `scale = alpha / lora_dim` (alpha defaulting to `lora_dim`), EXCEPT both-full forces
-    /// scale 1 (`LokrModule.__init__`: `if use_w1 and use_w2: alpha = lora_dim`).
-    fn lycoris_scale(&self) -> f32 {
-        match self.rank() {
-            None => 1.0,
-            Some(r) => self.alpha.unwrap_or(r) / r,
-        }
-    }
-
-    /// Reconstruct this module's `[out, in]` delta with the lycoris per-module scale baked in, times
-    /// the caller's `user_scale`. Reuses the shared [`reconstruct_lokr_delta`] by passing the lycoris
-    /// scale as `alpha` over `rank = 1.0` (so `eff = lycoris_scale · user_scale`).
-    fn delta(&self, base_shape: (usize, usize), user_scale: f32) -> Result<Tensor> {
-        reconstruct_lokr_delta(
-            self.w1.as_ref(),
-            self.w1_a.as_ref(),
-            self.w1_b.as_ref(),
-            self.w2.as_ref(),
-            self.w2_a.as_ref(),
-            self.w2_b.as_ref(),
-            self.lycoris_scale(),
-            1.0,
-            user_scale,
-            base_shape,
-        )
-    }
-}
-
-/// Group a third-party LoKr file's tensors by raw module key (the part before `.lokr_*`/`.alpha`). The
-/// raw key is whatever the trainer wrote — a `<PREFIX>_<flattened.path>` (kohya/lycoris) — resolved to
-/// a UNet dotted path in [`merge_lokr_thirdparty`].
-fn parse_lokr_thirdparty(af: &AdapterFile) -> Result<BTreeMap<String, ThirdPartyLokr>> {
-    let mut groups: BTreeMap<String, ThirdPartyLokr> = BTreeMap::new();
-    for (key, t) in &af.tensors {
-        if let Some(raw) = key.strip_suffix(".alpha") {
-            if let Some(a) = read_scalar_opt(t)? {
-                groups.entry(raw.to_string()).or_default().alpha = Some(a);
-            }
-            continue;
-        }
-        if let Some((path, factor)) = wmeta::split_factor_key(key, &wmeta::LOKR_TP_SUFFIXES) {
-            let g = groups.entry(path.to_string()).or_default();
-            match factor {
-                "lokr_w1" => g.w1 = Some(t.clone()),
-                "lokr_w1_a" => g.w1_a = Some(t.clone()),
-                "lokr_w1_b" => g.w1_b = Some(t.clone()),
-                "lokr_w2" => g.w2 = Some(t.clone()),
-                "lokr_w2_a" => g.w2_a = Some(t.clone()),
-                "lokr_w2_b" => g.w2_b = Some(t.clone()),
-                "lokr_t2" => {} // tucker (conv-only) — out of the Linear surface; module skips below.
-                _ => {}
-            }
-        }
-    }
-    Ok(groups)
-}
-
-/// One module's third-party LoHa factors — two low-rank Hadamard pairs + an optional per-module
-/// `.alpha`. The tucker `hada_t1`/`hada_t2` factors are conv-only and ignored (Linear surface).
-#[derive(Default)]
-struct ThirdPartyLoha {
-    w1_a: Option<Tensor>,
-    w1_b: Option<Tensor>,
-    w2_a: Option<Tensor>,
-    w2_b: Option<Tensor>,
-    alpha: Option<f32>,
-}
-
-impl ThirdPartyLoha {
-    /// rank (`lora_dim`) = `hada_w1_b.shape[0]` (lycoris stores `hada_w1_b` as `[lora_dim, …]`).
-    fn rank(&self) -> Option<f32> {
-        self.w1_b.as_ref().map(|b| b.dims()[0] as f32)
-    }
-
-    /// LyCORIS `scale = alpha / lora_dim` (alpha defaulting to `lora_dim`). LoHa is always decomposed
-    /// (no both-full case), so — unlike LoKr — there is no forced-1 branch.
-    fn lycoris_scale(&self) -> f32 {
-        match self.rank() {
-            None => 1.0,
-            Some(r) => self.alpha.unwrap_or(r) / r,
-        }
-    }
-
-    /// Reconstruct this module's `[out, in]` Hadamard delta (lycoris scale × `user_scale` baked in).
-    /// Errors if a `hada_w1/w2` `a`/`b` leg is missing (a conv-tucker-only module never reaches here —
-    /// it resolves to a 4-D base and skips first).
-    fn delta(&self, base_shape: (usize, usize), user_scale: f32) -> Result<Tensor> {
-        let (w1_a, w1_b, w2_a, w2_b) = match (&self.w1_a, &self.w1_b, &self.w2_a, &self.w2_b) {
-            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-            _ => {
-                return Err(CandleError::Msg(
-                    "loha: a hada_w1/w2 a/b factor is missing".into(),
-                ))
-            }
-        };
-        reconstruct_loha_delta(
-            w1_a,
-            w1_b,
-            w2_a,
-            w2_b,
-            self.lycoris_scale() * user_scale,
-            base_shape,
-        )
-    }
-}
-
-/// Group a third-party LoHa file's tensors by raw module key (the part before `.hada_*`/`.alpha`).
-fn parse_loha_thirdparty(af: &AdapterFile) -> Result<BTreeMap<String, ThirdPartyLoha>> {
-    let mut groups: BTreeMap<String, ThirdPartyLoha> = BTreeMap::new();
-    for (key, t) in &af.tensors {
-        if let Some(raw) = key.strip_suffix(".alpha") {
-            if let Some(a) = read_scalar_opt(t)? {
-                groups.entry(raw.to_string()).or_default().alpha = Some(a);
-            }
-            continue;
-        }
-        if let Some((path, factor)) = wmeta::split_factor_key(key, &wmeta::LOHA_TP_SUFFIXES) {
-            let g = groups.entry(path.to_string()).or_default();
-            match factor {
-                "hada_w1_a" => g.w1_a = Some(t.clone()),
-                "hada_w1_b" => g.w1_b = Some(t.clone()),
-                "hada_w2_a" => g.w2_a = Some(t.clone()),
-                "hada_w2_b" => g.w2_b = Some(t.clone()),
-                "hada_t1" | "hada_t2" => {} // tucker (conv-only) — module skips at the shape gate.
-                _ => {}
-            }
-        }
-    }
-    Ok(groups)
-}
-
-/// Merge one reconstructed `[out, in]` delta into the base at the resolved Linear module `path`
-/// (`W += δ`). Shared by the third-party LoKr + LoHa paths: resolve → Linear-only shape gate →
-/// reconstruct → merge. An unresolved key, a missing weight, or a 4-D (conv) target is surfaced as
-/// skipped, never mis-merged.
-fn merge_thirdparty(
-    base: &mut HashMap<String, Tensor>,
-    path: Option<&str>,
-    delta_at: impl FnOnce((usize, usize)) -> Result<Tensor>,
-    report: &mut MergeReport,
-) -> Result<()> {
-    let Some(path) = path else {
-        report.skipped_keys += 1;
-        return Ok(());
-    };
-    let base_key = format!("{path}.weight");
-    let Some(w) = base.get(&base_key) else {
-        report.skipped_keys += 1;
-        return Ok(());
-    };
-    if w.dims().len() != 2 {
-        report.skipped_keys += 1; // Linear-only surface (the conv surface is LoRA-only)
-        return Ok(());
-    }
-    let (out_f, in_f) = (w.dims()[0], w.dims()[1]);
-    let delta = delta_at((out_f, in_f))?;
-    merge_into(base, &base_key, &delta, report)
-}
-
 /// Merge a third-party LyCORIS **LoKr** file (`lokr_*` keys, per-module `.alpha`, no `networkType`
 /// stamp) into `base` at `scale`. Resolves each flattened module key against `table` (the kohya
 /// `flattened → dotted` map); an unresolved key is surfaced as skipped (mirrors mlx-gen's
@@ -580,7 +283,7 @@ fn merge_lokr_thirdparty(
     report: &mut MergeReport,
 ) -> Result<()> {
     for (raw, g) in parse_lokr_thirdparty(af)? {
-        merge_thirdparty(
+        merge_one_thirdparty(
             base,
             wmeta::resolve_lokr_path(&raw, table),
             |bs| g.delta(bs, scale),
@@ -600,7 +303,7 @@ fn merge_loha_thirdparty(
     report: &mut MergeReport,
 ) -> Result<()> {
     for (raw, g) in parse_loha_thirdparty(af)? {
-        merge_thirdparty(
+        merge_one_thirdparty(
             base,
             wmeta::resolve_lokr_path(&raw, table),
             |bs| g.delta(bs, scale),
@@ -621,7 +324,9 @@ pub fn merge_adapters(
     if specs.is_empty() {
         return Ok(MergeReport::default());
     }
-    let table = build_kohya_table(map);
+    // Both 2-D Linear (attention/proj/ff) and 4-D conv (resnet convs, samplers, conv_in/out) stems
+    // join the table (sc-5225), so a kohya conv key resolves and reaches the conv-LoRA merge.
+    let table = build_kohya_table(map, &[2, 4]);
     let mut report = MergeReport::default();
     for spec in specs {
         let af = read_adapter(&spec.path)?;
@@ -629,7 +334,7 @@ pub fn merge_adapters(
         // so the caller's declared `kind` can't label them — detect + route by keys before the kind
         // match. (A PEFT LoKr carries the stamp and goes through the `Lokr` arm; the LoKr-keys branch
         // excludes it via `!declares_lokr`.)
-        if !declares_lokr(&af) && wmeta::keys_contain_lokr(af.tensors.keys().map(String::as_str)) {
+        if !af.declares_lokr() && wmeta::keys_contain_lokr(af.tensors.keys().map(String::as_str)) {
             merge_lokr_thirdparty(map, &af, spec.scale, &table, &mut report)?;
             continue;
         }
@@ -642,7 +347,7 @@ pub fn merge_adapters(
             AdapterKind::Lora => {
                 // The file metadata is authoritative — a Lora-declared LoKr file has no lora_A/B keys
                 // and would merge nothing; surface the mismatch loudly rather than no-op.
-                if declares_lokr(&af) {
+                if af.declares_lokr() {
                     return Err(CandleError::Msg(format!(
                         "sdxl: adapter {} declared Lora but its metadata says networkType=lokr",
                         spec.path.display()
@@ -653,14 +358,15 @@ pub fn merge_adapters(
         }
     }
     if report.merged == 0 {
-        return Err(CandleError::Msg(format!(
-            "sdxl: no adapter target modules matched across {} file(s) — expected PEFT \
-             `base_model.model.unet.<path>.lora_A/B.weight` or kohya `lora_unet_<flat>.lora_down/up.\
-             weight` with diffusers `down_blocks_*` or original-SD `input_blocks_*` block naming \
-             (LoRA, incl. conv layers), `<module>.lokr_w1/w2` with networkType=lokr (LoKr), \
-             or untagged LyCORIS `lokr_*` / `hada_*` (third-party LoKr / LoHa)",
-            specs.len()
-        )));
+        return Err(no_target_matched(
+            "sdxl",
+            "expected PEFT `base_model.model.unet.<path>.lora_A/B.weight` or kohya \
+             `lora_unet_<flat>.lora_down/up.weight` with diffusers `down_blocks_*` or original-SD \
+             `input_blocks_*` block naming (LoRA, incl. conv layers), `<module>.lokr_w1/w2` with \
+             networkType=lokr (LoKr), or untagged LyCORIS `lokr_*` / `hada_*` (third-party LoKr / \
+             LoHa)",
+            specs.len(),
+        ));
     }
     Ok(report)
 }
@@ -668,6 +374,8 @@ pub fn merge_adapters(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::candle_core::{DType, Device};
+    use std::path::Path;
 
     /// A tiny stand-in for the base UNet tensor map: two attention Linears + one conv (4-D) weight.
     fn base_map() -> HashMap<String, Tensor> {
@@ -699,7 +407,7 @@ mod tests {
     /// the real `…to_out.0` path.
     #[test]
     fn classify_lora_resolves_peft_kohya_and_bare() {
-        let table = build_kohya_table(&base_map());
+        let table = build_kohya_table(&base_map(), &[2, 4]);
         // PEFT prefixed.
         let (p, _) = classify_lora_key(
             "base_model.model.unet.down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q.lora_A.weight",
@@ -793,7 +501,7 @@ mod tests {
             ]),
             meta: HashMap::new(),
         };
-        let table = build_kohya_table(&map);
+        let table = build_kohya_table(&map, &[2, 4]);
         let mut report = MergeReport::default();
         // scale 1.0; alpha 4, rank 2 ⇒ effective 2.0. ΔW = 2.0·(B·A).
         merge_lora_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
@@ -842,7 +550,7 @@ mod tests {
                 r#"{"lora_alpha": 16, "r": 8}"#.to_string(),
             )]),
         };
-        let table = build_kohya_table(&map);
+        let table = build_kohya_table(&map, &[2, 4]);
         let mut report = MergeReport::default();
         merge_lora_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
         assert_eq!(report.merged, 1);
@@ -902,7 +610,7 @@ mod tests {
             ]),
             meta: HashMap::new(),
         };
-        let table = build_kohya_table(&map);
+        let table = build_kohya_table(&map, &[2, 4]);
         let mut report = MergeReport::default();
         // alpha defaults to rank (2) ⇒ effective 1.0; scale 1.0.
         merge_lora_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
@@ -953,7 +661,7 @@ mod tests {
             ]),
             meta: HashMap::new(),
         };
-        let table = build_kohya_table(&map);
+        let table = build_kohya_table(&map, &[2, 4]);
         let mut report = MergeReport::default();
         merge_lora_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
         assert_eq!(report.merged, 1, "kohya conv stem must resolve and merge");
@@ -986,7 +694,7 @@ mod tests {
                 ("alpha".to_string(), "2".to_string()),
             ]),
         };
-        let table = build_kohya_table(&map);
+        let table = build_kohya_table(&map, &[2, 4]);
         let mut report = MergeReport::default();
         merge_lokr_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
         assert_eq!(report.merged, 1);
@@ -1032,7 +740,7 @@ mod tests {
             tensors: af_tensors,
             meta: HashMap::new(),
         };
-        let table = build_kohya_table(&map);
+        let table = build_kohya_table(&map, &[2, 4]);
         let mut report = MergeReport::default();
         merge_lora_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
         assert_eq!(report.merged, 0);
@@ -1048,7 +756,7 @@ mod tests {
             tensors: HashMap::new(),
             meta: HashMap::from([("networkType".to_string(), "lokr".to_string())]),
         };
-        assert!(declares_lokr(&af));
+        assert!(af.declares_lokr());
     }
 
     /// The keystone train→infer round-trip: a PEFT `.safetensors` written by the **actual trainer**
@@ -1170,7 +878,7 @@ mod tests {
             } else {
                 assert!(
                     wmeta::keys_contain_lokr(af.tensors.keys().map(String::as_str))
-                        && !declares_lokr(&af),
+                        && !af.declares_lokr(),
                     "{stem}: not detected as third-party LoKr"
                 );
             }
@@ -1236,11 +944,11 @@ mod tests {
             ]),
             meta: HashMap::new(), // no networkType stamp → third-party
         };
-        assert!(!declares_lokr(&af));
+        assert!(!af.declares_lokr());
         assert!(wmeta::keys_contain_lokr(
             af.tensors.keys().map(String::as_str)
         ));
-        let table = build_kohya_table(&map);
+        let table = build_kohya_table(&map, &[2, 4]);
         let mut report = MergeReport::default();
         merge_lokr_thirdparty(&mut map, &af, 1.0, &table, &mut report).unwrap();
         assert_eq!(report.merged, 1, "the to_q LoKr must merge");
@@ -1283,7 +991,7 @@ mod tests {
         assert!(wmeta::keys_contain_loha(
             af.tensors.keys().map(String::as_str)
         ));
-        let table = build_kohya_table(&map);
+        let table = build_kohya_table(&map, &[2, 4]);
         let mut report = MergeReport::default();
         merge_loha_thirdparty(&mut map, &af, 1.0, &table, &mut report).unwrap();
         assert_eq!(report.merged, 1);

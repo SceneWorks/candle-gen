@@ -47,12 +47,19 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use candle_gen::candle_core::{safetensors as cst, DType, Device, Tensor};
+use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::gen_core::weightsmeta as wmeta;
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-use candle_gen::train::lora::{
-    reconstruct_loha_delta, reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta,
+use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta};
+// The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report + third-party
+// LyCORIS engine this crate previously hand-copied. Only the SCAIL-2-specific key→module resolution
+// (bare/prefixed dotted paths, no kohya table) + the bespoke lightx2v diff-patch merge stay local below.
+use candle_gen::train::merge::{
+    merge_into, merge_one_thirdparty, no_target_matched, parse_loha_thirdparty,
+    parse_lokr_thirdparty, read_adapter, read_scalar, AdapterFile, LoraTriple, Role,
 };
+// Re-exported so `candle_gen_scail2::MergeReport` (the crate's public surface) keeps resolving.
+pub use candle_gen::train::merge::MergeReport;
 use candle_gen::{CandleError, Result};
 
 /// LoKr per-module factor suffixes, longest-first so `.lokr_w1_a` wins over `.lokr_w1`.
@@ -64,48 +71,6 @@ const LOKR_SUFFIXES: [&str; 6] = [
     ".lokr_w2_b",
     ".lokr_w2",
 ];
-
-/// Outcome of merging the adapter specs into the base DiT tensor map: how many base weights/biases were
-/// updated, and how many keys fell outside the merge surface (a non-DiT module, a cross-arch-shaped
-/// delta, a text-encoder key, …) — surfaced, not silently dropped.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct MergeReport {
-    pub merged: usize,
-    pub skipped_keys: usize,
-}
-
-#[derive(Clone, Copy)]
-enum Role {
-    Down,
-    Up,
-    Alpha,
-}
-
-#[derive(Default)]
-struct LoraTriple {
-    down: Option<Tensor>, // A: [rank, in]
-    up: Option<Tensor>,   // B: [out, rank]
-    alpha: Option<f32>,
-}
-
-/// A loaded adapter file: its tensors (CPU, native dtype) and the safetensors header metadata.
-struct AdapterFile {
-    tensors: HashMap<String, Tensor>,
-    meta: HashMap<String, String>,
-}
-
-/// Read an adapter `.safetensors` once: tensors via candle's loader, metadata via the safetensors
-/// header reader (candle's `load` drops the `__metadata__`, where LoKr's `rank`/`alpha` + the PEFT
-/// `lora_adapter_metadata` blob live).
-fn read_adapter(path: &Path) -> Result<AdapterFile> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| CandleError::Msg(format!("read adapter {}: {e}", path.display())))?;
-    let tensors = cst::load_buffer(&bytes, &Device::Cpu)?;
-    let (_, md) = safetensors::SafeTensors::read_metadata(&bytes)
-        .map_err(|e| CandleError::Msg(format!("read adapter metadata {}: {e}", path.display())))?;
-    let meta = md.metadata().clone().unwrap_or_default();
-    Ok(AdapterFile { tensors, meta })
-}
 
 /// Strip a leading SCAIL-2 LoRA namespace prefix (`transformer.` / `diffusion_model.`), if present —
 /// leaving the bare dotted module path that resolves directly against the base DiT keys. A bare key and
@@ -149,48 +114,6 @@ fn classify_lokr_key(key: &str) -> Option<(String, &'static str)> {
         }
     }
     None
-}
-
-fn read_scalar(t: &Tensor) -> Result<f32> {
-    Ok(t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?[0])
-}
-
-/// Read a per-module `.alpha` scalar as `f32`, regardless of on-disk dtype or shape (`[]` or `[1]`),
-/// returning `None` for a size-0 (malformed) tensor rather than panicking.
-fn read_scalar_opt(t: &Tensor) -> Result<Option<f32>> {
-    if t.elem_count() == 0 {
-        return Ok(None);
-    }
-    Ok(t.to_dtype(DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?
-        .first()
-        .copied())
-}
-
-/// Merge `delta` (matching the base tensor shape, f32) into the base weight/bias at `key`, computing
-/// `W += δ` in f32 (the stored f32 sum is cast to the DiT load dtype when the VarBuilder serves it). A
-/// missing key or a shape mismatch is surfaced as skipped, never a hard error.
-fn merge_into(
-    base: &mut HashMap<String, Tensor>,
-    key: &str,
-    delta: &Tensor,
-    report: &mut MergeReport,
-) -> Result<()> {
-    let merged = {
-        let Some(w) = base.get(key) else {
-            report.skipped_keys += 1;
-            return Ok(());
-        };
-        if w.dims() != delta.dims() {
-            report.skipped_keys += 1;
-            return Ok(());
-        }
-        (w.to_dtype(DType::F32)? + delta.to_dtype(DType::F32)?)?
-    };
-    base.insert(key.to_string(), merged);
-    report.merged += 1;
-    Ok(())
 }
 
 /// Merge one LoRA file's low-rank pairs into `base` at `scale`: classify every key, fold complete
@@ -381,188 +304,10 @@ fn merge_lokr_file(
     Ok(())
 }
 
-/// Whether the adapter file declares LoKr in its `networkType` metadata (the SceneWorks/PEFT stamp).
-fn declares_lokr(af: &AdapterFile) -> bool {
-    wmeta::is_lokr_network_type(af.meta.get("networkType").map(String::as_str))
-}
-
-// ---- Third-party LyCORIS LoKr / LoHa -------------------------------------------------------------
-//
-// kohya / ai-toolkit / lycoris-lib LoKr (`lokr_*`) and LoHa (`hada_*`) files ship the decomposition
-// factors but NOT the `networkType=lokr` stamp, and derive rank/alpha/scale **per module**. We reuse
-// `gen_core::weightsmeta` for the suffix tables + the shared f32 reconstruction; the SCAIL-2 factor
-// keys are dotted (bare or namespace-prefixed), so resolution is a prefix strip. Linear-only.
-
-/// One module's third-party LoKr factors (full `w1`/`w2`, low-rank `_a`/`_b`, optional `.alpha`).
-#[derive(Default)]
-struct ThirdPartyLokr {
-    w1: Option<Tensor>,
-    w1_a: Option<Tensor>,
-    w1_b: Option<Tensor>,
-    w2: Option<Tensor>,
-    w2_a: Option<Tensor>,
-    w2_b: Option<Tensor>,
-    alpha: Option<f32>,
-}
-
-impl ThirdPartyLokr {
-    /// The factorization rank (`lora_dim`): `lokr_w1_a` is `[shape0, dim]`; else `lokr_w2_a`. `None`
-    /// when both factors are full — lycoris then forces `alpha = lora_dim` ⇒ scale 1, so rank is unused.
-    fn rank(&self) -> Option<f32> {
-        if let Some(a) = &self.w1_a {
-            return Some(a.dims()[1] as f32);
-        }
-        self.w2_a.as_ref().map(|a| a.dims()[1] as f32)
-    }
-
-    /// LyCORIS `scale = alpha / lora_dim` (alpha defaulting to `lora_dim`), EXCEPT both-full forces
-    /// scale 1 (`LokrModule.__init__`: `if use_w1 and use_w2: alpha = lora_dim`).
-    fn lycoris_scale(&self) -> f32 {
-        match self.rank() {
-            None => 1.0,
-            Some(r) => self.alpha.unwrap_or(r) / r,
-        }
-    }
-
-    /// Reconstruct this module's `[out, in]` delta (lycoris per-module scale × `user_scale` baked in).
-    fn delta(&self, base_shape: (usize, usize), user_scale: f32) -> Result<Tensor> {
-        reconstruct_lokr_delta(
-            self.w1.as_ref(),
-            self.w1_a.as_ref(),
-            self.w1_b.as_ref(),
-            self.w2.as_ref(),
-            self.w2_a.as_ref(),
-            self.w2_b.as_ref(),
-            self.lycoris_scale(),
-            1.0,
-            user_scale,
-            base_shape,
-        )
-    }
-}
-
-/// Group a third-party LoKr file's tensors by raw module key (the part before `.lokr_*`/`.alpha`).
-fn parse_lokr_thirdparty(af: &AdapterFile) -> Result<BTreeMap<String, ThirdPartyLokr>> {
-    let mut groups: BTreeMap<String, ThirdPartyLokr> = BTreeMap::new();
-    for (key, t) in &af.tensors {
-        if let Some(raw) = key.strip_suffix(".alpha") {
-            if let Some(a) = read_scalar_opt(t)? {
-                groups.entry(raw.to_string()).or_default().alpha = Some(a);
-            }
-            continue;
-        }
-        if let Some((path, factor)) = wmeta::split_factor_key(key, &wmeta::LOKR_TP_SUFFIXES) {
-            let g = groups.entry(path.to_string()).or_default();
-            match factor {
-                "lokr_w1" => g.w1 = Some(t.clone()),
-                "lokr_w1_a" => g.w1_a = Some(t.clone()),
-                "lokr_w1_b" => g.w1_b = Some(t.clone()),
-                "lokr_w2" => g.w2 = Some(t.clone()),
-                "lokr_w2_a" => g.w2_a = Some(t.clone()),
-                "lokr_w2_b" => g.w2_b = Some(t.clone()),
-                "lokr_t2" => {} // tucker (conv-only) — out of the Linear surface; module skips below.
-                _ => {}
-            }
-        }
-    }
-    Ok(groups)
-}
-
-/// One module's third-party LoHa factors — two low-rank Hadamard pairs + optional `.alpha`.
-#[derive(Default)]
-struct ThirdPartyLoha {
-    w1_a: Option<Tensor>,
-    w1_b: Option<Tensor>,
-    w2_a: Option<Tensor>,
-    w2_b: Option<Tensor>,
-    alpha: Option<f32>,
-}
-
-impl ThirdPartyLoha {
-    /// rank (`lora_dim`) = `hada_w1_b.shape[0]` (lycoris stores `hada_w1_b` as `[lora_dim, …]`).
-    fn rank(&self) -> Option<f32> {
-        self.w1_b.as_ref().map(|b| b.dims()[0] as f32)
-    }
-
-    /// LyCORIS `scale = alpha / lora_dim` (alpha defaulting to `lora_dim`). LoHa is always decomposed.
-    fn lycoris_scale(&self) -> f32 {
-        match self.rank() {
-            None => 1.0,
-            Some(r) => self.alpha.unwrap_or(r) / r,
-        }
-    }
-
-    /// Reconstruct this module's `[out, in]` Hadamard delta (lycoris scale × `user_scale` baked in).
-    fn delta(&self, base_shape: (usize, usize), user_scale: f32) -> Result<Tensor> {
-        let (w1_a, w1_b, w2_a, w2_b) = match (&self.w1_a, &self.w1_b, &self.w2_a, &self.w2_b) {
-            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
-            _ => {
-                return Err(CandleError::Msg(
-                    "loha: a hada_w1/w2 a/b factor is missing".into(),
-                ))
-            }
-        };
-        reconstruct_loha_delta(
-            w1_a,
-            w1_b,
-            w2_a,
-            w2_b,
-            self.lycoris_scale() * user_scale,
-            base_shape,
-        )
-    }
-}
-
-/// Group a third-party LoHa file's tensors by raw module key (the part before `.hada_*`/`.alpha`).
-fn parse_loha_thirdparty(af: &AdapterFile) -> Result<BTreeMap<String, ThirdPartyLoha>> {
-    let mut groups: BTreeMap<String, ThirdPartyLoha> = BTreeMap::new();
-    for (key, t) in &af.tensors {
-        if let Some(raw) = key.strip_suffix(".alpha") {
-            if let Some(a) = read_scalar_opt(t)? {
-                groups.entry(raw.to_string()).or_default().alpha = Some(a);
-            }
-            continue;
-        }
-        if let Some((path, factor)) = wmeta::split_factor_key(key, &wmeta::LOHA_TP_SUFFIXES) {
-            let g = groups.entry(path.to_string()).or_default();
-            match factor {
-                "hada_w1_a" => g.w1_a = Some(t.clone()),
-                "hada_w1_b" => g.w1_b = Some(t.clone()),
-                "hada_w2_a" => g.w2_a = Some(t.clone()),
-                "hada_w2_b" => g.w2_b = Some(t.clone()),
-                "hada_t1" | "hada_t2" => {} // tucker (conv-only) — module skips at the shape gate.
-                _ => {}
-            }
-        }
-    }
-    Ok(groups)
-}
-
-/// Merge one reconstructed `[out, in]` delta into the resolved Linear module `path` (`W += δ`).
-/// Shared by the third-party LoKr + LoHa paths: prefix-strip → Linear-only shape gate → reconstruct →
-/// merge. A missing weight or a non-2-D (conv) target is surfaced as skipped.
-fn merge_thirdparty(
-    base: &mut HashMap<String, Tensor>,
-    raw: &str,
-    delta_at: impl FnOnce((usize, usize)) -> Result<Tensor>,
-    report: &mut MergeReport,
-) -> Result<()> {
-    let base_key = format!("{}.weight", strip_lora_prefix(raw));
-    let Some(w) = base.get(&base_key) else {
-        report.skipped_keys += 1;
-        return Ok(());
-    };
-    if w.dims().len() != 2 {
-        report.skipped_keys += 1; // Linear-only surface
-        return Ok(());
-    }
-    let (out_f, in_f) = (w.dims()[0], w.dims()[1]);
-    let delta = delta_at((out_f, in_f))?;
-    merge_into(base, &base_key, &delta, report)
-}
-
 /// Merge a third-party LyCORIS **LoKr** file (`lokr_*` keys, per-module `.alpha`, no `networkType`
-/// stamp) into `base` at `scale`.
+/// stamp) into `base` at `scale`, via the shared [`parse_lokr_thirdparty`] + [`merge_one_thirdparty`].
+/// Each raw key resolves by prefix-strip (SCAIL-2 has no kohya table); the per-module lycoris scale is
+/// baked into the delta closure. Linear-only.
 fn merge_lokr_thirdparty(
     base: &mut HashMap<String, Tensor>,
     af: &AdapterFile,
@@ -570,7 +315,12 @@ fn merge_lokr_thirdparty(
     report: &mut MergeReport,
 ) -> Result<()> {
     for (raw, g) in parse_lokr_thirdparty(af)? {
-        merge_thirdparty(base, &raw, |bs| g.delta(bs, scale), report)?;
+        merge_one_thirdparty(
+            base,
+            Some(strip_lora_prefix(&raw)),
+            |bs| g.delta(bs, scale),
+            report,
+        )?;
     }
     Ok(())
 }
@@ -583,7 +333,12 @@ fn merge_loha_thirdparty(
     report: &mut MergeReport,
 ) -> Result<()> {
     for (raw, g) in parse_loha_thirdparty(af)? {
-        merge_thirdparty(base, &raw, |bs| g.delta(bs, scale), report)?;
+        merge_one_thirdparty(
+            base,
+            Some(strip_lora_prefix(&raw)),
+            |bs| g.delta(bs, scale),
+            report,
+        )?;
     }
     Ok(())
 }
@@ -606,7 +361,7 @@ pub fn merge_adapters(
         let af = read_adapter(&spec.path)?;
         // Untagged LyCORIS: `lokr_*` / `hada_*` keys without a `networkType=lokr` stamp, so the
         // caller's declared `kind` can't label them — detect + route by keys before the kind match.
-        if !declares_lokr(&af) && wmeta::keys_contain_lokr(af.tensors.keys().map(String::as_str)) {
+        if !af.declares_lokr() && wmeta::keys_contain_lokr(af.tensors.keys().map(String::as_str)) {
             merge_lokr_thirdparty(map, &af, spec.scale, &mut report)?;
             continue;
         }
@@ -617,7 +372,7 @@ pub fn merge_adapters(
         match spec.kind {
             AdapterKind::Lokr => merge_lokr_file(map, &af, spec.scale, &mut report)?,
             AdapterKind::Lora => {
-                if declares_lokr(&af) {
+                if af.declares_lokr() {
                     return Err(CandleError::Msg(format!(
                         "scail2: adapter {} declared Lora but its metadata says networkType=lokr",
                         spec.path.display()
@@ -631,14 +386,15 @@ pub fn merge_adapters(
         merge_diff_patch_file(map, &af, spec.scale, &mut report)?;
     }
     if report.merged == 0 {
-        return Err(CandleError::Msg(format!(
-            "scail2: no adapter target modules matched across {} file(s) — expected diffusers/PEFT \
-             `‹transformer.|diffusion_model.›‹path›.lora_A/B|lora_down/up.weight` (+ optional `.alpha`) \
-             over `blocks.{{i}}.{{self_attn,cross_attn}}.{{q,k,v,o,k_img,v_img}}` / `blocks.{{i}}.ffn.{{0,2}}`, \
-             `‹path›.lokr_w1/w2` with networkType=lokr (LoKr), untagged LyCORIS `lokr_*` / `hada_*`, or \
-             lightx2v `‹path›.diff`/`.diff_b` (lightning diff-patch)",
-            specs.len()
-        )));
+        return Err(no_target_matched(
+            "scail2",
+            "expected diffusers/PEFT `‹transformer.|diffusion_model.›‹path›.lora_A/B|lora_down/up.\
+             weight` (+ optional `.alpha`) over `blocks.{i}.{self_attn,cross_attn}.{q,k,v,o,k_img,\
+             v_img}` / `blocks.{i}.ffn.{0,2}`, `‹path›.lokr_w1/w2` with networkType=lokr (LoKr), \
+             untagged LyCORIS `lokr_*` / `hada_*`, or lightx2v `‹path›.diff`/`.diff_b` (lightning \
+             diff-patch)",
+            specs.len(),
+        ));
     }
     Ok(report)
 }
@@ -646,6 +402,7 @@ pub fn merge_adapters(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::candle_core::Device;
 
     /// A tiny stand-in for the base DiT tensor map: one block's self-attn `q` (weight+bias) + an FFN
     /// Linear, a qk-RMSNorm weight, and a conv `patch_embedding` (weight+bias) — the cross-arch case.
@@ -888,7 +645,7 @@ mod tests {
             ]),
             meta: HashMap::new(),
         };
-        assert!(!declares_lokr(&af));
+        assert!(!af.declares_lokr());
         assert!(wmeta::keys_contain_lokr(
             af.tensors.keys().map(String::as_str)
         ));

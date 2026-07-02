@@ -32,5 +32,9 @@ pub mod dataset;
 pub mod flow_match;
 pub mod gradient_checkpoint;
 pub mod lora;
+/// The shared inference-side adapter-merge skeleton (sc-8998 / F-018): the format-parsing +
+/// merge-report machinery the provider crates' `adapters.rs` hand-copied around the [`lora`] delta
+/// reconstruction. Family-specific key→module resolution stays in each crate.
+pub mod merge;
 pub mod optim;
 pub mod schedule;
