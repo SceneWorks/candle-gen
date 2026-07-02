@@ -31,6 +31,12 @@ pub use gen_core::{
 pub use candle_core;
 pub use candle_nn;
 
+// Shared VRAM-budget probe (sc-9014 / F-030): the trusted-path `nvidia-smi` resolver the video-VAE
+// decode tilers (seedvr2/wan/ltx) route through, instead of each spawning a bare
+// `Command::new("nvidia-smi")` that Windows resolves via the process search order (a PATH-hijack
+// vector). Resolves an absolute path from System32 / CUDA_PATH once and caches it.
+pub mod gpu;
+
 // The MLX-packed → GGML repack seam (sc-9085 spike → sc-9086, epic 9083): lets the candle lane
 // load the hosted MLX quant tiers (epic 8506) directly — no dense staging, no second artifact
 // matrix. Provider crates' packed-detect loaders build on this.

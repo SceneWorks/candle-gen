@@ -370,29 +370,11 @@ fn estimated_ltx_decode_peak_gib(
         / GIB_F64
 }
 
-/// Total VRAM (GiB) read from `nvidia-smi` (min across GPUs) — the SceneWorks worker convention.
-/// `None` off-CUDA (e.g. the Mac dev host, where the budget falls back to the env override / default).
-/// Mirrors `candle-gen-seedvr2::video`'s reader (de-dupe into candle-gen core is a follow-up).
-fn nvidia_smi_total_gib() -> Option<f64> {
-    let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let min_mb = text
-        .lines()
-        .filter_map(|line| line.trim().parse::<f64>().ok())
-        .filter(|&mb| mb > 0.0)
-        .fold(f64::INFINITY, f64::min);
-    min_mb.is_finite().then_some(min_mb / 1024.0)
-}
-
 /// The safe peak-GiB budget for the LTX decode tiler. Resolved in order: `LTX_VAE_BUDGET_GIB` env
 /// override (positive float — the deterministic injection point for the worker/tests) → total VRAM ×
-/// [`LTX_VAE_BUDGET_SAFE_FRAC`] (via `nvidia-smi`) → [`LTX_VAE_DEFAULT_BUDGET_GIB`].
+/// [`LTX_VAE_BUDGET_SAFE_FRAC`] (via the shared trusted-path `nvidia-smi` probe
+/// [`candle_gen::gpu::nvidia_smi_min_total_gib`] — an absolute System32/CUDA_PATH binary, never a bare
+/// `PATH` lookup; sc-9014 / F-030) → [`LTX_VAE_DEFAULT_BUDGET_GIB`].
 pub fn ltx_vae_safe_budget_gib() -> f64 {
     if let Ok(raw) = std::env::var("LTX_VAE_BUDGET_GIB") {
         if let Ok(gib) = raw.trim().parse::<f64>() {
@@ -401,7 +383,7 @@ pub fn ltx_vae_safe_budget_gib() -> f64 {
             }
         }
     }
-    match nvidia_smi_total_gib() {
+    match candle_gen::gpu::nvidia_smi_min_total_gib() {
         Some(total) => total * LTX_VAE_BUDGET_SAFE_FRAC,
         None => LTX_VAE_DEFAULT_BUDGET_GIB,
     }

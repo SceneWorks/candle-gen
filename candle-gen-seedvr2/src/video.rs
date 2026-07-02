@@ -67,30 +67,12 @@ pub const SPATIAL_OVERLAP: i32 = 64;
 /// `1536 = 96 · SPATIAL_ALIGN`, so it is a valid tile edge.
 pub const VAE_SAFE_DECODE_EDGE_PX: i32 = 1536;
 
-/// Total VRAM (GiB) of the smallest visible CUDA device, read from `nvidia-smi` (the SceneWorks
-/// worker's GPU-discovery convention — ships with the driver on Windows + Linux). The MIN across
-/// devices is conservative on a heterogeneous box; `None` when `nvidia-smi` is absent or fails.
-fn nvidia_smi_min_total_gib() -> Option<f64> {
-    let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let min_mb = text
-        .lines()
-        .filter_map(|line| line.trim().parse::<f64>().ok())
-        .filter(|&mb| mb > 0.0)
-        .fold(f64::INFINITY, f64::min);
-    min_mb.is_finite().then_some(min_mb / 1024.0)
-}
-
 /// The safe peak-GB budget for the chunk/tile sizers. Resolved in order:
 ///   1. `SEEDVR2_BUDGET_GIB` env override (a positive float) — the deterministic injection point the
 ///      worker and tests use to pin a per-GPU budget;
-///   2. the device's total VRAM × [`SAFE_FRAC`] (read via `nvidia-smi`);
+///   2. the device's total VRAM × [`SAFE_FRAC`] (read via the shared trusted-path `nvidia-smi`
+///      probe [`candle_gen::gpu::nvidia_smi_min_total_gib`] — an absolute System32/CUDA_PATH binary,
+///      never a bare `PATH` lookup; sc-9014 / F-030);
 ///   3. [`DEFAULT_BUDGET_GIB`] when neither is available.
 pub fn safe_budget_gib() -> f64 {
     if let Ok(raw) = std::env::var("SEEDVR2_BUDGET_GIB") {
@@ -100,7 +82,7 @@ pub fn safe_budget_gib() -> f64 {
             }
         }
     }
-    match nvidia_smi_min_total_gib() {
+    match candle_gen::gpu::nvidia_smi_min_total_gib() {
         Some(total) => total * SAFE_FRAC,
         None => DEFAULT_BUDGET_GIB,
     }

@@ -713,30 +713,11 @@ fn estimated_wan22_decode_peak_gib(
         / GIB_F64
 }
 
-/// Total VRAM (GiB) read from `nvidia-smi` (min across GPUs) — the SceneWorks worker convention.
-/// `None` off-CUDA (e.g. the Mac dev host, where the budget falls back to the env override / default).
-/// Mirrors `candle-gen-ltx::vae` / `candle-gen-seedvr2::video` (de-dupe into candle-gen core is a
-/// tracked follow-up).
-fn nvidia_smi_total_gib() -> Option<f64> {
-    let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let min_mb = text
-        .lines()
-        .filter_map(|line| line.trim().parse::<f64>().ok())
-        .filter(|&mb| mb > 0.0)
-        .fold(f64::INFINITY, f64::min);
-    min_mb.is_finite().then_some(min_mb / 1024.0)
-}
-
 /// The safe peak-GiB budget for the z48 vae22 decode tiler. Resolved in order: `WAN_VAE_BUDGET_GIB`
 /// env override (positive float — the deterministic injection point for the worker/tests) → total VRAM
-/// × [`WAN22_VAE_BUDGET_SAFE_FRAC`] (via `nvidia-smi`) → [`WAN22_VAE_DEFAULT_BUDGET_GIB`].
+/// × [`WAN22_VAE_BUDGET_SAFE_FRAC`] (via the shared trusted-path `nvidia-smi` probe
+/// [`candle_gen::gpu::nvidia_smi_min_total_gib`] — an absolute System32/CUDA_PATH binary, never a bare
+/// `PATH` lookup; sc-9014 / F-030) → [`WAN22_VAE_DEFAULT_BUDGET_GIB`].
 pub fn wan22_vae_safe_budget_gib() -> f64 {
     if let Ok(raw) = std::env::var("WAN_VAE_BUDGET_GIB") {
         if let Ok(gib) = raw.trim().parse::<f64>() {
@@ -745,7 +726,7 @@ pub fn wan22_vae_safe_budget_gib() -> f64 {
             }
         }
     }
-    match nvidia_smi_total_gib() {
+    match candle_gen::gpu::nvidia_smi_min_total_gib() {
         Some(total) => total * WAN22_VAE_BUDGET_SAFE_FRAC,
         None => WAN22_VAE_DEFAULT_BUDGET_GIB,
     }
