@@ -132,6 +132,16 @@ pub fn detector_blob(img: &[u8], h: usize, w: usize, device: &Device) -> Result<
     } else {
         (det, (det as f64 * im_ratio) as usize)
     };
+    // Beyond ~640:1 the minor side truncates to 0 (e.g. new_w = (640 / im_ratio) as usize == 0):
+    // the blob would stay all-padding, detection returns an empty list, and det_scale maps
+    // coordinates through 1/0. Reject such degenerate aspect ratios explicitly (sc-9026, F-042),
+    // mirroring the zero-dimension guard in `detect`.
+    if new_w == 0 || new_h == 0 {
+        return Err(CandleError::Msg(format!(
+            "detector_blob: degenerate aspect ratio {h}×{w} resizes the minor side to 0 \
+             (new {new_h}×{new_w}); image is too far from square for face detection"
+        )));
+    }
     let det_scale = new_h as f32 / h as f32;
     let resized = resize_bilinear_cv2(img, h, w, new_h, new_w);
 
@@ -301,5 +311,59 @@ mod tests {
         let out = resize_bilinear_cv2(&src, in_h, w, 8, w);
         assert_eq!(out.len(), 8 * w * 3);
         assert!(out.iter().all(|&v| v == 123), "constant must be preserved");
+    }
+
+    // sc-9026 (F-042): a degenerate aspect ratio truncates the minor side to 0, which used to yield
+    // an all-padding blob + det_scale through 1/0 and a silent "no face". It must now error.
+    #[test]
+    fn detector_blob_rejects_extreme_wide_ratio() {
+        let device = Device::Cpu;
+        let (h, w) = (1usize, 700usize); // im_ratio ≈ 1/700 → new_h = (640 * 1/700) as usize == 0
+        let img = vec![0u8; h * w * 3];
+        let err = detector_blob(&img, h, w, &device).unwrap_err();
+        assert!(
+            err.to_string().contains("degenerate aspect ratio"),
+            "expected degenerate-ratio rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn detector_blob_rejects_extreme_tall_ratio() {
+        let device = Device::Cpu;
+        let (h, w) = (700usize, 1usize); // im_ratio == 700 → new_w = (640 / 700) as usize == 0
+        let img = vec![0u8; h * w * 3];
+        let err = detector_blob(&img, h, w, &device).unwrap_err();
+        assert!(
+            err.to_string().contains("degenerate aspect ratio"),
+            "expected degenerate-ratio rejection, got: {err}"
+        );
+    }
+
+    // A normal image still produces a full [1,3,640,640] blob; the common (square) path is unchanged:
+    // det == new_h == new_w, det_scale == 1.0, and the blob is non-empty.
+    #[test]
+    fn detector_blob_square_image_unchanged() {
+        let device = Device::Cpu;
+        let (h, w) = (128usize, 128usize);
+        let img: Vec<u8> = (0..h * w * 3).map(|i| (i * 31 % 256) as u8).collect();
+        let (blob, det_scale) = detector_blob(&img, h, w, &device).unwrap();
+        assert_eq!(blob.dims(), &[1, 3, DET_SIZE, DET_SIZE]);
+        assert_eq!(det_scale, DET_SIZE as f32 / h as f32);
+        let flat = blob.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            flat.iter().any(|&v| v != (0.0f32 - 127.5) / 128.0),
+            "a real square image must not produce an all-padding blob"
+        );
+    }
+
+    // A moderate (non-degenerate) wide ratio still resizes to a valid non-zero minor side.
+    #[test]
+    fn detector_blob_moderate_ratio_ok() {
+        let device = Device::Cpu;
+        let (h, w) = (64usize, 256usize); // im_ratio = 0.25 → new_h = 160, new_w = 640
+        let img = vec![200u8; h * w * 3];
+        let (blob, det_scale) = detector_blob(&img, h, w, &device).unwrap();
+        assert_eq!(blob.dims(), &[1, 3, DET_SIZE, DET_SIZE]);
+        assert!(det_scale > 0.0 && det_scale.is_finite());
     }
 }
