@@ -39,6 +39,10 @@ fn main() -> Result<()> {
             .into()
     });
     let negative = arg(&args, "--negative");
+    // Curated sampler/scheduler axes (epic 7114 / sc-8984): e.g. `--sampler dpmpp_2m`, or
+    // `--scheduler karras` ALONE (the previously-dropped scheduler-only curated request).
+    let sampler = arg(&args, "--sampler");
+    let scheduler = arg(&args, "--scheduler");
     let steps: Option<u32> = arg(&args, "--steps").and_then(|s| s.parse().ok());
     let guidance: Option<f32> = arg(&args, "--guidance").and_then(|s| s.parse().ok());
     let seed: u64 = arg(&args, "--seed")
@@ -58,7 +62,7 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("kolors_smoke.png"));
 
     println!(
-        "[smoke] snapshot={snapshot}\n[smoke] engine=kolors {width}x{height} steps={steps:?} guidance={guidance:?} seed={seed} count={count}\n[smoke] prompt={prompt:?}"
+        "[smoke] snapshot={snapshot}\n[smoke] engine=kolors {width}x{height} steps={steps:?} guidance={guidance:?} seed={seed} count={count} sampler={sampler:?} scheduler={scheduler:?}\n[smoke] prompt={prompt:?}"
     );
 
     // Force-link the provider so its `inventory::submit!` registration survives the linker.
@@ -81,6 +85,8 @@ fn main() -> Result<()> {
         seed: Some(seed),
         steps,
         guidance,
+        sampler,
+        scheduler,
         ..Default::default()
     };
 

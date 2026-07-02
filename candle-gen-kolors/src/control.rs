@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::{self as nn, Linear, Module, VarBuilder};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::sampling::{schedule_sigmas, DiscreteModelSampling, Scheduler, Solver};
+use candle_gen::gen_core::sampling::{schedule_sigmas, DiscreteModelSampling, Scheduler};
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
@@ -44,8 +44,7 @@ use candle_gen_sdxl::{
 
 use crate::chatglm3::ChatGlmModel;
 use crate::config::ChatGlmConfig;
-use crate::config::DEFAULT_SAMPLER;
-use crate::pipeline::{kolors_alpha_schedule, sdxl_vae_config, VAE_SCALE};
+use crate::pipeline::{curated_route, kolors_alpha_schedule, sdxl_vae_config, VAE_SCALE};
 use crate::sampler::KolorsEulerSampler;
 use crate::tokenizer::KolorsTokenizer;
 
@@ -92,7 +91,8 @@ pub struct KolorsControlRequest {
     /// ControlNet conditioning scale on the pose residuals.
     pub control_scale: f32,
     /// Curated unified-sampler selection (epic 7114, sc-7297). `None` (or `euler_discrete`) keeps the
-    /// bespoke leading-Euler default byte-exact (N1); a curated [`Solver`] name routes the pose-control
+    /// bespoke leading-Euler default byte-exact (N1); a curated
+    /// [`Solver`](candle_gen::gen_core::sampling::Solver) name routes the pose-control
     /// denoise through [`denoise_curated`] over the Kolors [`DiscreteModelSampling`].
     pub sampler: Option<String>,
     /// Curated σ-schedule selection (epic 7114). `None` ⇒ the native leading schedule; a [`Scheduler`]
@@ -279,23 +279,15 @@ impl KolorsControl {
         let (lat_h, lat_w) = ((req.height / 8) as usize, (req.width / 8) as usize);
 
         // Curated unified-sampler path (epic 7114, sc-7297): a curated solver name (≠ the native
-        // `euler_discrete`) OR a non-discrete scheduler routes the pose-control denoise through the
+        // `euler_discrete`) OR a curated scheduler routes the pose-control denoise through the
         // additive k-diffusion `denoise_curated`, which threads the Kolors ControlNet residuals through
-        // the curated solver. The native leading-Euler default stays byte-exact (N1).
-        let curated: Option<&str> = req
-            .sampler
-            .as_deref()
-            .filter(|n| Solver::from_name(n).is_some() && *n != DEFAULT_SAMPLER);
-        let scheduler_curated = req
-            .scheduler
-            .as_deref()
-            .and_then(Scheduler::from_name)
-            .is_some();
+        // the curated solver. The native leading-Euler default stays byte-exact (N1). The decision is
+        // the shared [`curated_route`] (sc-8984) so the three Kolors entry points can't drift.
+        let curated = curated_route(req.sampler.as_deref(), req.scheduler.as_deref());
 
-        let latents = if curated.is_some() || scheduler_curated {
+        let latents = if let Some(sampler_name) = curated {
             // k-diffusion VE-σ sampling over the Kolors `DiscreteModelSampling`. A scheduler-only curated
             // run keeps `euler_discrete` (a non-solver alias) ⇒ the driver's euler fallback (N3).
-            let sampler_name = req.sampler.as_deref().unwrap_or(DEFAULT_SAMPLER);
             let sched = kolors_alpha_schedule()?;
             let ms = DiscreteModelSampling::sdxl(&sched);
             let native = schedule_sigmas(Scheduler::Normal, &ms, req.steps);

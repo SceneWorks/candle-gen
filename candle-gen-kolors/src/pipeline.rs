@@ -59,6 +59,29 @@ pub(crate) fn kolors_alpha_schedule() -> Result<AlphaSchedule> {
         .map_err(|e| CandleError::Msg(format!("kolors curated schedule: {e}")))
 }
 
+/// Curated-vs-native routing shared by the three Kolors entry points — txt2img
+/// ([`Pipeline::render`]), pose-control ([`crate::control`]) and IP-Adapter
+/// ([`crate::ip_provider`]) — so the decision can't drift again (sc-8984: txt2img consulted only the
+/// sampler axis and silently rendered a validated scheduler-only request, e.g.
+/// `scheduler: Some("karras")` with the default sampler, over the native schedule).
+///
+/// Returns `Some(sampler_name)` — the name to drive [`candle_gen::run_curated_sampler`] with — when
+/// a curated solver name (≠ the native [`DEFAULT_SAMPLER`](crate::config::DEFAULT_SAMPLER)) OR a
+/// curated scheduler is requested; `None` keeps the native byte-exact leading-Euler default (N1).
+/// A scheduler-only request keeps `euler_discrete` (a non-solver alias) ⇒ the curated driver's euler
+/// fallback (N3). The legacy `discrete` scheduler alias is not a curated scheduler
+/// ([`Scheduler::from_name`] = `None`), so it stays native.
+pub(crate) fn curated_route<'a>(
+    sampler: Option<&'a str>,
+    scheduler: Option<&str>,
+) -> Option<&'a str> {
+    let sampler_curated = sampler
+        .is_some_and(|n| Solver::from_name(n).is_some() && n != crate::config::DEFAULT_SAMPLER);
+    let scheduler_curated = scheduler.and_then(Scheduler::from_name).is_some();
+    (sampler_curated || scheduler_curated)
+        .then(|| sampler.unwrap_or(crate::config::DEFAULT_SAMPLER))
+}
+
 /// A light pipeline handle: the snapshot `root` and compute device. Heavy components load via
 /// [`load_components`](Self::load_components) and are owned/cached by the generator.
 pub(crate) struct Pipeline {
@@ -145,13 +168,12 @@ impl Pipeline {
         let (h, w) = (req.height, req.width);
 
         // sc-7124 (epic 7114 P4): a curated solver name (≠ the native `euler_discrete` default / None)
-        // routes the unified `Sampler` over `DiscreteModelSampling` (EPS) as a NEW path. The native
-        // leading-Euler default stays byte-exact (N1) — Kolors' `steps_offset=1` leading timesteps can't
-        // be bit-reproduced by `DiscreteModelSampling::timestep`, so this is ADDITIVE, not a replacement.
-        let curated: Option<&str> = req
-            .sampler
-            .as_deref()
-            .filter(|n| Solver::from_name(n).is_some() && *n != crate::config::DEFAULT_SAMPLER);
+        // OR a curated scheduler (sc-8984) routes the unified `Sampler` over `DiscreteModelSampling`
+        // (EPS) as a NEW path — the same [`curated_route`] decision as the pose-control / IP-Adapter
+        // providers. The native leading-Euler default stays byte-exact (N1) — Kolors' `steps_offset=1`
+        // leading timesteps can't be bit-reproduced by `DiscreteModelSampling::timestep`, so this is
+        // ADDITIVE, not a replacement.
+        let curated = curated_route(req.sampler.as_deref(), req.scheduler.as_deref());
 
         let sampler = KolorsEulerSampler::new(steps).map_err(CandleError::Msg)?;
 
@@ -379,6 +401,42 @@ mod tests {
         assert_eq!(image_seed(42, 0), 42);
         assert_eq!(image_seed(42, 7), 49);
         assert_eq!(image_seed(u64::MAX, 1), 0);
+    }
+
+    /// sc-8984: a scheduler-only curated request (default / absent sampler) MUST route the curated
+    /// path — it was previously dropped on the floor by txt2img, silently rendering the native
+    /// schedule after `validate` accepted the scheduler.
+    #[test]
+    fn curated_route_scheduler_only_routes_curated() {
+        // Absent sampler ⇒ the default (non-solver) name drives the curated driver's euler fallback.
+        assert_eq!(curated_route(None, Some("karras")), Some("euler_discrete"));
+        assert_eq!(
+            curated_route(Some("euler_discrete"), Some("sgm_uniform")),
+            Some("euler_discrete")
+        );
+    }
+
+    #[test]
+    fn curated_route_sampler_axis() {
+        // A curated solver routes regardless of the scheduler axis, keeping its own name.
+        assert_eq!(curated_route(Some("dpmpp_2m"), None), Some("dpmpp_2m"));
+        assert_eq!(curated_route(Some("heun"), Some("karras")), Some("heun"));
+    }
+
+    #[test]
+    fn curated_route_native_default_stays_native() {
+        // N1: the byte-exact native leading-Euler default is untouched.
+        assert_eq!(curated_route(None, None), None);
+        assert_eq!(curated_route(Some("euler_discrete"), None), None);
+        // The legacy `discrete` scheduler alias is NOT a curated scheduler — native schedule.
+        assert_eq!(curated_route(None, Some("discrete")), None);
+        assert_eq!(
+            curated_route(Some("euler_discrete"), Some("discrete")),
+            None
+        );
+        // Unknown names fall back to the native default (N3 at this layer = stay native).
+        assert_eq!(curated_route(Some("not_a_solver"), None), None);
+        assert_eq!(curated_route(None, Some("not_a_scheduler")), None);
     }
 
     #[test]
