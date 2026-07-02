@@ -8,7 +8,10 @@
 //! cross-identity `replace_flag` (else animation). Inference adapters (`spec.adapters`) — LoRA / LoKr /
 //! LoHa, the lightx2v lightning diff-patch, and the Bias-Aware DPO refinement LoRA — are folded into the
 //! dense DiT before build ([`crate::adapters`], sc-6838). Multi-reference awaits the worker request
-//! contract; [`crate::generate`] already supports extra characters via [`crate::generate::CharacterRef`].
+//! contract (sc-5583: gen-core has no way to pair an extra reference image with its color-coded mask —
+//! `Conditioning::MultiReference` carries images only); [`crate::generate`] already supports extra
+//! characters via [`crate::generate::CharacterRef`], so until that contract lands `MultiReference` is
+//! deliberately NOT advertised and [`Generator::validate`] rejects it loudly (sc-8985).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -59,13 +62,16 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
-            // Reference character image (Reference) + its color-coded segmentation mask (Mask); extra
-            // characters (MultiReference, experimental); the driving video + its per-frame color masks
-            // map to ControlClip.
+            // Reference character image (Reference) + its color-coded segmentation mask (Mask); the
+            // driving video + its per-frame color masks map to ControlClip. `MultiReference` (extra
+            // characters) is deliberately NOT advertised: gen-core's `Conditioning::MultiReference`
+            // carries images only, with no way to pair each extra reference with its required
+            // color-coded mask, so the request contract can't reach `Scail2Job.additional` yet —
+            // sc-5583 tracks the paired ref+mask contract + worker plumbing (sc-8985: advertising it
+            // let multi-ref requests validate, render for minutes, and silently drop the extras).
             conditioning: vec![
                 ConditioningKind::Reference,
                 ConditioningKind::Mask,
-                ConditioningKind::MultiReference,
                 ConditioningKind::ControlClip,
             ],
             // Inference LoRA / LoKr / LoHa + the lightx2v lightning diff-patch + the Bias-Aware DPO
@@ -262,6 +268,10 @@ impl Generator for Scail2 {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
+        // Actionable multi-reference rejection first, so the caller learns WHY (pending contract,
+        // sc-5583) rather than the generic capability-floor "not supported" from `validate_request`
+        // (which also rejects it now that `MultiReference` is unadvertised, sc-8985).
+        reject_multi_reference(self.descriptor.id, req)?;
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)
@@ -275,6 +285,27 @@ impl Generator for Scail2 {
         self.validate(req)?;
         Ok(self.run(req, on_progress)?)
     }
+}
+
+/// Reject `MultiReference` conditioning loudly instead of letting a multi-character request render
+/// for minutes and silently drop the extra characters (sc-8985). The engine core already supports
+/// extra characters ([`crate::generate::CharacterRef`] / `Scail2Job.additional`), but gen-core's
+/// `Conditioning::MultiReference` carries images only — there is no way to pair each extra reference
+/// with its required color-coded segmentation mask until the paired ref+mask request contract lands
+/// (sc-5583).
+fn reject_multi_reference(id: &str, req: &GenerationRequest) -> gen_core::Result<()> {
+    if req
+        .conditioning
+        .iter()
+        .any(|c| matches!(c, Conditioning::MultiReference { .. }))
+    {
+        return Err(gen_core::Error::Unsupported(format!(
+            "{id}: MultiReference (extra reference characters) is not supported yet — each extra \
+             character needs its own color-coded segmentation mask and the paired reference+mask \
+             request contract is pending (sc-5583); pass exactly one Reference + Mask"
+        )));
+    }
+    Ok(())
 }
 
 /// The first conditioning input matching `f`.
@@ -340,6 +371,8 @@ impl Scail2 {
                 image: reference,
                 mask: ref_mask,
             },
+            // Extra characters await the paired ref+mask request contract (sc-5583); `validate`
+            // rejects `MultiReference` until then (sc-8985).
             additional: Vec::new(),
             driving_frames: driving.frames,
             driving_masks: driving.mask,
@@ -399,7 +432,49 @@ mod tests {
         assert!(d.capabilities.accepts(ConditioningKind::Reference));
         assert!(d.capabilities.accepts(ConditioningKind::Mask));
         assert!(d.capabilities.accepts(ConditioningKind::ControlClip));
+        // MultiReference is deliberately NOT advertised until the paired ref+mask request contract
+        // lands (sc-5583) — advertising it silently dropped the extra characters (sc-8985).
+        assert!(!d.capabilities.accepts(ConditioningKind::MultiReference));
         assert!(d.capabilities.samplers.contains(&"unipc"));
+    }
+
+    #[test]
+    fn multi_reference_is_rejected_loudly() {
+        let img = Image {
+            width: 64,
+            height: 64,
+            pixels: vec![0u8; 64 * 64 * 3],
+        };
+        let req = GenerationRequest {
+            prompt: "a character".into(),
+            width: 64,
+            height: 64,
+            count: 1,
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![img.clone(), img],
+            }],
+            ..Default::default()
+        };
+        // The dedicated guard fires with the actionable pending-contract message.
+        let err = reject_multi_reference(MODEL_ID, &req).expect_err("err");
+        assert!(matches!(err, gen_core::Error::Unsupported(_)), "got: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("MultiReference"), "got: {msg}");
+        assert!(msg.contains("sc-5583"), "got: {msg}");
+        // Backstop: with `MultiReference` unadvertised, the shared capability floor rejects it too.
+        assert!(
+            descriptor()
+                .capabilities
+                .validate_request(MODEL_ID, &req)
+                .is_err(),
+            "the capability floor must reject unadvertised MultiReference conditioning"
+        );
+        // A request without MultiReference passes the guard (the floor still enforces the rest).
+        let single = GenerationRequest {
+            conditioning: Vec::new(),
+            ..req
+        };
+        assert!(reject_multi_reference(MODEL_ID, &single).is_ok());
     }
 
     #[test]
