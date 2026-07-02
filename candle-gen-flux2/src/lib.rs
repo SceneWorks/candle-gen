@@ -306,7 +306,7 @@ impl Pipeline {
         // (sampler/scheduler unset) is the N1 no-op — euler over the native schedule reproduces the legacy
         // `euler_step` flow-match loop within tolerance.
         let mu = pipeline::compute_mu(pipeline::image_seq_len(req.width, req.height), steps);
-        let (native, _timesteps) = pipeline::schedule(steps, req.width, req.height);
+        let native = pipeline::schedule(steps, req.width, req.height);
         let sigmas =
             candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
 

@@ -183,7 +183,7 @@ impl Flux2Edit {
         // the default (`None`) euler over the native empirical-mu schedule: the N1 no-op that reproduces
         // the legacy `euler_step` flow-match loop within tolerance.
         let mu = pipeline::compute_mu(pipeline::image_seq_len(req.width, req.height), req.steps);
-        let (native, _timesteps) = pipeline::schedule(req.steps, req.width, req.height);
+        let native = pipeline::schedule(req.steps, req.width, req.height);
         let sigmas = candle_gen::resolve_flow_schedule(None, mu, req.steps, &native);
 
         let latents = pipeline::create_noise(cfg, req.seed, req.width, req.height, device)?;
