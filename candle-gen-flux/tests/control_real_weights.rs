@@ -150,6 +150,19 @@ fn real_weight_control() {
         "steered render must have tonal range (got {mn}..{mx})"
     );
 
+    // sc-8988 determinism gate: the same seed renders byte-identically — the control encode takes the
+    // VAE posterior MEAN (no device RNG), so nothing in the pipeline samples outside the CPU-seeded
+    // `StdRng` (the sc-3673 contract). Pre-fix, the sampled control latent made this per-launch at best.
+    let again = model
+        .generate(&base, &control_image, &mut noop)
+        .expect("generate (repeat seed 12345)");
+    let d_same = max_abs_diff_u8(&steered.pixels, &again.pixels);
+    println!("max|Δ| same seed = {d_same} (must be 0)");
+    assert_eq!(
+        d_same, 0,
+        "same seed must render byte-identically (sc-8988)"
+    );
+
     // A second seed yields a different (real) render — confirms it is not a constant output.
     let other = Flux1ControlRequest {
         seed: 999,
