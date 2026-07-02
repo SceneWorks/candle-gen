@@ -95,6 +95,15 @@ impl Variant {
     }
 }
 
+/// True when classifier-free guidance is actually active: the negative/uncond branch only changes the
+/// output at `guidance > 1.0`. At `guidance <= 1.0` the CFG combine `neg + g·(pos − neg)` reduces to
+/// `pos` (exactly `pos` at 1.0), so the negative UMT5 encode + per-expert projection + per-step forward
+/// are pure waste and are skipped (sc-8993). Kept as one predicate so the encode-time gate and the
+/// per-step gate can never diverge.
+fn cfg_active(guidance: f64) -> bool {
+    guidance > 1.0
+}
+
 #[derive(Clone)]
 struct Components {
     te: Arc<Umt5Encoder>,
@@ -332,14 +341,29 @@ impl Pipeline {
             None => (gl as f64, gh as f64),
         };
 
-        // Text encode (pos + neg) once; project to each expert's context (per-expert text_embedder).
+        // Text encode (pos always) once; project to each expert's context (per-expert text_embedder).
+        // The negative branch is only used at guidance > 1.0, and the two experts can have distinct
+        // guidance — so UMT5-encode + project the negative for an expert only when its own guidance
+        // enables CFG. At guidance <= 1.0 the denoise loop never touches `*_neg`, so the 24-layer UMT5
+        // forward over the negative and its projection are pure waste (sc-8993).
         let pos = self.encode(&comps.te, &req.prompt)?;
-        let neg_prompt = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
-        let neg = self.encode(&comps.te, neg_prompt)?;
         let high_pos = comps.high.embed_text(&pos)?;
-        let high_neg = comps.high.embed_text(&neg)?;
         let low_pos = comps.low.embed_text(&pos)?;
-        let low_neg = comps.low.embed_text(&neg)?;
+        // Shared UMT5 negative encode, computed once if either expert has CFG active.
+        let neg = if cfg_active(g_high) || cfg_active(g_low) {
+            let neg_prompt = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
+            Some(self.encode(&comps.te, neg_prompt)?)
+        } else {
+            None
+        };
+        let high_neg = match &neg {
+            Some(neg) if cfg_active(g_high) => Some(comps.high.embed_text(neg)?),
+            _ => None,
+        };
+        let low_neg = match &neg {
+            Some(neg) if cfg_active(g_low) => Some(comps.low.embed_text(neg)?),
+            _ => None,
+        };
 
         // Latent geometry (z16 strides) + RoPE for the shared token grid.
         let t_lat = ((frames - 1) / VAE16_STRIDE_TEMPORAL + 1) as usize;
@@ -376,9 +400,9 @@ impl Pipeline {
             // MoE: high-noise expert at/above the boundary timestep, low-noise below — switching the
             // transformer, its context, and its guidance together.
             let (expert, ctx_pos, ctx_neg, guidance) = if t >= boundary_ts {
-                (&comps.high, &high_pos, &high_neg, g_high)
+                (&comps.high, &high_pos, high_neg.as_ref(), g_high)
             } else {
-                (&comps.low, &low_pos, &low_neg, g_low)
+                (&comps.low, &low_pos, low_neg.as_ref(), g_low)
             };
             // I2V: concat the conditioning `y` onto the noise latent (→ in_dim 36) before the forward.
             let x = match &y {
@@ -386,11 +410,14 @@ impl Pipeline {
                 None => latents.clone(),
             };
             let v_pos = expert.forward(&x, ctx_pos, t, &cos, &sin)?;
-            let v = if guidance > 1.0 {
-                let v_neg = expert.forward(&x, ctx_neg, t, &cos, &sin)?;
-                cfg(&v_pos, &v_neg, guidance)?
-            } else {
-                v_pos
+            // Negative branch (and CFG combine) only when this expert's guidance enables it; `ctx_neg`
+            // is `Some` iff that guidance > 1.0 (sc-8993).
+            let v = match ctx_neg {
+                Some(ctx_neg) if cfg_active(guidance) => {
+                    let v_neg = expert.forward(&x, ctx_neg, t, &cos, &sin)?;
+                    cfg(&v_pos, &v_neg, guidance)?
+                }
+                _ => v_pos,
             };
             latents = sched.step(&v, &latents)?; // 16-channel latent (out_dim 16)
             on_progress(Progress::Step {
@@ -682,6 +709,40 @@ mod tests {
                 conditioning_len
             );
         }
+    }
+
+    /// sc-8993: `cfg_active` is the single predicate gating the negative branch. CFG only affects the
+    /// output at guidance > 1.0; at 1.0 the combine reduces to `pos` exactly and below 1.0 it's off, so
+    /// both the encode-time and per-step negative work must be skipped. Defaults (3.0–4.0) keep it on.
+    #[test]
+    fn cfg_active_gates_negative_branch() {
+        assert!(
+            !cfg_active(1.0),
+            "guidance 1.0 disables CFG (combine == pos)"
+        );
+        assert!(!cfg_active(0.0));
+        assert!(!cfg_active(0.9));
+        assert!(cfg_active(1.0001));
+        assert!(cfg_active(3.0), "T2V low default keeps CFG on");
+        assert!(cfg_active(4.0), "T2V high default keeps CFG on");
+        // Per-expert independence: a mixed (low off / high on) request encodes+projects only the high
+        // expert's negative, and vice-versa — mirroring the render's per-expert gating.
+        let (g_low, g_high) = (1.0_f64, 4.0_f64);
+        let neg_needed = cfg_active(g_low) || cfg_active(g_high);
+        assert!(
+            neg_needed,
+            "shared UMT5 encode runs when either expert needs it"
+        );
+        assert!(
+            !cfg_active(g_low),
+            "low expert skips its negative projection"
+        );
+        assert!(
+            cfg_active(g_high),
+            "high expert keeps its negative projection"
+        );
+        // Both off: no negative work at all.
+        assert!(!(cfg_active(1.0) || cfg_active(0.5)));
     }
 
     #[test]

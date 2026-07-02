@@ -231,14 +231,28 @@ impl Pipeline {
     /// `[2, S_txt, 2880]` (`[pos; neg]`) and the mask is `[2, S_txt]` (`1` = valid). An empty negative
     /// is the **unconditional branch**: zero text features + an all-zero mask (no text tokens), not a
     /// second encode.
+    ///
+    /// When `guided` is false (effective guidance `== 1.0`, the `lens_turbo` DEFAULT) the joint batch
+    /// collapses to `cond` under [`cfg_rescale`], so the uncond half is neither encoded nor batched —
+    /// each layer is `[1, S_txt, 2880]` and the mask `[1, S_txt]` (sc-8993). The denoise loop then runs
+    /// a single (batch-1) DiT forward per step instead of two.
     fn encode_prompt(
         &self,
         comps: &Components,
         prompt: &str,
         negative: &str,
         date: &str,
+        guided: bool,
     ) -> CResult<(Vec<Tensor>, Tensor)> {
         let (pos_feats, pos_mask) = self.encode_one(comps, prompt, date)?;
+        if !guided {
+            // Guidance disabled: skip the uncond encode/batch entirely; cond-only conditioning.
+            let features = pos_feats
+                .iter()
+                .map(|f| f.to_dtype(DIT_DTYPE))
+                .collect::<candle_gen::candle_core::Result<Vec<_>>>()?;
+            return Ok((features, pos_mask));
+        }
         let s_pos = pos_feats[0].dim(1)?;
         let (neg_feats, neg_mask) = if negative.trim().is_empty() {
             let zeros = pos_feats
@@ -286,6 +300,7 @@ impl Pipeline {
         latent_w: usize,
         num_steps: usize,
         guidance: f32,
+        guided: bool,
         sampler: Option<&str>,
         scheduler: Option<&str>,
         seed: u64,
@@ -305,6 +320,19 @@ impl Pipeline {
             cancel,
             on_progress,
             |latents, sigma| -> CResult<Tensor> {
+                if !guided {
+                    // Guidance disabled: cfg_rescale(cond, ·, 1.0) == cond, so run a single
+                    // cond-only (batch-1) forward and skip the wasted uncond half (sc-8993).
+                    return Ok(comps.transformer.forward(
+                        latents,
+                        features,
+                        Some(mask),
+                        sigma,
+                        1,
+                        latent_h,
+                        latent_w,
+                    )?);
+                }
                 // Joint CFG batch: duplicate the latent (cond/uncond share x_t), one DiT call.
                 let hidden = Tensor::cat(&[latents, latents], 0)?; // [2, seq, 128]
                 let noise = comps.transformer.forward(
@@ -335,12 +363,16 @@ impl Pipeline {
             .map(|s| s as usize)
             .unwrap_or(defaults.steps as usize);
         let guidance = req.guidance.unwrap_or(defaults.guidance);
+        // Standard CFG with the Lens `cfg_rescale`: at guidance == 1.0 the combine reduces exactly to
+        // cond, so guidance is effectively off — skip the uncond encode/forward entirely (sc-8993).
+        let guided = guidance != 1.0;
         let negative = req.negative_prompt.as_deref().unwrap_or("");
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let latent_h = (req.height / VAE_SCALE_FACTOR) as usize;
         let latent_w = (req.width / VAE_SCALE_FACTOR) as usize;
 
-        let (features, mask) = self.encode_prompt(comps, &req.prompt, negative, DEFAULT_DATE)?;
+        let (features, mask) =
+            self.encode_prompt(comps, &req.prompt, negative, DEFAULT_DATE, guided)?;
 
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
@@ -355,6 +387,7 @@ impl Pipeline {
                 latent_w,
                 steps,
                 guidance,
+                guided,
                 req.sampler.as_deref(),
                 req.scheduler.as_deref(),
                 seed,
@@ -514,9 +547,11 @@ impl LensGenerator {
         let comps = self
             .components()
             .map_err(|e| CandleError::Msg(e.to_string()))?;
+        // Match render's guidance gate: at guidance == 1.0 the uncond branch is skipped (sc-8993).
+        let guided = guidance != 1.0;
         let (features, mask) = self
             .pipeline
-            .encode_prompt(&comps, prompt, negative, date)?;
+            .encode_prompt(&comps, prompt, negative, date, guided)?;
         // Parity hook drives the default (euler over the native flow_match schedule), no cancel.
         let latents = self.pipeline.denoise(
             &comps,
@@ -527,6 +562,7 @@ impl LensGenerator {
             latent_w,
             num_steps,
             guidance,
+            guided,
             None,
             None,
             0,

@@ -152,4 +152,39 @@ mod tests {
         assert!((on[0] - 5.0).abs() < 1e-4, "token0 norm {}", on[0]);
         assert!((on[1] - 3.0).abs() < 1e-4, "token1 norm {}", on[1]);
     }
+
+    /// sc-8993: at guidance == 1.0 the CFG combine `uncond + (cond − uncond)·1` is exactly `cond`, and
+    /// the rescale ratio `cond_norm / comb_norm` is 1, so `cfg_rescale(cond, uncond, 1.0) == cond` for
+    /// ANY uncond. This is the algebraic justification for skipping the uncond encode/forward when
+    /// guidance is disabled — the denoise loop's cond-only path returns bit-identical output.
+    #[test]
+    fn cfg_rescale_at_guidance_one_is_cond_for_any_uncond() {
+        let dev = Device::Cpu;
+        let cond = Tensor::from_vec(
+            vec![3.0f32, 4.0, 0.0, -2.0, 1.0, 2.0, 2.0, 7.0],
+            (1, 2, 4),
+            &dev,
+        )
+        .unwrap();
+        // A deliberately unrelated uncond — the result must ignore it entirely at guidance 1.0.
+        let uncond = Tensor::from_vec(
+            vec![9.5f32, -0.5, 1.0, 3.0, -1.0, 8.0, 0.5, -4.5],
+            (1, 2, 4),
+            &dev,
+        )
+        .unwrap();
+        let out = cfg_rescale(&cond, &uncond, 1.0).unwrap();
+        let diff = (&out - &cond)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(
+            diff < 1e-5,
+            "cfg_rescale(cond, uncond, 1.0) must equal cond; max |diff| = {diff}"
+        );
+    }
 }

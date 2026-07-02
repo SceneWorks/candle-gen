@@ -292,16 +292,20 @@ impl Pipeline {
 
     /// Build the conditioning for a prompt: the aggregated pooled + context. For CFG the
     /// unconditional branch is the **empty-prompt** encode (diffusers encodes `""`), NOT a zero
-    /// tensor. Returns `(cond, Option<uncond>)`; `uncond` is `None` when CFG is off (Turbo).
+    /// tensor. Returns `(cond, Option<uncond>)`; `uncond` is `None` when CFG is off — either a
+    /// distilled (Turbo) variant, or an effective `cfg_scale == 1.0` where the blend
+    /// `uncond + 1·(cond − uncond)` reduces exactly to `cond`, so the uncond encode/forward is pure
+    /// waste (sc-8993).
     fn conditioning(
         &self,
         encoders: &Mutex<Sd3TextEncoders>,
         req: &GenerationRequest,
+        cfg_scale: f32,
     ) -> Result<(Sd3Conditioning, Option<Sd3Conditioning>)> {
         let mut enc = encoders.lock().expect("sd3 encoders mutex poisoned");
         let cond_out = enc.encode(&req.prompt)?;
         let cond = aggregate(&self.cfg, &cond_out)?;
-        let uncond = if self.variant.cfg_enabled() {
+        let uncond = if self.variant.cfg_enabled() && cfg_scale != 1.0 {
             let neg = req.negative_prompt.as_deref().unwrap_or("");
             let uncond_out = enc.encode(neg)?;
             Some(aggregate(&self.cfg, &uncond_out)?)
@@ -332,8 +336,9 @@ impl Pipeline {
         let lat_h = (req.height / VAE_SCALE) as usize;
         let lat_w = (req.width / VAE_SCALE) as usize;
 
-        // Conditioning is seed- and image-independent: encode once for the whole batch.
-        let (cond, uncond) = self.conditioning(&components.encoders, req)?;
+        // Conditioning is seed- and image-independent: encode once for the whole batch. `cfg_scale`
+        // gates the uncond encode — at 1.0 the CFG blend collapses to cond, so it's skipped (sc-8993).
+        let (cond, uncond) = self.conditioning(&components.encoders, req, cfg_scale)?;
 
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
@@ -725,6 +730,45 @@ mod tests {
         let a = render(7);
         let b = render(7);
         assert_eq!(a.pixels, b.pixels, "same seed + weights must reproduce");
+    }
+
+    /// sc-8993: at `cfg_scale == 1.0` the CFG blend `uncond + 1·(cond − uncond)` is exactly `cond`, so
+    /// running the uncond forward is pure waste. This pins the equivalence the `conditioning` gate
+    /// relies on: render_core with `Some(uncond)` at cfg 1.0 is byte-identical to the cond-only path
+    /// (`None`) — proving skipping the uncond branch when guidance is disabled cannot change output.
+    #[test]
+    fn cfg_scale_one_equals_cond_only_path() {
+        let device = Device::Cpu;
+        let cfg = tiny_cfg();
+        let (transformer, vae, cond, uncond) = harness(&cfg, &device);
+        let cancel = CancelFlag::default();
+        let render = |uncond_ref: Option<&Sd3Conditioning>| {
+            render_core(
+                &transformer,
+                &vae,
+                &cond,
+                uncond_ref,
+                1.0, // cfg_scale == 1.0: blend collapses to cond
+                4,
+                3.0,
+                (4, 4),
+                7,
+                device.clone(),
+                DType::F32,
+                None,
+                None,
+                &cancel,
+                &mut |_p: Progress| {},
+            )
+            .unwrap()
+        };
+        // With guidance ENABLED the uncond forward runs (wasted); with it skipped only cond runs.
+        let with_uncond = render(Some(&uncond));
+        let cond_only = render(None);
+        assert_eq!(
+            with_uncond.pixels, cond_only.pixels,
+            "cfg_scale 1.0 blend must equal cond-only; skipping the uncond branch is a no-op"
+        );
     }
 
     /// **CUDA random-weight smoke (sc-7877).** Asserts the tiny MMDiT + VAE render core compiles, runs
