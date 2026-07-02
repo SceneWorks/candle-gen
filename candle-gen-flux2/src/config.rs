@@ -35,12 +35,14 @@ pub const SIZE_MULTIPLE: u32 = 16;
 /// Its presence on disk flips the matching loader from the dense path to building each Linear (and
 /// the TE token embedding) directly from packed parts — so no dense bf16 weight is ever materialized,
 /// which is what keeps the dev load-time memory floor under the ceiling (60 GB DiT + 45 GB TE bf16
-/// would peak ~105 GB dense). Consume-side mirror of `mlx_gen_flux2::config::Flux2Quant`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Flux2Quant {
-    pub bits: i32,
-    pub group_size: i32,
-}
+/// would peak ~105 GB dense).
+///
+/// **Generalized into the shared packed-load module (sc-9086):** this is now an alias for
+/// [`candle_gen::quant::PackedConfig`] (parse a component `config.json` with
+/// `PackedConfig::from_config`; detect the packed path with `.scales`-sibling +
+/// `candle_gen::quant::lin` / `embedding`). Kept as a named FLUX.2 alias so the crate's local docs
+/// and any future dev-loader wiring read naturally.
+pub type Flux2Quant = candle_gen::quant::PackedConfig;
 
 /// The FLUX.2 txt2img variants this crate registers. `klein_9b` is distilled (4-step, CFG-free);
 /// `dev` is the guidance-distilled 32B flagship (Mistral TE + 48/48 DiT, embedded guidance ~4 over
