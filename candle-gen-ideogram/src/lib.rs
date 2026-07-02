@@ -37,7 +37,7 @@ use candle_gen::gen_core::{
     Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 
-use config::{MODEL_ID, MODEL_ID_TURBO, SIZE_MULTIPLE};
+use config::{MODEL_ID, MODEL_ID_TURBO, RES_MAX, RES_MIN, SIZE_MULTIPLE};
 use pipeline::Components;
 
 /// A lazily-loaded Ideogram 4 generator. `turbo` selects the CFG-free single-DiT + TurboTime LoRA
@@ -151,8 +151,8 @@ pub fn descriptor() -> ModelDescriptor {
             samplers: vec![],
             schedulers: vec!["flow_match_euler"],
             supported_guidance_methods: vec![],
-            min_size: 256,
-            max_size: 2048,
+            min_size: RES_MIN,
+            max_size: RES_MAX,
             max_count: 8,
             mac_only: false,
             supported_quants: &[] as &[Quant],

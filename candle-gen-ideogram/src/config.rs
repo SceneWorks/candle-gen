@@ -19,11 +19,6 @@ pub const MODEL_ID: &str = "ideogram_4";
 /// bundled LoRA ([`TURBO_LORA_FILE`]) and needs no unconditional DiT.
 pub const MODEL_ID_TURBO: &str = "ideogram_4_turbo";
 
-/// HF repo for the gated source weights (fp8 reference release). The candle lane needs bf16 (or an
-/// fp8→bf16 dequant at load) — the MLX-quantized turnkey `SceneWorks/ideogram-4-mlx` is not
-/// candle-readable.
-pub const IDEOGRAM_4_FP8_REPO: &str = "ideogram-ai/ideogram-4-fp8";
-
 /// Filename of the bundled TurboTime LoRA inside a turbo snapshot directory (sibling of
 /// `transformer/`). The turbo loader installs it onto the conditional DiT at load.
 pub const TURBO_LORA_FILE: &str = "turbo_lora.safetensors";
@@ -35,14 +30,11 @@ pub const TURBO_LORA_SCALE: f32 = 1.0;
 pub const DEFAULT_TURBO_STEPS: u32 = 8;
 
 // ── Defaults / limits ────────────────────────────────────────────────────────────────────
-pub const DEFAULT_WIDTH: u32 = 1024;
-pub const DEFAULT_HEIGHT: u32 = 1024;
-/// Native resolution range: 256–2048, multiples of 16, aspect up to 6:1.
+/// Native resolution range: 256–2048, multiples of 16, aspect up to 6:1. These are the single
+/// source of truth for the descriptor's `min_size`/`max_size` ([`crate::descriptor`]).
 pub const RES_MIN: u32 = 256;
 pub const RES_MAX: u32 = 2048;
-pub const RES_MULTIPLE: u32 = 16;
-/// Both image dims must be multiples of 16 (VAE /8 then the DiT 2×2 patch). Alias of
-/// [`RES_MULTIPLE`] for parity with the other candle-gen crates' `SIZE_MULTIPLE`.
+/// Both image dims must be multiples of 16 (VAE /8 then the DiT 2×2 patch).
 pub const SIZE_MULTIPLE: u32 = 16;
 
 /// Quality default step count — the `V4_QUALITY_48` preset (the reference `__call__` default is 128;
@@ -50,9 +42,6 @@ pub const SIZE_MULTIPLE: u32 = 16;
 pub const DEFAULT_STEPS: u32 = 48;
 /// Reference `__call__` default `guidance_scale=7.0` (asymmetric CFG: `v = g·cond + (1−g)·uncond`).
 pub const DEFAULT_GUIDANCE: f32 = 7.0;
-/// Ideogram 4 reference scheduler mean (`mu`) — the logit-normal schedule's `known_mean`. The
-/// ComfyUI "Ideogram 4 Scheduler" node defaults to `mu=0.0, std=1.75`. See [`crate::scheduler`].
-pub const DEFAULT_MU: f64 = 0.0;
 
 /// Default img2img (Remix) strength when an edit `Reference` carries no explicit strength (slice 3).
 pub const DEFAULT_IMG2IMG_STRENGTH: f32 = 0.6;

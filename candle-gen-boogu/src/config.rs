@@ -26,17 +26,13 @@ pub struct BooguConfig {
     pub num_refiner_layers: usize,
     pub num_attention_heads: usize,
     pub num_kv_heads: usize,
-    pub multiple_of: usize,
-    pub ffn_dim_multiplier: Option<f64>,
     pub norm_eps: f64,
     /// Per-axis (t, h, w) RoPE sub-dimensions; must sum to `hidden_size / num_attention_heads`.
     pub axes_dim_rope: [usize; 3],
-    pub axes_lens: [usize; 3],
     pub rope_theta: f32,
-    /// Qwen3-VL hidden width fed to the caption embedder (per-layer, before reduce).
-    pub instruction_feat_dim: usize,
-    pub num_instruction_feat_layers: usize,
-    /// `"mean"` (reduce over layers, keep dim) or `"concat"` (sum dims). Base uses `"mean"`.
+    /// Instruction-feature layer reduce. Only `"mean"` is implemented (the caption embedder runs
+    /// mean-shaped weights); any other value (e.g. `"concat"`) is rejected in [`BooguConfig::validate`]
+    /// rather than silently mis-running. Base uses `"mean"`.
     pub reduce_type: String,
     pub timestep_scale: f32,
 }
@@ -54,14 +50,9 @@ impl BooguConfig {
             num_refiner_layers: 2,
             num_attention_heads: 28,
             num_kv_heads: 7,
-            multiple_of: 256,
-            ffn_dim_multiplier: None,
             norm_eps: 1e-5,
             axes_dim_rope: [40, 40, 40],
-            axes_lens: [2048, 1664, 1664],
             rope_theta: 10000.0,
-            instruction_feat_dim: 4096,
-            num_instruction_feat_layers: 1,
             reduce_type: "mean".to_string(),
             timestep_scale: 1000.0,
         }
@@ -90,24 +81,9 @@ impl BooguConfig {
         let f = |k: &str, dflt: f64| v.get(k).and_then(serde_json::Value::as_f64).unwrap_or(dflt);
 
         let axes_dim = read_triple(v.get("axes_dim_rope"), d.axes_dim_rope);
-        let axes_lens = read_triple(v.get("axes_lens"), d.axes_lens);
 
-        let instr = v.get("instruction_feature_configs");
-        let instruction_feat_dim = instr
-            .and_then(|o| o.get("instruction_feat_dim"))
-            .and_then(serde_json::Value::as_u64)
-            .map(|n| n as usize)
-            .unwrap_or(d.instruction_feat_dim);
-        // The reference reads both spellings across versions; accept either, default 1.
-        let num_instruction_feat_layers = instr
-            .and_then(|o| {
-                o.get("num_instruction_feat_layers")
-                    .or_else(|| o.get("num_instruction_feature_layers"))
-            })
-            .and_then(serde_json::Value::as_u64)
-            .map(|n| n as usize)
-            .unwrap_or(d.num_instruction_feat_layers);
-        let reduce_type = instr
+        let reduce_type = v
+            .get("instruction_feature_configs")
             .and_then(|o| o.get("reduce_type"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or(&d.reduce_type)
@@ -130,16 +106,9 @@ impl BooguConfig {
             num_refiner_layers: u("num_refiner_layers", d.num_refiner_layers),
             num_attention_heads: u("num_attention_heads", d.num_attention_heads),
             num_kv_heads: u("num_kv_heads", d.num_kv_heads),
-            multiple_of: u("multiple_of", d.multiple_of),
-            ffn_dim_multiplier: v
-                .get("ffn_dim_multiplier")
-                .and_then(serde_json::Value::as_f64),
             norm_eps: f("norm_eps", d.norm_eps),
             axes_dim_rope: axes_dim,
-            axes_lens,
             rope_theta: d.rope_theta,
-            instruction_feat_dim,
-            num_instruction_feat_layers,
             reduce_type,
             timestep_scale: f("timestep_scale", d.timestep_scale as f64) as f32,
         };
@@ -166,6 +135,14 @@ impl BooguConfig {
             return Err(CandleError::Msg(format!(
                 "boogu: num_attention_heads ({}) not divisible by num_kv_heads ({})",
                 self.num_attention_heads, self.num_kv_heads
+            )));
+        }
+        // Only the mean reduce is implemented in the caption embedder; reject any other value loudly
+        // rather than loading a `"concat"` snapshot and silently running mean-shaped weights.
+        if self.reduce_type != "mean" {
+            return Err(CandleError::Msg(format!(
+                "boogu: unsupported instruction reduce_type {:?} (only \"mean\" is implemented)",
+                self.reduce_type
             )));
         }
         Ok(())
@@ -230,6 +207,19 @@ mod tests {
     fn bad_rope_sum_rejected() {
         let mut c = BooguConfig::base();
         c.axes_dim_rope = [40, 40, 41];
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn non_mean_reduce_type_rejected() {
+        // A `"concat"` snapshot must fail loudly instead of loading mean-shaped weights.
+        let v: serde_json::Value = serde_json::json!({
+            "instruction_feature_configs": { "reduce_type": "concat" }
+        });
+        assert!(BooguConfig::from_json(&v).is_err());
+
+        let mut c = BooguConfig::base();
+        c.reduce_type = "concat".to_string();
         assert!(c.validate().is_err());
     }
 }

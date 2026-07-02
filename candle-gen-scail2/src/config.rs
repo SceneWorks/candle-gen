@@ -52,8 +52,6 @@ pub struct Scail2Config {
     pub replace_h_shift: usize,
     /// RoPE W-shift applied to the spatially-downsampled pose chunk (120).
     pub pose_w_shift: usize,
-    /// Max source-id the model was trained with (drives fractional interpolation for >N references).
-    pub max_trained_src_id: f64,
 }
 
 impl Default for Scail2Config {
@@ -82,7 +80,6 @@ impl Scail2Config {
             vae_z_dim: 16,
             replace_h_shift: 120,
             pose_w_shift: 120,
-            max_trained_src_id: 5.0,
         }
     }
 
