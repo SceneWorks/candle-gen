@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::candle_nn::ops::sigmoid;
-use candle_gen::gen_core::Quant;
-use candle_gen::Result;
+use candle_gen::gen_core::{CancelFlag, Quant};
+use candle_gen::{CandleError, Result};
 
 use crate::config::Sam3VisionConfig;
 use crate::tracker::TrackerFrameOutput;
@@ -154,19 +154,32 @@ impl Sam3VideoModel {
 
     /// Process a whole video (forward, non-streaming): `frames[f]` = NCHW `[1,3,1008,1008]`; one text
     /// prompt (`input_ids[1,32]` + `text_mask`). Returns per-frame `obj_id → 288² mask logits`.
+    ///
+    /// `cancel` is the caller's cooperative cancel flag (the gen-core video per-step cancel
+    /// contract, sc-8972; mirrors `mlx-gen-sam3`): checked before each (seconds-to-minutes) frame,
+    /// surfacing the typed [`CandleError::Canceled`] on trip. `progress` is invoked
+    /// `(frame_index, total_frames)` after each propagated frame.
     pub fn propagate(
         &mut self,
         frames: &[Tensor],
         input_ids: &Tensor,
         text_mask: &[i32],
+        cancel: Option<&CancelFlag>,
+        mut progress: Option<&mut dyn FnMut(usize, usize)>,
     ) -> Result<Vec<VideoFrameOutput>> {
         self.num_frames = frames.len() as i32;
         // The concept prompt is fixed for the whole video; encode it through the 24-layer CLIP text
         // tower once here and reuse the features on every frame (F-016).
         let text = self.segmenter.encode_text(input_ids, text_mask)?; // [1, N, 256]
+        let total = frames.len();
         let mut outputs = Vec::new();
         for (f, px) in frames.iter().enumerate() {
+            // Honor the engine cancellation contract — check before each (seconds-to-minutes) frame.
+            check_canceled(cancel)?;
             outputs.push(self.process_frame(f as i32, px, &text, text_mask)?);
+            if let Some(cb) = progress.as_deref_mut() {
+                cb(f, total);
+            }
         }
         Ok(outputs)
     }
@@ -893,6 +906,16 @@ fn select_detections(pred_masks: &Tensor, probs: &[f32]) -> Result<Vec<Detection
     Ok(dets)
 }
 
+/// Bail with the typed [`CandleError::Canceled`] when the caller's cooperative cancel flag has
+/// tripped — [`Sam3VideoModel::propagate`] checks it before each frame (the gen-core video
+/// per-step cancel contract, sc-8972; mirrors `mlx-gen-sam3`'s `video.rs`).
+fn check_canceled(cancel: Option<&CancelFlag>) -> Result<()> {
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        return Err(CandleError::Canceled);
+    }
+    Ok(())
+}
+
 /// Flatten the memory encoder's NHWC `[1,72,72,64]` output to seq-first `[5184,1,64]`. The reference
 /// stores `maskmem_features` as **bfloat16** (`bf16 = true`) but `maskmem_pos_enc` stays f32, so the
 /// two round-trip differently.
@@ -920,6 +943,21 @@ mod tests {
             object_pointer: t(0.0),
             object_score: 0.0,
         }
+    }
+
+    /// sc-8972: the per-frame propagate cancel check surfaces the **typed**
+    /// [`CandleError::Canceled`] (never a stringified `Msg` — the worker keys off the variant to
+    /// map a user cancel), and an absent/untripped flag is a no-op.
+    #[test]
+    fn check_canceled_surfaces_typed_canceled_only_on_trip() {
+        assert!(check_canceled(None).is_ok(), "no flag → no-op");
+        let flag = CancelFlag::new();
+        assert!(check_canceled(Some(&flag)).is_ok(), "untripped → no-op");
+        flag.cancel();
+        assert!(
+            matches!(check_canceled(Some(&flag)), Err(CandleError::Canceled)),
+            "tripped → typed Canceled"
+        );
     }
 
     /// F-015: `evict_stale_bank` drops exactly the `non_cond` entries no future `gather_memory` can

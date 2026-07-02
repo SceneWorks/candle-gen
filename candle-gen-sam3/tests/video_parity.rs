@@ -66,7 +66,7 @@ fn video_pcs_matches_oracle() {
     let text_mask = fx_i32(&fx, "attention_mask");
 
     let outputs = model
-        .propagate(&frames, &input_ids, &text_mask)
+        .propagate(&frames, &input_ids, &text_mask, None, None)
         .expect("propagate");
 
     let per = 288 * 288;
