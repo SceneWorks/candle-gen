@@ -13,7 +13,9 @@
 //! via the per-struct `quantize` cascades (sc-6246; `Linear::quantize` skips the sub-block BoxRPB
 //! embedders).
 
+use std::collections::HashMap;
 use std::f32::consts::{LOG2_E, PI};
+use std::sync::Mutex;
 
 use candle_gen::candle_core::{Device, Tensor, D};
 use candle_gen::candle_nn::ops::sigmoid;
@@ -446,6 +448,10 @@ pub struct Sam3Detector {
     box_rpb_x: DecoderMlp,
     box_rpb_y: DecoderMlp,
     scoring: DotScoring,
+    /// Memoized flattened sine position embedding `[1, H·W, D]` per feature-grid size `(h, w)`. The
+    /// encoder's `vis_pos` is a pure function of the grid (a host coordinate loop + upload), so it is
+    /// built once and reused across every frame of a video instead of per frame (F-016).
+    vis_pos_cache: Mutex<HashMap<(usize, usize), Tensor>>,
     cfg: Sam3DetrConfig,
 }
 
@@ -478,6 +484,7 @@ impl Sam3Detector {
             box_rpb_x: DecoderMlp::from_weights(w, &join(&dec_prefix, "box_rpb_embed_x"), 2)?,
             box_rpb_y: DecoderMlp::from_weights(w, &join(&dec_prefix, "box_rpb_embed_y"), 2)?,
             scoring: DotScoring::from_weights(w, &join(prefix, "dot_product_scoring"), cfg)?,
+            vis_pos_cache: Mutex::new(HashMap::new()),
             cfg: cfg.clone(),
         })
     }
@@ -513,7 +520,19 @@ impl Sam3Detector {
         let d = self.cfg.hidden_size;
         let device = vision_feature.device().clone();
         let vision = vision_feature.reshape((1, hw, d))?;
-        let vis_pos = sine_position_embedding_flat(h, w, d, &device)?; // [1, HW, D]
+        // The sine position embedding is a pure function of (h, w, d); cache it so a video's per-frame
+        // detector passes reuse one build instead of rebuilding it every frame (F-016).
+        let vis_pos = {
+            let mut cache = self.vis_pos_cache.lock().unwrap();
+            match cache.get(&(h, w)) {
+                Some(t) => t.clone(),
+                None => {
+                    let t = sine_position_embedding_flat(h, w, d, &device)?; // [1, HW, D]
+                    cache.insert((h, w), t.clone());
+                    t
+                }
+            }
+        };
         let text_key_mask = text_key_mask(text_mask, &device)?;
 
         // --- encoder ---

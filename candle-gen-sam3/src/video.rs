@@ -161,9 +161,12 @@ impl Sam3VideoModel {
         text_mask: &[i32],
     ) -> Result<Vec<VideoFrameOutput>> {
         self.num_frames = frames.len() as i32;
+        // The concept prompt is fixed for the whole video; encode it through the 24-layer CLIP text
+        // tower once here and reuse the features on every frame (F-016).
+        let text = self.segmenter.encode_text(input_ids, text_mask)?; // [1, N, 256]
         let mut outputs = Vec::new();
         for (f, px) in frames.iter().enumerate() {
-            outputs.push(self.process_frame(f as i32, px, input_ids, text_mask)?);
+            outputs.push(self.process_frame(f as i32, px, &text, text_mask)?);
         }
         Ok(outputs)
     }
@@ -172,7 +175,7 @@ impl Sam3VideoModel {
         &mut self,
         frame_idx: i32,
         pixels: &Tensor,
-        input_ids: &Tensor,
+        text: &Tensor,
         text_mask: &[i32],
     ) -> Result<VideoFrameOutput> {
         // --- Step 1: vision + detection (one shared PE backbone pass feeds both necks) ---
@@ -181,7 +184,7 @@ impl Sam3VideoModel {
         let g = img_emb.dim(1)?;
         let cvf = img_emb.reshape((g * g, 1, 256))?;
         let cvp = self.tracker.frame_position_encoding(g)?;
-        let det = self.run_detection(&features, input_ids, text_mask)?;
+        let det = self.run_detection(&features, text, text_mask)?;
 
         // --- Step 2: propagate existing identities (run_mem_encoder = false) ---
         let num_existing = self.obj_ids.len();
@@ -289,12 +292,12 @@ impl Sam3VideoModel {
     fn run_detection(
         &self,
         features: &Tensor,
-        input_ids: &Tensor,
+        text: &Tensor,
         text_mask: &[i32],
     ) -> Result<DetFrame> {
         let seg = self
             .segmenter
-            .forward_from_backbone(features, input_ids, text_mask)?;
+            .forward_from_backbone_with_text(features, text, text_mask)?;
         let presence = sigmoid(&seg.presence_logits)?
             .flatten_all()?
             .to_vec1::<f32>()?[0];

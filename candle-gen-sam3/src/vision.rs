@@ -491,6 +491,21 @@ impl Sam3VisionEncoder {
             .collect()
     }
 
+    /// Run only the FPN levels the detector + mask head actually consume — i.e. every level except
+    /// the final scale-0.5 (36²) branch, which `detect_and_segment` never reads (it uses `fpn[0..=2]`)
+    /// (F-016). Skipping it avoids a full FPN branch of transposed-conv/max-pool + conv work per frame
+    /// in the video hot loop. The public [`Self::forward`] keeps returning all four levels for the
+    /// still-image parity API.
+    pub(crate) fn fpn_detect_from_backbone(&self, features: &Tensor) -> Result<Vec<Tensor>> {
+        // The scale-0.5 level is the last `scale_factors` entry (0.5); it downsamples via max-pool and
+        // is the only discarded level. Compute all but the last.
+        let keep = self.fpn_layers.len().saturating_sub(1).max(1);
+        self.fpn_layers[..keep]
+            .iter()
+            .map(|l| l.forward(features))
+            .collect()
+    }
+
     /// The shared PE [`Backbone`] handle (clone of the `Arc`) — used by the video model to reinstall a
     /// once-quantized backbone, and by the F-028 shared-backbone parity check.
     pub(crate) fn backbone_arc(&self) -> Arc<Backbone> {

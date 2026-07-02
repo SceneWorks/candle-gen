@@ -132,7 +132,8 @@ impl Sam3ImageSegmenter {
         input_ids: &Tensor,
         text_mask: &[i32],
     ) -> Result<SegmentationOutput> {
-        let fpn = self.vision.forward(pixel_values)?; // NHWC [288²,144²,72²,36²]
+        let features = self.vision.backbone_features(pixel_values)?;
+        let fpn = self.vision.fpn_detect_from_backbone(&features)?; // NHWC [288²,144²,72²] (F-016)
         let text = self.text.forward(input_ids, text_mask)?; // [1,32,256]
         self.detect_and_segment(&fpn, &text, text_mask)
     }
@@ -152,9 +153,29 @@ impl Sam3ImageSegmenter {
         input_ids: &Tensor,
         text_mask: &[i32],
     ) -> Result<SegmentationOutput> {
-        let fpn = self.vision.fpn_from_backbone(features)?; // NHWC [288²,144²,72²,36²]
         let text = self.text.forward(input_ids, text_mask)?; // [1,32,256]
-        self.detect_and_segment(&fpn, &text, text_mask)
+        self.forward_from_backbone_with_text(features, &text, text_mask)
+    }
+
+    /// Encode the (fixed, per-session) concept prompt through the 24-layer CLIP text tower **once**,
+    /// returning the projected text features `[1, N, 256]`. The video pipeline caches this and reuses
+    /// it across every frame via [`Self::forward_from_backbone_with_text`] instead of re-running the
+    /// tower per frame (F-016).
+    pub fn encode_text(&self, input_ids: &Tensor, text_mask: &[i32]) -> Result<Tensor> {
+        self.text.forward(input_ids, text_mask)
+    }
+
+    /// [`Self::forward_from_backbone`] with an already-encoded text prompt (see [`Self::encode_text`]),
+    /// so a caller running many frames against one fixed prompt pays the CLIP text tower cost once
+    /// rather than per frame (F-016).
+    pub fn forward_from_backbone_with_text(
+        &self,
+        features: &Tensor,
+        text: &Tensor,
+        text_mask: &[i32],
+    ) -> Result<SegmentationOutput> {
+        let fpn = self.vision.fpn_detect_from_backbone(features)?; // NHWC [288²,144²,72²] (F-016)
+        self.detect_and_segment(&fpn, text, text_mask)
     }
 
     /// Box-prompted **PVS** path: the geometry encoder turns `boxes` (normalized cxcywh `[1, N, 4]`)
@@ -169,7 +190,8 @@ impl Sam3ImageSegmenter {
         boxes: &Tensor,
         box_labels: &[i32],
     ) -> Result<SegmentationOutput> {
-        let fpn = self.vision.forward(pixel_values)?;
+        let features = self.vision.backbone_features(pixel_values)?;
+        let fpn = self.vision.fpn_detect_from_backbone(&features)?; // [288²,144²,72²] (F-016)
         let text = self.text.forward(input_ids, text_mask)?; // [1,32,256]
 
         // geometry prompt tokens cross-attend to the 72² feature (fpn[2]) + its sine pos embed.

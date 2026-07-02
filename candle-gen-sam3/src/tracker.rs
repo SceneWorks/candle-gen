@@ -12,8 +12,9 @@
 //! from `facebook/sam3` (torch-native OIHW / IOHW), so there is NO kernel permute (the MLX side
 //! permutes to OHWI because MLX convs are channels-last). Quantization is deferred to sc-6246.
 
+use std::collections::HashMap;
 use std::f64::consts::PI;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::ops::sigmoid;
@@ -293,6 +294,60 @@ impl TwoWayTransformer {
             layer.quantize(quant)?;
         }
         self.final_attn.quantize(quant)
+    }
+}
+
+/// Cache of the frame- and object-invariant geometry tables the video hot loop would otherwise
+/// rebuild once per tracked object per frame (host coordinate loops + H2D uploads) — the dense image
+/// PE, the neck sine PE, and the separable bilinear-resize matrices (F-016). Each entry is a pure
+/// function of a grid size (plus fixed weights, for `dense_pe`), so a memoized copy is bit-identical
+/// to a fresh build; tensors are `Arc`-backed, so a cache hit is a cheap clone. Behind `Mutex` so the
+/// tables can be filled lazily through the `&self` decode methods.
+#[derive(Default)]
+struct GeometryCache {
+    /// `dense_pe(g)` → NHWC `[1, g, g, 256]`, keyed by grid size `g`.
+    dense_pe: Mutex<HashMap<usize, Tensor>>,
+    /// `frame_position_encoding(g)` → `[g², 1, 256]`, keyed by grid size `g`.
+    frame_pos: Mutex<HashMap<usize, Tensor>>,
+    /// `bilinear_resize_matrix(in, out)` → `[out, in]`, keyed by `(in, out)`.
+    resize: Mutex<HashMap<(usize, usize), Tensor>>,
+}
+
+impl GeometryCache {
+    /// Read-through the `dense_pe` cache, building (and storing) the table on the first miss.
+    fn dense_pe(&self, g: usize, build: impl FnOnce() -> Result<Tensor>) -> Result<Tensor> {
+        if let Some(t) = self.dense_pe.lock().unwrap().get(&g) {
+            return Ok(t.clone());
+        }
+        let t = build()?;
+        self.dense_pe.lock().unwrap().insert(g, t.clone());
+        Ok(t)
+    }
+
+    /// Read-through the neck sine-PE cache.
+    fn frame_pos(&self, g: usize, build: impl FnOnce() -> Result<Tensor>) -> Result<Tensor> {
+        if let Some(t) = self.frame_pos.lock().unwrap().get(&g) {
+            return Ok(t.clone());
+        }
+        let t = build()?;
+        self.frame_pos.lock().unwrap().insert(g, t.clone());
+        Ok(t)
+    }
+
+    /// Read-through the bilinear-resize-matrix cache.
+    fn resize(
+        &self,
+        in_size: usize,
+        out_size: usize,
+        build: impl FnOnce() -> Result<Tensor>,
+    ) -> Result<Tensor> {
+        let key = (in_size, out_size);
+        if let Some(t) = self.resize.lock().unwrap().get(&key) {
+            return Ok(t.clone());
+        }
+        let t = build()?;
+        self.resize.lock().unwrap().insert(key, t.clone());
+        Ok(t)
     }
 }
 
@@ -1110,6 +1165,9 @@ pub struct Sam3Tracker {
     tpos_proj: Linear,
     /// `tracker_model.mask_downsample` — a single conv (1→1, k4s4).
     mask_downsample: (Tensor, Tensor),
+    /// Memoized frame-/object-invariant geometry tables (dense PE, neck sine PE, resize matrices) so
+    /// the video hot loop builds each once instead of once per object per frame (F-016).
+    geometry_cache: GeometryCache,
     device: Device,
 }
 
@@ -1186,6 +1244,7 @@ impl Sam3Tracker {
                 "tracker_model.temporal_positional_encoding_projection_layer",
             )?,
             mask_downsample: weight_bias(w, "tracker_model.mask_downsample")?,
+            geometry_cache: GeometryCache::default(),
             device,
         })
     }
@@ -1344,8 +1403,12 @@ impl Sam3Tracker {
         let resized = if in_h == MASK_MEM_SIZE && in_w == MASK_MEM_SIZE {
             m
         } else {
-            let wh = bilinear_resize_matrix(in_h, MASK_MEM_SIZE, &self.device)?;
-            let ww = bilinear_resize_matrix(in_w, MASK_MEM_SIZE, &self.device)?;
+            let wh = self.geometry_cache.resize(in_h, MASK_MEM_SIZE, || {
+                bilinear_resize_matrix(in_h, MASK_MEM_SIZE, &self.device)
+            })?;
+            let ww = self.geometry_cache.resize(in_w, MASK_MEM_SIZE, || {
+                bilinear_resize_matrix(in_w, MASK_MEM_SIZE, &self.device)
+            })?;
             wh.matmul(&m)?.matmul(&ww.t()?.contiguous()?)?
         };
         let prob = if is_mask_from_pts {
@@ -1391,9 +1454,18 @@ impl Sam3Tracker {
         self.neck.forward(features)
     }
 
-    /// The neck's 72² sine position encoding flattened seq-first `[g², 1, 256]`.
+    /// The neck's 72² sine position encoding flattened seq-first `[g², 1, 256]`. Frame-invariant, so
+    /// it is built once per grid size and reused across the whole video (F-016).
     pub fn frame_position_encoding(&self, g: usize) -> Result<Tensor> {
-        Ok(position_embedding_sine(g, HIDDEN / 2, &self.device)?.reshape((g * g, 1, HIDDEN))?)
+        self.geometry_cache.frame_pos(g, || {
+            Ok(
+                position_embedding_sine(g, HIDDEN / 2, &self.device)?.reshape((
+                    g * g,
+                    1,
+                    HIDDEN,
+                ))?,
+            )
+        })
     }
 
     /// Box-prompt a pre-encoded frame: `box_xyxy` in **1008-input** space → best low-res mask.
@@ -1421,7 +1493,9 @@ impl Sam3Tracker {
         let image_embedding =
             image_embedding.broadcast_add(&self.no_memory_embedding.reshape((1, 1, 1, HIDDEN))?)?;
         let (sparse, dense) = self.prompt.encode_box(box_xyxy_1008, g)?;
-        let image_pe = self.image_pe_embed.dense_pe(g)?;
+        let image_pe = self
+            .geometry_cache
+            .dense_pe(g, || self.image_pe_embed.dense_pe(g))?;
         let (masks, ious, obj_score, _mask_tokens) = self.decoder.forward(
             &image_embedding,
             &image_pe,
@@ -1450,7 +1524,9 @@ impl Sam3Tracker {
     ) -> Result<TrackerFrameOutput> {
         let g = conditioned_embedding.dim(1)?;
         let (sparse, dense) = self.prompt.encode_empty_point(g)?;
-        let image_pe = self.image_pe_embed.dense_pe(g)?;
+        let image_pe = self
+            .geometry_cache
+            .dense_pe(g, || self.image_pe_embed.dense_pe(g))?;
         let (masks, ious, obj_score, mask_tokens) = self.decoder.forward(
             conditioned_embedding,
             &image_pe,
@@ -1472,7 +1548,9 @@ impl Sam3Tracker {
         // high-res: separable bilinear 288→1008 (align_corners=False), for the memory encoder.
         let big = INPUT_SIZE as usize;
         let m = low_res.reshape((mg, mg))?;
-        let up = bilinear_resize_matrix(mg, big, &self.device)?;
+        let up = self
+            .geometry_cache
+            .resize(mg, big, || bilinear_resize_matrix(mg, big, &self.device))?;
         let high = up
             .matmul(&m)?
             .matmul(&up.t()?.contiguous()?)?
@@ -1504,7 +1582,9 @@ impl Sam3Tracker {
         let is_appearing = to_vec(mask_det)?.iter().any(|&v| v > 0.0);
         // upsample the binary mask to 1008² and turn it into ± logits.
         let md = mask_det.reshape((in_sz, in_sz))?;
-        let up = bilinear_resize_matrix(in_sz, big, &self.device)?;
+        let up = self.geometry_cache.resize(in_sz, big, || {
+            bilinear_resize_matrix(in_sz, big, &self.device)
+        })?;
         let mask_big = up.matmul(&md)?.matmul(&up.t()?.contiguous()?)?; // [1008,1008]
         let high = mask_big
             .affine(SIGMOID_SCALE_FOR_MEM as f64, SIGMOID_BIAS_FOR_MEM as f64)?
@@ -1520,14 +1600,18 @@ impl Sam3Tracker {
         )?; // [1,252,252,1]
         let ds = mds.dim(1)?;
         let mds2 = mds.reshape((ds, ds))?;
-        let up2 = bilinear_resize_matrix(ds, MASK_INPUT_SIZE, &self.device)?;
+        let up2 = self.geometry_cache.resize(ds, MASK_INPUT_SIZE, || {
+            bilinear_resize_matrix(ds, MASK_INPUT_SIZE, &self.device)
+        })?;
         let mask_288 = up2
             .matmul(&mds2)?
             .matmul(&up2.t()?.contiguous()?)?
             .reshape((1, MASK_INPUT_SIZE, MASK_INPUT_SIZE, 1))?;
         let (sparse, dense) = self.prompt.encode_mask_prompt(&mask_288)?;
         // decoder on the RAW image embedding (no no_memory_embedding), multimask=true.
-        let image_pe = self.image_pe_embed.dense_pe(g)?;
+        let image_pe = self
+            .geometry_cache
+            .dense_pe(g, || self.image_pe_embed.dense_pe(g))?;
         let (masks, ious, obj_score, mask_tokens) =
             self.decoder
                 .forward(raw_embedding, &image_pe, &sparse, &dense, high_res, true)?;
@@ -1643,5 +1727,60 @@ mod tests {
         assert_eq!(v.len(), 8);
         assert!(v[0..4].iter().all(|&s| s.abs() < 1e-6)); // sin(0) = 0
         assert!(v[4..8].iter().all(|&c| (c - 1.0).abs() < 1e-6)); // cos(0) = 1
+    }
+
+    fn bytes(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    /// F-016: the cached bilinear-resize matrix is bit-identical to a fresh build, and a cache hit
+    /// (second lookup for the same key) returns the exact same values — the hoist changes nothing
+    /// numerically.
+    #[test]
+    fn geometry_cache_resize_matches_fresh_and_is_stable() {
+        let dev = cpu();
+        let cache = GeometryCache::default();
+        let fresh = bilinear_resize_matrix(288, 1008, &dev).unwrap();
+        // First call: cache miss builds it.
+        let cached = cache
+            .resize(288, 1008, || bilinear_resize_matrix(288, 1008, &dev))
+            .unwrap();
+        assert_eq!(
+            bytes(&fresh),
+            bytes(&cached),
+            "cached resize != fresh build"
+        );
+        // Second call must NOT rebuild — the closure would panic if invoked.
+        let hit = cache
+            .resize(288, 1008, || panic!("cache miss on a warmed key"))
+            .unwrap();
+        assert_eq!(bytes(&fresh), bytes(&hit), "cache hit drifted from fresh");
+        // A different key is a distinct entry (no cross-contamination).
+        let other = cache
+            .resize(252, 288, || bilinear_resize_matrix(252, 288, &dev))
+            .unwrap();
+        assert_eq!(other.dims(), &[288, 252]);
+    }
+
+    /// F-016: the cached neck sine-PE / dense-PE read-throughs return exactly the fresh table and are
+    /// stable across repeated lookups.
+    #[test]
+    fn geometry_cache_pos_tables_are_deterministic() {
+        let dev = cpu();
+        let cache = GeometryCache::default();
+        let fresh = position_embedding_sine(9, HIDDEN / 2, &dev)
+            .unwrap()
+            .reshape((81, 1, HIDDEN))
+            .unwrap();
+        let a = cache
+            .frame_pos(9, || {
+                Ok(position_embedding_sine(9, HIDDEN / 2, &dev)?.reshape((81, 1, HIDDEN))?)
+            })
+            .unwrap();
+        let b = cache
+            .frame_pos(9, || panic!("frame_pos cache miss on a warmed key"))
+            .unwrap();
+        assert_eq!(bytes(&fresh), bytes(&a), "cached frame_pos != fresh");
+        assert_eq!(bytes(&a), bytes(&b), "frame_pos cache hit drifted");
     }
 }
