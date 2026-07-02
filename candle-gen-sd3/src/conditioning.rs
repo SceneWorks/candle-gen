@@ -139,7 +139,7 @@ const T5_PAD_TOKEN_ID: u32 = 0;
 fn fit_clip_tokens(mut ids: Vec<u32>, pad_id: u32, eos_id: u32) -> Vec<u32> {
     if ids.len() > CLIP_MAX_LEN {
         ids.truncate(CLIP_MAX_LEN);
-        // Force the last slot to EOS so `eos_position` (arg-max) still selects a real EOS.
+        // Force the last slot to EOS so `eos_position` still selects a real EOS.
         *ids.last_mut().unwrap() = eos_id;
     } else {
         ids.resize(CLIP_MAX_LEN, pad_id);
@@ -147,14 +147,27 @@ fn fit_clip_tokens(mut ids: Vec<u32>, pad_id: u32, eos_id: u32) -> Vec<u32> {
     ids
 }
 
-/// The EOS position of a CLIP token row = the arg-max token id (EOS = `<|endoftext|>` = 49407 is the
-/// highest id). diffusers pools the CLIP final hidden state here for the pooled `text_embeds`.
-fn eos_position(ids: &[u32]) -> usize {
-    ids.iter()
-        .enumerate()
-        .max_by_key(|(_, &v)| v)
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+/// The EOS position of a CLIP token row = the **first** occurrence of the EOS id (sc-8982).
+///
+/// HF `CLIPTextModel` pools the final hidden state at `input_ids.argmax(-1)` (EOS =
+/// `<|endoftext|>` = 49407 is the highest id), and torch's `argmax` returns the FIRST maximal
+/// index. SD3.5 pads CLIP rows with the EOS id (`pad_token_id == eos_token_id` for both
+/// encoders), so every pad slot ties at the max — the pooled hidden must come from the first
+/// EOS, not a trailing pad (the hidden states differ under causal attention). Falls back to the
+/// first arg-max index if `eos_id` is absent (torch-`argmax` parity for a degenerate row).
+fn eos_position(ids: &[u32], eos_id: u32) -> usize {
+    ids.iter().position(|&v| v == eos_id).unwrap_or_else(|| {
+        let max = ids.iter().copied().max().unwrap_or(0);
+        ids.iter().position(|&v| v == max).unwrap_or(0)
+    })
+}
+
+/// Pool a CLIP final-norm hidden state `[1, seq, embed]` at the row's EOS position (sc-8982):
+/// returns `[1, embed]` taken at the FIRST occurrence of `eos_id` in `ids` (diffusers' pooled
+/// `text_embeds` lookup), NOT the last sequence slot (a trailing EOS-id pad token).
+fn pool_hidden_at_eos(final_hidden: &Tensor, ids: &[u32], eos_id: u32) -> Result<Tensor> {
+    let eos = eos_position(ids, eos_id);
+    final_hidden.i((0, eos))?.unsqueeze(0)
 }
 
 /// The three loaded SD3.5 text encoders + their tokenizers and pooled-projection heads. Built once
@@ -266,11 +279,10 @@ impl Sd3TextEncoders {
             .get_ids()
             .to_vec();
         let ids = fit_clip_tokens(ids, eos_id, eos_id);
-        let eos = eos_position(&ids);
         let input = Tensor::new(ids.as_slice(), &self.device)?.reshape((1, CLIP_MAX_LEN))?;
         // `forward_until_encoder_layer(.., -2)` → (final-norm hidden, penultimate hidden).
         let (final_hidden, penult) = clip.forward_until_encoder_layer(&input, usize::MAX, -2)?;
-        let pooled_eos = final_hidden.i((0, eos))?.unsqueeze(0)?; // [1, embed]
+        let pooled_eos = pool_hidden_at_eos(&final_hidden, &ids, eos_id)?; // [1, embed]
         let pooled = proj.forward(&pooled_eos)?;
         Ok((penult.to_dtype(self.dtype)?, pooled.to_dtype(self.dtype)?))
     }
@@ -460,11 +472,47 @@ mod tests {
         assert_eq!(*fit.last().unwrap(), eos);
     }
 
-    /// `eos_position` finds the arg-max id (EOS is the highest CLIP id), even with padding after it.
+    /// `eos_position` finds the FIRST EOS, even when the row is padded with the EOS id itself —
+    /// the production case: `encode_clip` pads with `pad_id == eos_id`, so every pad slot ties at
+    /// the max token id and a last-maximal lookup (the sc-8982 bug) lands on the trailing pad.
     #[test]
-    fn eos_position_is_argmax() {
-        assert_eq!(eos_position(&[49406, 320, 49407, 9, 9]), 2);
-        assert_eq!(eos_position(&[49406, 1, 2, 3, 49407]), 4);
+    fn eos_position_is_first_eos() {
+        let eos = 49407u32;
+        // Row padded with a distinct pad id (< EOS): EOS is the unique max.
+        assert_eq!(eos_position(&[49406, 320, eos, 9, 9], eos), 2);
+        assert_eq!(eos_position(&[49406, 1, 2, 3, eos], eos), 4);
+        // Row padded with the EOS id (the production path): must pick the FIRST EOS, not the last
+        // pad slot. Pre-fix `max_by_key` returned 4 here.
+        assert_eq!(eos_position(&[49406, 320, eos, eos, eos], eos), 2);
+        // Exactly what `fit_clip_tokens(.., eos, eos)` produces for a short prompt.
+        let ids = fit_clip_tokens(vec![49406, 320, eos], eos, eos);
+        assert_eq!(eos_position(&ids, eos), 2);
+        // Degenerate row with no EOS: torch-argmax parity (first maximal index).
+        assert_eq!(eos_position(&[5, 9, 9, 3], eos), 1);
+    }
+
+    /// The pooled vector must equal the final hidden state at the FIRST EOS position, not the last
+    /// sequence slot. Synthetic CPU hidden state where each position is filled with its own index,
+    /// row padded with the EOS id exactly as `encode_clip` pads short prompts — the pre-fix code
+    /// pooled position `seq-1` (a trailing pad) and fails this test.
+    #[test]
+    fn pooled_hidden_is_taken_at_first_eos_not_last_pad() {
+        let eos = 49407u32;
+        let (seq, embed) = (77usize, 8usize);
+        // ids = short prompt [BOS, tok, EOS] padded to 77 with the EOS id (pad_id == eos_id).
+        let ids = fit_clip_tokens(vec![49406, 320, eos], eos, eos);
+        assert_eq!(ids.len(), seq);
+        // hidden[0, p, :] = p, so the pooled row identifies the position it was taken from.
+        let rows: Vec<f32> = (0..seq).flat_map(|p| vec![p as f32; embed]).collect();
+        let hidden = Tensor::from_vec(rows, (1, seq, embed), &Device::Cpu).unwrap();
+        let pooled = pool_hidden_at_eos(&hidden, &ids, eos).unwrap();
+        assert_eq!(pooled.dims(), &[1, embed]);
+        let v = pooled.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            v.iter().all(|&x| x == 2.0),
+            "pooled must come from the first EOS (position 2), got values {v:?} (position 76 = \
+             trailing pad would be the sc-8982 bug)"
+        );
     }
 
     #[test]
