@@ -90,6 +90,20 @@ fn validate_kps(kps: &[(f32, f32)]) -> Result<()> {
     Ok(())
 }
 
+/// Reject `steps == 0` with a typed error instead of running zero denoise iterations and VAE-decoding
+/// the pure scaled prior noise (sc-9016, F-032). Mirrors the registered `SdxlGenerator::validate` steps
+/// floor; the worker-driven InstantID path has no gen-core capability floor upstream of it. Every public
+/// entry (`generate`, `generate_angle`, `generate_with_kps`) funnels through `generate_with`, so guarding
+/// there covers the whole surface.
+fn check_steps(steps: usize) -> Result<()> {
+    if steps == 0 {
+        return Err(CandleError::Msg(
+            "instantid: steps must be >= 1 (an explicit 0 renders undenoised noise)".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Reject a non-512-d ArcFace embedding with a typed error.
 fn check_embedding(embedding: &[f32]) -> Result<()> {
     if embedding.len() != EMBEDDING_DIM {
@@ -340,6 +354,7 @@ impl InstantId {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        check_steps(req.steps)?;
         check_embedding(embedding)?;
         validate_kps(kps)?;
         let cfg_on = req.guidance > 1.0;
@@ -771,6 +786,16 @@ mod tests {
         assert!(check_embedding(&vec![0.0; 512]).is_ok());
         assert!(check_embedding(&vec![0.0; 511]).is_err());
         assert!(check_embedding(&[]).is_err());
+    }
+
+    /// `steps == 0` is rejected with a fast, actionable error (never decoded as undenoised noise);
+    /// a valid step count passes (sc-9016, F-032).
+    #[test]
+    fn check_steps_rejects_zero() {
+        let err = check_steps(0).unwrap_err().to_string();
+        assert!(err.contains("steps must be >= 1"), "got: {err}");
+        assert!(check_steps(1).is_ok());
+        assert!(check_steps(30).is_ok());
     }
 
     /// `place_face_kps` centers the face landmarks at the head box and scales by the face-height frac:

@@ -272,6 +272,7 @@ impl Generator for Scail2 {
         // sc-5583) rather than the generic capability-floor "not supported" from `validate_request`
         // (which also rejects it now that `MultiReference` is unadvertised, sc-8985).
         reject_multi_reference(self.descriptor.id, req)?;
+        reject_zero_steps(self.descriptor.id, req)?;
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)
@@ -303,6 +304,19 @@ fn reject_multi_reference(id: &str, req: &GenerationRequest) -> gen_core::Result
             "{id}: MultiReference (extra reference characters) is not supported yet — each extra \
              character needs its own color-coded segmentation mask and the paired reference+mask \
              request contract is pending (sc-5583); pass exactly one Reference + Mask"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject an explicit `steps: Some(0)` loudly instead of running zero denoise iterations and
+/// VAE-decoding the pure prior — on video that is MINUTES of GPU time for garbage (sc-9016, F-032).
+/// Mirrors the registered `SdxlGenerator::validate` steps floor; this worker-driven video path has no
+/// gen-core steps floor upstream of it. A `None` legitimately falls through to `DEFAULT_STEPS`.
+fn reject_zero_steps(id: &str, req: &GenerationRequest) -> gen_core::Result<()> {
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
         )));
     }
     Ok(())
@@ -475,6 +489,31 @@ mod tests {
             ..req
         };
         assert!(reject_multi_reference(MODEL_ID, &single).is_ok());
+    }
+
+    #[test]
+    fn zero_steps_is_rejected_loudly() {
+        // An explicit `steps: Some(0)` is a fast, actionable error — NOT minutes of video decoded from
+        // undenoised prior noise (sc-9016, F-032).
+        let zero = GenerationRequest {
+            prompt: "a character".into(),
+            steps: Some(0),
+            ..Default::default()
+        };
+        let err = reject_zero_steps(MODEL_ID, &zero).expect_err("steps==0 must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("steps must be >= 1"), "got: {msg}");
+        // A valid step count and an unset (default) step count both pass this guard.
+        let valid = GenerationRequest {
+            steps: Some(40),
+            ..zero.clone()
+        };
+        assert!(reject_zero_steps(MODEL_ID, &valid).is_ok());
+        let unset = GenerationRequest {
+            steps: None,
+            ..zero
+        };
+        assert!(reject_zero_steps(MODEL_ID, &unset).is_ok());
     }
 
     #[test]
