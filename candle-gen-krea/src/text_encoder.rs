@@ -100,25 +100,51 @@ impl KreaTeConfig {
             prefix_tokens: d.prefix_tokens,
         };
 
-        // `text_encoder_select_layers` lives in the pipeline manifest.
-        if let Ok(t) = std::fs::read_to_string(root.join("model_index.json")) {
-            if let Ok(mv) = serde_json::from_str::<serde_json::Value>(&t) {
-                if let Some(arr) = mv
-                    .get("text_encoder_select_layers")
-                    .and_then(|a| a.as_array())
-                {
-                    let sel: Vec<usize> = arr
-                        .iter()
-                        .filter_map(|x| x.as_u64().map(|n| n as usize))
-                        .collect();
-                    if !sel.is_empty() {
-                        cfg.select_hidden = sel;
-                    }
+        // `text_encoder_select_layers` lives in the pipeline manifest. A genuinely-absent
+        // `model_index.json` keeps the reference `select_hidden` default; a *present-but-corrupt*
+        // manifest (I/O error or malformed JSON) errors loudly rather than silently downgrading to the
+        // default on a damaged snapshot (sc-9010 / F-073).
+        if let Some(mv) = read_optional_model_index(&root.join("model_index.json"))? {
+            if let Some(arr) = mv
+                .get("text_encoder_select_layers")
+                .and_then(|a| a.as_array())
+            {
+                let sel: Vec<usize> = arr
+                    .iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as usize))
+                    .collect();
+                if !sel.is_empty() {
+                    cfg.select_hidden = sel;
                 }
             }
         }
         Ok(cfg)
     }
+}
+
+/// Read the **optional** `model_index.json`, distinguishing "genuinely absent" (→ `Ok(None)`, keep
+/// the reference default) from "present but corrupt" (→ `Err`, name the file). A missing manifest is a
+/// legitimate snapshot shape; an I/O error or malformed JSON on a manifest that *is* present signals a
+/// damaged/partial download that must surface rather than silently downgrade behavior (sc-9010 /
+/// F-073).
+fn read_optional_model_index(path: &Path) -> Result<Option<serde_json::Value>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea te: read {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    let v = serde_json::from_str(&text).map_err(|e| {
+        candle_gen::candle_core::Error::Msg(format!(
+            "krea te: parse {} (corrupt snapshot?): {e}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(v))
 }
 
 /// HF half-split RoPE table (θ over `head_dim`), built once for the max sequence length (f32).
@@ -400,5 +426,53 @@ mod tests {
         assert_eq!(out.first().copied(), Some(1));
         assert_eq!(out.last().copied(), Some(34));
         assert!(*out.iter().max().unwrap() < cfg.num_layers);
+    }
+
+    fn te_snapshot_tmp(name: &str) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "krea_te_{name}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("text_encoder")).unwrap();
+        // A minimal valid text_encoder/config.json (missing scalars default to qwen3_vl_4b).
+        std::fs::write(
+            tmp.join("text_encoder").join("config.json"),
+            br#"{"text_config": {}}"#,
+        )
+        .unwrap();
+        tmp
+    }
+
+    #[test]
+    fn from_snapshot_defaults_select_when_model_index_absent() {
+        // No model_index.json → keep the reference select_hidden default.
+        let tmp = te_snapshot_tmp("idx_absent");
+        let cfg = KreaTeConfig::from_snapshot(&tmp).unwrap();
+        assert_eq!(cfg.select_hidden, KreaTeConfig::qwen3_vl_4b().select_hidden);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn from_snapshot_reads_present_select_layers() {
+        let tmp = te_snapshot_tmp("idx_present");
+        std::fs::write(
+            tmp.join("model_index.json"),
+            br#"{"text_encoder_select_layers": [1, 2, 3]}"#,
+        )
+        .unwrap();
+        let cfg = KreaTeConfig::from_snapshot(&tmp).unwrap();
+        assert_eq!(cfg.select_hidden, vec![1, 2, 3]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn from_snapshot_errors_on_corrupt_model_index() {
+        // model_index.json present but malformed (partial download) → error, NOT silent default.
+        let tmp = te_snapshot_tmp("idx_corrupt");
+        std::fs::write(tmp.join("model_index.json"), b"{ not json").unwrap();
+        assert!(KreaTeConfig::from_snapshot(&tmp).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
