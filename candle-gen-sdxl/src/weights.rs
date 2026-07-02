@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use candle_core::safetensors::MmapedSafetensors;
 use candle_core::{safetensors as cst, DType, Tensor};
 
 use candle_gen::candle_core::Device;
@@ -69,6 +70,75 @@ impl Weights {
             let raw = cst::load(path, device)?;
             for (k, v) in raw {
                 let v = coerce_float(v, dtype)?;
+                if map.insert(k.clone(), v).is_some() {
+                    return Err(CandleError::Msg(format!(
+                        "duplicate tensor key {k:?} while merging shard {}: a checkpoint's tensors \
+                         must each live in exactly one .safetensors shard — this snapshot has {k:?} \
+                         in more than one file (mis-sharded checkpoint or a stray .safetensors in \
+                         the dir)",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        Ok(Self { map })
+    }
+
+    /// Load only the tensors whose key starts with one of `prefixes`, via a header-only mmap
+    /// (sc-8990 / F-010), casting floats to `dtype` exactly as [`from_file`](Self::from_file).
+    ///
+    /// The `openai/clip-vit-large-patch14` snapshot ships the *full* `CLIPModel` in one file, so the
+    /// image embedder's old `from_file` materialized the entire checkpoint — including the unused
+    /// `text_model.*` tower — on the device. Restricting to the needed prefixes (`vision_model.` +
+    /// `visual_projection.`) drops that transient. Each retained tensor is byte-identical to what
+    /// `from_file` would have produced for the same key.
+    pub fn from_file_filtered(
+        path: &Path,
+        device: &Device,
+        dtype: DType,
+        prefixes: &[&str],
+    ) -> Result<Self> {
+        // SAFETY: read-only, process-owned weight file, mapped only for this load and not mutated
+        // behind the mapping — the standard candle weight-loading invariant.
+        let st = unsafe { MmapedSafetensors::new(path)? };
+        let mut map = HashMap::new();
+        for (k, _view) in st.tensors() {
+            if !prefixes.iter().any(|p| k.starts_with(p)) {
+                continue;
+            }
+            // Load just this one tensor's bytes (header-only mmap), then re-cast floats to the compute
+            // dtype via the shared `coerce_float` helper — identical per-tensor handling to
+            // `from_file`, so retained values are byte-equal.
+            let v = coerce_float(st.load(&k, device)?, dtype)?;
+            map.insert(k, v);
+        }
+        Ok(Self { map })
+    }
+
+    /// Shard-aware [`from_file_filtered`](Self::from_file_filtered): apply the same header-only,
+    /// prefix-restricted read to EVERY `.safetensors` in `files` and merge the results, so a resharded
+    /// snapshot whose prefix-matched tensors are split across shards loads their full union (F-037,
+    /// sc-9021) while still never materializing the unmatched towers (sc-8990 / F-010).
+    ///
+    /// Duplicate-key policy matches [`from_files`](Self::from_files): a key present in more than one
+    /// shard is a HARD ERROR, not a silent last-file-wins overwrite (F-064, sc-9050).
+    pub fn from_files_filtered(
+        files: &[impl AsRef<Path>],
+        device: &Device,
+        dtype: DType,
+        prefixes: &[&str],
+    ) -> Result<Self> {
+        let mut map = HashMap::new();
+        for path in files {
+            let path = path.as_ref();
+            // SAFETY: read-only, process-owned weight file, mapped only for this load and not mutated
+            // behind the mapping — the standard candle weight-loading invariant.
+            let st = unsafe { MmapedSafetensors::new(path)? };
+            for (k, _view) in st.tensors() {
+                if !prefixes.iter().any(|p| k.starts_with(p)) {
+                    continue;
+                }
+                let v = coerce_float(st.load(&k, device)?, dtype)?;
                 if map.insert(k.clone(), v).is_some() {
                     return Err(CandleError::Msg(format!(
                         "duplicate tensor key {k:?} while merging shard {}: a checkpoint's tensors \
@@ -171,6 +241,54 @@ mod tests {
             Err(e) => panic!("expected a duplicate-key CandleError::Msg, got: {e}"),
             Ok(_) => panic!("expected a duplicate-key error, but from_files succeeded"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `from_file_filtered` materializes only the prefix-matched keys (byte-identical to `from_file`
+    /// for those keys) and drops everything else — e.g. the unused CLIP text tower for the image path.
+    #[test]
+    fn from_file_filtered_keeps_only_matching_prefixes() {
+        let dev = Device::Cpu;
+        let dir = std::env::temp_dir().join(format!("sdxl_weights_filter_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("model.safetensors");
+
+        let mut map = HashMap::new();
+        map.insert(
+            "vision_model.post_layernorm.weight".to_string(),
+            Tensor::new(&[1.0f32, 2.0], &dev).unwrap(),
+        );
+        map.insert(
+            "visual_projection.weight".to_string(),
+            Tensor::new(&[3.0f32, 4.0], &dev).unwrap(),
+        );
+        map.insert(
+            "text_model.embeddings.token_embedding.weight".to_string(),
+            Tensor::new(&[9.0f32, 9.0], &dev).unwrap(),
+        );
+        cst::save(&map, &file).unwrap();
+
+        let w = Weights::from_file_filtered(
+            &file,
+            &dev,
+            DType::F32,
+            &["vision_model.", "visual_projection."],
+        )
+        .unwrap();
+
+        // Kept: the two vision-side prefixes, values intact.
+        assert!(w.contains("vision_model.post_layernorm.weight"));
+        assert_eq!(
+            w.require("visual_projection.weight")
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            vec![3.0, 4.0]
+        );
+        // Dropped: the unused text tower is never materialized.
+        assert!(!w.contains("text_model.embeddings.token_embedding.weight"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

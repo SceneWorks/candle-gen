@@ -101,17 +101,16 @@ impl SdxlConditioner {
         let clip_g = stable_diffusion::build_clip_transformer(&cfg_g, &g_file, device, dtype)?;
 
         // The `text_projection.weight` lives in the same bigG checkpoint (a `CLIPTextModelWithProjection`)
-        // that `build_clip_transformer` read only the `text_model.*` of. Pull it out for the pooled head.
-        let g_tensors = candle_core::safetensors::load(&g_file, device)?;
-        let tp = g_tensors
-            .get("text_projection.weight")
-            .ok_or_else(|| {
-                CandleError::Msg(format!(
-                    "sdxl conditioning: text_projection.weight missing from {}",
-                    g_file.display()
-                ))
-            })?
-            .to_dtype(dtype)?;
+        // that `build_clip_transformer` read only the `text_model.*` of. Pull out just that one tensor via
+        // a header-only mmap (sc-8990 / F-010) instead of re-materializing the whole ~1.4 GB checkpoint on
+        // the device a second time.
+        let tp = candle_gen::load_one_tensor(
+            &g_file,
+            "text_projection.weight",
+            dtype,
+            device,
+            "sdxl conditioning",
+        )?;
         let text_projection = Linear::new(tp, None);
 
         Ok(Self {

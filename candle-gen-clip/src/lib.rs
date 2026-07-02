@@ -170,10 +170,23 @@ impl ClipTextEmbedder {
     pub fn from_snapshot(root: &Path) -> Result<Self> {
         let files = resolve_weights_files(root)?;
         let device = candle_gen::default_device()?;
+        // Body: the mmapped var-builder reads `text_model.*` across the full (possibly resharded) shard
+        // list (F-037, sc-9021). Head: pull just the pooled `text_projection.weight` through a
+        // header-only mmap (sc-8990 / F-010) — locating whichever shard carries it — instead of the old
+        // `Weights::from_file[s]`, which materialized the ENTIRE CLIP checkpoint (the full vision tower
+        // included) on the device a second time just to grab this one head weight.
         let vb = candle_gen::mmap_var_builder(&files, DType::F32, &device)?;
         let body = ClipTextTransformer::new(vb.pp("text_model"), &clip_text_config())?;
-        let weights = Weights::from_files(&files, &device, DType::F32)?;
-        let text_projection = Linear::new(weights.require("text_projection.weight")?, None);
+        let text_projection = Linear::new(
+            candle_gen::load_one_tensor_sharded(
+                &files,
+                "text_projection.weight",
+                DType::F32,
+                &device,
+                "clip_vit_l14_text",
+            )?,
+            None,
+        );
         let tokenizer = Tokenizer::from_file(root.join("tokenizer.json"))
             .map_err(|e| CandleError::Msg(format!("clip_vit_l14_text: load tokenizer: {e}")))?;
         Ok(Self {
@@ -270,7 +283,17 @@ pub fn load(spec: &LoadSpec) -> Result<Box<dyn ImageEmbedder>> {
     };
     let files = resolve_weights_files(root)?;
     let device = candle_gen::default_device()?;
-    let weights = Weights::from_files(&files, &device, DType::F32)?;
+    // The `openai/clip-vit-large-patch14` snapshot is the full `CLIPModel`, but the image embedder only
+    // needs the vision tower + its projection head — the whole `text_model.*` tower is dead weight here.
+    // Load just the needed prefixes via a header-only mmap (sc-8990 / F-010) so the unused text tower is
+    // never materialized on the device, spanning the full (possibly resharded) shard list so a snapshot
+    // whose vision tensors are split across shards still loads their union (F-037, sc-9021).
+    let weights = Weights::from_files_filtered(
+        &files,
+        &device,
+        DType::F32,
+        &["vision_model.", "visual_projection."],
+    )?;
     Ok(Box::new(ClipImageEmbedder::from_weights(&weights)?))
 }
 
