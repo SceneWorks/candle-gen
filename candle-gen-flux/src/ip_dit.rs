@@ -52,7 +52,25 @@ fn layer_norm(dim: usize, vb: VarBuilder) -> Result<LayerNorm> {
     Ok(LayerNorm::new_no_bias(ws, 1e-6))
 }
 
+/// Max elements in a single attention scores tensor `[…,Sq,Sk]` before [`scaled_dot_product_attention`]
+/// chunks over the query rows. candle CUDA kernels index elements with **i32**, so a scores/probs
+/// tensor exceeding `i32::MAX` (~2.147B) silently corrupts its tail — garbage attention in the trailing
+/// query rows → noise, with no error (sc-5487, the FLUX.2 fix; sc-8983 ports it here). The FLUX.1
+/// joint `[txt, img]` sequence at the largest advertised sizes pushes the 24-head scores tensor past
+/// the limit. 1.0B keeps each chunk well under it while leaving the common sizes (≤ ~0.7B at 1024²) a
+/// single un-chunked pass, so those stay byte-identical. The vendored upstream SDPA is otherwise
+/// unchanged.
+const ATTN_SCORES_BUDGET: usize = 1_000_000_000;
+
 pub(crate) fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
+    sdpa_budgeted(q, k, v, ATTN_SCORES_BUDGET)
+}
+
+/// [`scaled_dot_product_attention`] with an explicit per-block scores-element budget (so the chunking is
+/// unit-testable with a tiny budget that forces the chunked path on small tensors). Each query row's
+/// softmax is over all keys and independent of the other rows, so the chunked result is numerically
+/// identical to the single pass.
+fn sdpa_budgeted(q: &Tensor, k: &Tensor, v: &Tensor, budget: usize) -> Result<Tensor> {
     let dim = q.dim(D::Minus1)?;
     let scale_factor = 1.0 / (dim as f64).sqrt();
     let mut batch_dims = q.dims().to_vec();
@@ -61,8 +79,32 @@ pub(crate) fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -
     let q = q.flatten_to(batch_dims.len() - 1)?;
     let k = k.flatten_to(batch_dims.len() - 1)?;
     let v = v.flatten_to(batch_dims.len() - 1)?;
-    let attn_weights = (q.matmul(&k.t()?)? * scale_factor)?;
-    let attn_scores = candle_nn::ops::softmax_last_dim(&attn_weights)?.matmul(&v)?;
+    let (n, sq, _) = q.dims3()?;
+    let sk = k.dim(1)?;
+    let k_t = k.t()?;
+
+    // The largest query block whose `[N,block,Sk]` scores tensor stays within budget (the whole `Sq`
+    // for the common sizes, so that path is the unchanged single matmul+softmax+matmul).
+    let block = if n * sq * sk <= budget {
+        sq
+    } else {
+        (budget / (n * sk)).max(1)
+    };
+
+    let attn_scores = if block >= sq {
+        let attn_weights = (q.matmul(&k_t)? * scale_factor)?;
+        candle_nn::ops::softmax_last_dim(&attn_weights)?.matmul(&v)?
+    } else {
+        let mut blocks = Vec::new();
+        let mut start = 0;
+        while start < sq {
+            let len = block.min(sq - start);
+            let attn_weights = (q.narrow(1, start, len)?.matmul(&k_t)? * scale_factor)?;
+            blocks.push(candle_nn::ops::softmax_last_dim(&attn_weights)?.matmul(&v)?);
+            start += len;
+        }
+        Tensor::cat(&blocks, 1)? // [N, Sq, dim_v]
+    };
     batch_dims.push(attn_scores.dim(D::Minus2)?);
     batch_dims.push(attn_scores.dim(D::Minus1)?);
     attn_scores.reshape(batch_dims)
@@ -828,4 +870,46 @@ impl IpFlux {
 /// would never reach here (the caller filters an empty residual slice), so it is clamped to 1.
 pub(crate) fn control_residual_interval(num_double_blocks: usize, num_residuals: usize) -> usize {
     num_double_blocks.div_ceil(num_residuals.max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::Device;
+
+    fn assert_close(a: &Tensor, b: &Tensor) {
+        assert_eq!(a.dims(), b.dims());
+        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for (x, y) in a.iter().zip(&b) {
+            assert!(
+                (x - y).abs() < 1e-6,
+                "chunked attention diverged: {x} vs {y}"
+            );
+        }
+    }
+
+    #[test]
+    fn chunked_sdpa_matches_single_pass() {
+        // Per-query-row softmax is independent, so chunking over query rows (forced via a tiny budget)
+        // must match the single pass bit-for-bit — the guard for the i32-overflow fix (sc-8983,
+        // ported from FLUX.2's sc-5487). Covers the self-attn `[B,H,S,D]` shape and a cross-shape
+        // `Sq != Sk` (the fn is generic over the leading batch dims and the key length).
+        let dev = Device::Cpu;
+        let (b, h, s, d) = (1usize, 2usize, 7usize, 4usize);
+        let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        // Huge budget → single pass; tiny budget (1) → chunked into single-row blocks.
+        let single = sdpa_budgeted(&q, &k, &v, usize::MAX).unwrap();
+        let chunked = sdpa_budgeted(&q, &k, &v, 1).unwrap();
+        assert_close(&single, &chunked);
+
+        let sk = 5usize;
+        let kx = Tensor::randn(0f32, 1f32, (b, h, sk, d), &dev).unwrap();
+        let vx = Tensor::randn(0f32, 1f32, (b, h, sk, d), &dev).unwrap();
+        let single = sdpa_budgeted(&q, &kx, &vx, usize::MAX).unwrap();
+        let chunked = sdpa_budgeted(&q, &kx, &vx, 1).unwrap();
+        assert_close(&single, &chunked);
+    }
 }

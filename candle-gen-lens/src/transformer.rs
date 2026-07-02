@@ -113,6 +113,82 @@ pub fn gated(x: &Tensor, gate: &Tensor, y: &Tensor) -> Result<Tensor> {
     x.broadcast_add(&y.broadcast_mul(gate)?)
 }
 
+/// Max elements in a single attention scores tensor `[B,H,Sq,Sk]` before [`attention`] chunks over the
+/// query rows. candle CUDA kernels index elements with **i32**, so a scores/probs tensor exceeding
+/// `i32::MAX` (~2.147B) silently corrupts its tail — garbage attention in the trailing query rows →
+/// noise, with no error (sc-5487, the FLUX.2 fix; sc-8983 ports it here). Lens advertises buckets up
+/// to a 1440 base and always renders the CFG batch of 2: at the largest buckets the joint
+/// `[img, txt]` sequence pushes the 24-head, B=2 scores tensor to ~3.8B elements, past the limit.
+/// 1.0B keeps each chunk well under it while leaving the common sizes a single un-chunked pass, so
+/// those stay byte-identical.
+const ATTN_SCORES_BUDGET: usize = 1_000_000_000;
+
+/// SDPA over `[B,H,S,head_dim]` q/k/v → `[B, S, H·head_dim]`. scale = `head_dim^-0.5`. `mask` is an
+/// optional additive mask broadcast onto the scores; it must broadcast over the query rows (the
+/// [`build_joint_mask`] shape `[B, 1, 1, Sk]`). Chunks over the query rows when the full `[B,H,Sq,Sk]`
+/// scores tensor would exceed [`ATTN_SCORES_BUDGET`] (the candle CUDA i32-index limit). Each query
+/// row's softmax is over all keys and independent of the other rows, so the chunked result is
+/// numerically identical to the single pass — only the large buckets trip it.
+fn attention(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    mask: Option<&Tensor>,
+) -> Result<Tensor> {
+    attention_budgeted(q, k, v, head_dim, mask, ATTN_SCORES_BUDGET)
+}
+
+/// [`attention`] with an explicit per-block scores-element budget (so the chunking is unit-testable with
+/// a tiny budget that forces the chunked path on small tensors).
+fn attention_budgeted(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    head_dim: usize,
+    mask: Option<&Tensor>,
+    budget: usize,
+) -> Result<Tensor> {
+    let (b, h, s, d) = q.dims4()?;
+    let scale = (head_dim as f64).powf(-0.5);
+    let q = q.contiguous()?;
+    let k_t = k.transpose(2, 3)?.contiguous()?;
+    let v = v.contiguous()?;
+
+    // The largest query block whose `[B,H,block,S]` scores tensor stays within budget (the whole `S` for
+    // the common sizes, so that path is the unchanged single matmul+softmax+matmul).
+    let block = if b * h * s * s <= budget {
+        s
+    } else {
+        (budget / (b * h * s)).max(1)
+    };
+
+    let o = if block >= s {
+        let mut scores = (q.matmul(&k_t)? * scale)?;
+        if let Some(m) = mask {
+            scores = scores.broadcast_add(m)?;
+        }
+        let probs = softmax_last_dim(&scores)?;
+        probs.matmul(&v)? // [B,H,S,head_dim]
+    } else {
+        let mut blocks = Vec::new();
+        let mut start = 0;
+        while start < s {
+            let len = block.min(s - start);
+            let mut scores = (q.narrow(2, start, len)?.matmul(&k_t)? * scale)?;
+            if let Some(m) = mask {
+                // `[B,1,1,Sk]` broadcasts identically onto every query chunk.
+                scores = scores.broadcast_add(m)?;
+            }
+            let probs = softmax_last_dim(&scores)?;
+            blocks.push(probs.matmul(&v)?); // [B,H,len,head_dim]
+            start += len;
+        }
+        Tensor::cat(&blocks, 2)? // [B,H,S,head_dim]
+    };
+    o.transpose(1, 2)?.reshape((b, s, h * d))
+}
+
 /// Sinusoidal timestep embedding `[1, dim]` from the raw sigma (diffusers `Timesteps(dim,
 /// flip_sin_to_cos=True, downscale_freq_shift=0, scale=1000)`): arg `= σ·1000·freq`, `[cos | sin]`.
 fn timestep_embedding(sigma: f32, dim: usize, device: &Device) -> Result<Tensor> {
@@ -256,9 +332,9 @@ impl JointAttention {
         txt_sin: &Tensor,
         mask: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor)> {
-        let (b, img_seq, _) = img.dims3()?;
+        let img_seq = img.dim(1)?;
         let txt_seq = txt.dim(1)?;
-        let (h, hd) = (self.heads, self.head_dim);
+        let hd = self.head_dim;
 
         let (iq, ik, iv) = self.qkv(&self.img_qkv, img)?;
         let (tq, tk, tv) = self.qkv(&self.txt_qkv, txt)?;
@@ -282,15 +358,7 @@ impl JointAttention {
         let q = Tensor::cat(&[&iq, &tq], 2)?;
         let k = Tensor::cat(&[&ik, &tk], 2)?;
         let v = Tensor::cat(&[&iv, &tv], 2)?;
-        let scale = (hd as f64).powf(-0.5);
-        let mut scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
-        if let Some(m) = mask {
-            scores = scores.broadcast_add(m)?;
-        }
-        let probs = softmax_last_dim(&scores)?;
-        let o = probs.matmul(&v.contiguous()?)?; // [B, heads, joint, head_dim]
-        let joint = img_seq + txt_seq;
-        let o = o.transpose(1, 2)?.reshape((b, joint, h * hd))?;
+        let o = attention(&q, &k, &v, hd, mask)?; // [B, joint, H·head_dim]
 
         // Split back at the image/text boundary (image first).
         let img_o = o.narrow(1, 0, img_seq)?.contiguous()?;
@@ -586,6 +654,36 @@ pub fn build_joint_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunked_attention_matches_single_pass() {
+        // Per-query-row softmax is independent, so chunking over query rows (forced via a tiny budget)
+        // must match the single pass bit-for-bit — the guard for the i32-overflow fix (sc-8983,
+        // ported from FLUX.2's sc-5487). Checked with and without the `[B,1,1,Sk]` additive mask.
+        let dev = Device::Cpu;
+        let (b, h, s, d) = (2usize, 2usize, 7usize, 4usize);
+        let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        // Mask the last two "text" positions of the second batch item (build_joint_mask shape).
+        let valid = Tensor::from_vec(vec![1f32, 1., 1., 1., 1., 1., 0., 0.], (2, 4), &dev).unwrap();
+        let mask = build_joint_mask(&valid, s - 4, DType::F32, &dev).unwrap();
+        for m in [None, Some(&mask)] {
+            // Huge budget → single pass; tiny budget (1) → chunked into single-row blocks.
+            let single = attention_budgeted(&q, &k, &v, d, m, usize::MAX).unwrap();
+            let chunked = attention_budgeted(&q, &k, &v, d, m, 1).unwrap();
+            assert_eq!(single.dims(), chunked.dims());
+            let a = single.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let c = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            for (x, y) in a.iter().zip(&c) {
+                assert!(
+                    (x - y).abs() < 1e-6,
+                    "chunked attention diverged (mask={}): {x} vs {y}",
+                    m.is_some()
+                );
+            }
+        }
+    }
 
     #[test]
     fn dims_match_checkpoint() {
