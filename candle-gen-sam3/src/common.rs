@@ -396,9 +396,6 @@ mod tests {
         quant_roundtrip(Quant::Q4, 0.95);
     }
 
-    /// A linear whose contraction is not a multiple of 32 (in=20) stays dense (the reference
-    /// predicate that keeps SAM3's `2→256` / `4→256` / `258→256` projections full-precision), and
-    /// `quantize` is idempotent on an already-quantized linear.
     /// Write a single-tensor `.safetensors` file (`name -> [value]`, f32) at `path`.
     fn write_shard(path: &Path, name: &str, value: f32) {
         let t = Tensor::new(&[value], &Device::Cpu).unwrap();
@@ -478,6 +475,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A linear whose contraction is not a multiple of 32 (in=20) stays dense (the reference
+    /// predicate that keeps SAM3's `2→256` / `4→256` / `258→256` projections full-precision), and
+    /// `quantize` is idempotent on an already-quantized linear.
     #[test]
     fn quantize_skips_odd_contraction_and_is_idempotent() {
         let dev = Device::Cpu;
