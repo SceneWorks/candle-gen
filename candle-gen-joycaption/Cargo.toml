@@ -35,7 +35,13 @@ inventory = { workspace = true }
 # -> `branch=main` so it unifies with mlx-llm / sceneworks-gen-core (both `branch=main`); candle-llm main's
 # `rev=` spec would otherwise materialise a SECOND core-llm package and clash. Still `candle-core 65ecb58`
 # (the graph-wide rev), so one Tensor type, one core-llm (branch=main#3870ed1).
-candle-llm = { git = "https://github.com/SceneWorks/candle-llm", rev = "d0ba3e66b4d53420bb0b0745a185b975822089be" }
+# Bumped `d0ba3e6` -> `3d9fdf0` (2026-07-02, candle repin lockstep): candle-llm #46 bumps ITS
+# candle-core/nn/flash-attn pin `65ecb58` -> `c1e6756` (upstream Cow::Owned UAF fix, PR
+# huggingface/candle#3493) in lockstep with this workspace's candle bump — a `rev=` pin keyed to the
+# old candle rev would materialise TWO candle-core packages and clash. The range d0ba3e6..3d9fdf0 is
+# candle-llm main churn (sc-8528 KV-quant backout + docs) + the repin; this shim links no candle-llm
+# symbols, so it's pin alignment only.
+candle-llm = { git = "https://github.com/SceneWorks/candle-llm", rev = "3d9fdf04047bf3b1fbf323ab56c919f3a03f0794" }
 
 [features]
 default = []

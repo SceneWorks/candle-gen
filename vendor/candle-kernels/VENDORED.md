@@ -2,9 +2,12 @@
 
 This is a **local fork** of `candle-kernels` `0.10.2`, copied verbatim from the pinned candle revision
 
-    https://github.com/huggingface/candle @ 65ecb58c11d2244a7e60c71bdcdb19b15b0a4343
+    https://github.com/huggingface/candle @ c1e6756a89faefa888ea57b056394a0619925b87
 
-(the same rev the workspace pins `candle-core` / `candle-nn` / `candle-transformers` to). It is wired
+(the same rev the workspace pins `candle-core` / `candle-nn` / `candle-transformers` to). The copy
+was originally taken at rev `65ecb58c11d2244a7e60c71bdcdb19b15b0a4343`; the 2026-07-02 pin bump to
+`c1e6756a89` (upstream UAF fix #3493) did NOT require a re-copy — `candle-kernels/` is byte-identical
+across `65ecb58c..c1e6756a89` (verified via the GitHub compare: no candle-kernels/ files in the diff). It is wired
 into the build via a `[patch]` in the workspace `Cargo.toml`:
 
 ```toml
