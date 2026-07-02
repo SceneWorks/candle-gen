@@ -126,6 +126,19 @@ fn resolve_image_encoder(path: &Path) -> Result<PathBuf> {
     )))
 }
 
+/// Reject `steps == 0` loudly instead of running zero denoise iterations and VAE-decoding the pure
+/// scaled prior noise — a fast typed error, not GPU time burned on garbage (sc-9016, F-032). Mirrors
+/// the registered `SdxlGenerator::validate` steps floor; this worker-driven IP path has no gen-core
+/// capability floor upstream of it.
+fn reject_zero_steps(steps: usize) -> Result<()> {
+    if steps == 0 {
+        return Err(CandleError::Msg(
+            "sdxl ip-adapter: steps must be >= 1 (an explicit 0 renders undenoised noise)".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Loaded SDXL IP-Adapter model: the vendored SDXL UNet (with the IP K/V pairs installed + the
 /// `add_embedding` head) + the dual-CLIP conditioner + the CLIP image encoder/Resampler token source +
 /// the f16 VAE + the ancestral sampler.
@@ -194,6 +207,7 @@ impl IpAdapterSdxl {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        reject_zero_steps(req.steps)?;
         let cfg_on = req.guidance > 1.0;
 
         // Everything that borrows `&self`, computed into owned values BEFORE the `&mut self.unet`
@@ -311,6 +325,16 @@ mod tests {
         // The curated knobs default to None ⇒ the bespoke ancestral path (N1 byte-exact).
         assert!(r.sampler.is_none() && r.scheduler.is_none());
         assert!(!r.cancel.is_cancelled());
+    }
+
+    /// `steps == 0` is rejected with a fast, actionable error (never decoded as undenoised noise);
+    /// a valid step count passes (sc-9016, F-032).
+    #[test]
+    fn zero_steps_is_rejected() {
+        let err = reject_zero_steps(0).expect_err("steps==0 must be rejected");
+        assert!(err.to_string().contains("steps must be >= 1"), "got: {err}");
+        assert!(reject_zero_steps(1).is_ok());
+        assert!(reject_zero_steps(30).is_ok());
     }
 
     /// `resolve_image_encoder`: a directory resolves `model.safetensors`; a missing dir errors loudly.
