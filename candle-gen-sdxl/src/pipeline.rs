@@ -135,6 +135,38 @@ fn lightning_policy(num_steps: usize) -> Result<LightningPolicy> {
 pub(crate) const VAE_FIX_REPO: &str = "madebyollin/sdxl-vae-fp16-fix";
 pub(crate) const VAE_FIX_FILE: &str = "diffusion_pytorch_model.safetensors";
 
+/// Immutable commit SHAs pinning the three runtime `hf-hub` downloads on the SDXL render path
+/// (sc-9013 / F-029). Every `hf_get` resolves against one of these — never the mutable `main`
+/// default — so a compromised or force-pushed upstream cannot silently swap the fp16-fix VAE weights
+/// or the CLIP tokenizations out from under a cold-cache generation. The trio is model-agnostic (they
+/// do not vary per SDXL checkpoint), so a single pin per repo covers every request. Bump these
+/// deliberately (and re-validate) if an upstream fix is ever needed. SHAs captured 2026-07-02:
+/// - `madebyollin/sdxl-vae-fp16-fix`
+/// - `openai/clip-vit-large-patch14`
+/// - `laion/CLIP-ViT-bigG-14-laion2B-39B-b160k`
+const HUB_PINS: &[(&str, &str)] = &[
+    (VAE_FIX_REPO, "207b116dae70ace3637169f1ddd2434b91b3a8cd"),
+    (
+        "openai/clip-vit-large-patch14",
+        "32bd64288804d66eefd0ccbe215aa642df71cc41",
+    ),
+    (
+        "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
+        "743c27bd53dfe508a0ade0f50698f99b39d03bec",
+    ),
+];
+
+/// The pinned immutable revision for a runtime hub `repo`, or an error if the repo is not in
+/// [`HUB_PINS`] — an unpinned runtime download on the render path is a supply-chain risk (F-029), so
+/// `hf_get` refuses to resolve one rather than silently falling back to the mutable `main` revision.
+fn hub_revision(repo: &str) -> Result<&'static str> {
+    HUB_PINS
+        .iter()
+        .find(|(id, _)| *id == repo)
+        .map(|(_, rev)| *rev)
+        .ok_or_else(|| CandleError::Msg(format!("no pinned hub revision for repo {repo:?}")))
+}
+
 /// The SDXL VAE's tiling geometry (sc-4987): the decoder upsamples latents ×8 spatially, and an image
 /// VAE has **no temporal axis** — so temporal scale 1, non-causal (the `[B, 4, h, w]` latent is tiled
 /// on the two spatial axes only, with the singleton temporal axis a no-op in [`TilingConfig::plan`]).
@@ -179,11 +211,24 @@ impl Clip {
 }
 
 /// Resolve a file from a (cached) HF repo — used only for the model-agnostic tokenizers + fp16-VAE-fix.
+///
+/// sc-9013 / F-029: the download is pinned to an immutable commit SHA ([`hub_revision`]) rather than
+/// the hub's mutable `main` default, so an upstream force-push / compromise cannot silently alter the
+/// weights or tokenization at request time. A repo with no pin is rejected up front.
 pub(crate) fn hf_get(repo: &str, path: &str) -> Result<PathBuf> {
     use hf_hub::api::sync::Api;
+    use hf_hub::{Repo, RepoType};
+    let revision = hub_revision(repo)?;
     Api::new()
-        .and_then(|api| api.model(repo.to_string()).get(path))
-        .map_err(|e| CandleError::Msg(format!("hf-hub fetch {repo}/{path}: {e}")))
+        .and_then(|api| {
+            api.repo(Repo::with_revision(
+                repo.to_string(),
+                RepoType::Model,
+                revision.to_string(),
+            ))
+            .get(path)
+        })
+        .map_err(|e| CandleError::Msg(format!("hf-hub fetch {repo}/{path}@{revision}: {e}")))
 }
 
 /// A txt2img pipeline handle. sc-4987 made loading **staged**: this carries only the
@@ -779,6 +824,34 @@ mod tests {
         // float consts: compare with an epsilon (clippy's float_cmp would reject `==`).
         assert!((DEFAULT_GUIDANCE - 7.0).abs() < f64::EPSILON);
         assert!((VAE_SCALE - 0.13025).abs() < f64::EPSILON);
+    }
+
+    /// sc-9013 / F-029: every runtime `hf-hub` download on the SDXL render path must be pinned to an
+    /// immutable commit SHA — never the mutable `main` default. Assert each of the three render-path
+    /// repos (the fp16-fix VAE + both CLIP tokenizers) has a pin that is a 40-char lowercase hex SHA
+    /// (not `"main"`/a branch), and that `hub_revision` resolves each; an unpinned repo is rejected.
+    #[test]
+    fn render_path_hub_downloads_are_pinned_to_immutable_shas() {
+        let render_repos = [VAE_FIX_REPO, Clip::L.sources().0, Clip::BigG.sources().0];
+        for repo in render_repos {
+            let rev = hub_revision(repo).expect("render-path repo must be pinned");
+            assert_ne!(
+                rev, "main",
+                "{repo} is pinned to the mutable default revision"
+            );
+            assert_eq!(
+                rev.len(),
+                40,
+                "{repo} pin is not a 40-char commit SHA: {rev:?}"
+            );
+            assert!(
+                rev.chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "{repo} pin is not a lowercase hex SHA: {rev:?}"
+            );
+        }
+        // An unknown repo must be refused, not silently resolved against `main`.
+        assert!(hub_revision("some/unpinned-repo").is_err());
     }
 
     /// sc-5165: the adapter-merge path reconstructs the SDXL UNet config locally (since `build_unet`
