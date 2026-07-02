@@ -166,8 +166,15 @@ impl Captioner for JoyCaptioner {
             },
         ];
 
-        // The provider polls its own `core_llm::CancelFlag`; bridge the gen-core flag onto it by
-        // mirroring on each streamed token so the provider's next-step cancel check trips promptly.
+        // The provider polls its own `core_llm::CancelFlag`: it checks it once **before** the
+        // prefill (the expensive vision-tower + prompt forward) and again at the top of every decode
+        // step. The gen-core and core-llm flags are distinct types wrapping distinct atomics, so the
+        // two must be bridged. Mirroring only on each streamed token (the prior approach) meant a
+        // cancel that arrives during the long LLaVA prefill was invisible until the first token —
+        // worst-case cancel latency equal to a whole prefill (sc-9020 / F-036). Instead, run a small
+        // background mirror that copies the gen-core cancel onto the provider's flag continuously, so
+        // the provider's pre-prefill check (and every per-step check) observes a cancel promptly
+        // without waiting for a token to be emitted.
         let core_cancel = core_llm::CancelFlag::new();
         let request = TextLlmRequest {
             messages,
@@ -185,11 +192,23 @@ impl Captioner for JoyCaptioner {
             ..Default::default()
         };
 
-        // Report one progress step per emitted token (the testkit's Progress-monotonicity check) and
-        // bridge cancellation on every token.
+        // Seed the provider's flag from the current cancel state *before* inference starts, so an
+        // already-requested cancel short-circuits at the provider's pre-prefill check rather than
+        // after the first token. (An empty-window cancel — one set before `caption` ran — is already
+        // handled by the explicit pre-inference check above; this covers a cancel that lands between
+        // that check and the start of prefill.)
+        if req.cancel.is_cancelled() {
+            core_cancel.cancel();
+        }
+
+        // Spawn a background mirror so a cancel arriving *during* the prefill/decode is copied onto
+        // the provider's flag promptly (observed at the provider's next `is_cancelled()` poll),
+        // independent of token emission. The mirror stops when generation returns.
+        let mirror = CancelMirror::spawn(req.cancel.clone(), core_cancel.clone());
+
+        // Report one progress step per emitted token (the testkit's Progress-monotonicity check).
+        // Cancellation bridging is handled by the background mirror above, not here.
         let total = req.sampling.max_new_tokens;
-        let gen_cancel = req.cancel.clone();
-        let bridge_cancel = core_cancel;
         let mut produced = 0u32;
         let mut on_event = |ev: StreamEvent| {
             if let StreamEvent::Token { .. } = ev {
@@ -198,21 +217,80 @@ impl Captioner for JoyCaptioner {
                     current: produced,
                     total,
                 });
-                if gen_cancel.is_cancelled() {
-                    bridge_cancel.cancel();
-                }
             }
         };
-        let out = self
-            .provider
-            .generate(&request, &mut on_event)
-            .map_err(map_core_err)?;
+        let result = self.provider.generate(&request, &mut on_event);
+        // Tear the mirror down before mapping the result so the polling thread never outlives the
+        // request (and a late cancel doesn't linger on a shared flag).
+        mirror.stop();
+        let out = result.map_err(map_core_err)?;
 
         Ok(CaptionOutput {
             text: out.text.trim().to_owned(),
             generated_tokens: Some(out.usage.generated_tokens),
             finish_reason: out.finish_reason.map(map_finish),
         })
+    }
+}
+
+/// A background thread that mirrors the gen-core [`gen_core::CancelFlag`] onto the provider's
+/// [`core_llm::CancelFlag`] for the lifetime of a single `generate` call.
+///
+/// The two flags are distinct types (each an `Arc<AtomicBool>`), so they cannot share an atomic;
+/// this poller copies "gen-core cancelled" → "core cancelled" without waiting for a streamed token,
+/// which is what makes a cancel during the long LLaVA prefill observable at the provider's
+/// pre-prefill / per-step `is_cancelled()` checks (sc-9020 / F-036). Dropping or calling
+/// [`CancelMirror::stop`] joins the thread; it never touches caption output.
+struct CancelMirror {
+    /// Signals the poll loop to exit (set once generation returns).
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl CancelMirror {
+    /// Poll interval — short enough to be prompt relative to a multi-second prefill, coarse enough
+    /// not to busy-spin a core.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+    fn spawn(
+        gen_cancel: candle_gen::gen_core::CancelFlag,
+        core_cancel: core_llm::CancelFlag,
+    ) -> Self {
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_thread = done.clone();
+        let handle = std::thread::spawn(move || {
+            while !done_thread.load(std::sync::atomic::Ordering::Relaxed) {
+                if gen_cancel.is_cancelled() {
+                    core_cancel.cancel();
+                    // Once mirrored, the provider will observe it at its next poll; nothing left to
+                    // do but wait for generation to unwind and `stop` us.
+                    break;
+                }
+                std::thread::sleep(Self::POLL);
+            }
+        });
+        Self {
+            done,
+            handle: Some(handle),
+        }
+    }
+
+    /// Stop the poll loop and join the thread. Idempotent.
+    fn stop(mut self) {
+        self.shutdown();
+    }
+
+    fn shutdown(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for CancelMirror {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -308,5 +386,68 @@ mod tests {
             load(&spec).err().expect("err"),
             Error::Unsupported(_)
         ));
+    }
+
+    // ---- sc-9020 / F-036: cancellation is observed without waiting for a token ----
+
+    #[test]
+    fn mirror_bridges_a_cancel_without_a_token() {
+        // The provider observes cancellation only through its own `core_llm::CancelFlag`. The mirror
+        // must copy a gen-core cancel onto that flag on its own — i.e. during the prefill window, when
+        // no `StreamEvent::Token` has fired yet — so the provider's pre-prefill / per-step cancel
+        // checks trip promptly instead of after the first token (the F-036 latency bug).
+        let gen_cancel = candle_gen::gen_core::CancelFlag::new();
+        let core_cancel = core_llm::CancelFlag::new();
+        let mirror = CancelMirror::spawn(gen_cancel.clone(), core_cancel.clone());
+
+        assert!(
+            !core_cancel.is_cancelled(),
+            "provider flag starts un-cancelled"
+        );
+        // Simulate a cancel arriving mid-prefill (no token has been emitted).
+        gen_cancel.cancel();
+
+        // The mirror polls on a short interval; it must reflect the cancel well within a prefill.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !core_cancel.is_cancelled() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "mirror did not bridge the cancel onto the provider flag"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(core_cancel.is_cancelled());
+        mirror.stop();
+    }
+
+    #[test]
+    fn mirror_leaves_the_provider_flag_untouched_when_not_cancelled() {
+        // The non-cancelled path must be behavior-neutral: the mirror never sets the provider's flag,
+        // so a normal generation is unaffected.
+        let gen_cancel = candle_gen::gen_core::CancelFlag::new();
+        let core_cancel = core_llm::CancelFlag::new();
+        let mirror = CancelMirror::spawn(gen_cancel.clone(), core_cancel.clone());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        mirror.stop();
+        assert!(
+            !core_cancel.is_cancelled(),
+            "provider flag must stay un-cancelled when no cancel was requested"
+        );
+    }
+
+    #[test]
+    fn mirror_stop_is_prompt_and_joins() {
+        // Tearing the mirror down must return promptly (the thread observes `done` and exits), so it
+        // never outlives the request.
+        let mirror = CancelMirror::spawn(
+            candle_gen::gen_core::CancelFlag::new(),
+            core_llm::CancelFlag::new(),
+        );
+        let start = std::time::Instant::now();
+        mirror.stop();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(1),
+            "stop() should join promptly"
+        );
     }
 }
