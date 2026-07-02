@@ -14,9 +14,6 @@ candle-gen = { path = "../candle-gen" }
 # `candle-gen-flux2`'s `Flux2Vae` verbatim, exactly as `mlx-gen-ideogram` reuses `mlx-gen-flux2`.
 candle-gen-flux2 = { path = "../candle-gen-flux2" }
 inventory = { workspace = true }
-# Qwen3-VL tokenizer.json loading; the Qwen instruct chat template comes from gen-core's
-# `TextTokenizer` (re-exported through `candle_gen::gen_core`).
-tokenizers = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673 parity).
 rand = { workspace = true }
 rand_distr = { workspace = true }
