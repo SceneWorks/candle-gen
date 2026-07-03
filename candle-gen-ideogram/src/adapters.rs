@@ -80,8 +80,12 @@ pub fn merge_turbo_lora(w: &mut Weights, lora_path: &Path, scale: f32) -> Result
                 .map(|a| a as f64 / rank as f64)
                 .unwrap_or(1.0);
         let delta = up.contiguous()?.matmul(&down.contiguous()?)?; // [out, in]
-        let base = w.get_cpu_merge_base(&weight_key)?; // dense grid (packed → dequantized, dense → as-is)
-        let merged_w = (base + (delta * eff)?)?.to_dtype(w.dtype())?;
+        let base = w.get_cpu_merge_base(&weight_key)?;
+        // Fold in f32: `base` is f32 on a PACKED tier (dequantized) but the on-disk dtype (bf16) on the
+        // DENSE `SceneWorks/ideogram-4` tier, while `delta` is f32 — so a bare add raised `dtype mismatch
+        // in add, lhs: BF16, rhs: F32` there (sc-9654). `.to_dtype(F32)` is a no-op on the packed path;
+        // the result folds back to `w.dtype()`.
+        let merged_w = (base.to_dtype(DType::F32)? + (delta * eff)?)?.to_dtype(w.dtype())?;
         w.insert_override(weight_key, merged_w);
         merged += 1;
     }

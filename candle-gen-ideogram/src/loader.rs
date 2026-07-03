@@ -78,10 +78,14 @@ impl Weights {
         })
     }
 
-    /// Load `name` at the component dtype (the override layer wins over the mmap).
+    /// Load `name` at the component dtype **on the component device** (the override layer wins over the
+    /// mmap). The override is the CPU-folded adapter-merge result ([`Self::get_cpu_merge_base`] +
+    /// `merge_turbo_lora` run on the CPU), so it MUST be moved to `self.device` here — otherwise a
+    /// merged projection stays on the CPU while every other weight is on the GPU, and the forward matmul
+    /// raises `device mismatch ... lhs: Cuda, rhs: Cpu` (sc-9654, surfaced on the dense bf16 turbo tier).
     pub fn get(&self, name: &str) -> Result<Tensor> {
         if let Some(t) = self.overlay.get(name) {
-            return t.to_dtype(self.dtype);
+            return t.to_dtype(self.dtype)?.to_device(&self.device);
         }
         self.st.load(name, &self.device)?.to_dtype(self.dtype)
     }
