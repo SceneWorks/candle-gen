@@ -1,0 +1,109 @@
+{
+  "model": "stabilityai/stable-diffusion-3.5-large",
+  "tag": "sd35_large",
+  "prompt": "a photograph of an astronaut riding a horse on the surface of the moon, golden hour",
+  "seed": 20240703,
+  "timestep": 500.0,
+  "t5_len": 256,
+  "clip_len": 77,
+  "latent_shape": [
+    1,
+    16,
+    8,
+    8
+  ],
+  "tolerances": {
+    "clip_l_pooled": {
+      "cosine_min": 0.9999,
+      "max_abs": 0.005
+    },
+    "clip_g_pooled": {
+      "cosine_min": 0.9999,
+      "max_abs": 0.1
+    },
+    "clip_l_penultimate": {
+      "cosine_min": 0.9999,
+      "max_abs": 0.005
+    },
+    "clip_g_penultimate": {
+      "cosine_min": 0.9999,
+      "max_abs": 0.5
+    },
+    "t5_hidden": {
+      "cosine_min": 0.9995,
+      "max_abs": 0.01
+    },
+    "pooled": {
+      "cosine_min": 0.9999,
+      "max_abs": 0.1
+    },
+    "context": {
+      "cosine_min": 0.9995,
+      "max_abs": 0.5
+    },
+    "dit_velocity": {
+      "cosine_min": 0.999,
+      "max_abs": 0.05
+    }
+  },
+  "tensors": {
+    "clip_l_pooled": [
+      1,
+      768
+    ],
+    "clip_g_pooled": [
+      1,
+      1280
+    ],
+    "clip_l_penultimate": [
+      1,
+      77,
+      768
+    ],
+    "clip_g_penultimate": [
+      1,
+      77,
+      1280
+    ],
+    "clip_l_input_ids": [
+      1,
+      77
+    ],
+    "clip_g_input_ids": [
+      1,
+      77
+    ],
+    "t5_hidden": [
+      1,
+      256,
+      4096
+    ],
+    "t5_input_ids": [
+      1,
+      256
+    ],
+    "pooled": [
+      1,
+      2048
+    ],
+    "context": [
+      1,
+      333,
+      4096
+    ],
+    "dit_latent_in": [
+      1,
+      16,
+      8,
+      8
+    ],
+    "dit_velocity": [
+      1,
+      16,
+      8,
+      8
+    ]
+  },
+  "reference_file": "sd35_large_reference.safetensors",
+  "note": "SD3.5 diffusers component-parity reference (sc-9076). Regenerate with tests/parity/gen_reference.py in the sd35env venv."
+}

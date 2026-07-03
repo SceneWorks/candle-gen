@@ -134,6 +134,48 @@ const CLIP_MAX_LEN: usize = 77;
 /// every position (no T5 attention mask), so the padded length is parity-critical.
 const T5_PAD_TOKEN_ID: u32 = 0;
 
+/// Resolve a CLIP encoder's **pad token id** from its diffusers `tokenizer_config.json` `pad_token`
+/// (mapped through the tokenizer vocab), falling back to `eos_id` when the config/token is absent.
+///
+/// This is parity-critical and **differs between the two SD3.5 CLIP encoders** (sc-9076): the HF
+/// `CLIPTokenizer` pads with `padding="max_length"` to 77 using the tokenizer's configured
+/// `pad_token`, and the two encoders configure it differently —
+///  - **CLIP-L** (`tokenizer/`): `pad_token = "<|endoftext|>"` → pad id **49407** (== eos);
+///  - **CLIP-bigG** (`tokenizer_2/`): `pad_token = "!"` → pad id **0** (NOT eos).
+///
+/// Hardcoding eos for both (the pre-sc-9076 behaviour) padded bigG with 49407 instead of 0, which
+/// diverges the bigG penultimate hidden state on every pad position under causal attention, and hence
+/// the joint CLIP context fed to the MMDiT. The pooled vector was unaffected (it is read at the EOS
+/// position, which precedes the pad tail), so only a component-parity run against diffusers surfaces
+/// it. Caught by `tests/component_parity.rs`.
+/// The `<|endoftext|>` id for a CLIP tokenizer (49407 canonical) — the pooling anchor + pad fallback.
+fn clip_eos_id(tok: &Tokenizer) -> CandleResult<u32> {
+    tok.get_vocab(true)
+        .get("<|endoftext|>")
+        .copied()
+        .ok_or_else(|| CandleError::Msg("sd3: CLIP tokenizer missing <|endoftext|>".into()))
+}
+
+fn resolve_clip_pad_id(dir: &Path, tok: &Tokenizer, eos_id: u32) -> u32 {
+    // `tokenizer_config.json` -> `pad_token` (a string, e.g. "!" or "<|endoftext|>"); map to its id.
+    let cfg = dir.join("tokenizer_config.json");
+    let pad_str = std::fs::read_to_string(&cfg)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| match &v["pad_token"] {
+            // `pad_token` is either a bare string or an `AddedToken`-shaped object with `content`.
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Object(o) => {
+                o.get("content").and_then(|c| c.as_str().map(String::from))
+            }
+            _ => None,
+        });
+    match pad_str {
+        Some(s) => tok.get_vocab(true).get(&s).copied().unwrap_or(eos_id),
+        None => eos_id,
+    }
+}
+
 /// Right-pad / hard-truncate a CLIP token row to exactly `CLIP_MAX_LEN`. SD3.5's diffusers pipeline
 /// truncates to the model max (77) with a warning; we truncate (keeping BOS + the leading content)
 /// and re-append the EOS so the pooled EOS lookup still finds it. Pads with the encoder's pad id.
@@ -152,10 +194,11 @@ fn fit_clip_tokens(mut ids: Vec<u32>, pad_id: u32, eos_id: u32) -> Vec<u32> {
 ///
 /// HF `CLIPTextModel` pools the final hidden state at `input_ids.argmax(-1)` (EOS =
 /// `<|endoftext|>` = 49407 is the highest id), and torch's `argmax` returns the FIRST maximal
-/// index. SD3.5 pads CLIP rows with the EOS id (`pad_token_id == eos_token_id` for both
-/// encoders), so every pad slot ties at the max — the pooled hidden must come from the first
-/// EOS, not a trailing pad (the hidden states differ under causal attention). Falls back to the
-/// first arg-max index if `eos_id` is absent (torch-`argmax` parity for a degenerate row).
+/// index. CLIP-L pads with the EOS id (its `pad_token == eos`), so every pad slot ties at the max —
+/// the pooled hidden must come from the first EOS, not a trailing pad (the hidden states differ under
+/// causal attention). bigG pads with `!` (0, sc-9076), a unique-max EOS, but the first-occurrence
+/// lookup is correct either way. Falls back to the first arg-max index if `eos_id` is absent
+/// (torch-`argmax` parity for a degenerate row).
 fn eos_position(ids: &[u32], eos_id: u32) -> usize {
     ids.iter().position(|&v| v == eos_id).unwrap_or_else(|| {
         let max = ids.iter().copied().max().unwrap_or(0);
@@ -190,6 +233,10 @@ pub struct Sd3TextEncoders {
     proj_l: Linear,
     /// CLIP-bigG `text_projection.weight` (`[1280, 1280]`, no bias).
     proj_g: Linear,
+    /// CLIP-L pad token id — `<|endoftext|>` (49407) per its `tokenizer_config.json` (sc-9076).
+    pad_l: u32,
+    /// CLIP-bigG pad token id — `!` (0) per its `tokenizer_config.json` (sc-9076). Differs from L.
+    pad_g: u32,
     t5: T5EncoderModel,
     t5_seq_len: usize,
     device: Device,
@@ -217,6 +264,13 @@ impl Sd3TextEncoders {
         let tok_l = crate::clip_tokenizer::load_clip_tokenizer(&root.join("tokenizer"), "CLIP-L")?;
         let tok_g =
             crate::clip_tokenizer::load_clip_tokenizer(&root.join("tokenizer_2"), "CLIP-bigG")?;
+        // Per-encoder pad token id (sc-9076): resolved from each `tokenizer_config.json` `pad_token`,
+        // NOT hardcoded to eos — bigG pads with `!` (0), L pads with `<|endoftext|>` (49407). The
+        // eos id (49407 in the canonical CLIP vocab) is the fallback for either.
+        let eos_l = clip_eos_id(&tok_l)?;
+        let eos_g = clip_eos_id(&tok_g)?;
+        let pad_l = resolve_clip_pad_id(&root.join("tokenizer"), &tok_l, eos_l);
+        let pad_g = resolve_clip_pad_id(&root.join("tokenizer_2"), &tok_g, eos_g);
         // T5 ships its own `tokenizer.json` in a stock snapshot (out of scope for sc-8500).
         let tok_t5 = Tokenizer::from_file(root.join("tokenizer_3/tokenizer.json"))
             .map_err(|e| CandleError::Msg(format!("sd3: load T5 tokenizer: {e}")))?;
@@ -249,6 +303,8 @@ impl Sd3TextEncoders {
             clip_g,
             proj_l,
             proj_g,
+            pad_l,
+            pad_g,
             t5,
             t5_seq_len,
             device: device.clone(),
@@ -258,25 +314,25 @@ impl Sd3TextEncoders {
 
     /// Run one CLIP encoder for `prompt`: returns `(penultimate [1, 77, embed], pooled [1, embed])`.
     /// The penultimate hidden is the pre-final-norm `hidden_states[-2]`; the pooled is the EOS-position
-    /// final-norm hidden projected through that encoder's `text_projection`.
+    /// final-norm hidden projected through that encoder's `text_projection`. `pad_id` is the encoder's
+    /// diffusers `pad_token` id — differs between L (49407) and bigG (0), see [`resolve_clip_pad_id`].
     fn encode_clip(
         &self,
         tok: &Tokenizer,
         clip: &clip::ClipTextTransformer,
         proj: &Linear,
+        pad_id: u32,
         prompt: &str,
     ) -> CandleResult<(Tensor, Tensor)> {
-        let vocab = tok.get_vocab(true);
-        let eos_id = *vocab
-            .get("<|endoftext|>")
-            .ok_or_else(|| CandleError::Msg("sd3: CLIP tokenizer missing <|endoftext|>".into()))?;
-        // SD3.5 CLIP pads with the EOS token (diffusers `pad_token_id` = eos for these encoders).
+        let eos_id = clip_eos_id(tok)?;
+        // SD3.5 CLIP pads with the encoder's configured pad token (L: `<|endoftext|>`; bigG: `!` = 0),
+        // then truncates/pads to 77 (sc-9076). The pooling anchor is still the FIRST eos (sc-8982).
         let ids = tok
             .encode(prompt, true)
             .map_err(|e| CandleError::Msg(format!("sd3: CLIP tokenize: {e}")))?
             .get_ids()
             .to_vec();
-        let ids = fit_clip_tokens(ids, eos_id, eos_id);
+        let ids = fit_clip_tokens(ids, pad_id, eos_id);
         let input = Tensor::new(ids.as_slice(), &self.device)?.reshape((1, CLIP_MAX_LEN))?;
         // `forward_until_encoder_layer(.., -2)` → (final-norm hidden, penultimate hidden).
         let (final_hidden, penult) = clip.forward_until_encoder_layer(&input, usize::MAX, -2)?;
@@ -289,9 +345,9 @@ impl Sd3TextEncoders {
     /// to `t5_seq_len` with the pad id; every position is attended (no T5 mask), matching diffusers.
     pub fn encode(&mut self, prompt: &str) -> CandleResult<EncoderOutputs> {
         let (clip_l_hidden, clip_l_pooled) =
-            self.encode_clip(&self.tok_l, &self.clip_l, &self.proj_l, prompt)?;
+            self.encode_clip(&self.tok_l, &self.clip_l, &self.proj_l, self.pad_l, prompt)?;
         let (clip_g_hidden, clip_g_pooled) =
-            self.encode_clip(&self.tok_g, &self.clip_g, &self.proj_g, prompt)?;
+            self.encode_clip(&self.tok_g, &self.clip_g, &self.proj_g, self.pad_g, prompt)?;
 
         // T5 sequence, padded/truncated to t5_seq_len.
         let mut t5_ids: Vec<u32> = self
@@ -441,6 +497,79 @@ mod tests {
         cfg.clip_concat_dim = 999; // != 768 + 1280
         let enc = fixture(&cfg, 1);
         assert!(aggregate(&cfg, &enc).is_err());
+    }
+
+    /// Build a tiny WordLevel [`Tokenizer`] whose vocab maps the given `(token, id)` pairs — enough to
+    /// exercise `resolve_clip_pad_id`'s string→id lookup without a real CLIP snapshot.
+    fn tiny_tokenizer(dir: &std::path::Path, pairs: &[(&str, u32)]) -> tokenizers::Tokenizer {
+        use tokenizers::models::wordlevel::WordLevel;
+        // Build a WordLevel model from a temp `vocab.json` (avoids the builder's `ahash::AHashMap`
+        // vocab type, which isn't a direct dep here). The vocab just needs the pad/eos strings.
+        let vocab_json: String = format!(
+            "{{{}}}",
+            pairs
+                .iter()
+                .map(|(t, i)| format!("{}:{i}", serde_json::to_string(t).unwrap()))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let vocab_path = dir.join("vocab.json");
+        std::fs::write(&vocab_path, vocab_json).unwrap();
+        let wl = WordLevel::from_file(vocab_path.to_str().unwrap(), "<unk>".into()).unwrap();
+        tokenizers::Tokenizer::new(wl)
+    }
+
+    /// `resolve_clip_pad_id` (sc-9076) reads each encoder's `tokenizer_config.json` `pad_token` and
+    /// maps it through the vocab: bigG's `!` → 0, L's `<|endoftext|>` → 49407; missing config/token
+    /// falls back to eos. The pre-fix hardcoded-eos behaviour padded bigG with 49407 (wrong).
+    #[test]
+    fn resolve_clip_pad_id_reads_per_encoder_pad_token() {
+        let dir = std::env::temp_dir().join(format!("sd3_pad_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tok = tiny_tokenizer(&dir, &[("<unk>", 1), ("!", 0), ("<|endoftext|>", 49407)]);
+
+        // bigG-style config: pad_token = "!" (a bare string) -> id 0.
+        std::fs::write(dir.join("tokenizer_config.json"), r#"{"pad_token":"!"}"#).unwrap();
+        assert_eq!(
+            resolve_clip_pad_id(&dir, &tok, 49407),
+            0,
+            "bigG pads with ! (0)"
+        );
+
+        // L-style config: pad_token = "<|endoftext|>" -> id 49407 (== eos).
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"pad_token":"<|endoftext|>"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_clip_pad_id(&dir, &tok, 49407),
+            49407,
+            "L pads with eos"
+        );
+
+        // AddedToken-object shaped pad_token (`{"content": "!"}`) -> id 0.
+        std::fs::write(
+            dir.join("tokenizer_config.json"),
+            r#"{"pad_token":{"content":"!","lstrip":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_clip_pad_id(&dir, &tok, 49407),
+            0,
+            "object-shaped pad_token"
+        );
+
+        // No config file -> fall back to eos.
+        std::fs::remove_file(dir.join("tokenizer_config.json")).unwrap();
+        assert_eq!(
+            resolve_clip_pad_id(&dir, &tok, 49407),
+            49407,
+            "missing config -> eos fallback"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `fit_clip_tokens` pads short rows to 77 and hard-truncates long rows, keeping an EOS in the
