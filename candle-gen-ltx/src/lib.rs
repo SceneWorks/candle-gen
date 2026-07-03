@@ -84,10 +84,12 @@ struct Pipeline {
     vocoder_cfg: VocoderConfig,
     root: PathBuf,
     device: Device,
+    /// Gemma-encoder override from `LoadSpec::text_encoder` (sc-8827); see [`Pipeline::gemma_dir`].
+    gemma_override: Option<PathBuf>,
 }
 
 impl Pipeline {
-    fn load(root: &Path, device: &Device) -> Self {
+    fn load(root: &Path, device: &Device, gemma_override: Option<PathBuf>) -> Self {
         Self {
             av_cfg: AvConfig::ltx_2_3(),
             gemma_cfg: GemmaConfig::gemma_3_12b(),
@@ -97,6 +99,7 @@ impl Pipeline {
             vocoder_cfg: VocoderConfig::ltx_2_3(),
             root: root.to_path_buf(),
             device: device.clone(),
+            gemma_override,
         }
     }
 
@@ -146,8 +149,18 @@ impl Pipeline {
             .expect("cands non-empty"))
     }
 
-    /// The Gemma-3-12B encoder snapshot dir (`LTX_GEMMA_DIR`, or `<root>/text_encoder`).
+    /// The Gemma-3-12B encoder snapshot dir. A `LoadSpec::text_encoder` override (sc-8827) wins; then
+    /// `$LTX_GEMMA_DIR`; then `<root>/text_encoder`.
     fn gemma_dir(&self) -> CResult<PathBuf> {
+        if let Some(p) = &self.gemma_override {
+            if !p.is_dir() {
+                return Err(CandleError::Msg(format!(
+                    "ltx: LoadSpec text_encoder path is not a directory: {}",
+                    p.display()
+                )));
+            }
+            return Ok(p.clone());
+        }
         if let Ok(p) = std::env::var("LTX_GEMMA_DIR") {
             return Ok(PathBuf::from(p));
         }
@@ -316,6 +329,9 @@ pub struct LtxGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: Device,
+    /// Optional Gemma-encoder snapshot dir from `LoadSpec::text_encoder` (sc-8827); overrides the
+    /// `$LTX_GEMMA_DIR` env var / `<root>/text_encoder` fallback in [`Pipeline::gemma_dir`].
+    gemma_override: Option<PathBuf>,
     components: Mutex<Option<Components>>,
 }
 
@@ -380,7 +396,7 @@ impl Generator for LtxGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = Pipeline::load(&self.root, &self.device);
+        let pipe = Pipeline::load(&self.root, &self.device, self.gemma_override.clone());
         let components = self.components(&pipe)?;
         let (frames, fps, audio) = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Video { frames, fps, audio })
@@ -451,11 +467,18 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             "candle ltx does not support image / I2V conditioning yet (txt2video only)".into(),
         ));
     }
+    // sc-8827: the Gemma encoder location may ride the spec (`LoadSpec::text_encoder`) so the caller
+    // does not have to mutate the process-global `$LTX_GEMMA_DIR`; `None` keeps the env / `<root>`
+    // fallback in `gemma_dir`.
+    let gemma_override = spec.text_encoder.as_ref().map(|src| match src {
+        WeightsSource::Dir(p) | WeightsSource::File(p) => p.clone(),
+    });
     let device = candle_gen::default_device()?;
     Ok(Box::new(LtxGenerator {
         descriptor: descriptor(),
         root,
         device,
+        gemma_override,
         components: Mutex::new(None),
     }))
 }
@@ -486,6 +509,31 @@ mod tests {
     }
 
     #[test]
+    fn gemma_dir_prefers_spec_text_encoder_over_env() {
+        // sc-8827: a `LoadSpec::text_encoder` override drives the Gemma-encoder location, so the
+        // worker does not have to mutate the process-global `$LTX_GEMMA_DIR`. An existing dir is
+        // returned as-is (ahead of any env value); a nonexistent override errors with the spec-side
+        // message. Uses a unique env value that is NOT a real dir so a fallthrough would differ.
+        let real = std::env::temp_dir().join("ltx_gemma_spec_ok");
+        let _ = std::fs::create_dir_all(&real);
+        let pipe = Pipeline::load(
+            Path::new("/nonexistent/root"),
+            &Device::Cpu,
+            Some(real.clone()),
+        );
+        assert_eq!(pipe.gemma_dir().unwrap(), real);
+        std::fs::remove_dir_all(&real).ok();
+
+        let bad = Pipeline::load(
+            Path::new("/nonexistent/root"),
+            &Device::Cpu,
+            Some(PathBuf::from("/nonexistent/ltx_gemma")),
+        );
+        let err = bad.gemma_dir().unwrap_err().to_string();
+        assert!(err.contains("LoadSpec text_encoder"), "got: {err}");
+    }
+
+    #[test]
     fn ltx_checkpoint_selects_base_distilled_and_eros_bf16() {
         // Helper: a temp dir seeded with `files`, then `ltx_checkpoint()`'s chosen file name.
         let pick = |tag: &str, files: &[&str]| -> String {
@@ -495,7 +543,7 @@ mod tests {
             for f in files {
                 std::fs::write(dir.join(f), b"x").unwrap();
             }
-            let pipe = Pipeline::load(&dir, &Device::Cpu);
+            let pipe = Pipeline::load(&dir, &Device::Cpu, None);
             let got = pipe.ltx_checkpoint().unwrap();
             let name = got.file_name().unwrap().to_str().unwrap().to_owned();
             std::fs::remove_dir_all(&dir).unwrap();
