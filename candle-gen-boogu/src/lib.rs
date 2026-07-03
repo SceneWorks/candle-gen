@@ -218,8 +218,11 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: 2048,
             max_count: 8,
             mac_only: false,
-            // Story-1 slice is dense bf16; load-time Q4/Q8 quant gating is sc-7524 worker wiring.
-            supported_quants: &[] as &[Quant],
+            // sc-9607: advertise the packed tiers so the worker's A-B quant toggle engages off-Mac.
+            // The resolved `base/`-`-q4/`-`-bf16/` turnkey subdir self-describes its tier
+            // (`loader::linear_detect`, sc-9410, group-size-aware); `build` no-ops the requested quant.
+            // Turbo + edit inherit this via `descriptor()`.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
         },
@@ -273,12 +276,10 @@ fn build(
             descriptor.id
         )));
     }
-    if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle {} does not yet support on-the-fly Q4/Q8 quantization (load bf16 weights)",
-            descriptor.id
-        )));
-    }
+    // sc-9607: `spec.quantize` (Q4/Q8) is ACCEPTED and no-ops — the resolved per-tier turnkey is
+    // already MLX-packed and `loader::linear_detect` builds each `QLinear::Quantized` straight from the
+    // packed parts (sc-9410, group-size-aware), so no on-the-fly quant pass runs. Advertising
+    // `supported_quants` lets the worker's A-B tier toggle engage; the requested quant is recipe-only.
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {} does not support ControlNet / IP-Adapter overlays",
@@ -344,10 +345,17 @@ mod tests {
         assert!(b.capabilities.supports_guidance);
         assert!(!b.capabilities.supports_negative_prompt);
         assert!(b.capabilities.conditioning.is_empty());
+        // sc-9607: packed tiers advertised so the worker A-B toggle engages; turbo + edit inherit it.
+        assert_eq!(b.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         let t = descriptor_turbo();
         assert_eq!(t.id, BOOGU_IMAGE_TURBO_ID);
         assert!(!t.capabilities.supports_guidance);
         assert_eq!(t.capabilities.samplers, TURBO_SAMPLERS.to_vec());
+        assert_eq!(t.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert_eq!(
+            descriptor_edit().capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8]
+        );
     }
 
     #[test]
@@ -499,11 +507,6 @@ mod tests {
         ]);
         assert!(matches!(
             load(&lora).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
-        let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load(&quant).err().expect("err"),
             gen_core::Error::Unsupported(_)
         ));
     }

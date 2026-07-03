@@ -156,7 +156,10 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: RES_MAX,
             max_count: 8,
             mac_only: false,
-            supported_quants: &[] as &[Quant],
+            // sc-9607: advertise the packed tiers so the worker's `resolve_quant` / A-B quant toggle
+            // engages off-Mac (the resolved q4/q8 turnkey subdir self-describes; `build` no-ops the
+            // requested quant — see below). Both quality + turbo share this via `descriptor_turbo`.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
         },
@@ -187,22 +190,21 @@ fn build(
             )));
         }
     };
-    // User adapters / on-the-fly quant / ControlNet+IP-Adapter overlays are not wired (the turbo LoRA
-    // is bundled in the snapshot and installed internally). img2img/Remix + mask inpaint edit is NOT a
-    // LoadSpec overlay — it arrives as per-request `Reference`/`Mask` conditioning (sc-6598), handled
-    // in the pipeline, so it is unaffected by these load-time rejects.
+    // User adapters / ControlNet+IP-Adapter overlays are not wired (the turbo LoRA is bundled in the
+    // snapshot and installed internally). img2img/Remix + mask inpaint edit is NOT a LoadSpec overlay —
+    // it arrives as per-request `Reference`/`Mask` conditioning (sc-6598), handled in the pipeline, so
+    // it is unaffected by these load-time rejects.
     if !spec.adapters.is_empty() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {} does not accept user LoRA/LoKr (the TurboTime LoRA is bundled)",
             descriptor.id
         )));
     }
-    if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle {} does not support on-the-fly Q4/Q8 quantization (load bf16 weights)",
-            descriptor.id
-        )));
-    }
+    // sc-9607: `spec.quantize` (Q4/Q8) is ACCEPTED and is a no-op. The per-tier turnkey is already
+    // MLX-packed; `loader::linear_detect` builds each `QLinear::Quantized` straight from the packed
+    // parts (sc-9412), so the resolved q4/q8 subdir self-describes its tier and no on-the-fly quant
+    // pass runs (there is no post-load `.quantize()` to double-quantize). Advertising `supported_quants`
+    // lets the worker's A-B tier toggle engage; the requested quant is carried for the recipe only.
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {} does not support ControlNet / IP-Adapter overlays (img2img/mask edit is \
@@ -262,6 +264,12 @@ mod tests {
         let q = descriptor();
         assert!(q.capabilities.supports_guidance);
         assert!(!q.capabilities.supports_negative_prompt);
+        // sc-9607: advertises the packed tiers so the worker A-B toggle engages (turbo inherits it).
+        assert_eq!(q.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+        assert_eq!(
+            descriptor_turbo().capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8]
+        );
         // Edit surface (sc-6598): img2img Reference + inpaint Mask.
         assert!(q.capabilities.accepts(ConditioningKind::Reference));
         assert!(q.capabilities.accepts(ConditioningKind::Mask));
@@ -393,11 +401,6 @@ mod tests {
         ]);
         assert!(matches!(
             load(&lora).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
-        let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load(&quant).err().expect("err"),
             gen_core::Error::Unsupported(_)
         ));
     }

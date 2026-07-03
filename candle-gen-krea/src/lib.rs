@@ -17,8 +17,9 @@
 //! ([`schedule`]) are ported here.
 //!
 //! `backend = "candle"`, `mac_only = false`. Apache-2.0; Krea 2 Community License (non-commercial use
-//! satisfies it). The Q4/Q8 turnkey + worker quant gating is sc-7581; the Story-1 slice loads dense
-//! bf16.
+//! satisfies it). The packed q4/q8/bf16 turnkey loads per-tier via `loader::linear_detect` (sc-9411);
+//! the descriptor advertises `supported_quants: [Q4, Q8]` so the worker's A-B quant toggle engages
+//! (sc-9607).
 
 pub mod adapters;
 pub mod config;
@@ -154,7 +155,7 @@ pub fn descriptor() -> ModelDescriptor {
             conditioning: Vec::new(),
             // LoRA/LoKr wired (sc-7836): a trained `krea_2_raw` adapter merges into the dense DiT
             // attention projections at load ([`adapters::merge_into_weights`]), closing the candle
-            // train→infer loop. On-the-fly Q4/Q8 quantization is still deferred (rejected at load).
+            // train→infer loop.
             supports_lora: true,
             supports_lokr: true,
             // Rectified-flow v-param over the unified curated-sampler framework (epic 7114). The
@@ -166,8 +167,10 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: RES_MAX,
             max_count: MAX_COUNT,
             mac_only: false,
-            // Story-1 slice is dense bf16; the Q4/Q8 turnkey + load-time quant gating is sc-7581.
-            supported_quants: &[] as &[Quant],
+            // sc-9607: advertise the packed tiers so the worker's A-B quant toggle engages off-Mac.
+            // The resolved q4/q8/bf16 turnkey subdir self-describes its tier (`loader::linear_detect`,
+            // sc-9411); `build` no-ops the requested quant, and it composes with a merged LoRA overlay.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
         },
@@ -187,13 +190,11 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
     };
     // LoRA/LoKr adapters are accepted and merged into the DiT at first `generate` (sc-7836); the merge
     // (`adapters::merge_into_weights`) is lazy, so a nonexistent adapter path still loads here.
-    if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle {} does not yet support on-the-fly Q4/Q8 quantization (load bf16 weights); the \
-             packed turnkey is sc-7581",
-            descriptor.id
-        )));
-    }
+    //
+    // sc-9607: `spec.quantize` (Q4/Q8) is ACCEPTED and no-ops — the resolved per-tier turnkey is
+    // already MLX-packed and `loader::linear_detect` builds each `QLinear::Quantized` straight from the
+    // packed parts (sc-9411), composing with the adapter overlay (an adapter-merged projection stays
+    // dense and takes priority). No on-the-fly quant pass runs; the requested quant is recipe-only.
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {} does not support ControlNet / IP-Adapter overlays",
@@ -245,10 +246,10 @@ mod tests {
         assert!(!d.capabilities.supports_guidance);
         assert!(!d.capabilities.supports_negative_prompt);
         assert!(d.capabilities.conditioning.is_empty());
-        // LoRA/LoKr merge wired (sc-7836); on-the-fly quant still deferred.
+        // LoRA/LoKr merge wired (sc-7836); packed Q4/Q8 tiers advertised (sc-9607).
         assert!(d.capabilities.supports_lora);
         assert!(d.capabilities.supports_lokr);
-        assert!(d.capabilities.supported_quants.is_empty());
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert_eq!(d.capabilities.max_size, 2048);
         assert_eq!(TURBO_STEPS, 8);
     }
@@ -319,11 +320,12 @@ mod tests {
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
         assert!(load(&lora).is_ok(), "LoRA load is wired + lazy (sc-7836)");
-        // On-the-fly quantization is still deferred — a typed `Unsupported` so the worker can fall back.
+        // sc-9607: a Q4/Q8 `spec.quantize` is now ACCEPTED (a no-op on the already-packed tier) — load
+        // proceeds past the quant check and constructs lazily, exactly like the LoRA case above.
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load(&quant).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(
+            load(&quant).is_ok(),
+            "Q4/Q8 quant is accepted + lazy (sc-9607)"
+        );
     }
 }
