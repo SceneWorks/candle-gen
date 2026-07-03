@@ -37,10 +37,32 @@ pub fn extract_and_compress_mask_to_latent(
     temporal_stride: usize,
 ) -> Result<Tensor> {
     let (_c, t, h, w) = mask.dims4()?;
-    assert!(
-        h % 8 == 0 && w % 8 == 0,
-        "scail2 mask: H,W must be divisible by 8 (got {h}x{w})"
-    );
+    // Public boundary: return typed errors on caller-supplied shape/stride mismatches rather than
+    // aborting the process (assert) or surfacing an opaque candle reshape failure (sc-9025 / F-041).
+    if h % 8 != 0 || w % 8 != 0 {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "scail2 mask: H,W must be divisible by 8 (got {h}x{w})"
+        )));
+    }
+    if temporal_stride == 0 {
+        return Err(candle_gen::candle_core::Error::Msg(
+            "scail2 mask: temporal_stride must be >= 1 (got 0)".to_string(),
+        ));
+    }
+    if t == 0 {
+        return Err(candle_gen::candle_core::Error::Msg(
+            "scail2 mask: temporal dimension T must be >= 1 (got 0)".to_string(),
+        ));
+    }
+    // The temporal pack stacks `stride` frames into the channel axis, so the padded frame count
+    // (`stride + (t-1)`) must be a whole multiple of `stride`, i.e. `(t-1) % stride == 0`. Otherwise
+    // the reshape below would fail with an opaque candle shape error.
+    if (t - 1) % temporal_stride != 0 {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "scail2 mask: (T-1) must be divisible by temporal_stride \
+             (got T={t}, temporal_stride={temporal_stride})"
+        )));
+    }
 
     // (3, T, H, W) → (T, 3, H, W), threshold each channel to {0,1}.
     let m = mask
@@ -111,5 +133,32 @@ mod tests {
             &v[..7]
         );
         assert!(v[0].abs() < 1e-5, "white class should be off");
+    }
+
+    /// The public boundary must return a typed `Err` (not panic) on a mask whose spatial dims are
+    /// not divisible by 8 (sc-9025 / F-041).
+    #[test]
+    fn rejects_non_divisible_spatial_dims() {
+        let dev = Device::Cpu;
+        let mask = Tensor::zeros((3, 1, 7, 8), DType::F32, &dev).unwrap(); // H=7 not %8
+        let err = extract_and_compress_mask_to_latent(&mask, TEMPORAL_STRIDE).unwrap_err();
+        assert!(
+            err.to_string().contains("divisible by 8"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The public boundary must return a typed `Err` (not an opaque candle reshape error) on a
+    /// temporal length that does not align to the stride (sc-9025 / F-041).
+    #[test]
+    fn rejects_misaligned_temporal_length() {
+        let dev = Device::Cpu;
+        // T=3, stride=4 → (T-1) % stride == 2 != 0, so the temporal pack cannot tile cleanly.
+        let mask = Tensor::zeros((3, 3, 8, 8), DType::F32, &dev).unwrap();
+        let err = extract_and_compress_mask_to_latent(&mask, TEMPORAL_STRIDE).unwrap_err();
+        assert!(
+            err.to_string().contains("divisible by temporal_stride"),
+            "unexpected error: {err}"
+        );
     }
 }

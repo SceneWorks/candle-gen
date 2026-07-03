@@ -10,7 +10,7 @@
 //! → `cv2.warpAffine(img, M, (112,112), borderValue=0)`). The gate is the downstream embedding cosine.
 
 use candle_gen::candle_core::{Device, Tensor};
-use candle_gen::Result;
+use candle_gen::{CandleError, Result};
 
 /// insightface `arcface_dst` 112² template (L-eye, R-eye, nose, L-mouth, R-mouth).
 pub const ARCFACE_DST: [[f64; 2]; 5] = [
@@ -196,12 +196,15 @@ pub fn warp_affine(
     out_h: usize,
     out_w: usize,
     border: [u8; 3],
-) -> Vec<u8> {
-    assert!(
-        src.len() >= in_h * in_w * 3,
-        "warp_affine: src buffer of {} bytes too small for {in_h}×{in_w}×3",
-        src.len()
-    );
+) -> Result<Vec<u8>> {
+    // Public boundary: reject an undersized source buffer with a typed error rather than
+    // aborting the process on caller-supplied input (sc-9025 / F-041).
+    if src.len() < in_h * in_w * 3 {
+        return Err(CandleError::Msg(format!(
+            "warp_affine: src buffer of {} bytes too small for {in_h}×{in_w}×3",
+            src.len()
+        )));
+    }
     let im = forward.invert().0; // src_x = im0·x+im1·y+im2 ; src_y = im3·x+im4·y+im5
     let adelta: Vec<i64> = (0..out_w as i64)
         .map(|x| cv_round(im[0] * x as f64 * AB_SCALE))
@@ -243,18 +246,23 @@ pub fn warp_affine(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// insightface `norm_crop`: 5-pt kps → 112² aligned RGB `u8` crop (the ArcFace input image,
 /// `borderValue=0`). Feed [`to_arcface_input`] then [`crate::iresnet::ArcFace::forward`].
-pub fn norm_crop(src: &[u8], in_h: usize, in_w: usize, kps: &[[f32; 2]; 5]) -> Vec<u8> {
+pub fn norm_crop(src: &[u8], in_h: usize, in_w: usize, kps: &[[f32; 2]; 5]) -> Result<Vec<u8>> {
     warp_affine(src, in_h, in_w, &estimate_norm(kps), 112, 112, [0, 0, 0])
 }
 
 /// facexlib `align_warp_face` equivalent: 5-pt kps → 512² aligned RGB `u8` crop against the FFHQ
 /// template (gray border). The EVA-CLIP / parsing crop for PuLID (sc-5492; tolerant path).
-pub fn align_face_512(src: &[u8], in_h: usize, in_w: usize, kps: &[[f32; 2]; 5]) -> Vec<u8> {
+pub fn align_face_512(
+    src: &[u8],
+    in_h: usize,
+    in_w: usize,
+    kps: &[[f32; 2]; 5],
+) -> Result<Vec<u8>> {
     let m = estimate_similarity(kps, &FACEXLIB_DST_512);
     warp_affine(src, in_h, in_w, &m, 512, 512, FACEXLIB_BORDER_RGB)
 }
@@ -314,15 +322,19 @@ mod tests {
             *v = (i % 251) as u8;
         }
         let id = Affine2x3([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
-        let out = warp_affine(&src, 8, 8, &id, 8, 8, [0, 0, 0]);
+        let out = warp_affine(&src, 8, 8, &id, 8, 8, [0, 0, 0]).unwrap();
         assert_eq!(out, src, "identity warp must be lossless");
     }
 
+    /// The public boundary must return a typed `Err` (not panic) on an undersized buffer (sc-9025).
     #[test]
-    #[should_panic(expected = "too small for 8×8×3")]
     fn warp_affine_rejects_undersized_buffer() {
         let src = vec![0u8; 8 * 8 * 3 - 1];
         let id = Affine2x3([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
-        let _ = warp_affine(&src, 8, 8, &id, 8, 8, [0, 0, 0]);
+        let err = warp_affine(&src, 8, 8, &id, 8, 8, [0, 0, 0]).unwrap_err();
+        assert!(
+            err.to_string().contains("too small for 8×8×3"),
+            "unexpected error: {err}"
+        );
     }
 }

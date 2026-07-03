@@ -592,13 +592,15 @@ impl LensTransformer {
         h: usize,
         w: usize,
     ) -> Result<Tensor> {
-        assert_eq!(
-            text_feats.len(),
-            self.cfg.num_text_layers,
-            "expected {} text-feature layers, got {}",
-            self.cfg.num_text_layers,
-            text_feats.len()
-        );
+        // Public boundary: return a typed error rather than aborting the process on a
+        // caller-supplied text-feature count mismatch (sc-9025 / F-041).
+        if text_feats.len() != self.cfg.num_text_layers {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "lens transformer forward: expected {} text-feature layers, got {}",
+                self.cfg.num_text_layers,
+                text_feats.len()
+            )));
+        }
         let img_len = hidden_states.dim(1)?;
         let txt_len = text_feats[0].dim(1)?;
 
@@ -666,6 +668,50 @@ pub fn build_joint_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::candle_nn::VarMap;
+
+    /// A tiny Lens-shaped DiT config (1 text layer) — enough to build a real `LensTransformer` on CPU
+    /// so the public-boundary text-feature guard can be exercised without loading real weights.
+    fn tiny_cfg() -> LensDitConfig {
+        LensDitConfig {
+            patch_size: 2,
+            in_channels: 32,
+            out_channels: 8,
+            num_layers: 1,
+            num_heads: 2,
+            head_dim: 8,
+            inner_dim: 16,
+            enc_hidden_dim: 12,
+            num_text_layers: 1,
+            timestep_channels: 16,
+            axes_dims_rope: [2, 2, 4],
+            rope_theta: 10_000.0,
+        }
+    }
+
+    /// The public `forward` must return a typed `Err` (not panic/abort) when the caller supplies the
+    /// wrong number of text-feature layers (sc-9025 / F-041).
+    #[test]
+    fn forward_rejects_wrong_text_feature_count() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let dit = LensTransformer::new(&cfg, vb).unwrap();
+        let (h, w) = (2usize, 2usize);
+        let img_len = h * w;
+        let hidden = Tensor::zeros((1, img_len, cfg.in_channels), DType::F32, &dev).unwrap();
+        // cfg.num_text_layers == 1, but pass two layers → must error, not panic.
+        let feat = Tensor::zeros((1, 3, cfg.enc_hidden_dim), DType::F32, &dev).unwrap();
+        let err = dit
+            .forward(&hidden, &[feat.clone(), feat], None, 0.5, 1, h, w)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected 1 text-feature layers, got 2"),
+            "unexpected error: {err}"
+        );
+    }
 
     #[test]
     fn chunked_attention_matches_single_pass() {

@@ -43,13 +43,16 @@ pub fn resize_bilinear_cv2(
     in_w: usize,
     out_h: usize,
     out_w: usize,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     const C: usize = 3;
-    assert!(
-        src.len() >= in_h * in_w * C,
-        "resize_bilinear_cv2: src buffer of {} bytes too small for {in_h}×{in_w}×3",
-        src.len()
-    );
+    // Public boundary: reject an undersized source buffer with a typed error rather than
+    // aborting the process on caller-supplied input (sc-9025 / F-041).
+    if src.len() < in_h * in_w * C {
+        return Err(CandleError::Msg(format!(
+            "resize_bilinear_cv2: src buffer of {} bytes too small for {in_h}×{in_w}×3",
+            src.len()
+        )));
+    }
     const BITS: i64 = 11;
     const SCALE: f64 = (1i64 << BITS) as f64; // 2048
 
@@ -113,18 +116,21 @@ pub fn resize_bilinear_cv2(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Build the SCRFD detector blob from an RGB `u8` image: insightface-faithful resize-to-fit 640
 /// (aspect-preserving) → top-left pad to 640² → `(rgb − 127.5) / 128`. Returns the **NCHW**
 /// `[1,3,640,640]` f32 blob (MLX returns NHWC) and `det_scale` (= `new_h / h`).
 pub fn detector_blob(img: &[u8], h: usize, w: usize, device: &Device) -> Result<(Tensor, f32)> {
-    assert!(
-        img.len() >= h * w * 3,
-        "detector_blob: img buffer of {} bytes too small for {h}×{w}×3",
-        img.len()
-    );
+    // Public boundary: reject an undersized image buffer with a typed error rather than
+    // aborting the process on caller-supplied input (sc-9025 / F-041).
+    if img.len() < h * w * 3 {
+        return Err(CandleError::Msg(format!(
+            "detector_blob: img buffer of {} bytes too small for {h}×{w}×3",
+            img.len()
+        )));
+    }
     let det = DET_SIZE;
     let im_ratio = h as f64 / w as f64;
     let (new_w, new_h) = if im_ratio > 1.0 {
@@ -143,7 +149,7 @@ pub fn detector_blob(img: &[u8], h: usize, w: usize, device: &Device) -> Result<
         )));
     }
     let det_scale = new_h as f32 / h as f32;
-    let resized = resize_bilinear_cv2(img, h, w, new_h, new_w);
+    let resized = resize_bilinear_cv2(img, h, w, new_h, new_w)?;
 
     // top-left into a 640² canvas; normalize (rgb-127.5)/128.
     let norm = |v: u8| (v as f32 - 127.5) / 128.0;
@@ -217,7 +223,7 @@ impl FaceAnalysis {
     /// Align + ArcFace-embed a single [`detect`](Self::detect) result into a [`Face`] — one
     /// `[1,3,112,112]` recognition forward (embed-on-demand for the largest face).
     pub fn embed(&self, img: &[u8], h: usize, w: usize, det: &Detection) -> Result<Face> {
-        let crop = align::norm_crop(img, h, w, &det.kps);
+        let crop = align::norm_crop(img, h, w, &det.kps)?;
         let emb = self
             .arcface
             .forward(&align::to_arcface_input(&[crop], &self.device)?)?;
@@ -240,7 +246,7 @@ impl FaceAnalysis {
         let crops: Vec<Vec<u8>> = dets
             .iter()
             .map(|d| align::norm_crop(img, h, w, &d.kps))
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let emb = self
             .arcface
             .forward(&align::to_arcface_input(&crops, &self.device)?)?;
@@ -271,7 +277,7 @@ impl FaceAnalysis {
         let parser = self.parser.as_ref().ok_or_else(|| {
             CandleError::Msg("face_features_image requires a BiSeNet parser (with_parser)".into())
         })?;
-        let crop = align::align_face_512(img, h, w, &face.kps); // 512² RGB u8
+        let crop = align::align_face_512(img, h, w, &face.kps)?; // 512² RGB u8
         let rgb01 = u8_to_rgb01_nchw(&crop, 512, 512, &self.device)?;
         let mask = parser.parse_mask(&bisenet::to_parse_input(&rgb01)?)?;
         bisenet::face_features_image(&rgb01, &mask)
@@ -290,17 +296,21 @@ fn u8_to_rgb01_nchw(crop: &[u8], h: usize, w: usize, device: &Device) -> Result<
 mod tests {
     use super::*;
 
+    /// The public boundary must return a typed `Err` (not panic) on an undersized buffer (sc-9025).
     #[test]
-    #[should_panic(expected = "too small for 4×4×3")]
     fn resize_rejects_undersized_buffer() {
         let src = vec![0u8; 4 * 4 * 3 - 1];
-        let _ = resize_bilinear_cv2(&src, 4, 4, 8, 8);
+        let err = resize_bilinear_cv2(&src, 4, 4, 8, 8).unwrap_err();
+        assert!(
+            err.to_string().contains("too small for 4×4×3"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
     fn resize_same_size_is_identity() {
         let src: Vec<u8> = (0..5 * 3 * 3).map(|i| (i * 37 % 256) as u8).collect();
-        let out = resize_bilinear_cv2(&src, 5, 3, 5, 3);
+        let out = resize_bilinear_cv2(&src, 5, 3, 5, 3).unwrap();
         assert_eq!(out, src);
     }
 
@@ -308,7 +318,7 @@ mod tests {
     fn resize_constant_preserved_on_tall_downscale() {
         let (in_h, w) = (200usize, 4usize);
         let src = vec![123u8; in_h * w * 3];
-        let out = resize_bilinear_cv2(&src, in_h, w, 8, w);
+        let out = resize_bilinear_cv2(&src, in_h, w, 8, w).unwrap();
         assert_eq!(out.len(), 8 * w * 3);
         assert!(out.iter().all(|&v| v == 123), "constant must be preserved");
     }
