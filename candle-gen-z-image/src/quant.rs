@@ -14,94 +14,28 @@
 //! The dense path is byte-identical to the stock `candle-transformers` model (the parity tests pin it).
 //!
 //! **The packed forward dequantizes the weight into a dense matmul (sc-7702)** — it does *not* take
-//! candle's int8 `QMatMul` fast path (`fast_mmq`), so a Q4 denoise stays coherent. The compute path is
-//! the shared [`candle_gen::quant::QLinear`]/`QEmbedding`, which already own that behavior; this module
-//! is only the thin dense-or-packed **enum + detect** wrapper the vendored DiT/TE build their
-//! projections from (mirroring `candle-gen-flux2/src/quant.rs`).
+//! candle's int8 `QMatMul` fast path (`fast_mmq`), so a Q4 denoise stays coherent. The whole
+//! `Dense | Quantized` Linear seam now lives once in `candle-gen` (F-025 / sc-9005): Z-Image's packed
+//! projections load through the shared [`candle_gen::quant::QLinear`]'s
+//! [`MatmulStrategy::DequantDense`](candle_gen::quant::MatmulStrategy::DequantDense) arm, which owns
+//! that behavior. This module re-exports that shared `QLinear` under the crate-local name the vendored
+//! DiT / TE build their projections from, and keeps the thin dense-or-packed [`QEmbedding`] wrapper +
+//! the [`dequant_packed_to_dense`] VAE helper the packed loaders need.
+//!
+//! Z-Image has no *dense-tier on-the-fly* quant path (the only quantized tier is the pre-packed MLX
+//! one), so — like the FLUX.1 seam and unlike the flux2 seam — this crate never folds a dense weight;
+//! it only packed-detects. The [`QLinear::quantize`] / `quantize_onto` folds on the shared type are
+//! simply never called here.
 
 use candle_gen::candle_core::{Device, Result, Tensor};
-use candle_gen::candle_nn::{Embedding, Linear, Module, VarBuilder};
+use candle_gen::candle_nn::{Embedding, Module, VarBuilder};
 use candle_gen::quant as shared;
 
-/// A Linear projection that is **dense** (the loaded bf16 weight) or **packed** (loaded straight from an
-/// MLX-packed tier via the shared [`candle_gen::quant::QLinear`], sc-9408). Built dense
-/// ([`Self::linear`] / [`Self::linear_no_bias`]) or packed-detected ([`Self::linear_detect`]); the two
-/// forwards both compute `x·Wᵀ + b`. Z-Image has no *dense-tier on-the-fly* quant path (the only
-/// quantized tier is the pre-packed MLX one), so — unlike the flux2 seam — there is no
-/// `quantize_onto`/`Quantized` fold arm here.
-pub enum QLinear {
-    Dense(Linear),
-    /// Loaded directly from an MLX-packed tier through the shared module — the resident `Q4_1`/`Q8_0`
-    /// weight **dequantizes-on-forward** into a dense matmul (sc-7702, *not* the int8 `QMatMul` fast
-    /// path).
-    Packed(shared::QLinear),
-}
-
-impl QLinear {
-    /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`).
-    pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        Ok(Self::Dense(candle_gen::candle_nn::linear(
-            in_dim, out_dim, vb,
-        )?))
-    }
-
-    /// A bias-less dense `[out, in]` projection from `vb` (`{prefix}.weight`).
-    pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        Ok(Self::Dense(candle_gen::candle_nn::linear_no_bias(
-            in_dim, out_dim, vb,
-        )?))
-    }
-
-    /// **Packed-detecting** `[out, in]` loader (sc-9408): if `{base}.scales` is present in `vb` (a
-    /// pre-quantized MLX tier), build a [`Self::Packed`] straight from the packed parts on `vb`'s device
-    /// via the shared [`candle_gen::quant::lin`] — **no dense weight is materialized**. Otherwise the
-    /// **dense** path is taken unchanged (`{base}.weight` [+ `{base}.bias`]).
-    ///
-    /// `base` is the full dotted key prefix (e.g. `attention.to_out.0`), so the `.scales`/`.biases`
-    /// siblings survive any `to_out.0`-style key nesting (the key-remap trap: build the base string
-    /// first, then detect — never `.pp()` past the scales sibling; the `linear_detect_survives_*` test
-    /// pins this on the real z-image `to_out.0` layout).
-    pub fn linear_detect(
-        in_dim: usize,
-        out_dim: usize,
-        vb: &VarBuilder,
-        base: &str,
-        bias: bool,
-    ) -> Result<Self> {
-        if vb.contains_tensor(&format!("{base}.scales")) {
-            return Ok(Self::Packed(shared::lin(vb, base, in_dim, out_dim, bias)?));
-        }
-        let sub = vb.pp(base);
-        if bias {
-            Self::linear(in_dim, out_dim, sub)
-        } else {
-            Self::linear_no_bias(in_dim, out_dim, sub)
-        }
-    }
-
-    /// `x·Wᵀ + b`. Dense delegates to `candle_nn::Linear`; packed delegates to the shared
-    /// dequant-on-forward `QLinear` (sc-7702).
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Dense(l) => l.forward(x),
-            Self::Packed(l) => l.forward(x),
-        }
-    }
-
-    /// Whether this projection loaded directly from an MLX-packed tier (the packed path). Distinguishes a
-    /// packed load from the dense path — used by the loaders + tests to assert a packed tier fired the
-    /// packed path (and did not silently fall back to dense).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn is_packed(&self) -> bool {
-        matches!(self, Self::Packed(_))
-    }
-}
-
-impl Module for QLinear {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        QLinear::forward(self, x)
-    }
-}
+// The `Dense | Quantized` Linear seam now lives once in `candle-gen` (F-025 / sc-9005). Z-Image's packed
+// projections take the shared [`MatmulStrategy::DequantDense`] arm (sc-7702-safe, no int8 activation
+// quant), built by `QLinear::linear_detect` on an MLX tier. Re-export the shared type under the
+// crate-local `QLinear` name the vendored DiT / TE reference.
+pub use candle_gen::quant::QLinear;
 
 /// A token embedding that is **dense** (`candle_nn::Embedding`) or **packed** (loaded straight from an
 /// MLX-packed tier's `embed_tokens` triple via the shared [`candle_gen::quant::QEmbedding`], sc-9408).
@@ -136,6 +70,8 @@ impl QEmbedding {
         }
     }
 
+    /// Whether this embedding loaded directly from an MLX-packed tier — used by the loaders/tests to
+    /// assert a packed tier fired the packed path (and did not silently fall back to dense).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_packed(&self) -> bool {
         matches!(self, Self::Packed(_))
@@ -143,8 +79,8 @@ impl QEmbedding {
 }
 
 /// Dequantize an MLX-packed triple (`{base}.weight` u32 + `{base}.scales` + `{base}.biases`) to a
-/// **dense** `[out, in]` tensor on `vb`'s device at `vb.dtype()` (Q4 via the exact affine grid, Q8 via
-/// the exact-grid dequant — [`candle_gen::quant::repack`]). Used only by the VAE loader
+/// **dense** `[out, in]` tensor on `device` at `out_dtype` (Q4 via the exact affine grid, Q8 via the
+/// exact-grid dequant — [`candle_gen::quant::repack`]). Used only by the VAE loader
 /// ([`crate::pipeline`]): the packed tier's VAE quantizes just the 8 tiny (512×64) mid-block attention
 /// projections, so — rather than vendor the whole 685-line `AutoEncoderKL` for negligible weights — the
 /// packed VAE weights are dequantized to dense here and handed to the **stock** VAE through a
@@ -174,6 +110,8 @@ mod tests {
     use super::*;
     use candle_gen::candle_core::safetensors::MmapedSafetensors;
     use candle_gen::candle_core::{DType, Device};
+    use candle_gen::candle_nn::Linear;
+    use candle_gen::quant::{DenseLinear, MatmulStrategy};
     use std::collections::HashMap;
 
     /// Test-side MLX Q4 packer: per-element 4-bit codes → MLX u32 words (LSB-first nibbles), group 64.
@@ -226,8 +164,9 @@ mod tests {
     /// Writes a safetensors mimicking the real z-image DiT packed layout — a `to_out.0` triple (the key
     /// remap that would silently fall back to dense if the loader `.pp()`'d past the `.scales` sibling)
     /// and a dense `to_q` sibling — and loads both through `linear_detect`. The `.scales`/`.biases`
-    /// siblings must survive the `to_out.0` base string, `to_out.0` must load `Packed`, the dense sibling
-    /// stays `Dense`, and the packed forward must reproduce the affine grid bit-exactly.
+    /// siblings must survive the `to_out.0` base string, `to_out.0` must load quantized via the
+    /// sc-7702-safe **dequant-dense** arm, the dense sibling stays `Dense`, and the packed forward must
+    /// reproduce the affine grid bit-exactly.
     #[test]
     fn linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged() -> Result<()> {
         let dev = Device::Cpu;
@@ -254,19 +193,24 @@ mod tests {
         let attn = vb.pp("attention");
 
         // `to_out.0` — packed-detected through the remapped base (never `.pp("0")` past the sibling).
+        // The packed load must take the sc-7702-safe dequant-dense arm, NOT the int8-fast fold arm.
         let packed = QLinear::linear_detect(in_dim, out_dim, &attn, "to_out.0", false)?;
-        assert!(packed.is_packed(), "`.scales` under to_out.0 ⇒ packed load");
+        assert_eq!(
+            packed.matmul_strategy(),
+            Some(MatmulStrategy::DequantDense),
+            "`.scales` under to_out.0 ⇒ packed dequant-dense load"
+        );
 
         // `to_q` — dense (no `.scales`), path unchanged.
         let dense = QLinear::linear_detect(in_dim, out_dim, &attn, "to_q", false)?;
-        assert!(!dense.is_packed(), "no `.scales` ⇒ dense path unchanged");
+        assert!(!dense.is_quantized(), "no `.scales` ⇒ dense path unchanged");
         assert!(matches!(dense, QLinear::Dense(_)));
 
         // The packed forward reproduces the affine grid (bit-exact repack + dequant-on-forward).
-        let grid_lin = QLinear::Dense(Linear::new(
+        let grid_lin = QLinear::from_dense(DenseLinear::Linear(Linear::new(
             Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
             None,
-        ));
+        )));
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");

@@ -24,10 +24,11 @@
 mod adapters;
 mod dit;
 mod pipeline;
-// The packed-load seam (sc-9408, sc-9089 umbrella): the local dense-or-packed `QLinear`/`QEmbedding`
-// wrapper over the shared `candle_gen::quant` module, plus the vendored inference DiT + Qwen3 TE that
-// build their projections from it. Used only when the snapshot is a pre-quantized MLX-packed tier
-// (`SceneWorks/z-image-turbo-mlx`); a dense snapshot keeps the stock candle-transformers models.
+// The packed-load seam (sc-9408, sc-9089 umbrella): re-exports the shared `candle_gen::quant::QLinear`
+// (F-025 / sc-9005) + the thin dense-or-packed `QEmbedding` wrapper over the shared module, plus the
+// vendored inference DiT + Qwen3 TE that build their projections from it. Used only when the snapshot is
+// a pre-quantized MLX-packed tier (`SceneWorks/z-image-turbo-mlx`); a dense snapshot keeps the stock
+// candle-transformers models.
 mod packed_dit;
 mod packed_te;
 mod quant;

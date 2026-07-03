@@ -383,15 +383,15 @@ impl JointAttention {
     /// CPU-stage path (sc-8504): quantize every projection **onto `device`** (dense never lands on the
     /// GPU) and migrate the dense-kept per-head q/k RMSNorms there too.
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        self.to_q.quantize_onto(quant, device)?;
-        self.to_k.quantize_onto(quant, device)?;
-        self.to_v.quantize_onto(quant, device)?;
-        self.to_out.quantize_onto(quant, device)?;
-        self.add_q.quantize_onto(quant, device)?;
-        self.add_k.quantize_onto(quant, device)?;
-        self.add_v.quantize_onto(quant, device)?;
+        self.to_q.quantize_dequant_onto(quant, device)?;
+        self.to_k.quantize_dequant_onto(quant, device)?;
+        self.to_v.quantize_dequant_onto(quant, device)?;
+        self.to_out.quantize_dequant_onto(quant, device)?;
+        self.add_q.quantize_dequant_onto(quant, device)?;
+        self.add_k.quantize_dequant_onto(quant, device)?;
+        self.add_v.quantize_dequant_onto(quant, device)?;
         if let Some(p) = &mut self.to_add_out {
-            p.quantize_onto(quant, device)?;
+            p.quantize_dequant_onto(quant, device)?;
         }
         self.migrate_norms_to(device)
     }
@@ -504,10 +504,10 @@ impl SelfAttention {
 
     /// CPU-stage path (sc-8504): quantize the `attn2` projections **onto `device`** + migrate q/k norms.
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        self.to_q.quantize_onto(quant, device)?;
-        self.to_k.quantize_onto(quant, device)?;
-        self.to_v.quantize_onto(quant, device)?;
-        self.to_out.quantize_onto(quant, device)?;
+        self.to_q.quantize_dequant_onto(quant, device)?;
+        self.to_k.quantize_dequant_onto(quant, device)?;
+        self.to_v.quantize_dequant_onto(quant, device)?;
+        self.to_out.quantize_dequant_onto(quant, device)?;
         for rn in [&mut self.norm_q, &mut self.norm_k].into_iter().flatten() {
             *rn = rms_norm_to(rn, RMS_EPS, device)?;
         }
@@ -551,8 +551,8 @@ impl FeedForward {
 
     /// CPU-stage path (sc-8504): quantize both projections **onto `device`** (no dense GPU transient).
     fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        self.proj.quantize_onto(quant, device)?;
-        self.out.quantize_onto(quant, device)?;
+        self.proj.quantize_dequant_onto(quant, device)?;
+        self.out.quantize_dequant_onto(quant, device)?;
         Ok(())
     }
 
@@ -846,12 +846,12 @@ impl Sd3Transformer {
     /// transient — and thus the load-time peak — is gone. Mirrors `Flux2Transformer::quantize`
     /// (sc-7457). Idempotent per `QLinear`.
     pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        // Quantized projections onto the GPU.
-        self.context_embedder.quantize_onto(quant, device)?;
+        // Quantized projections onto the GPU (dequant-dense, sc-7702-safe).
+        self.context_embedder.quantize_dequant_onto(quant, device)?;
         for block in &mut self.blocks {
             block.quantize_onto(quant, device)?;
         }
-        self.proj_out.quantize_onto(quant, device)?;
+        self.proj_out.quantize_dequant_onto(quant, device)?;
         // Dense-kept leaves migrated to the GPU.
         self.pos_embed.migrate_to(device)?;
         self.time_text_embed.migrate_to(device)?;
@@ -1473,17 +1473,21 @@ mod tests {
             let mut model = Sd3Transformer::new(&cfg, vb).unwrap();
             model.quantize_onto(quant, &gpu).unwrap();
 
-            // (a) A quantized projection is on the GPU at the expected block dtype.
+            // (a) A quantized projection is on the GPU at the expected block dtype. SD3.5 folds to the
+            // sc-7702-safe dequant-dense arm, so the weight is a `QuantWeight::Dequant(QTensor)`.
             match &model.blocks[0].attn.to_q {
-                crate::quant::QLinear::Quantized { weight, .. } => {
-                    assert!(weight.device().is_cuda(), "quantized leaf not on CUDA");
+                crate::quant::QLinear::Quantized {
+                    weight: candle_gen::quant::QuantWeight::Dequant(qt),
+                    ..
+                } => {
+                    assert!(qt.device().is_cuda(), "quantized leaf not on CUDA");
                     let expected = match quant {
                         Quant::Q4 => GgmlDType::Q4_0,
                         Quant::Q8 => GgmlDType::Q8_0,
                     };
-                    assert_eq!(weight.dtype(), expected, "wrong GGUF block dtype");
+                    assert_eq!(qt.dtype(), expected, "wrong GGUF block dtype");
                 }
-                _ => panic!("attn.to_q did not quantize"),
+                _ => panic!("attn.to_q did not quantize to the dequant-dense arm"),
             }
 
             // (b) Dense-kept leaves migrated to the GPU.

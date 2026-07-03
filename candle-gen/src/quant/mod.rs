@@ -441,6 +441,29 @@ impl QLinear {
         )
     }
 
+    /// As [`Self::quantize`] (the sc-7702-safe [`MatmulStrategy::DequantDense`] arm) but lands the
+    /// folded `QTensor` on an explicit `device` — SD3.5's CPU-stage-then-quantize-onto-GPU path
+    /// (sc-8504), where the ~8 B dense MMDiT is staged in system RAM and each projection is folded
+    /// *onto* the GPU so the dense projection weight never lands there. This is the fourth fold
+    /// combination: [`Self::quantize`] is dequant-dense on the current device, [`Self::quantize_onto`]
+    /// is int8-fast onto an explicit device, [`Self::quantize_int8_fast`] is int8-fast on the current
+    /// device, and this is dequant-dense onto an explicit device. Feeds the SAME f32 CPU source to
+    /// `QTensor::quantize_onto` as [`Self::quantize`], so the `Q4_0`/`Q8_0` blocks are bit-identical
+    /// between the in-place and CPU-staged folds — only the dense on-device transient differs.
+    /// Idempotent on an already-quantized projection.
+    pub fn quantize_dequant_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
+        self.fold(
+            quant,
+            Some(device.clone()),
+            MatmulStrategy::DequantDense,
+            QuantForward {
+                flatten_leading: false,
+                cast_back: true,
+            },
+            false,
+        )
+    }
+
     /// Fold to [`MatmulStrategy::Int8Fast`] in place on the current device, **skipping** any projection
     /// whose `in_features` is not a multiple of the 32-wide GGUF block (SAM3 / SeedVR2's reference
     /// predicate — it leaves e.g. SeedVR2's `vid_in.proj` in=132 and SAM3's `2→256`/`4→256`/`258→256`
@@ -971,6 +994,48 @@ mod tests {
         assert!(lin.is_quantized());
         lin.quantize(Quant::Q8)?; // no-op, must not error
         assert!(matches!(lin, QLinear::Quantized { bias: None, .. }));
+        Ok(())
+    }
+
+    /// `quantize_dequant_onto` folds a dense projection to the **dequant-dense** arm (sc-7702-safe)
+    /// onto an explicit device — the SD3.5 CPU-stage path (sc-8504). It must NOT take the int8-fast
+    /// arm `quantize_onto` uses, and its `Q4_0`/`Q8_0` blocks (and thus forward) must be bit-identical
+    /// to the in-place [`QLinear::quantize`] fold of the same weight.
+    #[test]
+    fn quantize_dequant_onto_is_dequant_dense_and_matches_in_place() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (64, 32);
+        let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?;
+        let b = Tensor::randn(0f32, 1f32, (out_dim,), &dev)?;
+
+        for quant in [Quant::Q4, Quant::Q8] {
+            // In-place dequant-dense fold (the reference).
+            let mut in_place =
+                QLinear::Dense(DenseLinear::Linear(Linear::new(w.clone(), Some(b.clone()))));
+            in_place.quantize(quant)?;
+
+            // CPU-stage → dequant-dense onto the SAME device.
+            let mut staged =
+                QLinear::Dense(DenseLinear::Linear(Linear::new(w.clone(), Some(b.clone()))));
+            staged.quantize_dequant_onto(quant, &dev)?;
+            assert_eq!(
+                staged.matmul_strategy(),
+                Some(MatmulStrategy::DequantDense),
+                "quantize_dequant_onto must use the sc-7702-safe dequant-dense arm, not int8-fast"
+            );
+
+            // The forwards are bit-identical (same f32 CPU source → same GGUF blocks → same dequant).
+            let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+            let a = in_place.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
+            let c = staged.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
+            for (p, r) in a.iter().zip(c.iter()) {
+                assert_eq!(
+                    p.to_bits(),
+                    r.to_bits(),
+                    "{quant:?} quantize_dequant_onto forward differs from in-place quantize"
+                );
+            }
+        }
         Ok(())
     }
 

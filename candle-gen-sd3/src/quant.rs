@@ -1,5 +1,6 @@
-//! SD3.5 MMDiT quantization seam — **two routes to a quantized MMDiT**, both built on the shared
-//! [`candle_gen::quant`] packed-load module (sc-9086) and candle-core's first-class GGUF quant:
+//! SD3.5 MMDiT quantization seam — **two routes to a quantized MMDiT**, both built on the ONE shared
+//! [`candle_gen::quant`] seam (F-025 / sc-9005: this crate's `QLinear` was a fourth-family drifted copy,
+//! now unified into `candle_gen::quant::QLinear`) and candle-core's first-class GGUF quant:
 //!
 //! - **Packed tier (sc-9414, the fast path).** The hosted `SceneWorks/sd3.5-*-mlx` q4/q8 tiers store
 //!   each quantized DiT `Linear` as the MLX packed triple (`{base}.weight` u32 codes, `{base}.scales`,
@@ -11,30 +12,27 @@
 //!
 //! - **Dense → quantize (the legacy path, unchanged; sc-7879).** When the snapshot is a dense bf16 tier
 //!   (the stock diffusers snapshot; `.scales` absent), each DiT projection loads dense and
-//!   [`crate::transformer::Sd3Transformer::quantize`] / [`quantize_onto`](crate::transformer::Sd3Transformer::quantize_onto)
-//!   folds it to `Q4_0`/`Q8_0` in place **after** the (dense) weights — and any adapter merge — have
-//!   loaded. Both fold entry points are **no-ops** on an already-packed projection (idempotent), so a
-//!   packed-detect load and the unconditional post-load fold pass compose: an MLX-packed weight is never
-//!   double-quantized.
+//!   [`crate::transformer::Sd3Transformer::quantize`] /
+//!   [`quantize_onto`](crate::transformer::Sd3Transformer::quantize_onto) folds it to `Q4_0`/`Q8_0` in
+//!   place **after** the (dense) weights — and any adapter merge — have loaded. Both fold entry points
+//!   are **no-ops** on an already-packed projection (idempotent), so a packed-detect load and the
+//!   unconditional post-load fold pass compose: an MLX-packed weight is never double-quantized.
 //!
 //! **The quantized matmul DEQUANTIZES the weight and runs a *dense* matmul — it does NOT take candle's
 //! int8 `QMatMul` fast path (sc-7702).** That fast path (CUDA `fast_mmvq`/`fast_mmq`) quantizes the
 //! *activation* to per-32-element `q8_1` blocks; a single large activation outlier sets a block's int8
 //! scale and rounds every co-located channel to zero, which made the Lens Q4 DiT render solid black.
 //! Dequantizing the weight to a dense matmul keeps the activation full-precision, so **uniform Q4
-//! renders coherently** (GPU-verified on Blackwell for Lens). The load-time-quantized [`Self::Quantized`]
-//! arm owns this behavior directly; the packed [`Self::Packed`] arm delegates to the shared
-//! [`candle_gen::quant::QLinear`], which owns the identical dequant-on-forward compute path.
-//!
-//! **Quantize from CPU, store on the DiT's device.** The legacy fold's `QTensor::quantize_onto`
-//! requires the source on the CPU, so each weight round-trips device→CPU→`quantize_onto(dev)`; the
-//! resulting `QTensor` lives on the target device and the dense copy is dropped. The packed path skips
-//! this entirely — the shared repack builds the `QTensor` straight from the packed parts on the DiT
-//! device.
+//! renders coherently** (GPU-verified on Blackwell for Lens). Both SD3.5 routes therefore use the shared
+//! seam's [`candle_gen::quant::MatmulStrategy::DequantDense`] arm: [`QLinear::linear_detect`] builds a
+//! packed `DequantDense` projection, [`QLinear::quantize`] folds an in-place dense one to the same, and
+//! the CPU-stage fold uses [`QLinear::quantize_dequant_onto`] (dequant-dense onto an explicit device).
+//! (The shared [`QLinear::quantize_onto`] is the int8-fast arm FLUX.2 uses — SD3.5 deliberately does NOT
+//! call it; the strategy is now an explicit per-site knob, not a silently-diverged local type — F-025.)
 //!
 //! **Two fold entry points, same numerics.** SD3.5 Large's DiT (~8 B params) *fits* the GPU dense
-//! transiently, so the original [`QLinear::quantize`] builds dense on the target device and folds in
-//! place. [`QLinear::quantize_onto`] (sc-8504, the FLUX.2-dev CPU-stage pattern) instead takes an
+//! transiently, so [`QLinear::quantize`] builds dense on the target device and folds in place.
+//! [`QLinear::quantize_dequant_onto`] (sc-8504, the FLUX.2-dev CPU-stage pattern) instead takes an
 //! explicit target `device`: build the dense DiT on a **CPU** VarBuilder, then fold each projection
 //! *onto* the GPU so the dense projection weight never lands on the GPU at all. Both feed the same f32
 //! CPU source to `QTensor::quantize_onto`, so the `Q4_0`/`Q8_0` blocks are **bit-identical** between the
@@ -44,8 +42,8 @@
 //! **Which projections pack.** The MLX q4/q8 tier packs *every* DiT `Linear`, including the small AdaLN
 //! modulation linears (`norm1.linear`, `norm1_context.linear`, `norm_out.linear`) and the
 //! timestep/text embedders. The compute-heavy projections (attention q/k/v/out, the joint `add_*`, the
-//! GELU MLP, the image-only `attn2`, `context_embedder`, `proj_out`) load as [`Self::Packed`] and keep
-//! their Q4/Q8 footprint resident. The chaos-sensitive AdaLN / embedder linears load through
+//! GELU MLP, the image-only `attn2`, `context_embedder`, `proj_out`) load as the shared quantized arm
+//! and keep their Q4/Q8 footprint resident. The chaos-sensitive AdaLN / embedder linears load through
 //! [`linear_detect_dense`] — packed-**detected** the same way, but **dequantized to a full-precision
 //! dense [`Linear`]** so they stay a dense-typed leaf exactly as on the dense tier (matching the
 //! deliberate "AdaLN modulation linears stay dense" choice of the legacy fold, which never enumerates
@@ -56,24 +54,17 @@
 //! T5) and the VAE are stored **dense bf16** in every tier (byte-identical across `bf16/`, `q4/`, `q8/`
 //! — the `sd3.5-*-mlx` converter only packs `transformer/`), so they are not touched here.
 
-use candle_gen::candle_core::quantized::{GgmlDType, QTensor};
-use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::candle_nn::{Conv2d, Linear, Module, RmsNorm, VarBuilder};
+use candle_gen::candle_core::{Device, Result};
+use candle_gen::candle_nn::{Conv2d, Linear, RmsNorm, VarBuilder};
 use candle_gen::gen_core::Quant;
 use candle_gen::quant as shared;
 
-/// The GGUF block type a [`Quant`] level maps to when quantizing a *dense* weight in place — `Q4_0` /
-/// `Q8_0` (block size 32, the candle-core default GGUF quant). Every SD3.5 DiT projection contraction
-/// is divisible by 32 (`inner_dim`: Large 2432, Medium 1536; `ff_hidden`: 9728 / 6144;
-/// `joint_attention_dim` 4096), so the last-dim block check always passes. Shared single source of
-/// truth with the Lens/FLUX.2 DiT quant. The **packed** path uses `Q4_1` instead (the affine container
-/// the MLX tiers repack into losslessly — [`candle_gen::quant::repack`]).
-pub fn ggml_dtype(quant: Quant) -> GgmlDType {
-    match quant {
-        Quant::Q4 => GgmlDType::Q4_0,
-        Quant::Q8 => GgmlDType::Q8_0,
-    }
-}
+// The whole `Dense | Quantized` seam now lives once in `candle-gen` (F-025 / sc-9005). SD3.5's MMDiT
+// uses the dequant-dense (sc-7702-safe) forward: `QLinear::linear_detect` builds a packed `DequantDense`
+// projection, `QLinear::quantize` folds an in-place dense one to the same, and
+// `QLinear::quantize_dequant_onto` folds a CPU-staged dense one onto the GPU to the same — exactly as
+// this crate's former local copy did. Re-export under the crate-local names the transformer references.
+pub use candle_gen::quant::{ggml_dtype, QLinear};
 
 /// Bytes-per-parameter of a GGUF block type, **including** the per-32-element block scale overhead.
 /// `Q4_0` packs 32 weights into a 18-byte block (16 nibbles + one f16 scale) ⇒ 0.5625 B/param;
@@ -86,158 +77,6 @@ pub fn bytes_per_param(quant: Quant) -> f64 {
         Quant::Q4 => 18.0 / 32.0,
         // 34 bytes / 32 weights.
         Quant::Q8 => 34.0 / 32.0,
-    }
-}
-
-/// A Linear projection that is **dense** (the loaded bf16/f32 weight), **load-time GGUF-quantized** (the
-/// `Q4_0`/`Q8_0` weight blocks + the bias, folded from a dense weight — sc-7879), or **packed** (loaded
-/// directly from an MLX-packed tier through the shared [`candle_gen::quant::QLinear`] — sc-9414). Built
-/// dense ([`Self::linear`] / [`Self::linear_no_bias`]) or packed-detected ([`Self::linear_detect`]);
-/// [`Self::quantize`] / [`Self::quantize_onto`] transition a dense one to load-time-quantized in place
-/// and are a **no-op** on an already-quantized *or* packed one. All three forwards compute `x·Wᵀ + b`
-/// via a dense matmul (sc-7702).
-pub enum QLinear {
-    Dense(Linear),
-    Quantized {
-        /// The GGUF-quantized weight (`Q4_0`/`Q8_0`); dequantized to the activation dtype per forward.
-        weight: QTensor,
-        /// The bias kept full-precision (`None` for the bias-less projections, if any).
-        bias: Option<Tensor>,
-    },
-    /// Loaded straight from an MLX-packed tier via the shared module — the sc-9414 fast path (no dense
-    /// bf16 staging, no load-then-quantize). The inner [`shared::QLinear`] holds the resident
-    /// `Q4_1`/`Q8_0` weight and **dequantizes-on-forward** into a dense matmul (sc-7702, *not* the int8
-    /// `QMatMul` fast path).
-    Packed(shared::QLinear),
-}
-
-impl QLinear {
-    /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`).
-    pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        Ok(Self::Dense(candle_gen::candle_nn::linear(
-            in_dim, out_dim, vb,
-        )?))
-    }
-
-    /// A bias-less dense `[out, in]` projection from `vb` (`{prefix}.weight`).
-    pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        Ok(Self::Dense(candle_gen::candle_nn::linear_no_bias(
-            in_dim, out_dim, vb,
-        )?))
-    }
-
-    /// **Packed-detecting** `[out, in]` loader (sc-9414): if `{base}.scales` is present in `vb` (a
-    /// pre-quantized MLX tier), build a [`Self::Packed`] straight from the packed parts on `vb`'s device
-    /// via the shared [`candle_gen::quant::lin`] — **no dense weight is materialized**. Otherwise the
-    /// **dense** path is taken unchanged (`{base}.weight` [+ `{base}.bias`]), to be optionally folded
-    /// later by [`Self::quantize`] / [`Self::quantize_onto`].
-    ///
-    /// `base` is the full dotted key prefix (e.g. `to_out.0`), so the `.scales`/`.biases` siblings
-    /// survive any `to_out.0`-style key nesting — the key-remap trap: build the base string first, then
-    /// detect (never `.pp()` past the scales sibling). The SD3.5 DiT tier packs at group size 64 (the
-    /// MLX default the shared `lin` assumes), so no explicit group size is threaded.
-    pub fn linear_detect(
-        in_dim: usize,
-        out_dim: usize,
-        vb: &VarBuilder,
-        base: &str,
-        bias: bool,
-    ) -> Result<Self> {
-        if vb.contains_tensor(&format!("{base}.scales")) {
-            return Ok(Self::Packed(shared::lin(vb, base, in_dim, out_dim, bias)?));
-        }
-        let sub = vb.pp(base);
-        if bias {
-            Self::linear(in_dim, out_dim, sub)
-        } else {
-            Self::linear_no_bias(in_dim, out_dim, sub)
-        }
-    }
-
-    /// `x·Wᵀ + b`. All three arms run a **dense** matmul. `Dense` delegates to `candle_nn::Linear`;
-    /// `Quantized` dequantizes its `Q4_0`/`Q8_0` weight (and bias) to the activation dtype and delegates
-    /// likewise; `Packed` delegates to the shared dequant-on-forward `QLinear`. Dequantizing to a dense
-    /// matmul — rather than candle's int8 `QMatMul` fast path — is the sc-7702 fix (see the module docs).
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Dense(l) => l.forward(x),
-            Self::Quantized { weight, bias } => {
-                let in_dtype = x.dtype();
-                let w = weight.dequantize(x.device())?.to_dtype(in_dtype)?;
-                let bias = match bias {
-                    Some(b) => Some(b.to_dtype(in_dtype)?),
-                    None => None,
-                };
-                Linear::new(w, bias).forward(x)
-            }
-            Self::Packed(l) => l.forward(x),
-        }
-    }
-
-    /// Fold a dense projection to `Q4_0`/`Q8_0` in place. **Idempotent**: a no-op if already load-time
-    /// -quantized *or* packed (an MLX-packed weight must not be double-quantized). The weight is
-    /// quantized on the CPU and placed back on its **original** device via `QTensor::quantize_onto`; the
-    /// bias is kept full-precision for the (dense) post-matmul add. The in-place path: the dense weight
-    /// already lives on the (GPU) compute device.
-    pub fn quantize(&mut self, quant: Quant) -> Result<()> {
-        let device = match self {
-            Self::Dense(l) => l.weight().device().clone(),
-            // Already quantized (load-time fold) or packed (MLX tier) — no re-quantize.
-            Self::Quantized { .. } | Self::Packed(_) => return Ok(()),
-        };
-        self.quantize_onto(quant, &device)
-    }
-
-    /// Fold a dense projection to `Q4_0`/`Q8_0` **onto `device`** in place. **Idempotent**: a no-op if
-    /// already load-time-quantized *or* packed. The CPU-stage path (sc-8504): when the dense `QLinear`
-    /// was built on a CPU VarBuilder, this round-trips the weight through the CPU (the `quantize_onto`
-    /// source requirement) and lands the resulting `QTensor` on `device` (the GPU), so the dense
-    /// projection never lives on the GPU. The bias is moved to `device` and kept full-precision.
-    ///
-    /// Numerically identical to [`Self::quantize`]: both feed the same f32 CPU source to
-    /// `QTensor::quantize_onto`, so the `Q4_0`/`Q8_0` blocks are bit-for-bit the same regardless of
-    /// where the dense weight started.
-    pub fn quantize_onto(&mut self, quant: Quant, device: &Device) -> Result<()> {
-        let Self::Dense(l) = self else {
-            // Already quantized (load-time fold) or packed (MLX tier) — no re-quantize.
-            return Ok(());
-        };
-        let w_cpu = l.weight().to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
-        let weight = QTensor::quantize_onto(&w_cpu, ggml_dtype(quant), device)?;
-        let bias = match l.bias() {
-            Some(b) => Some(b.to_device(device)?),
-            None => None,
-        };
-        *self = Self::Quantized { weight, bias };
-        Ok(())
-    }
-
-    /// Move a still-**dense** projection (weight + optional bias) to `device`, in place. A no-op once
-    /// quantized *or* packed (the `QTensor` already lives on its device).
-    pub fn to_device(&mut self, device: &Device) -> Result<()> {
-        if let Self::Dense(l) = self {
-            let w = l.weight().to_device(device)?;
-            let b = match l.bias() {
-                Some(b) => Some(b.to_device(device)?),
-                None => None,
-            };
-            *self = Self::Dense(Linear::new(w, b));
-        }
-        Ok(())
-    }
-
-    /// Whether this projection loaded directly from an MLX-packed tier (the sc-9414 no-dense-staging
-    /// path). Distinguishes a packed load from a load-time `quantize` fold — used by the loaders/tests to
-    /// assert a packed tier fired the packed path (and did not silently fall back to dense).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn is_packed(&self) -> bool {
-        matches!(self, Self::Packed(_))
-    }
-}
-
-impl Module for QLinear {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        QLinear::forward(self, x)
     }
 }
 
@@ -327,13 +166,17 @@ pub fn rms_norm_to(n: &RmsNorm, eps: f64, device: &Device) -> Result<RmsNorm> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use candle_gen::candle_core::quantized::QTensor;
     use candle_gen::candle_core::safetensors::MmapedSafetensors;
+    use candle_gen::candle_core::{DType, Device, Tensor};
+    use candle_gen::candle_nn::Module;
+    use candle_gen::quant::{DenseLinear, MatmulStrategy};
     use std::collections::HashMap;
 
     /// A dense `[out, in]` `QLinear` straight from explicit weight/bias tensors (no VarBuilder), so a
     /// test can capture the dense output and quantize the *same* weights for a 1:1 comparison.
     fn dense_from(w: &Tensor, b: Option<&Tensor>) -> QLinear {
-        QLinear::Dense(Linear::new(w.clone(), b.cloned()))
+        QLinear::from_dense(DenseLinear::Linear(Linear::new(w.clone(), b.cloned())))
     }
 
     /// Cosine similarity over all elements (f64).
@@ -351,7 +194,8 @@ mod tests {
 
     /// A `[64, 32]` projection (in=32 = one Q4_0/Q8_0 block per row) quantizes and forwards
     /// near-losslessly at Q8 / coherently at Q4 vs the dense f32 result — the per-linear analog of the
-    /// full-DiT quant parity, on CPU with no weights.
+    /// full-DiT quant parity, on CPU with no weights. SD3.5's in-place fold is the sc-7702-safe
+    /// dequant-dense arm ([`QLinear::quantize`]).
     fn quant_roundtrip(quant: Quant, min_cos: f32) {
         let dev = Device::Cpu;
         let (in_dim, out_dim) = (32usize, 64usize);
@@ -363,9 +207,11 @@ mod tests {
         let dense = lin.forward(&x).unwrap();
 
         lin.quantize(quant).unwrap();
-        assert!(
-            matches!(lin, QLinear::Quantized { .. }),
-            "must be quantized"
+        assert!(lin.is_quantized(), "must be quantized");
+        assert_eq!(
+            lin.matmul_strategy(),
+            Some(MatmulStrategy::DequantDense),
+            "sd3 quantize must use the sc-7702-safe dequant-dense arm"
         );
         let q = lin.forward(&x).unwrap();
 
@@ -520,9 +366,9 @@ mod tests {
 
     /// **Packed-detect fires on the SD3 key layout** (sc-9414). A `to_out.0`-nested packed linear (the
     /// key-remap trap: the `.scales`/`.biases` siblings must survive the `to_out.0` nesting) is detected
-    /// and loaded as [`QLinear::Packed`] — NOT silently as dense — while a dense sibling with no
-    /// `.scales` stays `Dense`. The packed forward matches a dense linear built from the exact affine
-    /// grid the packed parts represent.
+    /// and loaded quantized via the sc-7702-safe dequant-dense arm — NOT silently as dense — while a
+    /// dense sibling with no `.scales` stays `Dense`. The packed forward matches a dense linear built
+    /// from the exact affine grid the packed parts represent.
     #[test]
     fn packed_detect_fires_on_sd3_layout_and_leaves_dense_unchanged() {
         let dev = Device::Cpu;
@@ -544,10 +390,12 @@ mod tests {
         let attn = vb.pp("attn");
 
         // `to_out.0` — packed-detected through the remapped base (never `.pp("0")` past the sibling).
+        // The packed load must take the sc-7702-safe dequant-dense arm.
         let lin = QLinear::linear_detect(in_dim, out_dim, &attn, "to_out.0", true).unwrap();
-        assert!(
-            lin.is_packed(),
-            "packed tier must load as Packed, not a silent dense fallback"
+        assert_eq!(
+            lin.matmul_strategy(),
+            Some(MatmulStrategy::DequantDense),
+            "packed tier must load quantized (dequant-dense), not a silent dense fallback"
         );
 
         // A dense sibling stays dense (path unchanged).
@@ -556,7 +404,7 @@ mod tests {
             matches!(dense_sib, QLinear::Dense(_)),
             "no `.scales` ⇒ dense"
         );
-        assert!(!dense_sib.is_packed());
+        assert!(!dense_sib.is_quantized());
 
         // Reference dense linear from the exact grid + the same bias.
         let w_ref = Tensor::from_vec(grid, (out_dim, in_dim), &dev).unwrap();
@@ -571,9 +419,10 @@ mod tests {
         );
     }
 
-    /// **`quantize` / `quantize_onto` are no-ops on a packed projection** (sc-9414): a packed-loaded
-    /// `QLinear` must not be re-quantized by the unconditional post-load fold pass — it stays `Packed`,
-    /// so an MLX-packed weight is never double-quantized. Covers BOTH fold entry points.
+    /// **The post-load fold pass is a no-op on a packed projection** (sc-9414): a packed-loaded
+    /// `QLinear` must not be re-quantized — it stays quantized on the dequant-dense arm, so an
+    /// MLX-packed weight is never double-quantized. Covers BOTH SD3.5 fold entry points ([`QLinear::quantize`]
+    /// and [`QLinear::quantize_dequant_onto`], the CPU-stage fold).
     #[test]
     fn quantize_is_noop_on_packed() {
         let (out_dim, in_dim) = (64usize, 128usize);
@@ -585,16 +434,18 @@ mod tests {
 
         let mut lin =
             QLinear::linear_detect(in_dim, out_dim, &vb, "context_embedder", false).unwrap();
-        assert!(lin.is_packed());
+        assert_eq!(lin.matmul_strategy(), Some(MatmulStrategy::DequantDense));
         lin.quantize(Quant::Q4).unwrap();
-        assert!(
-            lin.is_packed(),
+        assert_eq!(
+            lin.matmul_strategy(),
+            Some(MatmulStrategy::DequantDense),
             "quantize must not touch a packed projection"
         );
-        lin.quantize_onto(Quant::Q8, &Device::Cpu).unwrap();
-        assert!(
-            lin.is_packed(),
-            "quantize_onto must not touch a packed projection"
+        lin.quantize_dequant_onto(Quant::Q8, &Device::Cpu).unwrap();
+        assert_eq!(
+            lin.matmul_strategy(),
+            Some(MatmulStrategy::DequantDense),
+            "quantize_dequant_onto must not touch a packed projection"
         );
     }
 
