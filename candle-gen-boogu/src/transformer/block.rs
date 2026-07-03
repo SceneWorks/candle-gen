@@ -557,15 +557,23 @@ mod tests {
         let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
         let scale = (d as f64).powf(-0.5);
         let sm = |x: &Tensor| softmax_last_dim(x);
-        // Huge budget → single pass; tiny budget (1) → chunked into single-row blocks.
+        // Huge budget → single pass; tiny budget (1) → single-row chunks; a MID-SIZE budget forces
+        // multi-row chunks + a remainder (block=3 over s=7 → 3,3,1) — the sc-9116 hardening ask.
         let single =
             candle_gen::sdpa_budgeted_bhsd(&q, &k, &v, scale, None, sm, usize::MAX).unwrap();
-        let chunked = candle_gen::sdpa_budgeted_bhsd(&q, &k, &v, scale, None, sm, 1).unwrap();
-        assert_eq!(single.dims(), chunked.dims());
         let a = single.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let c = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        for (x, y) in a.iter().zip(&c) {
-            assert!((x - y).abs() < 1e-6, "chunked sdpa diverged: {x} vs {y}");
+        // budget = b·h·s·block = 1·2·7·3 = 42 → block = 42/(1·2·7) = 3.
+        for budget in [1usize, 42] {
+            let chunked =
+                candle_gen::sdpa_budgeted_bhsd(&q, &k, &v, scale, None, sm, budget).unwrap();
+            assert_eq!(single.dims(), chunked.dims());
+            let c = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            for (x, y) in a.iter().zip(&c) {
+                assert!(
+                    (x - y).abs() < 1e-6,
+                    "chunked sdpa diverged at budget {budget}: {x} vs {y}"
+                );
+            }
         }
     }
 }
