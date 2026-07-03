@@ -69,7 +69,7 @@ use candle_gen::gen_core::{
 use candle_gen::{CandleError, Result as CResult};
 
 use config::{Flux2Config, Flux2Variant, SIZE_MULTIPLE};
-use text_encoder::Qwen3TextEncoder;
+use text_encoder::Flux2PromptEncoder;
 use vae::Flux2Vae;
 
 /// Qwen3 `<|endoftext|>` pad token id (klein FLUX.2 text encoder).
@@ -80,7 +80,7 @@ const MISTRAL_PAD_TOKEN_ID: i32 = 11;
 /// The loaded FLUX.2 components, `Arc`-shared so the generator caches them across `generate` calls.
 #[derive(Clone)]
 struct Components {
-    te: Arc<Qwen3TextEncoder>,
+    te: Arc<Flux2PromptEncoder>,
     transformer: Arc<Flux2Transformer>,
     vae: Arc<Flux2Vae>,
     /// Tokenizer (variant-specific pad token + chat template), loaded+parsed **once** at component load
@@ -175,7 +175,7 @@ impl Pipeline {
     /// Load the base **Mistral/Qwen3 TE + `Flux2Transformer` DiT** pair — the exact quantizable stack
     /// shared by every entry point (txt2img [`Self::load_components`], `Flux2Edit::load_variant`,
     /// `Flux2Control::load`). This is the single home for the "which builders + which tier/staging
-    /// strategy" decision (F-024, sc-9004): it fixes the default builders (`Qwen3TextEncoder::new` /
+    /// strategy" decision (F-024, sc-9004): it fixes the default builders (`Flux2PromptEncoder::new` /
     /// `Flux2Transformer::new`) and delegates the packed-vs-dense-vs-quant routing to
     /// [`Self::load_quantizable`]. Callers layer their extra components on top (the edit/control VAE
     /// *with encoder*, the control-branch overlay) — those are the genuine per-site differences and stay
@@ -183,9 +183,9 @@ impl Pipeline {
     ///
     /// A staging-strategy change (e.g. pre-quantized snapshot consumption) now lives in one place. Use
     /// [`Self::load_quantizable`] directly only if a future caller needs non-default module builders.
-    pub(crate) fn load_te_and_dit(&self) -> CResult<(Qwen3TextEncoder, Flux2Transformer)> {
+    pub(crate) fn load_te_and_dit(&self) -> CResult<(Flux2PromptEncoder, Flux2Transformer)> {
         self.load_quantizable(
-            |cfg, vb| Ok(Qwen3TextEncoder::new(cfg, vb)?),
+            |cfg, vb| Ok(Flux2PromptEncoder::new(cfg, vb)?),
             |cfg, vb| Ok(Flux2Transformer::new(cfg, vb)?),
         )
     }
@@ -196,12 +196,12 @@ impl Pipeline {
     /// and `self.quant`. Shared by txt2img, `Flux2Edit::load_dev`, and `Flux2Control` (they load the same
     /// quantizable pair; the callers add the VAE / control overlay) via [`Self::load_te_and_dit`], which
     /// fixes the default builders. `mk_te` / `mk_dit` build the module from a component VarBuilder
-    /// (`Qwen3TextEncoder::new` / `Flux2Transformer::new`).
+    /// (`Flux2PromptEncoder::new` / `Flux2Transformer::new`).
     pub(crate) fn load_quantizable(
         &self,
-        mk_te: impl Fn(&Flux2Config, VarBuilder) -> CResult<Qwen3TextEncoder>,
+        mk_te: impl Fn(&Flux2Config, VarBuilder) -> CResult<Flux2PromptEncoder>,
         mk_dit: impl Fn(&Flux2Config, VarBuilder) -> CResult<Flux2Transformer>,
-    ) -> CResult<(Qwen3TextEncoder, Flux2Transformer)> {
+    ) -> CResult<(Flux2PromptEncoder, Flux2Transformer)> {
         let te = self.load_one_quantizable(
             "text_encoder",
             |vb| mk_te(&self.cfg, vb),
@@ -286,7 +286,7 @@ impl Pipeline {
     /// tokenizer ([`Self::build_tokenizer`]) — parsed once, reused across encodes (sc-8991 / F-011).
     pub(crate) fn encode(
         &self,
-        te: &Qwen3TextEncoder,
+        te: &Flux2PromptEncoder,
         tok: &TextTokenizer,
         prompt: &str,
     ) -> CResult<Tensor> {

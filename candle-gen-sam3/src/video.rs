@@ -438,14 +438,16 @@ impl Sam3VideoModel {
         // detections: new if score >= new_det_thresh and no track IoU >= assoc_iou.
         for i in 0..n {
             let matches_any = (0..m).any(|j| iou[i][j] >= ASSOC_IOU_THRESH);
-            if det.dets[i].score >= NEW_DET_THRESH && !matches_any {
+            // "New detection": high enough score and matched to no existing track. Computed once and
+            // reused below for the high-conf-IoU bookkeeping.
+            let is_new = det.dets[i].score >= NEW_DET_THRESH && !matches_any;
+            if is_new {
                 a.new_det_inds.push(i);
             }
             let matched: Vec<i32> = (0..m)
                 .filter(|&j| iou[i][j] >= ASSOC_IOU_THRESH)
                 .map(|j| self.obj_ids[j])
                 .collect();
-            let is_new = det.dets[i].score >= NEW_DET_THRESH && !matches_any;
             let (best_j, best_iou) = (0..m).fold((0usize, -1f32), |(bj, bi), j| {
                 if iou[i][j] > bi {
                     (j, iou[i][j])

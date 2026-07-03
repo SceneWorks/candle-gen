@@ -47,7 +47,7 @@ impl Rotary {
     }
 
     /// Rows of the precomputed cos/sin tables — the max sequence length this Rotary was sized for.
-    /// A `narrow(0, 0, seq)` beyond this fails opaquely, so [`Qwen3TextEncoder::prompt_embeds`]
+    /// A `narrow(0, 0, seq)` beyond this fails opaquely, so [`Flux2PromptEncoder::prompt_embeds`]
     /// validates `seq` against it up front (sc-9386, F-077 sibling).
     fn max_seq(&self) -> Result<usize> {
         self.cos.dim(0)
@@ -247,8 +247,10 @@ impl DecoderLayer {
     }
 }
 
-/// The FLUX.2 decoder-LM prompt-embeds encoder (Qwen3 for klein, Mistral for dev).
-pub struct Qwen3TextEncoder {
+/// The FLUX.2 decoder-LM prompt-embeds encoder. Backbone varies by variant (Qwen3 for klein,
+/// Mistral for dev) — hence the variant-neutral name; the assembly (`DecoderLayer`s + `Rotary`) is
+/// shared and dispatched off `Flux2Config`, so this single type loads/runs either tower.
+pub struct Flux2PromptEncoder {
     embed_tokens: QEmbedding,
     layers: Vec<DecoderLayer>,
     rotary: Rotary,
@@ -256,7 +258,7 @@ pub struct Qwen3TextEncoder {
     max_run: usize,
 }
 
-impl Qwen3TextEncoder {
+impl Flux2PromptEncoder {
     /// Build under `cfg.te_prefix` (klein Qwen3: `model`; dev Mistral: `language_model.model`). The
     /// final `…norm` and `lm_head` are intentionally not loaded — `prompt_embeds` uses the
     /// pre-final-norm intermediate states only. Only the first `max(out_layers)` layers are

@@ -30,7 +30,7 @@ use candle_gen::{CandleError, Result};
 
 use crate::config::{Flux2Variant, DEFAULT_GUIDANCE_DEV, DEFAULT_STEPS_DEV, SIZE_MULTIPLE};
 use crate::edit_provider::preprocess_ref;
-use crate::text_encoder::Qwen3TextEncoder;
+use crate::text_encoder::Flux2PromptEncoder;
 use crate::transformer::{Flux2ControlBranch, Flux2ControlTransformer};
 use crate::vae::Flux2Vae;
 use crate::{pipeline, to_image, Pipeline};
@@ -86,7 +86,7 @@ impl Default for Flux2ControlRequest {
 /// `generate` takes `&self` (no per-call mutation), so one load serves many renders.
 pub struct Flux2Control {
     pipe: Pipeline,
-    te: Qwen3TextEncoder,
+    te: Flux2PromptEncoder,
     /// Prompt tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
     /// instead of re-parsing `tokenizer.json` per prompt.
     tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,

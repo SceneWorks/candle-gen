@@ -31,7 +31,7 @@ use candle_gen::gen_core::{Image, Progress, Quant};
 use candle_gen::{CandleError, Result};
 
 use crate::config::{Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_STEPS, SIZE_MULTIPLE};
-use crate::text_encoder::Qwen3TextEncoder;
+use crate::text_encoder::Flux2PromptEncoder;
 use crate::transformer::Flux2Transformer;
 use crate::vae::Flux2Vae;
 use crate::{pipeline, to_image, Pipeline};
@@ -83,7 +83,7 @@ impl Default for Flux2EditRequest {
 pub struct Flux2Edit {
     pipe: Pipeline,
     variant: Flux2Variant,
-    te: Qwen3TextEncoder,
+    te: Flux2PromptEncoder,
     /// Prompt tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
     /// instead of re-parsing `tokenizer.json` per prompt/branch.
     tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,

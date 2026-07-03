@@ -428,6 +428,9 @@ impl T2iModel {
                     .as_deref_mut()
                     .expect("needs_cfg ⇒ uncond cache");
                 let rm_u = rm_uncond.as_ref().expect("needs_cfg ⇒ uncond rope-mask");
+                // `cond` here is the image/timestep token embedding (from `step_cond_embeds`), NOT the
+                // text conditioning — it is identical for both passes. The cond/uncond split lives
+                // entirely in `cache_u` (uncond text cache) and `rm_u`, so reusing `cond` is correct.
                 let v_uncond = self.predict_v(&cond, rm_u, cache_u, &z, t, opts.t_eps)?;
                 cfg_blend(&v_cond, &v_uncond, opts.cfg_scale)?
             } else {

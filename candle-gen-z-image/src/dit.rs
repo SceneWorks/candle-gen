@@ -105,6 +105,14 @@ impl ZImageAttention {
         let n_heads = cfg.n_heads;
         let head_dim = cfg.head_dim();
 
+        // K/V are constructed at `n_kv_heads`, but `forward` reshapes them by `n_heads` — that is only
+        // valid when `n_kv_heads == n_heads` (full MHA). Every shipped Z-Image config satisfies this
+        // (turbo/base = 30/30); true GQA (`n_kv_heads < n_heads`) is NOT supported by this attention and
+        // would panic at the `forward` reshape. Assert the invariant so a variant port fails loudly here.
+        debug_assert_eq!(
+            cfg.n_kv_heads, n_heads,
+            "ZImageAttention is MHA-only; GQA (n_kv_heads < n_heads) is unsupported"
+        );
         let to_q = lora_linear_no_bias(dim, n_heads * head_dim, vb.pp("to_q"))?;
         let to_k = lora_linear_no_bias(dim, cfg.n_kv_heads * head_dim, vb.pp("to_k"))?;
         let to_v = lora_linear_no_bias(dim, cfg.n_kv_heads * head_dim, vb.pp("to_v"))?;
@@ -153,7 +161,8 @@ impl ZImageAttention {
         let k = hidden_states.apply(&self.to_k)?;
         let v = hidden_states.apply(&self.to_v)?;
 
-        // (B, seq, n*hd) -> (B, seq, n, hd)
+        // (B, seq, n*hd) -> (B, seq, n, hd). K/V use `n_heads` (not `n_kv_heads`); valid only under the
+        // MHA invariant asserted in `new` (n_kv_heads == n_heads).
         let q = q.reshape((b, seq_len, self.n_heads, self.head_dim))?;
         let k = k.reshape((b, seq_len, self.n_heads, self.head_dim))?;
         let v = v.reshape((b, seq_len, self.n_heads, self.head_dim))?;

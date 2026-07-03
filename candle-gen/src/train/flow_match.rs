@@ -530,7 +530,6 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
 
     // --- train loop ---
     let mut accumulated: Option<GradStore> = None;
-    let mut micro = 0u32;
     // Micro-grads accumulated into the CURRENT (not-yet-flushed) window. Resets to 0 on each flush; at
     // a full boundary it equals `accum`, and whatever it holds when the loop ends is the sub-`accum`
     // remainder the final flush must divide by (F-034, sc-9018).
@@ -547,9 +546,11 @@ pub fn run_flow_match_training<T: FlowMatchTrainer>(
         last_loss = loss;
         steps_run = step;
         accumulate_grads(&mut accumulated, grads, &set.vars)?;
-        micro += 1;
         pending += 1;
-        if micro.is_multiple_of(accum) {
+        // `step` counts every micro-step (loop runs `1..=cfg.steps`, one micro per iteration), so a full
+        // accumulation window closes exactly when `step` is a multiple of `accum`. (Previously tracked by
+        // a separate `micro` counter that was never reset and thus always equalled `step`.)
+        if step.is_multiple_of(accum) {
             apply_update(
                 &mut opt,
                 &mut accumulated,

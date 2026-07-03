@@ -485,6 +485,10 @@ impl ZImageControl {
         skeleton: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        // Turbo (distilled) semantics: honor `req.steps` verbatim, only clamping the degenerate 0 up to
+        // a single step. This intentionally differs from `generate_base`, where `steps == 0` means "use
+        // the 50-step default" — the distilled schedule expects a caller-chosen small count (≈4), so an
+        // unset value here is a floor, not a request for the default.
         let steps = req.steps.max(1);
         let total = steps as u32;
         let lat_h = (req.height / SPATIAL_SCALE) as usize;
@@ -560,6 +564,8 @@ impl ZImageControl {
         skeleton: &Image,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Image> {
+        // Base (undistilled) semantics: `steps == 0` means "unset" → the 50-step default. This differs
+        // from `generate_turbo`, which clamps 0 up to 1 rather than substituting a default (see there).
         let steps = if req.steps == 0 {
             BASE_DEFAULT_STEPS
         } else {

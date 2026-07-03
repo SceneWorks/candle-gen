@@ -189,7 +189,13 @@ impl WanVaceTransformer {
     /// Per-frame strided conv2d patchify of a `[B,C,F,Hl,Wl]` latent → tokens `[B, L, dim]` (bf16).
     fn patchify(&self, latent: &Tensor, w: &Tensor, b: &Tensor, in_c: usize) -> Result<Tensor> {
         let (bb, _c, f, hl, wl) = latent.dims5()?;
-        let (_pt, ph, _pw) = self.cfg.base.patch;
+        let (_pt, ph, pw) = self.cfg.base.patch;
+        // Square spatial patch assumed: the conv2d stride below and the `wl / ph` width-token count use
+        // `ph` for both axes. Correct for every shipped Wan config (ph == pw); asserts guard variant ports.
+        debug_assert_eq!(
+            ph, pw,
+            "wan-vace patchify assumes a square spatial patch (ph == pw)"
+        );
         let dim = self.cfg.base.dim;
         let merged = latent
             .permute((0, 2, 1, 3, 4))?
@@ -198,7 +204,7 @@ impl WanVaceTransformer {
             .to_dtype(self.dtype)?;
         let y = merged.conv2d(w, 0, ph, 1, 1)?.broadcast_add(b)?; // [B*F,dim,pph,ppw]
         let pph = hl / ph;
-        let ppw = wl / ph;
+        let ppw = wl / ph; // square patch: width divides by `ph` too (see debug_assert above)
         y.reshape((bb, f, dim, pph, ppw))?
             .permute((0, 1, 3, 4, 2))? // [B,F,pph,ppw,dim]
             .reshape((bb, f * pph * ppw, dim))?
@@ -292,8 +298,12 @@ impl WanVaceTransformer {
             )));
         }
         let (b, _c, f, hl, wl) = latents.dims5()?;
-        let (pt, ph, _pw) = self.cfg.base.patch;
-        let grid = (f / pt, hl / ph, wl / ph);
+        let (pt, ph, pw) = self.cfg.base.patch;
+        debug_assert_eq!(
+            ph, pw,
+            "wan-vace grid assumes a square spatial patch (ph == pw)"
+        );
+        let grid = (f / pt, hl / ph, wl / ph); // width uses `ph` too (square patch)
 
         // Patch-embed the noisy latent → [B,L,dim] (bf16).
         let x_tokens = self.patchify(
@@ -448,8 +458,12 @@ pub fn denoise_vace(
     on_step: &mut dyn FnMut(usize),
 ) -> CResult<Tensor> {
     let (_b, _c, f, hl, wl) = init_noise.dims5()?;
-    let (pt, ph, _pw) = transformer.cfg.base.patch;
-    let l = (f / pt) * (hl / ph) * (wl / ph);
+    let (pt, ph, pw) = transformer.cfg.base.patch;
+    debug_assert_eq!(
+        ph, pw,
+        "wan-vace token length assumes a square spatial patch (ph == pw)"
+    );
+    let l = (f / pt) * (hl / ph) * (wl / ph); // width uses `ph` too (square patch)
     let control_emb = transformer.embed_control(control, l)?;
 
     let mut latents = init_noise.clone();
