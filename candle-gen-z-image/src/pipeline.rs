@@ -55,10 +55,18 @@ use std::sync::Arc;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{self, AdapterSpec, Conditioning, GenerationRequest, Image, Progress};
+use candle_gen::gen_core::{
+    self, AdapterSpec, Conditioning, GenerationRequest, Image, PidWeights, Progress,
+};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::image_seed;
 use candle_gen::{CandleError, Result};
+use candle_gen_pid::{PidDecoder, PidEngine};
+
+/// The PiD backbone (latent-space) tag for Z-Image (epic 7840 / sc-7853). Z-Image ships the FLUX.1
+/// 16-ch VAE, so it aliases the `flux` latent space — resolved via the `zimage-turbo` tag (which the
+/// PiD registry maps onto the shared `flux` student; no dedicated zimage checkpoint exists).
+const PID_BACKBONE: &str = "zimage-turbo";
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
 use candle_transformers::models::z_image::scheduler::{
     calculate_shift, FlowMatchEulerDiscreteScheduler, SchedulerConfig, BASE_IMAGE_SEQ_LEN,
@@ -206,6 +214,9 @@ pub(crate) struct Pipeline {
     dtype: DType,
     /// Adapters merged into the DiT weights at load. Empty ⇒ the stock mmap build (zero regression).
     adapters: Vec<AdapterSpec>,
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), built into the cached
+    /// [`Components`] so the PiD engine loads once alongside the base model. `None` ⇒ native VAE decode.
+    pid_spec: Option<PidWeights>,
 }
 
 /// The loaded Z-Image components, `Arc`-shared so the generator can cache them across `generate`
@@ -219,6 +230,8 @@ pub(crate) struct Components {
     /// Qwen tokenizer, loaded+parsed **once** at component load and reused across every prompt/uncond
     /// encode (sc-8991 / F-011) instead of re-parsing `tokenizer.json` per branch.
     tokenizer: Arc<TextTokenizer>,
+    /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
+    pid: Option<Arc<PidEngine>>,
 }
 
 impl Pipeline {
@@ -230,12 +243,14 @@ impl Pipeline {
         device: &Device,
         dtype: DType,
         adapters: &[AdapterSpec],
+        pid_spec: Option<PidWeights>,
     ) -> Self {
         Self {
             root: root.to_path_buf(),
             device: device.clone(),
             dtype,
             adapters: adapters.to_vec(),
+            pid_spec,
         }
     }
 
@@ -301,11 +316,23 @@ impl Pipeline {
         };
 
         let tokenizer = common::build_tokenizer(&self.root, "z-image")?;
+        // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
+        // opted in via `LoadSpec::pid`; Z-Image aliases the FLUX.1 latent space (`zimage-turbo` → the
+        // shared `flux` student).
+        let pid = match self.pid_spec.as_ref() {
+            Some(spec) => Some(Arc::new(PidEngine::from_spec(
+                spec,
+                PID_BACKBONE,
+                &self.device,
+            )?)),
+            None => None,
+        };
         Ok(Components {
             text_encoder: Arc::new(text_encoder),
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
             tokenizer: Arc::new(tokenizer),
+            pid,
         })
     }
 
@@ -527,6 +554,16 @@ impl Pipeline {
         let cap =
             self.text_embeddings(&components.text_encoder, &components.tokenizer, &req.prompt)?;
 
+        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
+        // else `None` → the native VAE decode. Shared across `count` images (same prompt).
+        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+            components.pid.as_deref(),
+            req,
+            base_seed,
+            crate::MODEL_ID,
+        )?;
+
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
             let seed = image_seed(base_seed, index);
@@ -596,7 +633,7 @@ impl Pipeline {
             )?;
 
             on_progress(Progress::Decoding);
-            images.push(self.decode(&components.vae, &latents)?);
+            images.push(self.decode(&components.vae, pid_decoder.as_ref(), &latents)?);
         }
         Ok(images)
     }
@@ -656,6 +693,16 @@ impl Pipeline {
         } else {
             None
         };
+
+        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
+        // else `None` → the native VAE decode. Shared across `count` images (same prompt).
+        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+            components.pid.as_deref(),
+            req,
+            base_seed,
+            crate::MODEL_ID,
+        )?;
 
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
@@ -747,16 +794,23 @@ impl Pipeline {
             )?;
 
             on_progress(Progress::Decoding);
-            images.push(self.decode(&components.vae, &latents)?);
+            images.push(self.decode(&components.vae, pid_decoder.as_ref(), &latents)?);
         }
         Ok(images)
     }
 
-    /// VAE-decode the final latents `(1, 16, 1, h, w)` to an RGB8 [`Image`] via the shared
-    /// [`common::decode`]. The VAE applies its own `/scaling_factor + shift_factor` un-scale inside
-    /// `decode`; `postprocess_image` maps the `[-1, 1]` output to `[0, 255]` u8.
-    fn decode(&self, vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
-        common::decode(vae, latents)
+    /// Decode the final latents `(1, 16, 1, h, w)` to an RGB8 [`Image`] via the shared [`common::decode`].
+    /// The native VAE applies its own `/scaling_factor + shift_factor` un-scale inside `decode`; when a
+    /// PiD decoder resolved (epic 7840 / sc-7853) it super-resolves the same squeezed NCHW latent
+    /// instead. `postprocess_image` maps the `[-1, 1]` output to `[0, 255]` u8, reading the size from the
+    /// tensor.
+    fn decode(
+        &self,
+        vae: &AutoEncoderKL,
+        pid: Option<&PidDecoder>,
+        latents: &Tensor,
+    ) -> Result<Image> {
+        common::decode(vae, pid, latents)
     }
 }
 
@@ -783,7 +837,7 @@ mod tests {
         .unwrap();
         std::fs::write(dense.join("config.json"), r#"{"latent_channels": 16}"#).unwrap();
 
-        let pipe = Pipeline::load(&dir, &Device::Cpu, DType::F32, &[]);
+        let pipe = Pipeline::load(&dir, &Device::Cpu, DType::F32, &[], None);
         assert!(
             pipe.component_is_packed("transformer").unwrap(),
             "a `quantization` block ⇒ packed tier"
@@ -802,7 +856,7 @@ mod tests {
         let corrupt = dir.join("transformer_bad");
         std::fs::create_dir_all(&corrupt).unwrap();
         std::fs::write(corrupt.join("config.json"), b"{ not json").unwrap();
-        let bad_pipe = Pipeline::load(&dir, &Device::Cpu, DType::F32, &[]);
+        let bad_pipe = Pipeline::load(&dir, &Device::Cpu, DType::F32, &[], None);
         let err = bad_pipe
             .component_is_packed("transformer_bad")
             .expect_err("corrupt config.json must error, not fall to dense");

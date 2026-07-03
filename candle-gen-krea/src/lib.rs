@@ -54,7 +54,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Progress, Quant, WeightsSource,
+    Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
@@ -78,6 +78,9 @@ pub struct KreaGenerator {
     /// LoRA/LoKr adapters merged into the DiT weights at component-load (sc-7836). Fixed for this
     /// generator instance; empty ⇒ the stock unadapted build.
     adapters: Vec<AdapterSpec>,
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
+    /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
+    pid_spec: Option<PidWeights>,
     components: Mutex<Option<Arc<Components>>>,
 }
 
@@ -94,6 +97,7 @@ impl KreaGenerator {
             &self.root,
             &self.device,
             &self.adapters,
+            self.pid_spec.as_ref(),
         )?);
         *guard = Some(c.clone());
         Ok(c)
@@ -207,6 +211,9 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         root,
         device,
         adapters: spec.adapters.clone(),
+        // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if any)
+        // so the lazy component build loads the engine once. `None` keeps the byte-exact native path.
+        pid_spec: spec.pid.clone(),
         components: Mutex::new(None),
     }))
 }

@@ -36,8 +36,8 @@ use std::sync::Mutex;
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor, Progress,
-    WeightsSource,
+    self, GenerationOutput, GenerationRequest, Generator, LoadSpec, ModelDescriptor, PidWeights,
+    Progress, WeightsSource,
 };
 
 pub use config::{ChromaVariant, CHROMA1_BASE_ID, CHROMA1_FLASH_ID, CHROMA1_HD_ID, SIZE_MULTIPLE};
@@ -52,6 +52,9 @@ pub struct ChromaGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: Device,
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
+    /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
+    pid_spec: Option<PidWeights>,
     components: Mutex<Option<Components>>,
 }
 
@@ -107,7 +110,12 @@ impl Generator for ChromaGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = Pipeline::load(self.variant, &self.root, &self.device);
+        let pipe = Pipeline::load(
+            self.variant,
+            &self.root,
+            &self.device,
+            self.pid_spec.clone(),
+        );
         let components = self.components(&pipe)?;
         let images = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Images(images))
@@ -161,6 +169,10 @@ fn load_variant(variant: ChromaVariant, spec: &LoadSpec) -> gen_core::Result<Box
         descriptor: variant.descriptor(),
         root,
         device,
+        // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
+        // any) so the lazy component build loads the engine once. Unlike adapters/quant/control above,
+        // it is not rejected — `None` simply keeps the byte-exact native-VAE path.
+        pid_spec: spec.pid.clone(),
         components: Mutex::new(None),
     }))
 }

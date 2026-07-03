@@ -12,6 +12,10 @@ categories = ["science"]
 # Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
 # build (single resolution; see scripts/check-gen-core-skew.sh).
 candle-gen = { path = "../candle-gen" }
+# NVIDIA PiD optional super-resolving decoder (epic 7840 / sc-7853): FLUX's own `flux` 16-ch
+# latent-space student (4× SR). Wired behind `req.use_pid` (default off → the byte-exact native FLUX
+# AutoEncoder decode).
+candle-gen-pid = { path = "../candle-gen-pid" }
 # Link-time self-registration into gen-core's model registry (the two `inventory::submit!` below).
 inventory = { workspace = true }
 # FLUX building blocks: the `flux` model (DiT) + `autoencoder` (VAE) read the original
@@ -46,8 +50,8 @@ serde_json = "1"
 # Pass the backend selection through to the core crate AND candle-transformers so a downstream
 # `--features metal`/`cuda` on this provider crate selects the matching candle backend everywhere.
 default = []
-metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-sdxl/metal"]
-cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-sdxl/cuda"]
+metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-sdxl/metal", "candle-gen-pid/metal"]
+cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-sdxl/cuda", "candle-gen-pid/cuda"]
 
 [dev-dependencies]
 # `examples/flux-txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to PNG so a

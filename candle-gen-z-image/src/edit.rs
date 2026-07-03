@@ -300,8 +300,10 @@ impl ZImageEdit {
     }
 
     /// VAE-decode the final latents `(1, 16, 1, h, w)` → an RGB8 [`Image`] (the shared txt2img decode).
+    /// The edit lane does not carry a PiD decoder (base txt2img is the shipping PiD path, epic 7840 /
+    /// sc-7853); native VAE decode.
     fn decode(&self, latents: &Tensor) -> Result<Image> {
-        common::decode(&self.vae, latents)
+        common::decode(&self.vae, None, latents)
     }
 }
 

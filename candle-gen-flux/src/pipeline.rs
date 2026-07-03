@@ -62,10 +62,15 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::{Module, VarBuilder};
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
+use candle_gen::gen_core::{self, GenerationRequest, Image, PidWeights, Progress};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::image_seed;
-use candle_gen::{CandleError, Result};
+use candle_gen::{CandleError, LatentDecoder, Result};
+use candle_gen_pid::{PidDecoder, PidEngine};
+
+/// The PiD backbone (latent-space) tag for FLUX (epic 7840 / sc-7853): the `flux` 16-ch latent-space
+/// student (4× SR). Shared by Boogu / Chroma / Z-Image, which reuse this FLUX.1 VAE latent space.
+const PID_BACKBONE: &str = "flux";
 use candle_transformers::models::clip::text_model::{
     Activation as ClipActivation, ClipTextConfig, ClipTextTransformer,
 };
@@ -119,6 +124,9 @@ pub(crate) struct Pipeline {
     root: PathBuf,
     device: Device,
     dtype: DType,
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), built into the cached
+    /// [`Components`] so the PiD engine loads once alongside the base model. `None` ⇒ native VAE decode.
+    pid_spec: Option<PidWeights>,
 }
 
 /// The loaded FLUX components, `Arc`-shared so the generator can cache them across `generate` calls
@@ -145,6 +153,8 @@ pub(crate) enum Components {
         /// T5 + CLIP tokenizers, loaded+parsed **once** at component load and reused across encodes
         /// (sc-8991 / F-011) instead of re-parsing per prompt/branch.
         toks: Arc<FluxTokenizers>,
+        /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
+        pid: Option<Arc<PidEngine>>,
     },
     Packed {
         clip: Arc<PackedClipText>,
@@ -153,19 +163,42 @@ pub(crate) enum Components {
         vae: Arc<AutoEncoderKL>,
         /// T5 + CLIP tokenizers, loaded+parsed **once** at component load (sc-8991 / F-011).
         toks: Arc<FluxTokenizers>,
+        /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
+        pid: Option<Arc<PidEngine>>,
     },
 }
 
 impl Pipeline {
     /// Build the (light) pipeline handle for the FLUX snapshot `root` at the given device/dtype. Does
     /// **no** weight I/O — components load lazily via [`load_components`](Self::load_components).
-    pub(crate) fn load(variant: Variant, root: &Path, device: &Device, dtype: DType) -> Self {
+    pub(crate) fn load(
+        variant: Variant,
+        root: &Path,
+        device: &Device,
+        dtype: DType,
+        pid_spec: Option<PidWeights>,
+    ) -> Self {
         Self {
             variant,
             root: root.to_path_buf(),
             device: device.clone(),
             dtype,
+            pid_spec,
         }
+    }
+
+    /// Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller opted in
+    /// via `LoadSpec::pid`; FLUX's own `flux` latent-space student. `None` ⇒ native VAE. Shared by both
+    /// the stock and packed component-build paths.
+    fn load_pid(&self) -> Result<Option<Arc<PidEngine>>> {
+        Ok(match self.pid_spec.as_ref() {
+            Some(spec) => Some(Arc::new(PidEngine::from_spec(
+                spec,
+                PID_BACKBONE,
+                &self.device,
+            )?)),
+            None => None,
+        })
     }
 
     /// Load the four heavy components from the snapshot, auto-detecting the tier. A pre-quantized
@@ -212,6 +245,7 @@ impl Pipeline {
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
             toks: Arc::new(FluxTokenizers::load(&self.root)?),
+            pid: self.load_pid()?,
         })
     }
 
@@ -248,6 +282,7 @@ impl Pipeline {
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
             toks: Arc::new(FluxTokenizers::load(&self.root)?),
+            pid: self.load_pid()?,
         })
     }
 
@@ -457,6 +492,21 @@ impl Pipeline {
         // Text embeddings are seed- and image-independent: encode once for the whole batch.
         let (t5_emb, clip_emb) = self.text_embeddings(components, &req.prompt)?;
 
+        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
+        // else `None` → the native FLUX VAE decode. Shared across `count` images (same prompt); the PiD
+        // engine lives in whichever `Components` arm loaded.
+        let pid_engine = match components {
+            Components::Stock { pid, .. } => pid.as_deref(),
+            Components::Packed { pid, .. } => pid.as_deref(),
+        };
+        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+            pid_engine,
+            req,
+            base_seed,
+            self.variant.model_id(),
+        )?;
+
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
             let seed = image_seed(base_seed, index);
@@ -495,12 +545,20 @@ impl Pipeline {
 
             on_progress(Progress::Decoding);
             let image = match components {
-                Components::Stock { vae, .. } => {
-                    self.decode(vae, &latents, req.height as usize, req.width as usize)?
-                }
-                Components::Packed { vae, .. } => {
-                    self.decode_packed(vae, &latents, req.height as usize, req.width as usize)?
-                }
+                Components::Stock { vae, .. } => self.decode(
+                    vae,
+                    pid_decoder.as_ref(),
+                    &latents,
+                    req.height as usize,
+                    req.width as usize,
+                )?,
+                Components::Packed { vae, .. } => self.decode_packed(
+                    vae,
+                    pid_decoder.as_ref(),
+                    &latents,
+                    req.height as usize,
+                    req.width as usize,
+                )?,
             };
             images.push(image);
         }
@@ -591,39 +649,53 @@ impl Pipeline {
     fn decode(
         &self,
         vae: &AutoEncoder,
+        pid: Option<&PidDecoder>,
         latents: &Tensor,
         height: usize,
         width: usize,
     ) -> Result<Image> {
-        decode_latents(vae, latents, height, width)
+        decode_latents(vae, pid, latents, height, width)
     }
 
-    /// Decode the packed tier's denoised latents through the diffusers `AutoEncoderKL` (which applies
-    /// `(z / scaling) + shift` inside `decode`). The latents are first unpacked from the DiT token form
-    /// `(1, h·w, 64)` back to the NCHW latent `(1, 16, H/8, W/8)` the VAE expects (the same `unpack` the
-    /// BFL path uses), then decoded to `[-1, 1]` and mapped to RGB8.
+    /// Decode the packed tier's denoised latents. Unpack from the DiT token form `(1, h·w, 64)` back to
+    /// the NCHW latent `(1, 16, H/8, W/8)`, then either the diffusers `AutoEncoderKL` (which applies
+    /// `(z / scaling) + shift` inside `decode`) or — when a PiD decoder resolved (epic 7840 / sc-7853) —
+    /// the super-resolving `flux`-student, which consumes the SAME unpacked latent the VAE receives (a
+    /// zero-transform seam) and emits a larger `[1,3,4H,4W]` tensor. Both yield `[-1, 1]` pixels;
+    /// [`to_image`] reads the size from the tensor (never `latent*8`).
     fn decode_packed(
         &self,
         vae: &AutoEncoderKL,
+        pid: Option<&PidDecoder>,
         latents: &Tensor,
         height: usize,
         width: usize,
     ) -> Result<Image> {
         let latents = unpack(latents, height, width)?;
-        let decoded = vae.decode(&latents)?.to_dtype(DType::F32)?; // (1, 3, H, W) in [-1, 1]
-        let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
-        let img = img.i(0)?.to_device(&Device::Cpu)?;
-        let (c, h, w) = img.dims3()?;
-        if c != 3 {
-            return Err(CandleError::Msg(format!("expected 3 channels, got {c}")));
-        }
-        let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
-        Ok(Image {
-            width: w as u32,
-            height: h as u32,
-            pixels,
-        })
+        let decoded = match pid {
+            Some(pid) => pid.decode(&latents)?,
+            None => vae.decode(&latents)?.to_dtype(DType::F32)?, // (1, 3, H, W) in [-1, 1]
+        };
+        to_image(&decoded)
     }
+}
+
+/// Convert a decoded pixel tensor `(1, 3, H, W)` in `[-1, 1]` (f32) → RGB8 [`Image`] (`(x+1)·127.5`).
+/// Shared by the native VAE decode and the PiD super-resolving decode; the output size is read from the
+/// tensor, never assumed (PiD may be 4× the VAE-native size).
+fn to_image(decoded: &Tensor) -> Result<Image> {
+    let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
+    let img = img.i(0)?.to_device(&Device::Cpu)?;
+    let (c, h, w) = img.dims3()?;
+    if c != 3 {
+        return Err(CandleError::Msg(format!("expected 3 channels, got {c}")));
+    }
+    let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
+    Ok(Image {
+        width: w as u32,
+        height: h as u32,
+        pixels,
+    })
 }
 
 /// The diffusers `AutoEncoderKL` config for the FLUX packed VAE — identical to z-image's (16 latent
@@ -707,30 +779,25 @@ pub fn encode_text(
     Ok((t5_emb, clip_emb))
 }
 
-/// Unpack the denoised latents `(1, h·w, 64)` back to `(1, 16, H/8, W/8)`, VAE-decode to an RGB8
-/// [`Image`]. Shared by the txt2img [`Pipeline::decode`] and the IP-Adapter provider. The AutoEncoder
-/// applies its own `(z / scale) + shift` un-scale inside `decode`; the `[-1, 1]` output is mapped to
-/// `[0, 255]` u8.
+/// Unpack the denoised latents `(1, h·w, 64)` back to `(1, 16, H/8, W/8)` and decode to an RGB8
+/// [`Image`]. Shared by the txt2img [`Pipeline::decode`] and the IP-Adapter provider (which passes
+/// `pid = None`). The native path uses the FLUX `AutoEncoder` (its own `(z / scale) + shift` un-scale is
+/// applied inside `decode`); when a PiD decoder resolved (epic 7840 / sc-7853) the super-resolving
+/// `flux`-student consumes the SAME unpacked latent the VAE receives (a zero-transform seam) and emits a
+/// larger `[1,3,4H,4W]` tensor. Both yield `[-1, 1]` pixels; [`to_image`] reads the size from the tensor.
 pub fn decode_latents(
     vae: &AutoEncoder,
+    pid: Option<&PidDecoder>,
     latents: &Tensor,
     height: usize,
     width: usize,
 ) -> Result<Image> {
     let latents = unpack(latents, height, width)?;
-    let decoded = vae.decode(&latents)?.to_dtype(DType::F32)?; // (1, 3, H, W) in [-1, 1]
-    let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
-    let img = img.i(0)?.to_device(&Device::Cpu)?;
-    let (c, h, w) = img.dims3()?;
-    if c != 3 {
-        return Err(CandleError::Msg(format!("expected 3 channels, got {c}")));
-    }
-    let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
-    Ok(Image {
-        width: w as u32,
-        height: h as u32,
-        pixels,
-    })
+    let decoded = match pid {
+        Some(pid) => pid.decode(&latents)?,
+        None => vae.decode(&latents)?.to_dtype(DType::F32)?, // (1, 3, H, W) in [-1, 1]
+    };
+    to_image(&decoded)
 }
 
 /// The fixed CLIP-L (openai/clip-vit-large-patch14) text config FLUX uses — identical across
@@ -795,7 +862,7 @@ mod tests {
         )
         .map_err(|e| CandleError::Msg(e.to_string()))?;
 
-        let pipe = Pipeline::load(Variant::Schnell, &tmp, &Device::Cpu, DType::F32);
+        let pipe = Pipeline::load(Variant::Schnell, &tmp, &Device::Cpu, DType::F32, None);
         assert!(
             pipe.component_is_packed("transformer")?,
             "`quantization` block ⇒ packed"

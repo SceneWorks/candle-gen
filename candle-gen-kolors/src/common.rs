@@ -17,7 +17,8 @@
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::gen_core::sampling::{schedule_sigmas, DiscreteModelSampling, Scheduler};
 use candle_gen::gen_core::Image;
-use candle_gen::{CandleError, Result};
+use candle_gen::{CandleError, LatentDecoder, Result};
+use candle_gen_pid::PidDecoder;
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -55,11 +56,32 @@ pub(crate) fn initial_noise(
     Ok(Tensor::from_vec(noise, (1, 4, lat_h, lat_w), &Device::Cpu)?.to_device(device)?)
 }
 
-/// VAE-decode latents `[1, 4, H/8, W/8]` → an RGB8 [`Image`] (un-scale by [`VAE_SCALE`], `x/2 + 0.5`,
-/// clamp, ×255). Shared verbatim by all three entry points.
-pub(crate) fn decode(vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
-    let unscaled = (latents / VAE_SCALE)?;
-    let img = vae.decode(&unscaled)?;
+/// Decode latents `[1, 4, H/8, W/8]` → an RGB8 [`Image`], either through the native SDXL VAE or — when
+/// a PiD decoder resolved (epic 7840 / sc-7853, the `sdxl` student, reused because Kolors reuses the
+/// SDXL VAE) — the super-resolving PiD student (emits a larger `[1,3,4H,4W]` tensor). Both yield
+/// `[-1, 1]` pixels; [`to_image`] reads the size from the tensor. Shared by all three entry points
+/// (control/IP pass `None`).
+///
+/// **Latent convention (sc-7848 parity — NOT zero-transform on candle):** the PiD `sdxl` student
+/// trained on the **0.13025-normalized** latent (the scaled sampler output `latents`), so PiD gets
+/// `latents` while the VAE gets the pipeline-de-scaled raw latent (`latents / VAE_SCALE`) — candle
+/// de-scales here, not inside `vae.decode`, unlike the qwen/flux families. Matches MLX.
+pub(crate) fn decode(
+    vae: &AutoEncoderKL,
+    pid: Option<&PidDecoder>,
+    latents: &Tensor,
+) -> Result<Image> {
+    let img = match pid {
+        Some(pid) => pid.decode(latents)?,
+        None => vae.decode(&(latents / VAE_SCALE)?)?,
+    };
+    to_image(&img)
+}
+
+/// Convert a decoded pixel tensor `[1, 3, H, W]` in `[-1, 1]` → RGB8 [`Image`] (`x/2 + 0.5`, clamp,
+/// ×255). Shared by the native VAE decode and the PiD super-resolving decode; the output size is read
+/// from the tensor, never assumed (PiD may be 4× the VAE-native size).
+pub(crate) fn to_image(img: &Tensor) -> Result<Image> {
     let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
     let img = (img * 255.)?
         .to_dtype(DType::U8)?

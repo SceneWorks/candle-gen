@@ -23,10 +23,11 @@ use std::sync::Arc;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::{AlphaSchedule, Scheduler, Solver};
-use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
+use candle_gen::gen_core::{self, GenerationRequest, Image, PidWeights, Progress};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::image_seed;
 use candle_gen::{CandleError, Result};
+use candle_gen_pid::PidEngine;
 use candle_transformers::models::stable_diffusion::vae::{AutoEncoderKL, AutoEncoderKLConfig};
 
 use crate::chatglm3::ChatGlmModel;
@@ -37,6 +38,10 @@ use crate::config::{ChatGlmConfig, DEFAULT_GUIDANCE, DEFAULT_STEPS};
 use crate::sampler::KolorsEulerSampler;
 use crate::tokenizer::KolorsTokenizer;
 use crate::unet::KolorsUNet;
+
+/// The PiD backbone (latent-space) tag for Kolors (epic 7840 / sc-7853). Kolors reuses the SDXL VAE,
+/// so its latent space is `sdxl` — the same 4× SR student SDXL resolves.
+const PID_BACKBONE: &str = "sdxl";
 
 /// diffusers SDXL VAE `scaling_factor` (Kolors reuses it). The latents are divided by this before
 /// decode — the diffusers-correct SDXL value (NOT candle's hardcoded SD1.5 0.18215). `pub(crate)` so
@@ -88,6 +93,9 @@ pub(crate) fn curated_route<'a>(
 pub(crate) struct Pipeline {
     root: PathBuf,
     device: Device,
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), built into the cached
+    /// [`Components`] so the PiD engine loads once alongside the base model. `None` ⇒ native VAE decode.
+    pid_spec: Option<PidWeights>,
 }
 
 /// The loaded Kolors components, `Arc`-shared so the generator can cache them across `generate` calls.
@@ -98,13 +106,16 @@ pub(crate) struct Components {
     chatglm: Arc<ChatGlmModel>,
     unet: Arc<KolorsUNet>,
     vae: Arc<AutoEncoderKL>,
+    /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
+    pid: Option<Arc<PidEngine>>,
 }
 
 impl Pipeline {
-    pub(crate) fn load(root: &Path, device: &Device) -> Self {
+    pub(crate) fn load(root: &Path, device: &Device, pid_spec: Option<PidWeights>) -> Self {
         Self {
             root: root.to_path_buf(),
             device: device.clone(),
+            pid_spec,
         }
     }
 
@@ -123,11 +134,22 @@ impl Pipeline {
             3,
             sdxl_vae_config(),
         )?;
+        // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
+        // opted in via `LoadSpec::pid`; Kolors shares the SDXL VAE latent space (`sdxl` student).
+        let pid = match self.pid_spec.as_ref() {
+            Some(spec) => Some(Arc::new(PidEngine::from_spec(
+                spec,
+                PID_BACKBONE,
+                &self.device,
+            )?)),
+            None => None,
+        };
         Ok(Components {
             tokenizer: Arc::new(tokenizer),
             chatglm: Arc::new(chatglm),
             unet: Arc::new(unet),
             vae: Arc::new(vae),
+            pid,
         })
     }
 
@@ -162,6 +184,16 @@ impl Pipeline {
         // leading timesteps can't be bit-reproduced by `DiscreteModelSampling::timestep`, so this is
         // ADDITIVE, not a replacement.
         let curated = curated_route(req.sampler.as_deref(), req.scheduler.as_deref());
+
+        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
+        // else `None` → the native SDXL VAE decode. Shared across `count` images (same prompt).
+        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+            components.pid.as_deref(),
+            req,
+            base_seed,
+            crate::MODEL_ID,
+        )?;
 
         let sampler = KolorsEulerSampler::new(steps).map_err(CandleError::Msg)?;
 
@@ -238,7 +270,11 @@ impl Pipeline {
             };
 
             on_progress(Progress::Decoding);
-            images.push(common::decode(&components.vae, &latents)?);
+            images.push(common::decode(
+                &components.vae,
+                pid_decoder.as_ref(),
+                &latents,
+            )?);
         }
         Ok(images)
     }

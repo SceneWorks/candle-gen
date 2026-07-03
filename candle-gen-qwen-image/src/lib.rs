@@ -92,9 +92,14 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, WeightsSource,
+    ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
-use candle_gen::{CandleError, Result as CResult};
+use candle_gen::{CandleError, LatentDecoder, Result as CResult};
+use candle_gen_pid::PidEngine;
+
+/// The PiD backbone (latent-space) tag for the Qwen-Image VAE — resolves to the `qwenimage` `2kto4k`
+/// student + 4× SR (`candle_gen_pid::registry`). Shared with Krea (which reuses [`vae::QwenVae`]).
+const PID_BACKBONE: &str = "qwenimage";
 
 use config::{
     TextEncoderConfig, TransformerConfig, DEFAULT_GUIDANCE, DEFAULT_STEPS, MODEL_ID,
@@ -116,6 +121,9 @@ struct Components {
     /// Qwen tokenizer, loaded+parsed **once** at component load and reused across every prompt/branch
     /// encode (sc-8991 / F-011) instead of re-parsing `tokenizer.json` per request.
     tokenizer: Arc<TextTokenizer>,
+    /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853), loaded once when the model
+    /// was loaded with `LoadSpec::pid`. `None` ⇒ the native `QwenVae` decode (the default path).
+    pid: Option<Arc<PidEngine>>,
 }
 
 struct Pipeline {
@@ -123,15 +131,18 @@ struct Pipeline {
     dit_cfg: TransformerConfig,
     root: PathBuf,
     device: Device,
+    /// The `LoadSpec::pid` component (converted PiD checkpoint + gemma dir), if the caller opted in.
+    pid_spec: Option<PidWeights>,
 }
 
 impl Pipeline {
-    fn load(root: &Path, device: &Device) -> Self {
+    fn load(root: &Path, device: &Device, pid_spec: Option<PidWeights>) -> Self {
         Self {
             te_cfg: TextEncoderConfig::qwen_image(),
             dit_cfg: TransformerConfig::qwen_image(),
             root: root.to_path_buf(),
             device: device.clone(),
+            pid_spec,
         }
     }
 
@@ -174,11 +185,22 @@ impl Pipeline {
             },
         )
         .map_err(|e| CandleError::Msg(format!("qwen-image: load tokenizer: {e}")))?;
+        // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
+        // opted in via `LoadSpec::pid`; otherwise `None` and the render path uses the native QwenVae.
+        let pid = match &self.pid_spec {
+            Some(spec) => Some(Arc::new(PidEngine::from_spec(
+                spec,
+                PID_BACKBONE,
+                &self.device,
+            )?)),
+            None => None,
+        };
         Ok(Components {
             te: Arc::new(te),
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
             tokenizer: Arc::new(tokenizer),
+            pid,
         })
     }
 
@@ -226,6 +248,13 @@ impl Pipeline {
         let sigmas =
             candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
 
+        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
+        // else `None` → the native QwenVae decode. Built before the loop so all `count` images share it
+        // (same prompt), mirroring the MLX `decode_and_collect` seam.
+        let pid_decoder =
+            candle_gen_pid::resolve_pid_decoder(comps.pid.as_deref(), req, base_seed, MODEL_ID)?;
+
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
             let seed = base_seed.wrapping_add(index as u64);
@@ -259,7 +288,14 @@ impl Pipeline {
 
             on_progress(Progress::Decoding);
             let lat = pipeline::unpack_latents(&latents, req.width, req.height)?;
-            let decoded = comps.vae.decode(&lat)?;
+            // PiD (super-resolving) decode when the toggle resolved one; else the native VAE. Both
+            // consume the same normalized `[1,16,H/8,W/8]` latent (QwenVae de-normalizes internally,
+            // and PiD is trained on that normalized latent) — a zero-transform seam. PiD returns a
+            // larger `[1,3,4H,4W]` tensor; `to_image` reads the size from it.
+            let decoded = match &pid_decoder {
+                Some(pid) => pid.decode(&lat)?,
+                None => comps.vae.decode(&lat)?,
+            };
             images.push(to_image(&decoded)?);
         }
         Ok(images)
@@ -300,6 +336,9 @@ pub struct QwenImageGenerator {
     descriptor: ModelDescriptor,
     root: PathBuf,
     device: Device,
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
+    /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
+    pid_spec: Option<PidWeights>,
     components: Mutex<Option<Components>>,
 }
 
@@ -352,7 +391,7 @@ impl Generator for QwenImageGenerator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = Pipeline::load(&self.root, &self.device);
+        let pipe = Pipeline::load(&self.root, &self.device, self.pid_spec.clone());
         let components = self.components(&pipe)?;
         let images = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Images(images))
@@ -435,6 +474,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         descriptor: descriptor(),
         root,
         device,
+        // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
+        // any) so the lazy component build loads the engine once. Unlike adapters/quant/control above,
+        // it is not rejected — `None` simply keeps the byte-exact native-VAE path.
+        pid_spec: spec.pid.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -642,7 +685,7 @@ mod tests {
         let g = load(&spec).expect("a 2512-shaped snapshot dir must load like the base");
         assert_eq!(g.descriptor().id, MODEL_ID);
 
-        let pipe = Pipeline::load(&tmp, &Device::Cpu);
+        let pipe = Pipeline::load(&tmp, &Device::Cpu, None);
         assert!(
             pipe.root.join("tokenizer/tokenizer.json").is_file(),
             "loader must resolve the overlaid tokenizer.json under tokenizer/"

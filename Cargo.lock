@@ -214,6 +214,7 @@ name = "candle-gen-boogu"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-pid",
  "candle-transformers",
  "image",
  "inventory",
@@ -227,6 +228,7 @@ name = "candle-gen-chroma"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-pid",
  "candle-transformers",
  "image",
  "inventory",
@@ -274,6 +276,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-gen",
+ "candle-gen-pid",
  "candle-gen-sdxl",
  "candle-nn",
  "candle-transformers",
@@ -291,6 +294,7 @@ name = "candle-gen-flux2"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-pid",
  "candle-transformers",
  "image",
  "inventory",
@@ -307,6 +311,7 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-flux2",
+ "candle-gen-pid",
  "image",
  "inventory",
  "rand",
@@ -343,6 +348,7 @@ name = "candle-gen-kolors"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-pid",
  "candle-gen-sdxl",
  "candle-transformers",
  "image",
@@ -358,6 +364,7 @@ name = "candle-gen-krea"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-pid",
  "candle-gen-qwen-image",
  "image",
  "inventory",
@@ -373,6 +380,7 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-flux2",
+ "candle-gen-pid",
  "image",
  "inventory",
  "rand",
@@ -396,6 +404,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-pid"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "image",
+ "rand",
+ "sceneworks-gen-core-testkit",
+]
+
+[[package]]
 name = "candle-gen-pulid"
 version = "0.0.0"
 dependencies = [
@@ -415,6 +433,7 @@ name = "candle-gen-qwen-image"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-pid",
  "image",
  "inventory",
  "rand",
@@ -474,6 +493,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-gen",
+ "candle-gen-pid",
  "candle-nn",
  "candle-transformers",
  "hf-hub",
@@ -546,6 +566,7 @@ version = "0.0.0"
 dependencies = [
  "candle-core",
  "candle-gen",
+ "candle-gen-pid",
  "candle-nn",
  "candle-transformers",
  "image",

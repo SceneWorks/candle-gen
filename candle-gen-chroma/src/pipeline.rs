@@ -26,11 +26,16 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
+use candle_gen::gen_core::{self, GenerationRequest, Image, PidWeights, Progress};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::image_seed;
-use candle_gen::{CandleError, Result};
+use candle_gen::{CandleError, LatentDecoder, Result};
+use candle_gen_pid::{PidDecoder, PidEngine};
 use candle_transformers::models::flux::sampling::unpack;
+
+/// The PiD backbone (latent-space) tag for Chroma (epic 7840 / sc-7853). Chroma is a FLUX.1-lineage
+/// DiT over the FLUX.1 16-ch VAE, so its latent space is `flux` — the same 4× SR student FLUX resolves.
+const PID_BACKBONE: &str = "flux";
 use candle_transformers::models::t5::T5EncoderModel;
 use rand::{rngs::StdRng, SeedableRng};
 use tokenizers::Tokenizer;
@@ -50,6 +55,9 @@ pub(crate) struct Pipeline {
     variant: ChromaVariant,
     root: PathBuf,
     device: Device,
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), built into the cached
+    /// [`Components`] so the PiD engine loads once alongside the base model. `None` ⇒ native VAE decode.
+    pid_spec: Option<PidWeights>,
 }
 
 /// The loaded Chroma components, `Arc`-shared so the generator can cache them across `generate`
@@ -62,14 +70,22 @@ pub(crate) struct Components {
     transformer: Arc<ChromaTransformer>,
     vae: Arc<Vae>,
     cfg: ChromaTransformerConfig,
+    /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
+    pid: Option<Arc<PidEngine>>,
 }
 
 impl Pipeline {
-    pub(crate) fn load(variant: ChromaVariant, root: &Path, device: &Device) -> Self {
+    pub(crate) fn load(
+        variant: ChromaVariant,
+        root: &Path,
+        device: &Device,
+        pid_spec: Option<PidWeights>,
+    ) -> Self {
         Self {
             variant,
             root: root.to_path_buf(),
             device: device.clone(),
+            pid_spec,
         }
     }
 
@@ -91,12 +107,23 @@ impl Pipeline {
         let gs = self.transformer_group_size(&dit_dir);
         let transformer = ChromaTransformer::new_gs(cfg, self.f32_vb(&dit_dir)?, gs)?;
         let vae = Vae::new(self.f32_vb(&self.root.join("vae"))?)?;
+        // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller opted
+        // in via `LoadSpec::pid`; Chroma is a FLUX.1-lineage latent space (`flux` student).
+        let pid = match self.pid_spec.as_ref() {
+            Some(spec) => Some(Arc::new(PidEngine::from_spec(
+                spec,
+                PID_BACKBONE,
+                &self.device,
+            )?)),
+            None => None,
+        };
         Ok(Components {
             tokenizer: Arc::new(tokenizer),
             t5: Arc::new(Mutex::new(t5)),
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
             cfg,
+            pid,
         })
     }
 
@@ -163,6 +190,16 @@ impl Pipeline {
             None => None,
         };
 
+        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
+        // else `None` → the native FLUX-lineage VAE decode. Shared across `count` images (same prompt).
+        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+            components.pid.as_deref(),
+            req,
+            base_seed,
+            self.variant.id(),
+        )?;
+
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
             if req.cancel.is_cancelled() {
@@ -187,7 +224,13 @@ impl Pipeline {
                 on_progress,
             )?;
             on_progress(Progress::Decoding);
-            images.push(self.decode(&components.vae, &latents, req.height, req.width)?);
+            images.push(self.decode(
+                &components.vae,
+                pid_decoder.as_ref(),
+                &latents,
+                req.height,
+                req.width,
+            )?);
         }
         Ok(images)
     }
@@ -295,11 +338,24 @@ impl Pipeline {
         )
     }
 
-    /// Unpack the denoised packed latent `[1, Si, 64]` → `[1, 16, H/8, W/8]`, VAE-decode to an RGB8
-    /// [`Image`] (the `[-1, 1]` output mapped to `[0, 255]`).
-    fn decode(&self, vae: &Vae, latents: &Tensor, height: u32, width: u32) -> Result<Image> {
+    /// Unpack the denoised packed latent `[1, Si, 64]` → `[1, 16, H/8, W/8]` and decode to an RGB8
+    /// [`Image`] (the `[-1, 1]` output mapped to `[0, 255]`). Native path: the FLUX-lineage `Vae` applies
+    /// its own scale/shift un-scale internally. When a PiD decoder resolved (epic 7840 / sc-7853), the
+    /// super-resolving `flux`-student consumes the SAME unpacked latent the VAE receives (a zero-transform
+    /// seam) and emits a larger `[1,3,4H,4W]` tensor; the size is read from the tensor (never `latent*8`).
+    fn decode(
+        &self,
+        vae: &Vae,
+        pid: Option<&PidDecoder>,
+        latents: &Tensor,
+        height: u32,
+        width: u32,
+    ) -> Result<Image> {
         let latents = unpack(latents, height as usize, width as usize)?;
-        let decoded = vae.decode(&latents)?.to_dtype(DType::F32)?; // [1, 3, H, W] in [-1, 1]
+        let decoded = match pid {
+            Some(pid) => pid.decode(&latents)?,
+            None => vae.decode(&latents)?.to_dtype(DType::F32)?, // [1, 3, H, W] in [-1, 1]
+        };
         let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
         let img = img.i(0)?.to_device(&Device::Cpu)?; // [3, H, W]
         let (c, h, w) = img.dims3()?;
@@ -339,7 +395,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("sc9409_gs_pipe_{}", std::process::id()));
         let dir = tmp.join("transformer");
         std::fs::create_dir_all(&dir).ok();
-        let pipe = Pipeline::load(ChromaVariant::Base, &tmp, &Device::Cpu);
+        let pipe = Pipeline::load(ChromaVariant::Base, &tmp, &Device::Cpu, None);
 
         // A real Chroma packed tier: bits 4, group 64.
         std::fs::write(
@@ -383,7 +439,7 @@ mod tests {
     /// HD's static shift moves the interior sigmas but keeps a descending 1→0 schedule of length N+1.
     #[test]
     fn hd_sigmas_descend_with_shift() {
-        let pipe = Pipeline::load(ChromaVariant::Hd, Path::new("/x"), &Device::Cpu);
+        let pipe = Pipeline::load(ChromaVariant::Hd, Path::new("/x"), &Device::Cpu, None);
         let s = pipe.sigmas(8);
         assert_eq!(s.len(), 9);
         assert!(
@@ -399,7 +455,7 @@ mod tests {
     /// Flash uses shift 1.0 → the schedule is the raw `linspace(1, 1/N, N)` + trailing 0.
     #[test]
     fn flash_sigmas_are_unshifted_linspace() {
-        let pipe = Pipeline::load(ChromaVariant::Flash, Path::new("/x"), &Device::Cpu);
+        let pipe = Pipeline::load(ChromaVariant::Flash, Path::new("/x"), &Device::Cpu, None);
         let s = pipe.sigmas(4);
         // linspace(1, 1/4, 4) = [1, 0.75, 0.5, 0.25], then 0.
         let want = [1.0, 0.75, 0.5, 0.25, 0.0];
@@ -411,7 +467,7 @@ mod tests {
     /// Base routes through the beta-spaced schedule (distinct from the linspace).
     #[test]
     fn base_sigmas_use_beta_schedule() {
-        let pipe = Pipeline::load(ChromaVariant::Base, Path::new("/x"), &Device::Cpu);
+        let pipe = Pipeline::load(ChromaVariant::Base, Path::new("/x"), &Device::Cpu, None);
         let s = pipe.sigmas(4);
         assert_eq!(s, crate::beta::base_sigmas(4));
         // 0.79344 (beta) ≠ 0.75 (linspace) at index 1.

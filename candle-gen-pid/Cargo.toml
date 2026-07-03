@@ -1,0 +1,34 @@
+[package]
+name = "candle-gen-pid"
+version = "0.0.0"
+edition = "2021"
+description = "NVIDIA PiD (Pixel Diffusion Decoder) — optional latent→pixel super-resolving decoder for candle-gen (epic 7840, candle dup sc-7853). Windows/CUDA + Linux sibling of mlx-gen-pid."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "pixel-decoder", "super-resolution"]
+categories = ["science"]
+
+[dependencies]
+# The shared candle backend + commons (device/dtype seam, `Weights`, `LatentDecoder` seam,
+# `sdpa_budgeted_bhsd`, seeded noise). Re-exports `candle_core` / `candle_nn` / `gen_core`, so the PiD
+# engine resolves the SAME candle build + gen-core rev the provider crates it wires into resolve.
+candle-gen = { path = "../candle-gen" }
+# The sampler draws its initial noise + per-step SDE ε from a seeded `StdRng` via `candle_gen::seed`
+# (CPU-first, launch-portable — sc-3673). Same workspace pin as candle-gen so the `StdRng` type the
+# `seeded_*` helpers take matches.
+rand = { workspace = true }
+# Encode the e2e real-weight smoke output to PNG (mirrors mlx-gen-pid / candle-gen-krea test IO).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[dev-dependencies]
+# Backend-neutral gen-core contract conformance floor (sc-4481); weight-gated (#[ignore]).
+sceneworks-gen-core-testkit = { workspace = true }
+# Shared test-support helpers (PPM IO / cosine / HF-cache resolution) behind candle-gen's `testkit`.
+candle-gen = { path = "../candle-gen", features = ["testkit"] }
+
+[features]
+default = []
+# Apple Metal GPU backend (Mac) — forwarded to the candle backend. Not in `default`.
+metal = ["candle-gen/metal"]
+# NVIDIA CUDA backend (Windows/Linux target) — forwarded to the candle backend. Not in `default`.
+cuda = ["candle-gen/cuda"]

@@ -46,10 +46,15 @@ use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, Image,
-    LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
+    LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
-use candle_gen::{CandleError, Result as CResult};
+use candle_gen::{CandleError, LatentDecoder, Result as CResult};
+use candle_gen_pid::PidEngine;
 use rand::{rngs::StdRng, SeedableRng};
+
+/// The PiD backbone (latent-space) tag for Lens (epic 7840 / sc-7853). Lens reuses the FLUX.2 VAE, so
+/// its latent space is `flux2` — the same packed 128-ch BN-normalized student FLUX.2 resolves.
+const PID_BACKBONE: &str = "flux2";
 
 use candle_gen::gen_core::sampling::TimestepConvention;
 use schedule::{cfg_rescale, lens_mu, lens_sigmas, LensSamplingDefaults, BASE, TURBO};
@@ -86,6 +91,9 @@ struct Components {
     encoder: Arc<GptOssTextEncoder>,
     transformer: Arc<LensTransformer>,
     vae: Arc<Flux2Vae>,
+    /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853), loaded once when the model
+    /// was loaded with `LoadSpec::pid`. `None` ⇒ the native `Flux2Vae` decode (the default path).
+    pid: Option<Arc<PidEngine>>,
 }
 
 /// A loadable Lens pipeline (the snapshot root + device + any DiT LoRA/LoKr adapters + optional DiT
@@ -101,6 +109,9 @@ struct Pipeline {
     /// compute-heavy linears (sc-5117) — the encoder is the memory hog, the DiT the compute. The VAE
     /// stays f32. One `Quant` drives both; each consumer maps it to the GGUF block dtype it needs.
     quant: Option<Quant>,
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
+    /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
+    pid_spec: Option<PidWeights>,
 }
 
 impl Pipeline {
@@ -109,12 +120,14 @@ impl Pipeline {
         device: &Device,
         adapters: Vec<AdapterSpec>,
         quant: Option<Quant>,
+        pid_spec: Option<PidWeights>,
     ) -> Self {
         Self {
             root: root.to_path_buf(),
             device: device.clone(),
             adapters,
             quant,
+            pid_spec,
         }
     }
 
@@ -177,11 +190,22 @@ impl Pipeline {
             transformer.quantize(quant)?;
         }
         let vae = Flux2Vae::new(self.component_vb("vae", VAE_DTYPE)?)?;
+        // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
+        // opted in via `LoadSpec::pid`; Lens shares the FLUX.2 VAE latent space (`flux2` student).
+        let pid = match self.pid_spec.as_ref() {
+            Some(spec) => Some(Arc::new(PidEngine::from_spec(
+                spec,
+                PID_BACKBONE,
+                &self.device,
+            )?)),
+            None => None,
+        };
         Ok(Components {
             tokenizer: Arc::new(tokenizer),
             encoder: Arc::new(encoder),
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
+            pid,
         })
     }
 
@@ -365,6 +389,12 @@ impl Pipeline {
         let (features, mask) =
             self.encode_prompt(comps, &req.prompt, negative, DEFAULT_DATE, guided)?;
 
+        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
+        // else `None` → the native Flux2Vae decode. Shared across `count` images (same prompt).
+        let pid_decoder =
+            candle_gen_pid::resolve_pid_decoder(comps.pid.as_deref(), req, base_seed, defaults.id)?;
+
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
             let seed = base_seed.wrapping_add(index as u64);
@@ -386,7 +416,21 @@ impl Pipeline {
                 on_progress,
             )?;
             on_progress(Progress::Decoding);
-            let decoded = vae::decode(&comps.vae, &latents, latent_h, latent_w)?;
+            // PiD (super-resolving) decode when the toggle resolved one; else the native VAE. PiD
+            // consumes the packed BN-normalized `[1,128,h,w]` latent directly — the *same* packed grid
+            // `vae::decode` builds from the DiT output `[1, seq, 128]` (reshape → permute → contiguous),
+            // then BN-de-normalizes; here PiD gets that grid before de-normalization. Returns `[1,3,4H,4W]`.
+            let decoded = match &pid_decoder {
+                Some(pid) => {
+                    let (b, _seq, c) = latents.dims3()?;
+                    let packed = latents
+                        .reshape((b, latent_h, latent_w, c))?
+                        .permute((0, 3, 1, 2))?
+                        .contiguous()?;
+                    pid.decode(&packed)?
+                }
+                None => vae::decode(&comps.vae, &latents, latent_h, latent_w)?,
+            };
             images.push(to_image(&decoded)?);
         }
         Ok(images)
@@ -502,7 +546,7 @@ impl LensGenerator {
         Ok(Self {
             descriptor: descriptor_turbo(),
             defaults: TURBO_DEFAULTS,
-            pipeline: Pipeline::load(root.as_ref(), &device, Vec::new(), None),
+            pipeline: Pipeline::load(root.as_ref(), &device, Vec::new(), None, None),
             components: Mutex::new(None),
         })
     }
@@ -692,7 +736,16 @@ fn load_with(spec: &LoadSpec, defaults: Defaults) -> gen_core::Result<Box<dyn Ge
     Ok(Box::new(LensGenerator {
         descriptor: descriptor_for(defaults.id),
         defaults,
-        pipeline: Pipeline::load(&root, &device, spec.adapters.clone(), spec.quantize),
+        // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
+        // any) so the lazy component build loads the engine once. Unlike control/IP above, it is not
+        // rejected — `None` simply keeps the byte-exact native-VAE path.
+        pipeline: Pipeline::load(
+            &root,
+            &device,
+            spec.adapters.clone(),
+            spec.quantize,
+            spec.pid.clone(),
+        ),
         components: Mutex::new(None),
     }))
 }

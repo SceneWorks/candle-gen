@@ -13,6 +13,11 @@ candle-gen = { path = "../candle-gen" }
 # Ideogram's VAE is the FLUX.2 `AutoencoderKLFlux2` (32-ch, 2×2 patchify, identity scaling) — reuse
 # `candle-gen-flux2`'s `Flux2Vae` verbatim, exactly as `mlx-gen-ideogram` reuses `mlx-gen-flux2`.
 candle-gen-flux2 = { path = "../candle-gen-flux2" }
+# NVIDIA PiD optional super-resolving decoder (epic 7840 / sc-7853): Ideogram 4 reuses the FLUX.2 VAE,
+# so it shares the `flux2` PiD latent-space student (its DiT packs the 128 channels in a DIFFERENT
+# `(ph,pw,c)` order, so the decode branch reconstructs the FLUX.2-canonical packed latent). Wired
+# behind `req.use_pid` (default off → the byte-exact native `Flux2Vae::decode_latent`).
+candle-gen-pid = { path = "../candle-gen-pid" }
 inventory = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673 parity).
 rand = { workspace = true }
@@ -23,8 +28,8 @@ safetensors = "0.7"
 
 [features]
 default = []
-metal = ["candle-gen/metal", "candle-gen-flux2/metal"]
-cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda"]
+metal = ["candle-gen/metal", "candle-gen-flux2/metal", "candle-gen-pid/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda", "candle-gen-pid/cuda"]
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }

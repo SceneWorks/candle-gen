@@ -63,10 +63,15 @@ use candle_gen::gen_core::sampling::{
     Scheduler, Solver,
 };
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
-use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress};
+use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, PidWeights, Progress};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::image_seed;
-use candle_gen::{CandleError, Result};
+use candle_gen::{CandleError, LatentDecoder, Result};
+use candle_gen_pid::{PidDecoder, PidEngine};
+
+/// The PiD backbone (latent-space) tag for SDXL (epic 7840 / sc-7853): SDXL's own `sdxl` VP-frame
+/// student (4× SR). Kolors reuses this crate's decode seam via the same `sdxl` tag (shared VAE).
+const PID_BACKBONE: &str = "sdxl";
 use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
 use candle_transformers::models::stable_diffusion::schedulers::SchedulerConfig;
 use candle_transformers::models::stable_diffusion::unet_2d::{
@@ -266,6 +271,9 @@ pub(crate) struct Pipeline {
     /// generator's lifetime (they come from the `LoadSpec`), so they do not enter the component cache
     /// key — only flash-attn does. Empty ⇒ the stock mmap `build_unet` path (zero regression).
     adapters: Vec<AdapterSpec>,
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), built into the cached
+    /// [`Components`] so the PiD engine loads once alongside the UNet/VAE. `None` ⇒ native VAE decode.
+    pid_spec: Option<PidWeights>,
 }
 
 /// The seed- and prompt-independent heavy components (UNet + f16 VAE), `Arc`-shared so they can be
@@ -279,6 +287,8 @@ pub(crate) struct Pipeline {
 pub(crate) struct Components {
     pub(crate) unet: SdxlUnet,
     pub(crate) vae: Arc<AutoEncoderKL>,
+    /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
+    pub(crate) pid: Option<Arc<PidEngine>>,
 }
 
 /// The SDXL denoise UNet, in one of two builds that share the txt2img `forward(x, t, ehs)` contract
@@ -329,6 +339,7 @@ impl Pipeline {
         width: u32,
         height: u32,
         adapters: &[AdapterSpec],
+        pid_spec: Option<PidWeights>,
     ) -> Result<Self> {
         // The config's only request-dependent fields are the latent dims; the component configs
         // (clip/clip2/unet/autoencoder) are fixed for SDXL.
@@ -339,6 +350,7 @@ impl Pipeline {
             device: device.clone(),
             dtype,
             adapters: adapters.to_vec(),
+            pid_spec,
         })
     }
 
@@ -493,9 +505,20 @@ impl Pipeline {
             &self.device,
             self.dtype,
         )?;
+        // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
+        // opted in via `LoadSpec::pid`; SDXL's own `sdxl` latent-space student. `None` ⇒ native VAE.
+        let pid = match self.pid_spec.as_ref() {
+            Some(spec) => Some(Arc::new(PidEngine::from_spec(
+                spec,
+                PID_BACKBONE,
+                &self.device,
+            )?)),
+            None => None,
+        };
         Ok(Components {
             unet,
             vae: Arc::new(vae),
+            pid,
         })
     }
 
@@ -580,6 +603,7 @@ impl Pipeline {
         text_embeddings: &Tensor,
         unet: &SdxlUnet,
         vae: &AutoEncoderKL,
+        pid: Option<&PidEngine>,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
         // sc-6128: a `lightning` request runs the few-step Euler-trailing path; the native DDIM path is
@@ -604,6 +628,12 @@ impl Pipeline {
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let total = steps as u32;
         let (lat_h, lat_w) = (self.config.height / 8, self.config.width / 8);
+
+        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
+        // else `None` → the native SDXL VAE decode. Shared across `count` images (same prompt).
+        let pid_decoder =
+            candle_gen_pid::resolve_pid_decoder(pid, req, base_seed, crate::MODEL_ID)?;
 
         // Lightning precompute (seed-independent): the trailing-Euler policy + the cond-only text
         // embedding (row 1 of the `[uncond, cond]` dual-CLIP stack — Lightning runs one conditioned
@@ -688,7 +718,7 @@ impl Pipeline {
             };
 
             on_progress(Progress::Decoding);
-            images.push(self.decode(vae, &latents)?);
+            images.push(self.decode(vae, pid_decoder.as_ref(), &latents)?);
         }
         Ok(images)
     }
@@ -804,11 +834,34 @@ impl Pipeline {
         Ok(out.to_dtype(self.dtype)?)
     }
 
-    /// VAE-decode latents to an RGB8 [`Image`] (un-scale by [`VAE_SCALE`], `x/2 + 0.5`, clamp, ×255).
-    /// The decode itself runs tiled or monolithic per [`decode_image`](Self::decode_image).
-    fn decode(&self, vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
-        let unscaled = (latents / VAE_SCALE)?;
-        let img = self.decode_image(vae, &unscaled)?;
+    /// Decode latents to an RGB8 [`Image`], either through the native VAE or — when a PiD decoder
+    /// resolved (epic 7840 / sc-7853) — the super-resolving PiD student (emits a larger `[1,3,4H,4W]`
+    /// tensor). Both produce `[-1, 1]` pixels; [`to_image`](Self::to_image) reads the size from the
+    /// tensor (never `latent*8`).
+    ///
+    /// **Latent convention (sc-7848 parity — NOT zero-transform on candle):** the PiD `sdxl` student
+    /// trained on the **0.13025-normalized** latent — the scaled sampler output `latents`. In candle the
+    /// VAE de-scale happens here in the pipeline (`latents / VAE_SCALE`) rather than inside `vae.decode`
+    /// (unlike the qwen/flux families, whose VAE de-normalizes internally), so PiD gets `latents`
+    /// (normalized) while the VAE gets the de-scaled raw latent. This matches MLX, where `vae.decode`
+    /// de-scales internally and both paths receive that same normalized tensor.
+    fn decode(
+        &self,
+        vae: &AutoEncoderKL,
+        pid: Option<&PidDecoder>,
+        latents: &Tensor,
+    ) -> Result<Image> {
+        let img = match pid {
+            Some(pid) => pid.decode(latents)?,
+            None => self.decode_image(vae, &(latents / VAE_SCALE)?)?,
+        };
+        self.to_image(&img)
+    }
+
+    /// Convert a decoded pixel tensor `[1, 3, H, W]` in `[-1, 1]` → RGB8 [`Image`] (`x/2 + 0.5`, clamp,
+    /// ×255). Shared by the native VAE decode and the PiD super-resolving decode; the output size is
+    /// read from the tensor, never assumed (PiD may be 4× the VAE-native size).
+    fn to_image(&self, img: &Tensor) -> Result<Image> {
         let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
         let img = (img * 255.)?
             .to_dtype(DType::U8)?
@@ -1037,6 +1090,7 @@ mod tests {
             device: Device::Cpu,
             dtype: DType::F32,
             adapters: vec![],
+            pid_spec: None,
         };
         let got = pipe.detect_packed_unet().unwrap();
         assert!(got.is_some(), "a quantization block ⇒ packed tier");
@@ -1091,6 +1145,7 @@ mod tests {
             device: Device::Cpu,
             dtype: DType::F32,
             adapters: vec![],
+            pid_spec: None,
         };
         assert!(
             pipe.detect_packed_unet().is_err(),

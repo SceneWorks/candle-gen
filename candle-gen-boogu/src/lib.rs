@@ -37,7 +37,8 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
     self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
-    Generator, Image, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
+    Generator, Image, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress, Quant,
+    WeightsSource,
 };
 
 use pipeline::{Components, EditComponents};
@@ -84,6 +85,9 @@ pub struct BooguGenerator {
     root: PathBuf,
     variant: Variant,
     device: Device,
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
+    /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
+    pid_spec: Option<PidWeights>,
     components: Mutex<Option<Arc<Components>>>,
     edit_components: Mutex<Option<Arc<EditComponents>>>,
 }
@@ -97,7 +101,11 @@ impl BooguGenerator {
         if let Some(c) = guard.as_ref() {
             return Ok(c.clone());
         }
-        let c = Arc::new(pipeline::load_components(&self.root, &self.device)?);
+        let c = Arc::new(pipeline::load_components(
+            &self.root,
+            &self.device,
+            self.pid_spec.as_ref(),
+        )?);
         *guard = Some(c.clone());
         Ok(c)
     }
@@ -292,6 +300,10 @@ fn build(
         root,
         variant,
         device,
+        // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
+        // any) so the lazy component build loads the engine once. Unlike adapters/control above, it is
+        // not rejected — `None` simply keeps the byte-exact native-VAE path.
+        pid_spec: spec.pid.clone(),
         components: Mutex::new(None),
         edit_components: Mutex::new(None),
     }))

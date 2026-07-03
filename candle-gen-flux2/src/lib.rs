@@ -64,13 +64,19 @@ use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, WeightsSource,
+    ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
 };
-use candle_gen::{CandleError, Result as CResult};
+use candle_gen::{CandleError, LatentDecoder, Result as CResult};
+use candle_gen_pid::PidEngine;
 
 use config::{Flux2Config, Flux2Variant, SIZE_MULTIPLE};
 use text_encoder::Flux2PromptEncoder;
 use vae::Flux2Vae;
+
+/// The PiD backbone (latent-space) tag for FLUX.2 (epic 7840 / sc-7853): the `flux2` student consumes
+/// the packed 128-channel BN-normalized latent at H/16 directly (the same tensor `decode_packed`
+/// BN-de-normalizes). Lens reuses this same latent space (it shares the FLUX.2 VAE).
+const PID_BACKBONE: &str = "flux2";
 
 /// Qwen3 `<|endoftext|>` pad token id (klein FLUX.2 text encoder).
 const QWEN_PAD_TOKEN_ID: i32 = 151643;
@@ -87,6 +93,9 @@ struct Components {
     /// and reused across every prompt/branch encode (sc-8991 / F-011) instead of re-parsing
     /// `tokenizer.json` per request.
     tokenizer: Arc<TextTokenizer>,
+    /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853), loaded once when the model
+    /// was loaded with `LoadSpec::pid`. `None` ⇒ the native `Flux2Vae::decode_packed` (the default path).
+    pid: Option<Arc<PidEngine>>,
 }
 
 /// A txt2img pipeline handle: snapshot root + device + the f32 compute dtype. `pub(crate)` so the
@@ -100,6 +109,9 @@ pub(crate) struct Pipeline {
     /// When `Some`, the quantizable components (TE + DiT) are staged dense in CPU RAM and quantized
     /// onto `device` (the dev 32B path; klein leaves this `None`).
     pub(crate) quant: Option<Quant>,
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
+    /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
+    pub(crate) pid_spec: Option<PidWeights>,
 }
 
 impl Pipeline {
@@ -108,6 +120,7 @@ impl Pipeline {
         quant: Option<Quant>,
         root: &Path,
         device: &Device,
+        pid_spec: Option<PidWeights>,
     ) -> Self {
         Self {
             variant,
@@ -118,6 +131,7 @@ impl Pipeline {
             // the math is parity-sensitive; a bf16 pass is a follow-up optimization.
             dtype: DType::F32,
             quant,
+            pid_spec,
         }
     }
 
@@ -252,11 +266,22 @@ impl Pipeline {
         let (te, transformer) = self.load_te_and_dit()?;
         let vae = Flux2Vae::new(self.component_vb("vae")?)?;
         let tokenizer = self.build_tokenizer()?;
+        // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
+        // opted in via `LoadSpec::pid`; otherwise `None` and the render path uses the native Flux2Vae.
+        let pid = match self.pid_spec.as_ref() {
+            Some(spec) => Some(Arc::new(PidEngine::from_spec(
+                spec,
+                PID_BACKBONE,
+                &self.device,
+            )?)),
+            None => None,
+        };
         Ok(Components {
             te: Arc::new(te),
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
             tokenizer: Arc::new(tokenizer),
+            pid,
         })
     }
 
@@ -341,6 +366,16 @@ impl Pipeline {
         let sigmas =
             candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), mu, steps, &native);
 
+        // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+        // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded),
+        // else `None` → the native Flux2Vae decode. Shared across `count` images (same prompt).
+        let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+            comps.pid.as_deref(),
+            req,
+            base_seed,
+            self.variant.id(),
+        )?;
+
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
             let seed = base_seed.wrapping_add(index as u64);
@@ -396,7 +431,12 @@ impl Pipeline {
 
             on_progress(Progress::Decoding);
             let packed = pipeline::unpack_latents(&latents, req.width, req.height)?;
-            let decoded = comps.vae.decode_packed(&packed)?; // [1,3,H,W] in [-1,1]
+            let decoded = match &pid_decoder {
+                // PiD consumes the packed BN-normalized [1,128,H/16,W/16] latent directly (the same
+                // tensor decode_packed BN-de-normalizes); returns [1,3,4H,4W].
+                Some(pid) => pid.decode(&packed)?,
+                None => comps.vae.decode_packed(&packed)?, // [1,3,H,W] in [-1,1]
+            };
             images.push(to_image(&decoded)?);
         }
         Ok(images)
@@ -428,6 +468,9 @@ pub struct Flux2Generator {
     device: Device,
     /// `Some` ⇒ CPU-stage → quantize-onto-GPU at load (dev Q4/Q8); `None` ⇒ dense.
     quant: Option<Quant>,
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
+    /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
+    pid_spec: Option<PidWeights>,
     components: Mutex<Option<Components>>,
 }
 
@@ -479,7 +522,13 @@ impl Generator for Flux2Generator {
         on_progress: &mut dyn FnMut(Progress),
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
-        let pipe = Pipeline::load(self.variant, self.quant, &self.root, &self.device);
+        let pipe = Pipeline::load(
+            self.variant,
+            self.quant,
+            &self.root,
+            &self.device,
+            self.pid_spec.clone(),
+        );
         let components = self.components(&pipe)?;
         let images = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Images(images))
@@ -587,6 +636,10 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<
         root,
         device,
         quant,
+        // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
+        // any) so the lazy component build loads the engine once. Unlike adapters/control above, it is
+        // not rejected — `None` simply keeps the byte-exact native-VAE path.
+        pid_spec: spec.pid.clone(),
         components: Mutex::new(None),
     }))
 }
@@ -725,7 +778,7 @@ mod tests {
     #[test]
     fn component_is_packed_reads_quantization_block() {
         let dir = std::env::temp_dir().join(format!("sc9087_pkg_{}", std::process::id()));
-        let pipe = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu);
+        let pipe = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu, None);
 
         let packed = dir.join("transformer");
         std::fs::create_dir_all(&packed).unwrap();
@@ -825,7 +878,7 @@ mod tests {
 
         // no quant → configured device, no staging call.
         write_shard("text_encoder", false);
-        let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &dir, &Device::Cpu);
+        let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &dir, &Device::Cpu, None);
         let p = pipe
             .load_one_quantizable("text_encoder", build, quantize)
             .unwrap();
@@ -834,7 +887,7 @@ mod tests {
         assert!(!p.quantized.get(), "no-quant path must not quantize");
 
         // dense tier + quant → the builder sees the CPU (staging), then quantize runs onto the device.
-        let dense = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu);
+        let dense = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu, None);
         let p = dense
             .load_one_quantizable("text_encoder", build, quantize)
             .unwrap();
@@ -849,7 +902,7 @@ mod tests {
 
         // packed tier + quant → the builder sees the configured device directly (no dense staging).
         write_shard("transformer", true);
-        let packed = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu);
+        let packed = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu, None);
         let p = packed
             .load_one_quantizable("transformer", build, quantize)
             .unwrap();
@@ -873,7 +926,7 @@ mod tests {
     fn load_te_and_dit_surfaces_missing_component() {
         let dir = std::env::temp_dir().join(format!("sc9004_missing_{}", std::process::id()));
         // No component dirs written → the shared loader must error on the missing text_encoder/.
-        let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &dir, &Device::Cpu);
+        let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &dir, &Device::Cpu, None);
         let err = pipe
             .load_te_and_dit()
             .err()

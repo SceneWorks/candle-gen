@@ -339,7 +339,15 @@ impl PulidFlux {
             on_progress,
         )?;
         on_progress(Progress::Decoding);
-        decode_latents(&self.vae, &latents, req.height as usize, req.width as usize)
+        // PuLID is a bespoke face-ID provider outside the PiD toggle scope (epic 7840 / sc-7853): pass
+        // `None` so it keeps the native FLUX VAE decode.
+        decode_latents(
+            &self.vae,
+            None,
+            &latents,
+            req.height as usize,
+            req.width as usize,
+        )
     }
 
     /// The flow-match denoise with the PuLID CA injector, routed through the unified curated

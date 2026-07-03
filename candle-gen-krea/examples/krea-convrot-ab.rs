@@ -88,7 +88,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Canonical bf16.
     let t0 = Instant::now();
-    let bf16 = pipeline::load_components(&snapshot, &device, &[])?;
+    let bf16 = pipeline::load_components(&snapshot, &device, &[], None)?;
     let load_bf16 = t0.elapsed();
     let t1 = Instant::now();
     let img_bf16 = render(&bf16, &req, &device);
@@ -114,7 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         String::from("Q4 packed:      (not run — pass a packed snapshot dir as arg 8)");
     if let Some(dir) = q4_dir {
         let t4 = Instant::now();
-        let q4 = pipeline::load_components(&PathBuf::from(&dir), &device, &[])?;
+        let q4 = pipeline::load_components(&PathBuf::from(&dir), &device, &[], None)?;
         let load_q4 = t4.elapsed();
         let t5 = Instant::now();
         let img_q4 = render(&q4, &req, &device);

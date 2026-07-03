@@ -18,6 +18,10 @@ candle-gen = { path = "../candle-gen" }
 # The Lens VAE *is* the Flux.2 `AutoencoderKLFlux2` (32-ch latent, 2×2 patchify, bn-stats normalize),
 # already ported in candle-gen-flux2 — the Lens decode path reuses `Flux2Vae::decode_packed` (sc-5113).
 candle-gen-flux2 = { path = "../candle-gen-flux2" }
+# NVIDIA PiD optional super-resolving decoder (epic 7840 / sc-7853): Lens reuses the FLUX.2 VAE, so it
+# shares the `flux2` PiD latent-space student. Wired behind `req.use_pid` (default off → the byte-exact
+# native `Flux2Vae::decode_packed`).
+candle-gen-pid = { path = "../candle-gen-pid" }
 # Link-time self-registration into gen-core's model registry (`inventory::submit!`, sc-5115).
 inventory = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673 pattern) — NOT candle's CUDA `randn`.
@@ -37,5 +41,5 @@ sceneworks-gen-core-testkit = { workspace = true }
 
 [features]
 default = []
-metal = ["candle-gen/metal", "candle-gen-flux2/metal"]
-cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda"]
+metal = ["candle-gen/metal", "candle-gen-flux2/metal", "candle-gen-pid/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda", "candle-gen-pid/cuda"]

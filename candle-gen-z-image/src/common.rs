@@ -27,7 +27,8 @@ use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::Image;
-use candle_gen::{CandleError, Result};
+use candle_gen::{CandleError, LatentDecoder, Result};
+use candle_gen_pid::PidDecoder;
 use candle_transformers::models::z_image::sampling::postprocess_image;
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder};
 use rand::{rngs::StdRng, SeedableRng};
@@ -247,10 +248,22 @@ pub(crate) fn encode_mean(
 /// VAE-decode the final latents `(1, 16, 1, h, w)` to an RGB8 [`Image`]. The VAE applies its own
 /// `/scaling_factor + shift_factor` un-scale inside `decode`; `postprocess_image` maps the `[-1, 1]`
 /// output to `[0, 255]` u8. Byte-identical across the three entry points.
-pub(crate) fn decode(vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
-    // Drop the singleton frame axis: (1, 16, 1, h, w) -> (1, 16, h, w).
+pub(crate) fn decode(
+    vae: &AutoEncoderKL,
+    pid: Option<&PidDecoder>,
+    latents: &Tensor,
+) -> Result<Image> {
+    // Drop the singleton frame axis: (1, 16, 1, h, w) -> (1, 16, h, w). This is the exact NCHW latent
+    // the VAE decode receives — and the same one PiD consumes (a zero-transform seam, epic 7840 /
+    // sc-7853). When a PiD decoder resolved, the `zimage-turbo`-tagged `flux`-student (Z-Image aliases
+    // the FLUX.1 latent space) super-resolves; else the native VAE (its own `/scaling + shift` un-scale
+    // is applied inside `decode`). PiD emits a larger `[1,3,4H,4W]` tensor; `postprocess_image` reads
+    // the size from the tensor (never `latent*8`).
     let latents = latents.squeeze(2)?;
-    let decoded = vae.decode(&latents)?.to_dtype(DType::F32)?; // (1, 3, H, W) in [-1, 1]
+    let decoded = match pid {
+        Some(pid) => pid.decode(&latents)?,
+        None => vae.decode(&latents)?.to_dtype(DType::F32)?, // (1, 3, H, W) in [-1, 1]
+    };
     let img = postprocess_image(&decoded)? // u8 (1, 3, H, W)
         .i(0)?
         .to_device(&Device::Cpu)?;

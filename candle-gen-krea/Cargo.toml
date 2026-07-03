@@ -15,6 +15,10 @@ candle-gen = { path = "../candle-gen" }
 # than re-port the causal-Conv3d VAE — exactly as `mlx-gen-krea` reuses `mlx-gen-qwen-image`'s `QwenVae`
 # (the boogu→z-image / kolors→sdxl provider-reuse precedent).
 candle-gen-qwen-image = { path = "../candle-gen-qwen-image" }
+# NVIDIA PiD optional super-resolving decoder (epic 7840 / sc-7853). Krea reuses the Qwen-Image VAE, so
+# it shares the `qwenimage` PiD latent-space student. Wired behind `req.use_pid` (default off → the
+# byte-exact native QwenVae decode).
+candle-gen-pid = { path = "../candle-gen-pid" }
 # Link-time self-registration of the `krea_2_turbo` generator into the `candle_gen` registry
 # (`lib.rs::inventory::submit!`); discovered by `gen_core::registry::load(id, …)` when the worker
 # force-links this crate.
@@ -31,8 +35,8 @@ safetensors = "0.7"
 
 [features]
 default = []
-metal = ["candle-gen/metal", "candle-gen-qwen-image/metal"]
-cuda = ["candle-gen/cuda", "candle-gen-qwen-image/cuda"]
+metal = ["candle-gen/metal", "candle-gen-qwen-image/metal", "candle-gen-pid/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-qwen-image/cuda", "candle-gen-pid/cuda"]
 
 [dev-dependencies]
 # Encode the e2e real-weight smoke output to PNG for eyeballing (sc-7582); mirrors the other families.

@@ -10,6 +10,10 @@ categories = ["science"]
 
 [dependencies]
 candle-gen = { path = "../candle-gen" }
+# NVIDIA PiD optional super-resolving decoder (epic 7840 / sc-7853). Boogu reuses the FLUX.1 / z-image
+# 16-ch VAE, so it shares the `flux` PiD latent-space student. Wired behind `req.use_pid` (default off
+# → the byte-exact native VAE decode).
+candle-gen-pid = { path = "../candle-gen-pid" }
 # Boogu's VAE is the FLUX.1 16-channel `AutoencoderKL` (scaling 0.3611 / shift 0.1159, latent 16) —
 # byte-identical to the VAE Z-Image ships, so reuse `candle-transformers`' `z_image::vae` verbatim
 # exactly as `mlx-gen-boogu` reuses `mlx-gen-z-image`'s `Vae`.
@@ -24,8 +28,8 @@ serde_json = "1"
 
 [features]
 default = []
-metal = ["candle-gen/metal", "candle-transformers/metal"]
-cuda = ["candle-gen/cuda", "candle-transformers/cuda"]
+metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-pid/metal"]
+cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-pid/cuda"]
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }

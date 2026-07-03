@@ -22,9 +22,14 @@ use std::sync::Arc;
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::{Module, VarBuilder};
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
-use candle_gen::{CandleError, Result};
+use candle_gen::gen_core::{self, GenerationRequest, Image, PidWeights, Progress};
+use candle_gen::{CandleError, LatentDecoder, Result};
+use candle_gen_pid::{PidDecoder, PidEngine};
 use candle_transformers::models::z_image::sampling::postprocess_image;
+
+/// The PiD backbone (latent-space) tag for Boogu (epic 7840 / sc-7853). Boogu reuses the FLUX.1 /
+/// z-image 16-ch VAE, so its latent space is `flux` — the same 4× SR student FLUX/Chroma/Z-Image use.
+const PID_BACKBONE: &str = "flux";
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder, VaeConfig};
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -69,10 +74,18 @@ pub(crate) struct Components {
     te: BooguTextEncoder,
     dit: BooguTransformer,
     vae: Arc<AutoEncoderKL>,
+    /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853); None ⇒ native VAE decode.
+    pid: Option<Arc<PidEngine>>,
 }
 
-/// Load the text-to-image components from a Boogu snapshot (`mllm/ transformer/ vae/`).
-pub(crate) fn load_components(root: &Path, device: &Device) -> Result<Components> {
+/// Load the text-to-image components from a Boogu snapshot (`mllm/ transformer/ vae/`). `pid_spec` is
+/// the optional `LoadSpec::pid` component (epic 7840 / sc-7853): when `Some`, the PiD super-resolving
+/// decoder loads once here alongside the base model; `None` keeps the byte-exact native VAE decode.
+pub(crate) fn load_components(
+    root: &Path,
+    device: &Device,
+    pid_spec: Option<&PidWeights>,
+) -> Result<Components> {
     let tok = BooguTokenizer::from_snapshot(root, device, MAX_TEXT_TOKENS)?;
 
     let te_w = Weights::from_dir(&root.join("mllm"), device, TE_DTYPE)?;
@@ -90,11 +103,19 @@ pub(crate) fn load_components(root: &Path, device: &Device) -> Result<Components
     let vae_vb = vae_varbuilder(&root.join("vae"), device)?;
     let vae = AutoEncoderKL::new(&VaeConfig::z_image(), vae_vb)?;
 
+    // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller opted
+    // in via `LoadSpec::pid`; Boogu reuses the FLUX.1/z-image VAE latent space (`flux` student).
+    let pid = match pid_spec {
+        Some(spec) => Some(Arc::new(PidEngine::from_spec(spec, PID_BACKBONE, device)?)),
+        None => None,
+    };
+
     Ok(Components {
         tok,
         te,
         dit,
         vae: Arc::new(vae),
+        pid,
     })
 }
 
@@ -131,6 +152,16 @@ pub(crate) fn render_base(
         &native,
     );
 
+    // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+    // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
+    // `None` → the native VAE decode. Shared across `count` images (same prompt).
+    let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+        comps.pid.as_deref(),
+        req,
+        base_seed,
+        crate::BOOGU_IMAGE_ID,
+    )?;
+
     let mut images = Vec::with_capacity(req.count as usize);
     for index in 0..req.count {
         let seed = base_seed.wrapping_add(index as u64);
@@ -158,7 +189,7 @@ pub(crate) fn render_base(
             },
         )?;
         on_progress(Progress::Decoding);
-        images.push(decode(&comps.vae, &lat)?);
+        images.push(decode(&comps.vae, pid_decoder.as_ref(), &lat)?);
     }
     Ok(images)
 }
@@ -173,6 +204,16 @@ pub(crate) fn render_turbo(
     let steps = req.steps.map(|s| s as usize).unwrap_or(DEFAULT_TURBO_STEPS);
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     let cond = comps.te.last_hidden(&comps.tok.encode_t2i(&req.prompt)?)?;
+
+    // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+    // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
+    // `None` → the native VAE decode. Shared by both the curated and native DMD decode sites below.
+    let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+        comps.pid.as_deref(),
+        req,
+        base_seed,
+        crate::BOOGU_IMAGE_TURBO_ID,
+    )?;
 
     // Curated sampler axis (sc-9009, mirroring the mlx twin's sc-7491): a selected sampler/scheduler
     // routes the few-step denoise through the unified framework over the DMD σ grid. The DMD x0
@@ -205,7 +246,7 @@ pub(crate) fn render_turbo(
                 },
             )?;
             on_progress(Progress::Decoding);
-            images.push(decode(&comps.vae, &lat)?);
+            images.push(decode(&comps.vae, pid_decoder.as_ref(), &lat)?);
         }
         return Ok(images);
     }
@@ -238,7 +279,7 @@ pub(crate) fn render_turbo(
             });
         }
         on_progress(Progress::Decoding);
-        images.push(decode(&comps.vae, &lat)?);
+        images.push(decode(&comps.vae, pid_decoder.as_ref(), &lat)?);
     }
     Ok(images)
 }
@@ -323,6 +364,16 @@ pub(crate) fn render_edit(
         &native,
     );
 
+    // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+    // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
+    // `None` → the native VAE decode. Shared across `count` images (same prompt).
+    let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+        comps.pid.as_deref(),
+        req,
+        base_seed,
+        crate::BOOGU_IMAGE_EDIT_ID,
+    )?;
+
     let mut images = Vec::with_capacity(req.count as usize);
     for index in 0..req.count {
         let seed = base_seed.wrapping_add(index as u64);
@@ -350,7 +401,7 @@ pub(crate) fn render_edit(
             },
         )?;
         on_progress(Progress::Decoding);
-        images.push(decode(&comps.vae, &lat)?);
+        images.push(decode(&comps.vae, pid_decoder.as_ref(), &lat)?);
     }
     Ok(images)
 }
@@ -451,10 +502,17 @@ fn init_noise(height: u32, width: u32, seed: u64, step: u64, device: &Device) ->
     )
 }
 
-/// VAE-decode a final latent `[1, 16, H/8, W/8]` → RGB8 [`Image`]. The z-image `AutoEncoderKL::decode`
-/// applies its own `/scaling + shift` un-scale internally; `postprocess_image` maps `[-1, 1]` → u8.
-fn decode(vae: &AutoEncoderKL, lat: &Tensor) -> Result<Image> {
-    let decoded = vae.decode(lat)?.to_dtype(DType::F32)?; // [1, 3, H, W] in [-1, 1]
+/// Decode a final latent `[1, 16, H/8, W/8]` → RGB8 [`Image`]. Native path: the z-image
+/// `AutoEncoderKL::decode` applies its own `/scaling + shift` un-scale internally. When a PiD decoder
+/// resolved (epic 7840 / sc-7853), the super-resolving `flux`-student (Boogu reuses the FLUX.1/z-image
+/// VAE) consumes the SAME `[1,16,H/8,W/8]` latent the VAE receives (a zero-transform seam) and emits a
+/// larger `[1,3,4H,4W]` tensor. Both yield `[-1, 1]` pixels; `postprocess_image` maps `[-1, 1]` → u8
+/// and reads the size from the tensor (never `latent*8`).
+fn decode(vae: &AutoEncoderKL, pid: Option<&PidDecoder>, lat: &Tensor) -> Result<Image> {
+    let decoded = match pid {
+        Some(pid) => pid.decode(lat)?,
+        None => vae.decode(lat)?.to_dtype(DType::F32)?, // [1, 3, H, W] in [-1, 1]
+    };
     let img = postprocess_image(&decoded)?.i(0)?.to_device(&Device::Cpu)?;
     let (c, h, w) = img.dims3()?;
     if c != 3 {

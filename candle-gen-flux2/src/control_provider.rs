@@ -101,7 +101,9 @@ impl Flux2Control {
     /// the real 32B weights.
     pub fn load(paths: &Flux2ControlPaths, quant: Option<Quant>) -> Result<Self> {
         let device = candle_gen::default_device()?;
-        let pipe = Pipeline::load(Flux2Variant::Dev, quant, &paths.root, &device);
+        // PiD (super-resolving decode) is wired only through the txt2img render path (epic 7840 /
+        // sc-7853); the control provider passes `None`.
+        let pipe = Pipeline::load(Flux2Variant::Dev, quant, &paths.root, &device, None);
 
         // Base DiT + Mistral TE. Packed MLX tier → build directly on the GPU from the packed parts
         // (sc-9087, no ~105 GB dense CPU staging); dense tier → stage dense in CPU RAM and quantize each

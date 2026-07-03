@@ -360,7 +360,15 @@ impl Flux1DevControl {
             on_progress,
         )?;
         on_progress(Progress::Decoding);
-        decode_latents(&self.vae, &latents, req.height as usize, req.width as usize)
+        // Control lane does not carry a PiD decoder (base txt2img is the shipping PiD path, epic 7840 /
+        // sc-7853); native FLUX VAE decode.
+        decode_latents(
+            &self.vae,
+            None,
+            &latents,
+            req.height as usize,
+            req.width as usize,
+        )
     }
 
     /// VAE-encode + 2×2-pack the control hint into the packed control latent `[1, seq, 64]` (constant

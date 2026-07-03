@@ -156,7 +156,7 @@ use std::sync::{Arc, Mutex};
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, Progress, WeightsSource,
+    Modality, ModelDescriptor, PidWeights, Progress, WeightsSource,
 };
 
 use pipeline::{Components, Pipeline};
@@ -229,6 +229,9 @@ pub struct SdxlGenerator {
     /// Fixed for the generator's lifetime (from the `LoadSpec`), so they sit outside the component
     /// cache key. Empty ⇒ the stock no-adapter UNet load.
     adapters: Vec<AdapterSpec>,
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
+    /// component build so the PiD engine loads once alongside the UNet/VAE. `None` when not opted in.
+    pid_spec: Option<PidWeights>,
     /// Cached UNet+VAE + the flash-attn flag they were built with. `Mutex` because `Generator` is
     /// shared and `generate` takes `&self`; the lock is held only to read/populate the cache (a
     /// cheap `Arc` clone or a one-time load), never across the denoise.
@@ -328,6 +331,7 @@ impl Generator for SdxlGenerator {
             req.width,
             req.height,
             &self.adapters,
+            self.pid_spec.clone(),
         )?;
         // Encode text FIRST (loads + frees CLIP) so the cold-call ordering — CLIP gone before the
         // UNet/VAE are resident — is preserved (sc-4987); only then acquire the cached UNet/VAE
@@ -342,6 +346,7 @@ impl Generator for SdxlGenerator {
             &text_embeddings,
             &components.unet,
             &components.vae,
+            components.pid.as_deref(),
             on_progress,
         )?;
         Ok(GenerationOutput::Images(images))
@@ -435,6 +440,10 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         device,
         dtype: DType::F16,
         adapters: spec.adapters.clone(),
+        // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
+        // any) so the lazy component build loads the engine once. Unlike adapters, it is not rejected
+        // — `None` simply keeps the byte-exact native-VAE path.
+        pid_spec: spec.pid.clone(),
         components: Mutex::new(None),
         tokenizers: Mutex::new(None),
     }))

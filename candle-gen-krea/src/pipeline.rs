@@ -18,10 +18,15 @@ use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress};
-use candle_gen::{CandleError, Result};
+use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, PidWeights, Progress};
+use candle_gen::{CandleError, LatentDecoder, Result};
+use candle_gen_pid::PidEngine;
 use candle_gen_qwen_image::vae::QwenVae;
 use rand::{rngs::StdRng, SeedableRng};
+
+/// The PiD backbone (latent-space) tag for Krea (epic 7840 / sc-7853). Krea reuses the Qwen-Image VAE,
+/// so its latent space is `qwenimage` — the same `2kto4k` 4× student Qwen-Image resolves.
+const PID_BACKBONE: &str = "qwenimage";
 
 use crate::config::Krea2Config;
 use crate::loader::Weights;
@@ -52,6 +57,9 @@ pub struct Components {
     te: KreaTextEncoder,
     dit: Krea2Transformer,
     vae: Arc<QwenVae>,
+    /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853), loaded once when the model
+    /// was loaded with `LoadSpec::pid`. `None` ⇒ the native `QwenVae` decode (the default path).
+    pid: Option<Arc<PidEngine>>,
 }
 
 /// Load all Turbo components from a Krea 2 snapshot (`tokenizer/ text_encoder/ transformer/ vae/`).
@@ -63,6 +71,7 @@ pub fn load_components(
     root: &Path,
     device: &Device,
     adapters: &[AdapterSpec],
+    pid_spec: Option<&PidWeights>,
 ) -> Result<Components> {
     let tok = crate::tokenizer::KreaTokenizer::from_snapshot(root, device)?;
 
@@ -81,11 +90,19 @@ pub fn load_components(
 
     let vae = load_vae(root, device)?;
 
+    // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller opted
+    // in via `LoadSpec::pid`; Krea shares the Qwen-Image VAE latent space (`qwenimage` student).
+    let pid = match pid_spec {
+        Some(spec) => Some(Arc::new(PidEngine::from_spec(spec, PID_BACKBONE, device)?)),
+        None => None,
+    };
+
     Ok(Components {
         tok,
         te,
         dit,
         vae: Arc::new(vae),
+        pid,
     })
 }
 
@@ -131,6 +148,9 @@ pub fn load_components_convrot(
         te,
         dit,
         vae: Arc::new(vae),
+        // The INT8-ConvRot path is a deferred non-shipping variant (see the fn docs); PiD is not wired
+        // through it. The shipping `load_components` path carries the optional decoder.
+        pid: None,
     })
 }
 
@@ -189,6 +209,16 @@ pub fn render(
         &native,
     );
 
+    // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+    // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
+    // `None` → the native QwenVae decode. Shared across `count` images (same prompt).
+    let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+        comps.pid.as_deref(),
+        req,
+        base_seed,
+        crate::KREA_2_TURBO_ID,
+    )?;
+
     let mut images = Vec::with_capacity(req.count as usize);
     for index in 0..req.count {
         let seed = base_seed.wrapping_add(index as u64);
@@ -208,7 +238,14 @@ pub fn render(
             },
         )?;
         on_progress(Progress::Decoding);
-        images.push(decode(&comps.vae, &lat)?);
+        // PiD (super-resolving) decode when the toggle resolved one; else the native VAE. Both consume
+        // the same normalized `[1,16,H/8,W/8]` latent (a zero-transform seam); PiD returns a larger
+        // `[1,3,4H,4W]` tensor and `to_image` reads the size from it.
+        let decoded = match &pid_decoder {
+            Some(pid) => pid.decode(&lat)?,
+            None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
+        };
+        images.push(to_image(&decoded)?);
     }
     Ok(images)
 }
@@ -230,11 +267,12 @@ fn init_noise(height: u32, width: u32, seed: u64, device: &Device) -> Result<Ten
     )
 }
 
-/// VAE-decode a final latent `[1, 16, H/8, W/8]` → RGB8 [`Image`]. `QwenVae::decode` applies the
-/// per-channel `z·std + mean` de-normalize internally and returns `[1, 3, H, W]` in `[-1, 1]` (the
-/// reference's `clamp(-1,1)·0.5 + 0.5` denormalize is the `(x+1)·127.5` below).
-fn decode(vae: &QwenVae, lat: &Tensor) -> Result<Image> {
-    let decoded = vae.decode(lat)?.to_dtype(DType::F32)?; // [1, 3, H, W] in [-1, 1]
+/// Convert a decoded pixel tensor `[1, 3, H, W]` in `[-1, 1]` (f32) → RGB8 [`Image`]. Shared by the
+/// native VAE decode (`QwenVae::decode` applies the per-channel `z·std + mean` de-normalize internally)
+/// and the PiD super-resolving decode (which already emits `[-1, 1]` pixels, possibly at 4× the size).
+/// The reference `clamp(-1,1)·0.5 + 0.5` denormalize is the `(x+1)·127.5` below; the output size is read
+/// from the tensor, never assumed (PiD may be larger than VAE-native).
+fn to_image(decoded: &Tensor) -> Result<Image> {
     let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
     let img = img.i(0)?.to_device(&Device::Cpu)?;
     let (c, h, w) = img.dims3()?;

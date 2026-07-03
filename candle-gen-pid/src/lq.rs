@@ -1,0 +1,266 @@
+//! Sigma-aware LQ adapter (`LQProjection2D` + `SigmaAwareGatePerTokenPerDim`) and the `PidNet`
+//! wrapper that injects its controlnet-style gate between the backbone's patch blocks. Faithful port
+//! of `pid/_src/networks/lq_projection_2d.py` + `pid_net.py` (the inference subset).
+//!
+//! Scope: the **latent-only** path every in-scope catalog student uses (`lq_in_channels=0`,
+//! `z_to_patch_ratio = (sr_scale·lsdf)/patch_size` → nearest-upsample, `lq_interval=2`). The
+//! image branch and the merge path are never exercised by any released catalog checkpoint and are
+//! intentionally not ported.
+//!
+//! candle simplification vs the MLX port: candle conv2d/group-norm are native **NCHW**, so the adapter
+//! stays in the checkpoint's NCHW layout — no NHWC transpose, and the conv weights load `[out,in,kH,kW]`
+//! as-is (the MLX port transposed to `[out,kH,kW,in]`). Runs f32 throughout.
+
+use candle_gen::candle_core::Tensor;
+use candle_gen::candle_nn::ops::sigmoid;
+use candle_gen::candle_nn::{Conv2d, Conv2dConfig, GroupNorm, Linear, Module};
+use candle_gen::{Result, Weights};
+
+use crate::backbone::{PatchInjector, PixDiT};
+use crate::config::PidConfig;
+use crate::nn::linear;
+
+const GN_EPS: f64 = 1e-5; // torch nn.GroupNorm default
+const GN_GROUPS: usize = 4; // ResBlock default num_groups
+
+/// Load a same-padding (stride 1, padding `p`) NCHW Conv2d with `[out,in,kH,kW]` weight + optional bias.
+fn conv2d(w: &Weights, prefix: &str, padding: usize) -> Result<Conv2d> {
+    let weight = w.require(&format!("{prefix}.weight"))?;
+    let bias_key = format!("{prefix}.bias");
+    let bias = if w.contains(&bias_key) {
+        Some(w.require(&bias_key)?)
+    } else {
+        None
+    };
+    let cfg = Conv2dConfig {
+        padding,
+        ..Default::default()
+    };
+    Ok(Conv2d::new(weight, bias, cfg))
+}
+
+/// Per-channel GroupNorm (NCHW), 4 groups, eps 1e-5.
+fn group_norm(w: &Weights, prefix: &str, channels: usize) -> Result<GroupNorm> {
+    let weight = w.require(&format!("{prefix}.weight"))?;
+    let bias = w.require(&format!("{prefix}.bias"))?;
+    Ok(GroupNorm::new(weight, bias, channels, GN_GROUPS, GN_EPS)?)
+}
+
+/// Pre-activation residual block: `x + Conv(SiLU(GN(Conv(SiLU(GN(x))))))`. Indices match the torch
+/// `nn.Sequential` (0 GN, 2 Conv, 3 GN, 5 Conv).
+struct ResBlock {
+    gn0: GroupNorm,
+    conv2: Conv2d,
+    gn3: GroupNorm,
+    conv5: Conv2d,
+}
+
+impl ResBlock {
+    fn from_weights(w: &Weights, prefix: &str, channels: usize) -> Result<Self> {
+        Ok(Self {
+            gn0: group_norm(w, &format!("{prefix}.block.0"), channels)?,
+            conv2: conv2d(w, &format!("{prefix}.block.2"), 1)?,
+            gn3: group_norm(w, &format!("{prefix}.block.3"), channels)?,
+            conv5: conv2d(w, &format!("{prefix}.block.5"), 1)?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let h = self.conv2.forward(&self.gn0.forward(x)?.silu()?)?;
+        let h = self.conv5.forward(&self.gn3.forward(&h)?.silu()?)?;
+        Ok((x + h)?)
+    }
+}
+
+/// `Conv(in→hidden) → SiLU → Conv(hidden→hidden) → ResBlock×N` over NCHW.
+struct ConvStack {
+    conv0: Conv2d,
+    conv2: Conv2d,
+    res: Vec<ResBlock>,
+}
+
+impl ConvStack {
+    fn from_weights(w: &Weights, prefix: &str, hidden: usize, num_res_blocks: i32) -> Result<Self> {
+        Ok(Self {
+            conv0: conv2d(w, &format!("{prefix}.0"), 1)?,
+            conv2: conv2d(w, &format!("{prefix}.2"), 1)?,
+            res: (0..num_res_blocks)
+                .map(|i| ResBlock::from_weights(w, &format!("{prefix}.{}", i + 3), hidden))
+                .collect::<Result<_>>()?,
+        })
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let mut x = self.conv2.forward(&self.conv0.forward(x)?.silu()?)?;
+        for rb in &self.res {
+            x = rb.forward(&x)?;
+        }
+        Ok(x)
+    }
+}
+
+/// `SigmaAwareGatePerTokenPerDim`: `out = x + sigmoid(content_proj([x;lq]) − exp(log_alpha)·σ)·lq`.
+struct SigmaGate {
+    content_proj: Linear,
+    log_alpha: Tensor,
+}
+
+impl SigmaGate {
+    fn from_weights(w: &Weights, prefix: &str) -> Result<Self> {
+        Ok(Self {
+            content_proj: linear(w, &format!("{prefix}.content_proj"))?,
+            log_alpha: w.require(&format!("{prefix}.log_alpha"))?,
+        })
+    }
+
+    /// `x`, `lq`: `[B, N, D]`; `sigma`: `[B]`.
+    fn forward(&self, x: &Tensor, lq: &Tensor, sigma: &Tensor) -> Result<Tensor> {
+        let cat = Tensor::cat(&[x, lq], candle_gen::candle_core::D::Minus1)?;
+        let logit = self.content_proj.forward(&cat)?; // [B,N,D]
+        let b = sigma.dim(0)?;
+        // exp(log_alpha)·σ  →  [D] · [B,1,1] = [B,1,D] (broadcast)
+        let alpha = self.log_alpha.exp()?;
+        let sigma_off = sigma.reshape((b, 1, 1))?.broadcast_mul(&alpha)?;
+        let gate = sigmoid(&logit.broadcast_sub(&sigma_off)?)?;
+        Ok((x + gate.mul(lq)?)?)
+    }
+}
+
+/// `LQProjection2D` (latent-only): nearest-upsample the latent to the patch grid, run the conv stack,
+/// then project to `num_outputs` per-block token feature sets; plus the per-block sigma gates.
+pub struct LqAdapter {
+    latent_proj: ConvStack,
+    output_heads: Vec<Linear>,
+    gates: Vec<SigmaGate>,
+    interval: i32,
+    upsample_ratio: i32,
+}
+
+impl LqAdapter {
+    pub fn from_weights(w: &Weights, prefix: &str, cfg: &PidConfig) -> Result<Self> {
+        let num_outputs = cfg.num_lq_outputs();
+        let z_to_patch = (cfg.sr_scale * cfg.latent_spatial_down_factor) / cfg.patch_size;
+        Ok(Self {
+            latent_proj: ConvStack::from_weights(
+                w,
+                &format!("{prefix}.latent_proj"),
+                cfg.lq_hidden_dim as usize,
+                cfg.lq_num_res_blocks,
+            )?,
+            output_heads: (0..num_outputs)
+                .map(|i| linear(w, &format!("{prefix}.output_heads.{i}")))
+                .collect::<Result<_>>()?,
+            gates: (0..num_outputs)
+                .map(|i| SigmaGate::from_weights(w, &format!("{prefix}.gate_modules.{i}")))
+                .collect::<Result<_>>()?,
+            interval: cfg.lq_interval,
+            upsample_ratio: z_to_patch.max(1),
+        })
+    }
+
+    /// Project an LQ latent `[B, z_dim, zH, zW]` to `num_outputs` token feature sets `[B, N, out_dim]`
+    /// (`N = pH·pW`). Stays NCHW through the conv stack, then flattens to tokens.
+    pub fn forward(&self, lq_latent: &Tensor, _p_h: i32, _p_w: i32) -> Result<Vec<Tensor>> {
+        let (b, _c, zh, zw) = lq_latent.dims4()?;
+        let mut x = lq_latent.clone();
+        if self.upsample_ratio > 1 {
+            let r = self.upsample_ratio as usize;
+            x = x.upsample_nearest2d(zh * r, zw * r)?;
+        }
+        let x = self.latent_proj.forward(&x)?; // [B, hidden, pH, pW]
+        let (_b, hidden, ph, pw) = x.dims4()?;
+        // NCHW -> NHWC -> [B, pH·pW, hidden]
+        let tokens = x
+            .permute((0, 2, 3, 1))?
+            .contiguous()?
+            .reshape((b, ph * pw, hidden))?;
+        self.output_heads
+            .iter()
+            .map(|h| Ok(h.forward(&tokens)?))
+            .collect()
+    }
+
+    /// Whether the gate fires at this patch-block index (`interval>1` → every `interval`-th block).
+    pub fn is_gate_active(&self, block_idx: i32) -> bool {
+        self.interval <= 1 || block_idx % self.interval == 0
+    }
+
+    /// Map a patch-block index to its output-head / gate index.
+    pub fn output_index(&self, block_idx: i32) -> i32 {
+        if self.interval > 1 {
+            block_idx / self.interval
+        } else {
+            block_idx
+        }
+    }
+
+    /// Apply the `out_idx`-th sigma-aware gate: `x + sigmoid(content_proj([x;lq]) − α·σ)·lq`.
+    pub fn gate(&self, out_idx: usize, x: &Tensor, lq: &Tensor, sigma: &Tensor) -> Result<Tensor> {
+        self.gates[out_idx].forward(x, lq, sigma)
+    }
+}
+
+/// `PidNet` — the backbone plus the LQ adapter wired as a between-blocks gate injector.
+pub struct PidNet {
+    backbone: PixDiT,
+    lq: LqAdapter,
+    patch_size: i32,
+}
+
+impl PidNet {
+    /// `prefix` is `""` for a bare-key fixture or `"net."` for the released checkpoint's nesting.
+    pub fn from_weights(w: &Weights, prefix: &str, cfg: &PidConfig) -> Result<Self> {
+        Ok(Self {
+            backbone: PixDiT::from_weights(w, prefix, cfg)?,
+            lq: LqAdapter::from_weights(w, &format!("{prefix}lq_proj"), cfg)?,
+            patch_size: cfg.patch_size,
+        })
+    }
+
+    /// `x`: `[B, 3, H, W]`; `t`: `[B]`; `y`: caption embeddings `[B, Ltxt, txt_embed_dim]`;
+    /// `lq_latent`: `[B, z_dim, zH, zW]`; `sigma`: per-sample LQ noise level `[B]`.
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        t: &Tensor,
+        y: &Tensor,
+        lq_latent: &Tensor,
+        sigma: &Tensor,
+    ) -> Result<Tensor> {
+        let (_b, _c, h, w) = x.dims4()?;
+        let (p_h, p_w) = (h as i32 / self.patch_size, w as i32 / self.patch_size);
+        let feats = self.lq.forward(lq_latent, p_h, p_w)?;
+        let inj = LqInjection {
+            lq: &self.lq,
+            feats,
+            sigma: sigma.clone(),
+        };
+        self.backbone.forward_with(x, t, y, &inj)
+    }
+
+    /// Access the LQ adapter (e.g. to parity-test its projection in isolation).
+    pub fn lq(&self) -> &LqAdapter {
+        &self.lq
+    }
+}
+
+/// Binds the LQ adapter + this generation's precomputed features + sigma into the patch-block hook.
+struct LqInjection<'a> {
+    lq: &'a LqAdapter,
+    feats: Vec<Tensor>,
+    sigma: Tensor,
+}
+
+impl PatchInjector for LqInjection<'_> {
+    fn inject(&self, block_idx: i32, s_main: &Tensor) -> Result<Tensor> {
+        if self.lq.is_gate_active(block_idx) {
+            let out_idx = self.lq.output_index(block_idx) as usize;
+            if out_idx < self.feats.len() {
+                return self
+                    .lq
+                    .gate(out_idx, s_main, &self.feats[out_idx], &self.sigma);
+            }
+        }
+        Ok(s_main.clone())
+    }
+}

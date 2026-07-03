@@ -12,6 +12,10 @@ categories = ["science"]
 # Core crate — re-exports gen_core + candle, so this provider links exactly one gen-core / candle
 # build (single resolution; see scripts/check-gen-core-skew.sh).
 candle-gen = { path = "../candle-gen" }
+# NVIDIA PiD optional super-resolving decoder (epic 7840 / sc-7853): FLUX.2's own `flux2` latent-space
+# student (4× SR) that consumes the packed 128-ch BN-normalized latent directly. Wired behind
+# `req.use_pid` (default off → the byte-exact native Flux2Vae `decode_packed`).
+candle-gen-pid = { path = "../candle-gen-pid" }
 # Link-time self-registration into gen-core's model registry (the `inventory::submit!` below).
 inventory = { workspace = true }
 # FLUX.2 has NO candle-transformers reference impl (unlike FLUX.1's `flux`): the MMDiT, the 32-ch
@@ -31,8 +35,8 @@ serde_json = "1"
 # Pass the backend selection through to the core crate so a downstream `--features metal`/`cuda` on
 # this provider selects the matching candle backend everywhere.
 default = []
-metal = ["candle-gen/metal", "candle-transformers/metal"]
-cuda = ["candle-gen/cuda", "candle-transformers/cuda"]
+metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-pid/metal"]
+cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-pid/cuda"]
 
 [dev-dependencies]
 # Shared test-support helpers (sc-9055 / F-069: candle_gen::testkit). `tests/convert_real_weights.rs`

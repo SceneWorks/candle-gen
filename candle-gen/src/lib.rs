@@ -70,6 +70,12 @@ pub use loader::{
 pub mod attention;
 pub use attention::{sdpa_budgeted_bhsd, sdpa_budgeted_flat, ATTN_SCORES_BUDGET};
 
+// The latent→pixel decode seam (epic 7840, sc-7853): the `LatentDecoder` trait a provider routes its
+// final `vae.decode(latent)` through so a per-generation `req.use_pid` toggle can swap in NVIDIA PiD
+// (`candle-gen-pid`) without N bespoke per-engine ports. The candle twin of `mlx_gen::decoder`.
+pub mod decoder;
+pub use decoder::LatentDecoder;
+
 // Shared VRAM-budget probe (sc-9014 / F-030): the trusted-path `nvidia-smi` resolver the video-VAE
 // decode tilers (seedvr2/wan/ltx) route through, instead of each spawning a bare
 // `Command::new("nvidia-smi")` that Windows resolves via the process search order (a PATH-hijack

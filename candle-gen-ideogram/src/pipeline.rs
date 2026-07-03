@@ -27,11 +27,18 @@ use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::imageops::{resize_lanczos_u8, resize_nearest_u8};
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
-use candle_gen::gen_core::{self, Conditioning, GenerationRequest, Image, Progress};
-use candle_gen::{CandleError, Result as CResult};
+use candle_gen::gen_core::{self, Conditioning, GenerationRequest, Image, PidWeights, Progress};
+use candle_gen::{CandleError, LatentDecoder, Result as CResult};
 use candle_gen_flux2::vae::Flux2Vae;
+use candle_gen_pid::{PidDecoder, PidEngine};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+
+/// The PiD backbone (latent-space) tag for Ideogram (epic 7840 / sc-7853). Ideogram 4 reuses the
+/// FLUX.2 VAE, so its latent space is `flux2` — but its DiT packs the 128 channels in `(ph,pw,c)`
+/// order (c innermost) vs FLUX.2's canonical `(c,ph,pw)`, so the decode branch reconstructs the
+/// canonical packed BN-normalized latent the `flux2` student trained on before handing it to PiD.
+const PID_BACKBONE: &str = "flux2";
 
 use crate::config::{
     Ideogram4DitConfig, Ideogram4TextEncoderConfig, DEFAULT_GUIDANCE, DEFAULT_IMG2IMG_STRENGTH,
@@ -67,6 +74,9 @@ pub struct Components {
     /// encode (sc-8991 / F-011) instead of re-parsing `tokenizer.json` per request.
     tokenizer: TextTokenizer,
     dit: Ideogram4DitConfig,
+    /// Optional NVIDIA PiD super-resolving decoder (epic 7840 / sc-7853), loaded once when the model
+    /// was loaded with `LoadSpec::pid`. `None` ⇒ the native `Flux2Vae` decode (the default path).
+    pid: Option<PidEngine>,
 }
 
 /// Build the Ideogram tokenizer from `root/tokenizer/tokenizer.json` **once** (sc-8991 / F-011).
@@ -96,7 +106,11 @@ fn component_vb(
 /// Load all components from a candle-readable (bf16) Ideogram 4 snapshot dir (`transformer/`,
 /// `unconditional_transformer/`, `text_encoder/`, `vae/`, `tokenizer/`) — the quality (asymmetric
 /// CFG) mode.
-pub fn load_components(root: &Path, device: &Device) -> CResult<Components> {
+pub fn load_components(
+    root: &Path,
+    device: &Device,
+    pid_spec: Option<&PidWeights>,
+) -> CResult<Components> {
     let dit = Ideogram4DitConfig::v4();
     let te_cfg = Ideogram4TextEncoderConfig::qwen3_vl_8b();
 
@@ -128,12 +142,27 @@ pub fn load_components(root: &Path, device: &Device) -> CResult<Components> {
         vae,
         tokenizer: build_tokenizer(root)?,
         dit,
+        pid: load_pid(pid_spec, device)?,
     })
+}
+
+/// Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller opted in
+/// via `LoadSpec::pid`; Ideogram shares the FLUX.2 VAE latent space (`flux2` student). `None` keeps the
+/// byte-exact native `Flux2Vae` decode.
+fn load_pid(pid_spec: Option<&PidWeights>, device: &Device) -> CResult<Option<PidEngine>> {
+    match pid_spec {
+        Some(spec) => Ok(Some(PidEngine::from_spec(spec, PID_BACKBONE, device)?)),
+        None => Ok(None),
+    }
 }
 
 /// Load the **turbo** components: the conditional DiT with the bundled TurboTime LoRA merged in (no
 /// unconditional DiT). CFG-free single-DiT few-step path.
-pub fn load_components_turbo(root: &Path, device: &Device) -> CResult<Components> {
+pub fn load_components_turbo(
+    root: &Path,
+    device: &Device,
+    pid_spec: Option<&PidWeights>,
+) -> CResult<Components> {
     let dit = Ideogram4DitConfig::v4();
     let te_cfg = Ideogram4TextEncoderConfig::qwen3_vl_8b();
 
@@ -165,6 +194,7 @@ pub fn load_components_turbo(root: &Path, device: &Device) -> CResult<Components
         vae,
         tokenizer: build_tokenizer(root)?,
         dit,
+        pid: load_pid(pid_spec, device)?,
     })
 }
 
@@ -269,6 +299,18 @@ pub fn render(
         None => None,
     };
 
+    // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+    // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
+    // `None` → the native Flux2Vae decode. Shared across `count` images (same prompt). The engine id is
+    // turbo vs quality per whether the unconditional DiT is present.
+    let model_id = if comps.uncond.is_none() {
+        crate::config::MODEL_ID_TURBO
+    } else {
+        crate::config::MODEL_ID
+    };
+    let pid_decoder =
+        candle_gen_pid::resolve_pid_decoder(comps.pid.as_ref(), req, base_seed, model_id)?;
+
     let mut images = Vec::with_capacity(req.count as usize);
     for index in 0..req.count {
         let seed = base_seed.wrapping_add(index as u64);
@@ -284,7 +326,13 @@ pub fn render(
             on_progress,
         )?;
         on_progress(Progress::Decoding);
-        images.push(decode(comps, &z, req.width, req.height)?);
+        images.push(decode(
+            comps,
+            &z,
+            req.width,
+            req.height,
+            pid_decoder.as_ref(),
+        )?);
     }
     Ok(images)
 }
@@ -458,8 +506,17 @@ fn denoise(
     Ok(z)
 }
 
-/// De-normalize (bn) → (ph,pw,c) unpatchify → VAE decode → RGB image.
-fn decode(comps: &Components, z: &Tensor, width: u32, height: u32) -> CResult<Image> {
+/// De-normalize (bn) → (ph,pw,c) unpatchify → VAE decode → RGB image. When a PiD decoder resolved
+/// (epic 7840 / sc-7853), the raw NCHW `latent` is instead re-packed into the FLUX.2-canonical
+/// `(c,ph,pw)` order + BN-normalized (the tensor the `flux2` student trained on) and fed to PiD, which
+/// emits a larger `[1,3,4H,4W]` tensor; `to_image` reads the size from the decoded tensor.
+fn decode(
+    comps: &Components,
+    z: &Tensor,
+    width: u32,
+    height: u32,
+    pid: Option<&PidDecoder>,
+) -> CResult<Image> {
     let grid_h = (height / PATCH_AE) as usize;
     let grid_w = (width / PATCH_AE) as usize;
 
@@ -477,7 +534,17 @@ fn decode(comps: &Components, z: &Tensor, width: u32, height: u32) -> CResult<Im
         .contiguous()?
         .reshape((1, 32, grid_h * 2, grid_w * 2))?;
 
-    let decoded = comps.vae.decode_latent(&latent)?; // [1, 3, H, W] f32 ~[-1,1]
+    let decoded = match pid {
+        Some(d) => {
+            // Reconstruct the FLUX.2-canonical packed BN-normalized latent the flux2 student trained on:
+            // raw NCHW [1,32,H/8,W/8] -> canonical (c,ph,pw) patchify [1,128,H/16,W/16] -> BN-normalize.
+            let patched = candle_gen_flux2::vae::patchify(&latent)?; // [1,128,gh,gw] (c,ph,pw)
+            let (bn_std, bn_mean) = comps.vae.bn_stats(); // each [1,128,1,1], canonical order
+            let normed = patched.broadcast_sub(bn_mean)?.broadcast_div(bn_std)?;
+            d.decode(&normed)?
+        }
+        None => comps.vae.decode_latent(&latent)?, // unchanged native path: [1, 3, H, W] f32 ~[-1,1]
+    };
     to_image(&decoded)
 }
 

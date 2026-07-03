@@ -331,7 +331,9 @@ impl IpAdapterKolors {
         };
 
         on_progress(Progress::Decoding);
-        common::decode(&self.vae, &latents)
+        // IP-Adapter lane does not carry a PiD decoder (base txt2img is the shipping PiD path,
+        // epic 7840 / sc-7853); native SDXL VAE decode.
+        common::decode(&self.vae, None, &latents)
     }
 
     /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])` via the ChatGLM3 encoder. Stays

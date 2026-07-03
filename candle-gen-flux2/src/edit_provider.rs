@@ -114,7 +114,9 @@ impl Flux2Edit {
         quant: Option<Quant>,
     ) -> Result<Self> {
         let device = candle_gen::default_device()?;
-        let pipe = Pipeline::load(variant, quant, &paths.root, &device);
+        // PiD (super-resolving decode) is wired only through the txt2img render path (epic 7840 /
+        // sc-7853); the edit provider passes `None`.
+        let pipe = Pipeline::load(variant, quant, &paths.root, &device, None);
         // Packed MLX tier → build directly on the GPU from the packed parts (sc-9087, no ~105 GB dense
         // CPU staging); dense tier → the legacy CPU-stage → quantize-onto-GPU path. Shared TE+DiT loader
         // with txt2img / control (F-024, sc-9004). The VAE *with encoder* (the reference encode) is the

@@ -92,7 +92,7 @@ use std::sync::Mutex;
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, WeightsSource,
+    ModelDescriptor, PidWeights, Progress, WeightsSource,
 };
 
 use pipeline::{Components, Pipeline};
@@ -177,6 +177,9 @@ pub struct FluxGenerator {
     root: PathBuf,
     device: Device,
     dtype: DType,
+    /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
+    /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
+    pid_spec: Option<PidWeights>,
     /// Cached components. `Mutex` because `Generator` is shared and `generate` takes `&self`; the lock
     /// is held only to read/populate the cache, never across the denoise.
     components: Mutex<Option<Components>>,
@@ -239,7 +242,13 @@ impl Generator for FluxGenerator {
         // The rich-`CandleError` tail — including the typed `Canceled` — bridges into
         // `gen_core::Error` via `?`. The light `Pipeline` handle carries the snapshot/device; the
         // heavy components come from the cache.
-        let pipe = Pipeline::load(self.variant, &self.root, &self.device, self.dtype);
+        let pipe = Pipeline::load(
+            self.variant,
+            &self.root,
+            &self.device,
+            self.dtype,
+            self.pid_spec.clone(),
+        );
         let components = self.components(&pipe)?;
         let images = pipe.render(req, &components, on_progress)?;
         Ok(GenerationOutput::Images(images))
@@ -340,6 +349,10 @@ fn load_variant(variant: Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn G
         root,
         device,
         dtype: DType::BF16,
+        // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if
+        // any) so the lazy component build loads the engine once. Unlike adapters/quant/control above,
+        // it is not rejected — `None` simply keeps the byte-exact native-VAE path.
+        pid_spec: spec.pid.clone(),
         components: Mutex::new(None),
     }))
 }
