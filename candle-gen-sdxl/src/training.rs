@@ -796,7 +796,6 @@ mod tests {
             mid_block_scale_factor: 1.,
             norm_eps: 1e-5,
             norm_num_groups: 32,
-            sliced_attention_size: None,
             use_linear_projection: false,
         };
         UNet2DConditionModel::new(vb, 4, 4, false, cfg).unwrap()
@@ -927,7 +926,6 @@ mod tests {
         assert!(c.use_linear_projection);
         assert!(!c.center_input_sample);
         assert!(c.flip_sin_to_cos);
-        assert_eq!(c.sliced_attention_size, None);
     }
 
     /// The trainer self-registers and resolves through gen-core's trainer registry as the candle

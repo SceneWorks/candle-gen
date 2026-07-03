@@ -487,7 +487,6 @@ mod tests {
             norm_num_groups: 32,
             norm_eps: 1e-5,
             cross_attention_dim: 16,
-            sliced_attention_size: None,
             use_linear_projection: false,
         }
     }

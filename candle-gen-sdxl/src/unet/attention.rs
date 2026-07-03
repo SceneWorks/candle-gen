@@ -1,5 +1,5 @@
 //! Attention Based Building Blocks
-use candle_core::{DType, IndexOp, Result, Tensor, D};
+use candle_core::{DType, Result, Tensor, D};
 use candle_gen::quant::QLinear;
 use candle_gen::train::lora::{lora_linear_detect, lora_linear_no_bias_detect, LoraLinear};
 use candle_nn as nn;
@@ -95,7 +95,6 @@ pub struct CrossAttention {
     to_out: LoraLinear,
     heads: usize,
     scale: f64,
-    slice_size: Option<usize>,
     span: tracing::Span,
     span_attn: tracing::Span,
     span_softmax: tracing::Span,
@@ -122,7 +121,6 @@ impl CrossAttention {
         context_dim: Option<usize>,
         heads: usize,
         dim_head: usize,
-        slice_size: Option<usize>,
         use_flash_attn: bool,
         group_size: usize,
     ) -> Result<Self> {
@@ -146,7 +144,6 @@ impl CrossAttention {
             to_out,
             heads,
             scale,
-            slice_size,
             span,
             span_attn,
             span_softmax,
@@ -170,34 +167,6 @@ impl CrossAttention {
         xs.reshape((batch_size / self.heads, self.heads, seq_len, dim))?
             .transpose(1, 2)?
             .reshape((batch_size / self.heads, seq_len, dim * self.heads))
-    }
-
-    fn sliced_attention(
-        &self,
-        query: &Tensor,
-        key: &Tensor,
-        value: &Tensor,
-        slice_size: usize,
-    ) -> Result<Tensor> {
-        let batch_size_attention = query.dim(0)?;
-        let mut hidden_states = Vec::with_capacity(batch_size_attention / slice_size);
-        let in_dtype = query.dtype();
-        let query = query.to_dtype(DType::F32)?;
-        let key = key.to_dtype(DType::F32)?;
-        let value = value.to_dtype(DType::F32)?;
-
-        for i in 0..batch_size_attention / slice_size {
-            let start_idx = i * slice_size;
-            let end_idx = (i + 1) * slice_size;
-
-            let xs = query
-                .i(start_idx..end_idx)?
-                .matmul(&(key.i(start_idx..end_idx)?.t()? * self.scale)?)?;
-            let xs = nn::ops::softmax(&xs, D::Minus1)?.matmul(&value.i(start_idx..end_idx)?)?;
-            hidden_states.push(xs)
-        }
-        let hidden_states = Tensor::stack(&hidden_states, 0)?.to_dtype(in_dtype)?;
-        self.reshape_batch_dim_to_heads(&hidden_states)
     }
 
     fn attention(&self, query: &Tensor, key: &Tensor, value: &Tensor) -> Result<Tensor> {
@@ -247,18 +216,7 @@ impl CrossAttention {
         let query = self.reshape_heads_to_batch_dim(&query)?;
         let key = self.reshape_heads_to_batch_dim(&key)?;
         let value = self.reshape_heads_to_batch_dim(&value)?;
-        let dim0 = query.dim(0)?;
-        let slice_size = self.slice_size.and_then(|slice_size| {
-            if dim0 < slice_size {
-                None
-            } else {
-                Some(slice_size)
-            }
-        });
-        let mut xs = match slice_size {
-            None => self.attention(&query, &key, &value)?,
-            Some(slice_size) => self.sliced_attention(&query, &key, &value, slice_size)?,
-        };
+        let mut xs = self.attention(&query, &key, &value)?;
         // IP-Adapter decoupled branch (sc-5491): reuse the text query against the image/identity
         // tokens' own K/V, scaled and added before the output projection. A no-op (skipped) unless the
         // K/V are installed AND tokens are set — so the training / stock path is unchanged.
@@ -332,7 +290,6 @@ impl BasicTransformerBlock {
         n_heads: usize,
         d_head: usize,
         context_dim: Option<usize>,
-        sliced_attention_size: Option<usize>,
         use_flash_attn: bool,
         group_size: usize,
     ) -> Result<Self> {
@@ -342,7 +299,6 @@ impl BasicTransformerBlock {
             None,
             n_heads,
             d_head,
-            sliced_attention_size,
             use_flash_attn,
             group_size,
         )?;
@@ -353,7 +309,6 @@ impl BasicTransformerBlock {
             context_dim,
             n_heads,
             d_head,
-            sliced_attention_size,
             use_flash_attn,
             group_size,
         )?;
@@ -403,7 +358,6 @@ pub struct SpatialTransformerConfig {
     pub depth: usize,
     pub num_groups: usize,
     pub context_dim: Option<usize>,
-    pub sliced_attention_size: Option<usize>,
     pub use_linear_projection: bool,
 }
 
@@ -413,7 +367,6 @@ impl Default for SpatialTransformerConfig {
             depth: 1,
             num_groups: 32,
             context_dim: None,
-            sliced_attention_size: None,
             use_linear_projection: false,
         }
     }
@@ -499,7 +452,6 @@ impl SpatialTransformer {
                 n_heads,
                 d_head,
                 config.context_dim,
-                config.sliced_attention_size,
                 use_flash_attn,
                 group_size,
             )?;
@@ -771,7 +723,6 @@ mod ip_tests {
             Some(ctx_dim),
             heads,
             dim_head,
-            None,
             false,
             candle_gen::quant::MLX_GROUP_SIZE,
         )
@@ -959,7 +910,6 @@ mod packed_tests {
             depth: 1,
             num_groups: 32,
             context_dim: Some(ctx),
-            sliced_attention_size: None,
             use_linear_projection: true,
         };
         let xf = SpatialTransformer::new_gs(vb, channels, n_heads, d_head, false, cfg, GS).unwrap();

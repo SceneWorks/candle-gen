@@ -58,7 +58,6 @@ pub fn sdxl_unet_config() -> UNet2DConditionModelConfig {
         norm_num_groups: 32,
         norm_eps: 1e-5,
         cross_attention_dim: 2048,
-        sliced_attention_size: None,
         use_linear_projection: true,
     }
 }
@@ -327,7 +326,6 @@ impl ControlNet {
                     downblock: db_cfg,
                     attn_num_head_channels: attention_head_dim,
                     cross_attention_dim: u.cross_attention_dim,
-                    sliced_attention_size: u.sliced_attention_size,
                     use_linear_projection: u.use_linear_projection,
                     transformer_layers_per_block,
                 };
@@ -520,7 +518,6 @@ mod tests {
                 norm_num_groups: 32,
                 norm_eps: 1e-5,
                 cross_attention_dim: 16,
-                sliced_attention_size: None,
                 use_linear_projection: false,
             },
             addition_time_embed_dim: 8,

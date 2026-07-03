@@ -432,7 +432,6 @@ mod tests {
             norm_num_groups: 32,
             norm_eps: 1e-5,
             cross_attention_dim: CROSS_DIM,
-            sliced_attention_size: None,
             use_linear_projection: false,
         };
         // add_embedding loaded, but NO install_ip_adapter / set_ip_context — the plain-SDXL edit path.

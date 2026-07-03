@@ -33,7 +33,6 @@ pub struct UNet2DConditionModelConfig {
     pub norm_num_groups: usize,
     pub norm_eps: f64,
     pub cross_attention_dim: usize,
-    pub sliced_attention_size: Option<usize>,
     pub use_linear_projection: bool,
 }
 
@@ -71,7 +70,6 @@ impl Default for UNet2DConditionModelConfig {
             norm_num_groups: 32,
             norm_eps: 1e-5,
             cross_attention_dim: 1280,
-            sliced_attention_size: None,
             use_linear_projection: false,
         }
     }
@@ -141,12 +139,6 @@ impl UNet2DConditionModel {
                     attention_head_dim,
                 } = config.blocks[i];
 
-                // Enable automatic attention slicing if the config sliced_attention_size is set to 0.
-                let sliced_attention_size = match config.sliced_attention_size {
-                    Some(0) => Some(attention_head_dim / 2),
-                    _ => config.sliced_attention_size,
-                };
-
                 let in_channels = if i > 0 {
                     config.blocks[i - 1].out_channels
                 } else {
@@ -165,7 +157,6 @@ impl UNet2DConditionModel {
                         downblock: db_cfg,
                         attn_num_head_channels: attention_head_dim,
                         cross_attention_dim: config.cross_attention_dim,
-                        sliced_attention_size,
                         use_linear_projection: config.use_linear_projection,
                         transformer_layers_per_block,
                     };
@@ -224,12 +215,6 @@ impl UNet2DConditionModel {
                     attention_head_dim,
                 } = config.blocks[n_blocks - 1 - i];
 
-                // Enable automatic attention slicing if the config sliced_attention_size is set to 0.
-                let sliced_attention_size = match config.sliced_attention_size {
-                    Some(0) => Some(attention_head_dim / 2),
-                    _ => config.sliced_attention_size,
-                };
-
                 let prev_out_channels = if i > 0 {
                     config.blocks[n_blocks - i].out_channels
                 } else {
@@ -255,7 +240,6 @@ impl UNet2DConditionModel {
                         upblock: ub_cfg,
                         attn_num_head_channels: attention_head_dim,
                         cross_attention_dim: config.cross_attention_dim,
-                        sliced_attention_size,
                         use_linear_projection: config.use_linear_projection,
                         transformer_layers_per_block,
                     };
@@ -752,7 +736,6 @@ mod instantid_tests {
             norm_num_groups: 32,
             norm_eps: 1e-5,
             cross_attention_dim: 16,
-            sliced_attention_size: None,
             use_linear_projection: false,
         }
     }
