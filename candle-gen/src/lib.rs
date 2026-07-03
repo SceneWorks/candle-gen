@@ -9,12 +9,33 @@
 //!
 //! This crate owns the candle-specific seam: device/dtype selection across the CPU (default),
 //! Metal (`metal` feature, Mac), and CUDA (`cuda` feature, Windows) backends, plus the
-//! [`CandleError`] → [`gen_core::Error`] bridge that lets a provider crate's
+//! [`CandleError`] ⇄ [`gen_core::Error`] bridges that let a provider crate's
 //! `Generator::generate` (whose signature is `gen_core::Result`) keep using `?` on the candle
 //! `Result`s that do the actual tensor work.
 //!
-//! **Phase 1 (sc-4946) is a scaffold:** the contract + capability surface + device plumbing are
-//! wired and proven to compile/register, but the real SDXL pipeline lands in a later slice.
+//! Beyond that seam this crate is the **shared commons** for the candle provider crates — the single
+//! audited home for machinery that would otherwise be hand-copied across ~25 providers and drift. The
+//! provider crates (`candle-gen-sdxl`, `-z-image`, `-flux`, `-wan`, `-ltx`, `-lens`, `-krea`, …) build
+//! their `gen_core::Generator` / `Trainer` on top of these modules:
+//!
+//! - [`loader`] — sorted-`.safetensors` → unsafe-mmap [`VarBuilder`](candle_nn::VarBuilder) loading,
+//!   the single concentrated `unsafe` mmap surface (sc-8999).
+//! - [`weights`] — the non-`VarBuilder` safetensors key→[`Tensor`](candle_core::Tensor) weight map
+//!   (dtype-coerce, duplicate-key policy, prefix-filtered reads) shared by the IP-Adapter / ControlNet /
+//!   PuLID loads (sc-9044).
+//! - [`seed`] — seed derivation + launch-portable CPU-first seeded-noise helpers, so every provider
+//!   draws reproducible noise identically across providers and backends (sc-7792).
+//! - [`sampler`] — the gen-core `LatentOps` impl over [`Tensor`](candle_core::Tensor) plus the unified
+//!   curated / flow / two-stream (A/V) sampler drivers and schedule resolvers (epic 7114).
+//! - [`train`] — the shared native training harness (LoRA/LoKr adapters, optimizers, LR schedules,
+//!   dataset bucketing, manual gradient checkpointing, and the inference-side [`train::merge`] adapter
+//!   reconstruction), epic 5164.
+//! - [`quant`] — the MLX-packed → GGML repack seam that lets the candle lane consume the hosted MLX
+//!   quant tiers directly (epic 9083).
+//! - [`vae_tiling`] — the budgeted video-VAE tile/blend/accumulate driver shared by the wan/ltx
+//!   decoders (sc-9006).
+//! - [`gpu`] — the trusted-path `nvidia-smi` VRAM-budget probe (sc-9014).
+//! - [`sync`] — poison-tolerant [`lock_recover`] for the shared generator/component caches (sc-9015).
 
 // Re-export the backend-neutral contract so downstream provider crates resolve `gen_core::…`
 // through `candle_gen::gen_core` (single gen-core resolution — see the skew gate). Mirrors how
@@ -202,7 +223,7 @@ mod tests {
     #[test]
     fn default_device_constructs() {
         // CPU on the default Mac build; Metal/CUDA when those features are on. Proves candle is
-        // linked and a Device is constructible — the scaffold's "candle actually builds" check.
+        // linked and a Device is constructible on whatever backend the build selected.
         let dev = default_device().expect("default device constructs");
         // A trivial tensor op on the device proves the backend is live, not just named.
         let t = candle_core::Tensor::zeros((2, 2), default_dtype(), &dev).expect("alloc");

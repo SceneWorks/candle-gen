@@ -14,7 +14,7 @@ calls the identical `Generator` / registry API regardless of which tensor backen
 > flash-attention (sc-3674), VAE tiling + staged CLIP free for torch-parity peak VRAM at 1024²
 > (sc-4987), and UNet/VAE component caching across `generate` calls (sc-5037). The provider still
 > self-registers into the shared `gen_core` inventory registry, with the
-> `CandleError → gen_core::Error` bridge + device plumbing wired (scaffold sc-4946).
+> `CandleError → gen_core::Error` bridge + device plumbing wired (sc-4946).
 >
 > **Z-Image txt2img** is the first model-family expansion beyond SDXL (epic 3692, sc-3693):
 > `ZImageGenerator::generate` adapts the `candle-transformers` `z_image` reference (Qwen3 text
@@ -286,5 +286,5 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace                  # registry-resolution + bridge tests
 ```
 
-The candle version this scaffold settled on is recorded in `[workspace.dependencies]`
+The candle version this workspace settled on is recorded in `[workspace.dependencies]`
 (`candle-core` / `candle-nn`).

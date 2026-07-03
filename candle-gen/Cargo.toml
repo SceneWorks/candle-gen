@@ -2,7 +2,7 @@
 name = "candle-gen"
 version = "0.0.0"
 edition = "2021"
-description = "Rust-native generative image & video model inference on candle (CPU/Metal/CUDA); Windows/CUDA sibling of mlx-gen (work in progress; scaffold)."
+description = "Shared candle (CPU/Metal/CUDA) commons for SceneWorks generative image & video inference — device/dtype seam, weight loaders, seeded noise, unified samplers, training harness, and quantization; Windows/CUDA sibling of mlx-gen."
 license = "Apache-2.0"
 repository = "https://github.com/michaeltrefry/candle-gen"
 keywords = ["candle", "cuda", "diffusion", "inference", "generative"]
