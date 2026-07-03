@@ -41,6 +41,9 @@
 //! finding and the one accepted sampler difference (DDIM vs euler_ancestral, sc-3673).
 
 mod pipeline;
+// The PiD backbone (latent-space) tag (epic 7840 / sc-8373), re-exported so `candle-gen-instantid`
+// loads the same `sdxl` student through its own `with_pid` (it composes the SDXL VAE).
+pub use pipeline::PID_BACKBONE;
 
 // Inference-side LoRA/LoKr adapter merge (sc-5165) — folds a trained adapter's delta into the dense
 // UNet weights before the stock UNet is built (`pipeline` calls this on the adapter path). The candle

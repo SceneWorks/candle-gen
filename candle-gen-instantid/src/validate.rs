@@ -157,6 +157,10 @@ fn real_weight_instantid() {
         sampler: None,
         scheduler: None,
         seed: 12345,
+        // Native VAE decode: this harness validates the identity/pose pipeline, not the optional PiD
+        // super-resolve (epic 7840, sc-8373). The PiD toggle is exercised end-to-end via the worker /
+        // Character Studio smoke (sc-8386).
+        use_pid: false,
         cancel: CancelFlag::new(),
     };
 

@@ -211,7 +211,7 @@ impl SdxlEdit {
             on_progress,
         )?;
         on_progress(Progress::Decoding);
-        decode_image(&self.vae, &latents)
+        decode_image(&self.vae, &latents, None)
     }
 
     /// VAE-encode `source` (resized to the render size, LANCZOS, normalized to `[-1,1]` NCHW) to the

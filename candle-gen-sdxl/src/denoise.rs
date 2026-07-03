@@ -32,7 +32,7 @@ use rand::SeedableRng;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::DiscreteModelSampling;
 use candle_gen::gen_core::{Image, Progress};
-use candle_gen::{CandleError, Result};
+use candle_gen::{CandleError, LatentDecoder, Result};
 
 use crate::pipeline::VAE_SCALE;
 use crate::sampler::EulerAncestralSampler;
@@ -140,15 +140,36 @@ pub fn preprocess_control_image(
     Ok(hwc.permute((2, 0, 1))?.unsqueeze(0)?.contiguous()?)
 }
 
-/// VAE-decode final latents `[1, 4, h, w]` to an RGB8 [`Image`]: un-scale by [`VAE_SCALE`], `x/2 + 0.5`,
-/// clamp, ×255 (the candle txt2img post-process). The decode itself routes through the shared
-/// [`crate::pipeline::tiled_vae_decode`] (F-061 / sc-9045), so every bespoke lane that calls this —
-/// the trainer preview, the IP / edit providers — gets the same sc-4987 budgeted VAE tiling the
-/// registered [`crate::pipeline::Pipeline::decode`] path uses. The tiling only bounds peak VRAM on
-/// large latents (>512² output); ≤512² decodes are byte-identical to the prior monolithic path.
-pub fn decode_image(vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
-    let unscaled = (latents / VAE_SCALE)?;
-    let img = crate::pipeline::tiled_vae_decode(vae, &unscaled)?;
+/// Decode final latents `[1, 4, h, w]` to an RGB8 [`Image`], through the native VAE by default or —
+/// when a `pid` decoder is supplied (epic 7840, sc-8373) — the super-resolving PiD student. Both
+/// produce `[-1, 1]` pixels; the common tail is `x/2 + 0.5`, clamp, ×255 (the candle txt2img
+/// post-process), reading the output size from the decoded tensor (never `latent·8`, since PiD emits a
+/// larger `[1, 3, 4H, 4W]`).
+///
+/// **Latent convention (sc-7848 parity):** the native VAE path un-scales by [`VAE_SCALE`] (candle
+/// de-scales in the pipeline, not inside `vae.decode`), while the PiD `sdxl` student was trained on the
+/// **0.13025-normalized** latent — the scaled sampler output — so it receives `latents` unchanged.
+/// This mirrors [`crate::pipeline::Pipeline::decode`] exactly.
+///
+/// The native VAE decode routes through the shared [`crate::pipeline::tiled_vae_decode`] (F-061 /
+/// sc-9045), so every bespoke lane that calls this — the trainer preview, the IP / edit / InstantID
+/// providers — gets the same sc-4987 budgeted VAE tiling the registered
+/// [`crate::pipeline::Pipeline::decode`] path uses. The tiling only bounds peak VRAM on large latents
+/// (>512² output); ≤512² decodes are byte-identical to the prior monolithic path. `pid = None` is
+/// byte-identical to the pre-sc-8373 signature.
+pub fn decode_image(
+    vae: &AutoEncoderKL,
+    latents: &Tensor,
+    pid: Option<&dyn LatentDecoder>,
+) -> Result<Image> {
+    let img = match pid {
+        // PiD decodes (and 4× super-resolves) the normalized latent directly — no VAE de-scale.
+        Some(pid) => pid.decode(latents)?,
+        None => {
+            let unscaled = (latents / VAE_SCALE)?;
+            crate::pipeline::tiled_vae_decode(vae, &unscaled)?
+        }
+    };
     let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
     let img = (img * 255.)?
         .to_dtype(DType::U8)?

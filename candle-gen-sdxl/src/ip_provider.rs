@@ -283,7 +283,7 @@ impl IpAdapterSdxl {
             )?
         };
         on_progress(Progress::Decoding);
-        decode_image(&self.vae, &latents)
+        decode_image(&self.vae, &latents, None)
     }
 
     /// Build the CFG-batched IP tokens from the reference image. **Uncond-first**: under CFG the uncond

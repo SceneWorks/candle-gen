@@ -71,7 +71,9 @@ use candle_gen_pid::{PidDecoder, PidEngine};
 
 /// The PiD backbone (latent-space) tag for SDXL (epic 7840 / sc-7853): SDXL's own `sdxl` VP-frame
 /// student (4× SR). Kolors reuses this crate's decode seam via the same `sdxl` tag (shared VAE).
-const PID_BACKBONE: &str = "sdxl";
+/// Re-exported (sc-8373) so `candle-gen-instantid` loads the SAME `sdxl` student — InstantID composes
+/// the SDXL VAE, so there is no InstantID-specific PiD checkpoint.
+pub const PID_BACKBONE: &str = "sdxl";
 use candle_transformers::models::stable_diffusion::ddim::DDIMSchedulerConfig;
 use candle_transformers::models::stable_diffusion::schedulers::SchedulerConfig;
 use candle_transformers::models::stable_diffusion::unet_2d::{

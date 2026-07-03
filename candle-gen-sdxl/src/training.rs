@@ -298,7 +298,7 @@ fn render_one_preview(
     }
     // The shared decode expects compute-dtype latents (like the inference DDIM loop); un-scale +
     // `x/2 + 0.5` + clamp + ×255 → RGB8 `Image` lives in `crate::denoise::decode_image`.
-    decode_image(vae, &latents.to_dtype(compute_dtype)?)
+    decode_image(vae, &latents.to_dtype(compute_dtype)?, None)
 }
 
 /// One micro-step's forward+backward over the installed adapter `Var`s: build the noised latent at

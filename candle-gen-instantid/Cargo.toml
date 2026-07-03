@@ -21,6 +21,11 @@ candle-gen-sdxl = { path = "../candle-gen-sdxl" }
 # The native SCRFD + ArcFace face stack (sc-5490) — `largest_face` gives the reference's 512-d ArcFace
 # identity embedding + 5 landmarks that drive the kps control image.
 candle-gen-face = { path = "../candle-gen-face" }
+# The optional PiD super-resolving decoder (epic 7840, sc-8373): `with_pid` loads a `PidEngine` from the
+# `LoadSpec::pid` component and decodes the final SDXL latent through the `sdxl` student (4× SR) instead
+# of the native VAE when `req.use_pid` is set. InstantID composes the SDXL VAE, so it reuses the same
+# `sdxl` checkpoint as the registered SDXL provider (candle-gen-sdxl::PID_BACKBONE).
+candle-gen-pid = { path = "../candle-gen-pid" }
 # The control-image `letterbox` uses a PIL-LANCZOS-analog resample (the sc-2009 IdentityNet aspect
 # rule). The `image` crate's Lanczos3 stands in — the control image is a directional gate, not
 # bit-parity vs PIL. Matches the `image` version candle-gen's trainer uses (one resolution).
@@ -38,5 +43,5 @@ candle-gen = { path = "../candle-gen", features = ["testkit"] }
 # Pass the backend selection through to the core crate AND the composed provider crates so a downstream
 # `--features cuda`/`metal` selects the matching candle backend everywhere (one device, one resolution).
 default = []
-metal = ["candle-gen/metal", "candle-gen-sdxl/metal", "candle-gen-face/metal"]
-cuda = ["candle-gen/cuda", "candle-gen-sdxl/cuda", "candle-gen-face/cuda"]
+metal = ["candle-gen/metal", "candle-gen-sdxl/metal", "candle-gen-face/metal", "candle-gen-pid/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-sdxl/cuda", "candle-gen-face/cuda", "candle-gen-pid/cuda"]

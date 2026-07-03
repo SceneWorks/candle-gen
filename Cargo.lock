@@ -327,6 +327,7 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-face",
+ "candle-gen-pid",
  "candle-gen-sdxl",
  "image",
  "rand",
