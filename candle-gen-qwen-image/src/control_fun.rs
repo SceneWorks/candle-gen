@@ -3,7 +3,7 @@
 //! Structural control (pose / canny / depth) on the **Qwen-Image-2512** base via the alibaba-pai
 //! `Qwen-Image-2512-Fun-Controlnet-Union` checkpoint (Apache-2.0, ungated).
 //!
-//! Unlike the retired InstantX [`crate::control::QwenControl`] (an independent mini-transformer
+//! Unlike the InstantX [`crate::control::QwenControl`] (an independent mini-transformer
 //! emitting residuals the base ADDs at a fixed interval), this is **VACE-style**: a `control_img_in`
 //! patch embedder feeds a control state threaded through 5 control blocks that reuse the base block
 //! math (seeded at block 0 by `before_proj(c) + img_embed`); each emits a zero-init `after_proj` hint

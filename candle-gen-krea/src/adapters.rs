@@ -428,7 +428,7 @@ fn merge_surface_keys(cfg: &Krea2Config) -> Vec<String> {
 }
 
 /// Merge the LoRA/LoKr `specs` into the DiT `Weights` `w` (sc-7836): preload the attention-projection
-/// base weights ([`attention_surface_keys`]) onto the CPU, fold each adapter's delta in
+/// base weights ([`merge_surface_keys`]) onto the CPU, fold each adapter's delta in
 /// ([`merge_adapters`], f32 math matching the trainer), and install the result as `w`'s overlay so the
 /// subsequent `Krea2Transformer::load` reads the merged weights. A no-op (empty overlay) when `specs`
 /// is empty — the stock unadapted build. The engine's adapter-merge entry; [`crate::pipeline`] calls it

@@ -111,7 +111,7 @@ pub fn load_with_parser(dir: &Path) -> Result<CandleFaceAnalysis> {
     load_with_parser_on(dir, &device)
 }
 
-/// `[x1,y1,x2,y2]` image-space dims of an [`Image`], rejecting a zero/oversized buffer.
+/// Returns an [`Image`]'s `(height, width)`, rejecting a buffer too small for `width·height·3`.
 fn image_dims(image: &Image) -> Result<(usize, usize)> {
     let (w, h) = (image.width as usize, image.height as usize);
     if image.pixels.len() < w * h * 3 {

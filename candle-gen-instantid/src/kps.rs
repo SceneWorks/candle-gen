@@ -8,7 +8,9 @@
 //! rasterization must match OpenCV's integer drawing. The three primitives are faithful ports of
 //! OpenCV 4.13 `drawing.cpp`: `ellipse2Poly` (float `SinTable` + `cvRound` round-half-to-even),
 //! `fillConvexPoly` (XY_SHIFT=16 fixed-point scanline fill + the `Line` outline), and the filled
-//! `Circle` (Bresenham span fill). Validated pixel-for-pixel vs cv2 in `tests/instantid_kps.rs`.
+//! `Circle` (Bresenham span fill). The pixel-for-pixel-vs-cv2 golden validation lives in the mlx-gen
+//! parity suite (the shared reference for this renderer); the in-crate tests here cover the primitive
+//! helpers (e.g. `hline`).
 //!
 //! Also here: [`letterbox`] (resize-keep-aspect + center-pad, the sc-2009 kps-distortion rule) and the
 //! canonical [`VIEW_ANGLE_KPS`] multi-view landmark sets.

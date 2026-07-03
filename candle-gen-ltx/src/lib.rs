@@ -407,7 +407,8 @@ impl Generator for LtxGenerator {
 /// LTX-2.3 distilled txt2video descriptor — single-stage rectified-flow (no CFG / negative prompt;
 /// guidance is distilled in). The denoise step count is FIXED at [`NATIVE_STEPS`] (the baked
 /// `STAGE1_SIGMAS` schedule); an explicit non-native `req.steps` is rejected in `validate` rather than
-/// silently ignored (sc-9027 / F-043). Audio / I2V / upsampler / LoRA / quant deferred.
+/// silently ignored (sc-9027 / F-043). Synchronized audio is produced (sc-5495, the joint video+audio
+/// streams); I2V / upsampler / LoRA / quant remain deferred.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,

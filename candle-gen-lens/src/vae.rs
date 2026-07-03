@@ -18,8 +18,9 @@ use candle_gen::candle_core::{DType, Result, Tensor};
 
 pub use candle_gen_flux2::vae::Flux2Vae;
 
-/// Decode the Lens DiT output into an image. `dit_out`: `[B, h·w, 128]` (the transformer's packed
-/// patch-space velocity at the final step); `(latent_h, latent_w)` is the packed latent grid
+/// Decode the Lens DiT output into an image. `dit_out`: `[B, h·w, 128]` (the final denoised
+/// patch-space latents after the last sampling step, NOT a per-step velocity); `(latent_h, latent_w)`
+/// is the packed latent grid
 /// (`= height/16, width/16`). Returns `[B, 3, H, W]` (NCHW) in ~`[−1, 1]`, where `H = latent_h·16`,
 /// `W = latent_w·16` (2× unpatchify × 8× VAE upsample).
 pub fn decode(

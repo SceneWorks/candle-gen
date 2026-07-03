@@ -370,7 +370,8 @@ mod budget_tests {
     fn ltx_tiling_bounds_moderate_res_peak() {
         // 1280×1280×121 single-pass would peak ~66 GB; on a 48 GiB-class budget it must tile and keep
         // the recomputed peak under the safe ceiling (bounded/catchable). Cost constants are the
-        // mlx-seeded placeholders — this checks the SELECTOR logic, not the (CUDA-pending) calibration.
+        // CUDA-calibrated (sc-7148) anchors; this checks the SELECTOR logic, not the calibration itself
+        // (that is covered by `ltx_decode_peak_matches_cuda_anchors`).
         let safe = 48.0 * 0.85;
         let cfg = plan_ltx_tiling(1280, 1280, 121, safe)
             .unwrap()

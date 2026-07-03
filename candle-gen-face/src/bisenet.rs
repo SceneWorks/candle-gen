@@ -24,6 +24,7 @@
 
 use candle_gen::candle_core::{Device, Tensor};
 use candle_gen::{CandleError, Result};
+use candle_nn::ops::sigmoid;
 
 use crate::common::{Conv, ConvW, Weights};
 
@@ -32,11 +33,6 @@ pub const BG_LABELS: [u32; 8] = [0, 16, 18, 7, 8, 9, 14, 15];
 /// ImageNet normalization (the facexlib parse-net preprocessing).
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const STD: [f32; 3] = [0.229, 0.224, 0.225];
-
-/// `sigmoid(x) = 1 / (1 + exp(-x))` (avoids a candle_nn dep; the ARM/FFM attention gates).
-fn sigmoid(x: &Tensor) -> Result<Tensor> {
-    Ok((x.neg()?.exp()? + 1.0)?.recip()?)
-}
 
 /// Global average pool over the NCHW spatial axes → `[B,C,1,1]`.
 fn global_avg(x: &Tensor) -> Result<Tensor> {

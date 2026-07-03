@@ -3,9 +3,10 @@
 //! to support the quantized split checkpoints; we load the single dense file and pin the LTX-2.3
 //! values directly (they are fixed for this model family).
 //!
-//! First slice is **video-only txt2video**: only the video-stack DiT, the Gemma-3-12B text encoder,
-//! the video connector, and the video VAE decoder are consumed. The audio stack, the 2-stage latent
-//! upsampler, I2V, prompt-enhance, LoRA, and fp8/quant are deferred to follow-up stories.
+//! This is **txt2video+audio**: the video-stack DiT, the Gemma-3-12B text encoder, the video connector,
+//! and the video VAE decoder, plus the synchronized-audio stack (audio text head + connector, the
+//! dual-modal AV DiT, the audio VAE decoder, and the vocoder — sc-5495) are all consumed. The 2-stage
+//! latent upsampler, I2V, prompt-enhance, LoRA, and fp8/quant are deferred to follow-up stories.
 
 /// Registry id (the distilled 22B text-to-video model).
 pub const MODEL_ID: &str = "ltx_2_3_distilled";

@@ -108,9 +108,10 @@ fn pad_hidden_to(x: &Tensor, target: usize) -> Result<Tensor> {
     Tensor::cat(&[x, &pad], D::Minus1)
 }
 
-/// Build zeroed encoder outputs at the config's shapes for a given batch (the "empty/unconditioned"
-/// path and a test fixture). C2's CFG uses this to assemble the negative branch when a T5/CLIP empty
-/// encode is degenerate; here it doubles as the structural-test fixture.
+/// Build zeroed encoder outputs at the config's shapes for a given batch. NOTE: this is a
+/// structural-test fixture only — the real CFG negative branch is the **empty-prompt encode** through
+/// the same encoders (NOT a zero tensor; see the pipeline module header), so `zeroed_outputs` is not
+/// on the generation path. Its only consumer is `zeroed_outputs_aggregate_to_correct_shape`.
 pub fn zeroed_outputs(
     cfg: &Sd3Config,
     batch: usize,
