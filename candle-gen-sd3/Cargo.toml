@@ -41,7 +41,6 @@ serde_json = { workspace = true }
 default = []
 metal = ["candle-gen/metal", "candle-transformers/metal"]
 cuda = ["candle-gen/cuda", "candle-transformers/cuda"]
-flash-attn = ["candle-gen/flash-attn", "candle-transformers/flash-attn"]
 
 [dev-dependencies]
 # `examples/sd3-txt2img.rs` smoke driver (C2) — encode the produced `gen_core::Image` (RGB8) to PNG.

@@ -34,7 +34,7 @@ use candle_gen::gen_core::{
 use candle_transformers::models::z_image::vae::Encoder as VaeEncoder;
 
 use crate::pipeline::{self, Components, Pipeline, BASE_DEFAULT_STEPS};
-use crate::{accel_attn_enabled, SIZE_MULTIPLE};
+use crate::SIZE_MULTIPLE;
 
 /// Registry id for the **base** Z-Image (non-Turbo). Matches the SceneWorks catalog `z_image` entry
 /// (added by mlx sc-8320) and the macOS `mlx-gen-z-image::model_base` descriptor. Coexists with
@@ -68,7 +68,9 @@ impl ZImageBaseGenerator {
     /// Get the cached components, loading (and caching) them on a miss. Keyed by the effective
     /// accel-attn setting (baked into the DiT config at build), identical to the Turbo generator.
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        let accel = cfg!(feature = "flash-attn") && accel_attn_enabled();
+        // sc-9032: no-op `flash-attn` feature removed; flash path is never wired, so `false` is
+        // byte-identical to the old `cfg!(feature = "flash-attn") && accel_attn_enabled()`.
+        let accel = false;
         let mut guard = self
             .components
             .lock()

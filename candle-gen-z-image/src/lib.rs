@@ -101,23 +101,25 @@ pub const MODEL_ID: &str = "z_image_turbo";
 pub(crate) const SIZE_MULTIPLE: u32 = 16;
 
 /// Process-global accelerated-attention runtime toggle (the Z-Image analogue of the SDXL flash-attn
-/// switch, sc-3674). The DiT's fused attention dispatch (CUDA flash-attn / Metal SDPA) is a **build
-/// opt-in** (`--features flash-attn`); this switch decides whether a capable build actually *uses*
-/// it, so the SceneWorks UI can expose it (defaulted on) and the worker flips it from settings
-/// without recompiling. ANDed with `cfg!(feature = "flash-attn")` at load, so on a build without the
-/// feature it is inert (the reference's manual attention path always runs). Default **on**.
+/// switch, sc-3674). This switch was designed to decide whether a capable build actually *uses* the
+/// DiT's fused attention dispatch (CUDA flash-attn / Metal SDPA), so the SceneWorks UI can expose it
+/// (defaulted on) and the worker flips it from settings without recompiling. **sc-9032:** the
+/// `flash-attn` cargo feature it was ANDed with was a no-op alias (`= ["cuda"]`, no fused dispatch
+/// wired) and was removed; the pipeline now hard-codes the accelerated path off, so this toggle is
+/// retained as public worker API but is inert until a real fused-dispatch slice re-gates it.
+/// Default **on**.
 static ACCEL_ATTN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Enable/disable accelerated attention for subsequently-loaded pipelines. Process-global; the worker
-/// calls this from its backend setting at startup. No effect on a build without the `flash-attn`
-/// feature (the fused kernels aren't compiled in).
+/// calls this from its backend setting at startup. Inert since sc-9032 removed the no-op `flash-attn`
+/// feature — no fused dispatch is wired in (retained as worker API).
 pub fn set_accel_attn(on: bool) {
     ACCEL_ATTN.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether accelerated attention is currently enabled (the runtime toggle, [`set_accel_attn`]). The
-/// pipeline gates this behind `cfg!(feature = "flash-attn")`, so this returning `true` on a non-flash
-/// build does not enable anything.
+/// Whether accelerated attention is currently enabled (the runtime toggle, [`set_accel_attn`]). Since
+/// sc-9032 the pipeline hard-codes the accelerated path off (the no-op `flash-attn` feature was
+/// removed), so this returning `true` does not enable anything.
 pub fn accel_attn_enabled() -> bool {
     ACCEL_ATTN.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -145,7 +147,11 @@ impl ZImageGenerator {
     /// accel-attn setting (baked into the DiT config at build), so flipping [`set_accel_attn`] between
     /// calls rebuilds rather than serving a stale DiT.
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        let accel = cfg!(feature = "flash-attn") && accel_attn_enabled();
+        // sc-9032: the no-op `flash-attn` cargo feature (formerly ANDed here) was removed. No fused
+        // CUDA flash-attn / Metal SDPA dispatch is wired behind a build feature, so `false` is
+        // byte-identical to the old `cfg!(feature = "flash-attn") && accel_attn_enabled()` (which
+        // always resolved false in every buildable config). `set_accel_attn` stays as worker API.
+        let accel = false;
         let mut guard = self
             .components
             .lock()

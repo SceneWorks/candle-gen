@@ -75,8 +75,8 @@ fn main() -> Result<()> {
     // it only through the gen_core registry below — see `candle_gen_z_image::force_link`).
     candle_gen_z_image::force_link();
 
-    // `--no-accel` exercises the runtime toggle: turn fused attention off even on a flash-attn build
-    // (the worker drives this from the UI setting). No effect on a non-flash build.
+    // `--no-accel` exercises the runtime toggle: the worker drives it from the UI setting.
+    // Inert since sc-9032 removed the no-op `flash-attn` feature — no fused dispatch is wired.
     if args.iter().any(|a| a == "--no-accel") {
         candle_gen_z_image::set_accel_attn(false);
     }
@@ -122,7 +122,8 @@ fn main() -> Result<()> {
         };
     }
     let gen_s = *call_secs.last().unwrap();
-    let accel = cfg!(feature = "flash-attn") && candle_gen_z_image::accel_attn_enabled();
+    // sc-9032: no-op `flash-attn` feature removed; accelerated dispatch is never wired, so always off.
+    let accel = false;
     println!(
         "[smoke] {} image(s) in {gen_s:.1}s total (accel_attn={accel})",
         images.len()

@@ -33,4 +33,3 @@ inventory = { workspace = true }
 default = []
 metal = ["candle-gen/metal", "candle-gen-sdxl/metal", "candle-transformers/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-sdxl/cuda", "candle-transformers/cuda"]
-flash-attn = ["candle-gen/flash-attn", "candle-gen-sdxl/flash-attn", "candle-transformers/flash-attn"]

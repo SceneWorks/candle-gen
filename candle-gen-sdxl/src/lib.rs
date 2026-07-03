@@ -169,24 +169,25 @@ pub const MODEL_ID: &str = "sdxl";
 /// SDXL works in latent space at /8: both dims must be multiples of 8.
 const SIZE_MULTIPLE: u32 = 8;
 
-/// Process-global flash-attention runtime toggle (sc-3674). The **fused CUTLASS kernels are a build
-/// opt-in** (`--features flash-attn`); this switch decides whether a flash-attn-capable build
-/// actually *uses* them, so the SceneWorks UI can expose it (defaulted on) and the worker flips it
-/// from settings — without recompiling. Mirrors `mlx-gen-sdxl::set_compile_glue`. Read at pipeline
-/// load via [`flash_attn_enabled`]; the pipeline ANDs it with `cfg!(feature = "flash-attn")`, so on a
-/// build without the feature this is inert (the unfused path always runs). Default **on**.
+/// Process-global flash-attention runtime toggle (sc-3674). This switch was designed to decide
+/// whether a flash-attn-capable build actually *uses* the fused kernels, so the SceneWorks UI can
+/// expose it (defaulted on) and the worker flips it from settings — without recompiling. Mirrors
+/// `mlx-gen-sdxl::set_compile_glue`. **sc-9032:** the `flash-attn` cargo feature it was ANDed with
+/// was a no-op alias (`= ["cuda"]`, no `candle-flash-attn` wired) and was removed; `components` now
+/// hard-codes the flash path off, so this toggle is retained as public worker API but is inert until
+/// the fused-kernel slice lands and re-gates the load on it. Default **on**.
 static FLASH_ATTN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Enable/disable flash-attention for subsequently-loaded pipelines (sc-3674). Process-global; the
-/// worker calls this from its `backend_candle`/flash setting at startup. No effect on a build without
-/// the `flash-attn` feature (the kernels aren't compiled in).
+/// worker calls this from its `backend_candle`/flash setting at startup. Inert since sc-9032 removed
+/// the no-op `flash-attn` feature — no fused kernels are compiled in (retained as worker API).
 pub fn set_flash_attn(on: bool) {
     FLASH_ATTN.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Whether flash-attention is currently enabled (the runtime toggle, [`set_flash_attn`]). The
-/// pipeline still gates this behind `cfg!(feature = "flash-attn")`, so this returning `true` on a
-/// non-flash build does not enable anything.
+/// Whether flash-attention is currently enabled (the runtime toggle, [`set_flash_attn`]). Since
+/// sc-9032 the pipeline hard-codes the flash path off (the no-op `flash-attn` feature was removed),
+/// so this returning `true` does not enable anything.
 pub fn flash_attn_enabled() -> bool {
     FLASH_ATTN.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -244,7 +245,12 @@ impl SdxlGenerator {
     /// calls rebuilds rather than serving a stale UNet. The lock is held over the cache-miss load
     /// (concurrent first-callers serialize on it) but released before the caller's denoise.
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        let flash = cfg!(feature = "flash-attn") && flash_attn_enabled();
+        // sc-9032: the `flash-attn` cargo feature (a no-op alias for `cuda`) was removed. No fused
+        // candle-flash-attn kernel is wired, so the flash path is never taken — `false` here is
+        // byte-identical to the old `cfg!(feature = "flash-attn") && flash_attn_enabled()`, which
+        // always resolved false in every buildable config. The `set_flash_attn` runtime toggle stays
+        // (public worker API) but is inert until the fused-kernel slice lands and re-gates this.
+        let flash = false;
         // sc-9015 / F-031: recover from a poisoned lock (overwrite-on-miss cache; a prior panic
         // while locked must not turn every later `generate` into a panic).
         let mut guard = candle_gen::lock_recover(&self.components);

@@ -36,4 +36,3 @@ rand = "0.9"
 default = []
 metal = ["candle-gen/metal", "candle-gen-sdxl/metal", "candle-gen-face/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-sdxl/cuda", "candle-gen-face/cuda"]
-flash-attn = ["candle-gen/flash-attn", "candle-gen-sdxl/flash-attn", "candle-gen-face/flash-attn"]

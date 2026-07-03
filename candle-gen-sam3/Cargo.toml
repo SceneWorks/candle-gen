@@ -30,4 +30,3 @@ tokenizers = { workspace = true }
 default = []
 metal = ["candle-gen/metal"]
 cuda = ["candle-gen/cuda"]
-flash-attn = ["candle-gen/flash-attn"]

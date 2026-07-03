@@ -155,11 +155,11 @@ The default build is **CPU** (`candle-core`'s default) and works on macOS with n
 | *(none)*     | CPU                    | all (Mac dev)   | yes           |
 | `metal`      | Apple Metal GPU        | macOS           | no            |
 | `cuda`       | NVIDIA CUDA            | Windows/Linux   | no            |
-| `flash-attn` | implies `cuda` (TODO)  | Windows/CUDA    | no            |
 
-`cuda` / `flash-attn` need the CUDA toolkit and **do not build on Mac**; all CUDA-only code is gated
-behind `#[cfg(feature = "cuda")]`. `flash-attn` currently just implies `cuda` — the fused kernels
-need the separate `candle-flash-attn` crate, wired in a later slice on the Windows box.
+`cuda` needs the CUDA toolkit and **does not build on Mac**; all CUDA-only code is gated behind
+`#[cfg(feature = "cuda")]`. A `flash-attn` feature used to exist as a no-op alias (`= ["cuda"]`,
+forwarded crate-to-crate) that wired no fused kernels; it was removed in sc-9032. When the
+`candle-flash-attn` slice is scheduled, reintroduce it behind real gated code, not a bare alias.
 
 ## Packaging (Windows / CUDA) — sc-3676
 

@@ -151,8 +151,9 @@ impl ZImageEdit {
         )?;
 
         let mut dit_cfg = DitConfig::z_image_turbo();
-        dit_cfg
-            .set_use_accelerated_attn(cfg!(feature = "flash-attn") && crate::accel_attn_enabled());
+        // sc-9032: no-op `flash-attn` feature removed; accelerated dispatch is never wired behind a
+        // build feature, so this is always off (was `cfg!(feature = "flash-attn") && …`).
+        dit_cfg.set_use_accelerated_attn(false);
         let transformer = ZImageTransformer2DModel::new(
             &dit_cfg,
             component_vb(&root, "transformer", DTYPE, &device)?,

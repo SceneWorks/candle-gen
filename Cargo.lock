@@ -193,17 +193,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "candle-flash-attn"
-version = "0.10.2"
-source = "git+https://github.com/huggingface/candle?rev=c1e6756a89faefa888ea57b056394a0619925b87#c1e6756a89faefa888ea57b056394a0619925b87"
-dependencies = [
- "anyhow",
- "candle-core",
- "cudaforge",
- "half",
-]
-
-[[package]]
 name = "candle-gen"
 version = "0.0.0"
 dependencies = [
@@ -627,7 +616,6 @@ source = "git+https://github.com/huggingface/candle?rev=c1e6756a89faefa888ea57b0
 dependencies = [
  "byteorder",
  "candle-core",
- "candle-flash-attn",
  "candle-nn",
  "fancy-regex",
  "num-traits",

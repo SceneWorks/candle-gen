@@ -20,7 +20,6 @@ rand_distr = { workspace = true }
 default = []
 metal = ["candle-gen/metal"]
 cuda = ["candle-gen/cuda"]
-flash-attn = ["candle-gen/flash-attn"]
 
 [dev-dependencies]
 sceneworks-gen-core-testkit = { workspace = true }

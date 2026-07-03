@@ -48,11 +48,6 @@ serde_json = "1"
 default = []
 metal = ["candle-gen/metal", "candle-transformers/metal", "candle-gen-sdxl/metal"]
 cuda = ["candle-gen/cuda", "candle-transformers/cuda", "candle-gen-sdxl/cuda"]
-flash-attn = [
-    "candle-gen/flash-attn",
-    "candle-transformers/flash-attn",
-    "candle-gen-sdxl/flash-attn",
-]
 
 [dev-dependencies]
 # `examples/flux-txt2img.rs` smoke driver only — encode the produced `gen_core::Image` (RGB8) to PNG so a

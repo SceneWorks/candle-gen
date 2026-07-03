@@ -33,7 +33,6 @@ safetensors = "0.7"
 default = []
 metal = ["candle-gen/metal", "candle-gen-qwen-image/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-qwen-image/cuda"]
-flash-attn = ["candle-gen/flash-attn", "candle-gen-qwen-image/flash-attn"]
 
 [dev-dependencies]
 # Encode the e2e real-weight smoke output to PNG for eyeballing (sc-7582); mirrors the other families.

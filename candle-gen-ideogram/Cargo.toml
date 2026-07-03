@@ -25,7 +25,6 @@ safetensors = "0.7"
 default = []
 metal = ["candle-gen/metal", "candle-gen-flux2/metal"]
 cuda = ["candle-gen/cuda", "candle-gen-flux2/cuda"]
-flash-attn = ["candle-gen/flash-attn", "candle-gen-flux2/flash-attn"]
 
 [dev-dependencies]
 image = { version = "0.25", default-features = false, features = ["png"] }

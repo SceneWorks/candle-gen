@@ -50,9 +50,3 @@ cuda = [
     "candle-gen-flux/cuda",
     "candle-gen-face/cuda",
 ]
-flash-attn = [
-    "candle-gen/flash-attn",
-    "candle-transformers/flash-attn",
-    "candle-gen-flux/flash-attn",
-    "candle-gen-face/flash-attn",
-]

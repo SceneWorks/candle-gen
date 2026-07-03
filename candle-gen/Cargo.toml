@@ -45,6 +45,6 @@ metal = ["candle-core/metal", "candle-nn/metal"]
 # NVIDIA CUDA backend (Windows target). MUST NOT be in `default` — it needs the CUDA toolkit and
 # will not build on Mac. All cuda-only code is gated behind `#[cfg(feature = "cuda")]`.
 cuda = ["candle-core/cuda", "candle-nn/cuda", "dep:float8"]
-# Flash-Attention kernels (Windows/CUDA only). For now this just implies `cuda`; the real fused
-# kernels need the separate `candle-flash-attn` crate, wired in a later slice on the Windows box.
-flash-attn = ["cuda"]
+# NOTE: a `flash-attn` feature was removed in sc-9032 — it was a pure no-op (`flash-attn = ["cuda"]`,
+# forwarded crate-to-crate) that wired no fused kernels. When the `candle-flash-attn` slice is
+# scheduled, reintroduce it here (and its forwards) behind real gated code, not as a bare alias.

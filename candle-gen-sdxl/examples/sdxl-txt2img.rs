@@ -87,8 +87,8 @@ fn main() -> Result<()> {
     // it only through the gen_core registry below — see `candle_gen_sdxl::force_link`).
     candle_gen_sdxl::force_link();
 
-    // `--no-flash` exercises the runtime toggle (sc-3674): turn fused flash-attention off even on a
-    // flash-attn build (the worker drives this from the UI setting). No effect on a non-flash build.
+    // `--no-flash` exercises the runtime toggle (sc-3674): the worker drives it from the UI setting.
+    // Inert since sc-9032 removed the no-op `flash-attn` feature — no fused kernel is compiled in.
     if args.iter().any(|a| a == "--no-flash") {
         candle_gen_sdxl::set_flash_attn(false);
     }
@@ -179,7 +179,9 @@ fn main() -> Result<()> {
     } else {
         deltas.iter().sum::<f32>() / deltas.len() as f32
     };
-    let flash = cfg!(feature = "flash-attn") && candle_gen_sdxl::flash_attn_enabled();
+    // sc-9032: the no-op `flash-attn` feature was removed; no fused kernel is wired, so the flash
+    // path is always off (byte-identical to the old `cfg!(feature = "flash-attn") && …`).
+    let flash = false;
     let tiling = candle_gen_sdxl::vae_tiling_enabled();
     println!(
         "[smoke] {} image(s) in {gen_s:.1}s total; steady-state {:.3}s/step (flash_attn={flash} vae_tiling={tiling})",
