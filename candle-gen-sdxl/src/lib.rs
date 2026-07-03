@@ -42,6 +42,12 @@
 
 mod pipeline;
 
+// The vendored, packed-detecting SDXL CLIP text-encoder tower (sc-9527, sc-9089j follow-up to the
+// sc-9416 UNet packed-load): its Linear surface (attn q/k/v/out_proj, MLP fc1/fc2, bigG
+// text_projection) routes through `candle_gen::quant` so the packed MLX tier's dual CLIP loads
+// straight from the packed parts. A pure superset — a dense snapshot takes the stock path unchanged.
+pub mod clip;
+
 // Inference-side LoRA/LoKr adapter merge (sc-5165) — folds a trained adapter's delta into the dense
 // UNet weights before the stock UNet is built (`pipeline` calls this on the adapter path). The candle
 // twin of `mlx-gen-sdxl::adapters`; closes the train→infer loop with the trainer below.

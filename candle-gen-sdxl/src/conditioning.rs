@@ -20,12 +20,15 @@
 use std::path::Path;
 
 use candle_core::{DType, Device, IndexOp, Tensor, D};
-use candle_nn::{Linear, Module};
-use candle_transformers::models::stable_diffusion::{self, clip};
 use tokenizers::Tokenizer;
 
+use candle_gen::quant::QLinear;
 use candle_gen::{CandleError, Result};
 
+// The vendored, packed-detecting CLIP tower + its config (sc-9527): a pure superset of the stock
+// `stable_diffusion::clip` — a dense snapshot loads exactly as before, a packed MLX tier loads its
+// dual CLIP straight from the packed parts.
+use crate::clip::{self, ClipTextTransformer};
 use crate::pipeline::{hf_get, snapshot_file, Clip};
 
 /// Pad/truncate-check a token id list to exactly `max_len`: error if longer (parity with the txt2img
@@ -57,7 +60,11 @@ fn eos_position(ids: &[u32]) -> usize {
 /// Pool the bigG final-layer-norm hidden `final_g` `[B, 77, 1280]` at each row's EOS position and run it
 /// through `text_projection` → pooled text-embeds `[B, 1280]`. `token_rows[b]` is row `b`'s padded ids
 /// (for the EOS lookup). Split out so the gather/projection is testable with synthetic tensors.
-fn pool_eos(final_g: &Tensor, token_rows: &[Vec<u32>], text_projection: &Linear) -> Result<Tensor> {
+fn pool_eos(
+    final_g: &Tensor,
+    token_rows: &[Vec<u32>],
+    text_projection: &QLinear,
+) -> Result<Tensor> {
     let mut rows = Vec::with_capacity(token_rows.len());
     for (b, ids) in token_rows.iter().enumerate() {
         rows.push(final_g.i((b, eos_position(ids)))?); // [1280]
@@ -71,47 +78,91 @@ fn pool_eos(final_g: &Tensor, token_rows: &[Vec<u32>], text_projection: &Linear)
 pub struct SdxlConditioner {
     tok_l: Tokenizer,
     tok_g: Tokenizer,
-    clip_l: clip::ClipTextTransformer,
-    clip_g: clip::ClipTextTransformer,
-    /// bigG `CLIPTextModelWithProjection` head (`text_projection.weight`, `[1280, 1280]`, no bias).
-    text_projection: Linear,
+    clip_l: ClipTextTransformer,
+    clip_g: ClipTextTransformer,
+    /// bigG `CLIPTextModelWithProjection` head (`text_projection.weight`, `[1280, 1280]`, no bias) —
+    /// a packed-detecting [`QLinear`] (sc-9527): packed straight from the MLX triple, else dense.
+    text_projection: QLinear,
     cfg_l: clip::Config,
     cfg_g: clip::Config,
     device: Device,
 }
 
+/// Resolve one CLIP encoder's weight file + packed group size (sc-9527): the packed
+/// `text_encoder{,_2}/model.safetensors` + its config group size on a packed MLX tier, else the dense
+/// `.fp16` file at the default group 64. The vendored tower's `linear_detect_gs` takes the packed or
+/// dense path per the presence of `.scales` siblings; the returned group size only matters on the
+/// packed branch.
+fn clip_weight_file(
+    root: &Path,
+    which: &Clip,
+    dense_sub: &str,
+) -> Result<(std::path::PathBuf, usize)> {
+    match crate::pipeline::detect_packed_clip(root, which)? {
+        Some((packed_file, group_size)) => Ok((packed_file, group_size)),
+        None => Ok((
+            snapshot_file(root, dense_sub)?,
+            candle_gen::quant::MLX_GROUP_SIZE,
+        )),
+    }
+}
+
+/// Build one vendored, packed-detecting CLIP tower for `which` and return it alongside the VarBuilder
+/// it was built from (so a caller — the bigG `text_projection` — can reuse the same mmap) and the
+/// packed group size.
+fn load_clip_tower_with_vb(
+    root: &Path,
+    which: &Clip,
+    device: &Device,
+    dtype: DType,
+) -> Result<(ClipTextTransformer, candle_nn::VarBuilder<'static>, usize)> {
+    let (_tok_repo, dense_sub) = which.sources();
+    let (file, group_size) = clip_weight_file(root, which, dense_sub)?;
+    let vb = candle_gen::mmap_var_builder(&[file], dtype, device)?;
+    let tower = ClipTextTransformer::new_gs(vb.clone(), &which.vendored_config(), group_size)?;
+    Ok((tower, vb, group_size))
+}
+
+/// As [`load_clip_tower_with_vb`] but drops the VarBuilder (the CLIP-L encoder has no projection head).
+fn load_clip_tower(
+    root: &Path,
+    which: &Clip,
+    device: &Device,
+    dtype: DType,
+) -> Result<ClipTextTransformer> {
+    Ok(load_clip_tower_with_vb(root, which, device, dtype)?.0)
+}
+
 impl SdxlConditioner {
     /// Load both CLIP encoders from the SDXL snapshot (`text_encoder/` = CLIP-L, `text_encoder_2/` =
     /// bigG), the bigG `text_projection`, and the two model-agnostic tokenizers (cached via `hf-hub`,
-    /// exactly as the txt2img path). `dtype` is the compute dtype (f16 for production).
+    /// exactly as the txt2img path). `dtype` is the compute dtype (f16 for production). Both encoders
+    /// and the projection head packed-detect through the vendored tower (sc-9527), so a packed MLX tier
+    /// loads its dual CLIP straight from the packed parts; a dense snapshot is byte-identical.
     pub fn load(root: &Path, device: &Device, dtype: DType) -> Result<Self> {
         let cfg_l = clip::Config::sdxl();
         let cfg_g = clip::Config::sdxl2();
-        let (tok_l_repo, l_sub) = Clip::L.sources();
-        let (tok_g_repo, g_sub) = Clip::BigG.sources();
+        let (tok_l_repo, _l_sub) = Clip::L.sources();
+        let (tok_g_repo, _g_sub) = Clip::BigG.sources();
 
         let tok_l = Tokenizer::from_file(hf_get(tok_l_repo, "tokenizer.json")?)
             .map_err(|e| CandleError::Msg(format!("load tokenizer {tok_l_repo}: {e}")))?;
         let tok_g = Tokenizer::from_file(hf_get(tok_g_repo, "tokenizer.json")?)
             .map_err(|e| CandleError::Msg(format!("load tokenizer {tok_g_repo}: {e}")))?;
 
-        let l_file = snapshot_file(root, l_sub)?;
-        let g_file = snapshot_file(root, g_sub)?;
-        let clip_l = stable_diffusion::build_clip_transformer(&cfg_l, &l_file, device, dtype)?;
-        let clip_g = stable_diffusion::build_clip_transformer(&cfg_g, &g_file, device, dtype)?;
+        // sc-9527: build each encoder through the vendored, packed-detecting tower. On a packed MLX
+        // tier the weights live under `text_encoder{,_2}/model.safetensors` (with `.scales` siblings);
+        // on a dense snapshot they live under the `.fp16` name and the vendored tower takes the dense
+        // path (byte-identical to the stock builder, pinned by `clip::tests::vendored_dense_matches_stock`).
+        let clip_l = load_clip_tower(root, &Clip::L, device, dtype)?;
+        let (clip_g, g_vb, g_group_size) =
+            load_clip_tower_with_vb(root, &Clip::BigG, device, dtype)?;
 
-        // The `text_projection.weight` lives in the same bigG checkpoint (a `CLIPTextModelWithProjection`)
-        // that `build_clip_transformer` read only the `text_model.*` of. Pull out just that one tensor via
-        // a header-only mmap (sc-8990 / F-010) instead of re-materializing the whole ~1.4 GB checkpoint on
-        // the device a second time.
-        let tp = candle_gen::load_one_tensor(
-            &g_file,
-            "text_projection.weight",
-            dtype,
-            device,
-            "sdxl conditioning",
-        )?;
-        let text_projection = Linear::new(tp, None);
+        // The bigG `text_projection.weight` (`CLIPTextModelWithProjection` pooled head) lives at the bare
+        // top-level key of the SAME bigG checkpoint the tower just read. It packs on a packed tier, so
+        // load it packed-detecting from the same VarBuilder (no separate materialization) — dense
+        // (`text_projection.weight`) on a dense snapshot.
+        let text_projection = clip::text_projection(&g_vb, cfg_g.projection_dim, g_group_size)?;
 
         Ok(Self {
             tok_l,
@@ -233,10 +284,13 @@ mod tests {
         // final_g: rows 0..4 are [r,r,r]; the EOS row (index 2) is [2,2,2].
         let data: Vec<f32> = (0..4).flat_map(|r| vec![r as f32; 3]).collect();
         let final_g = Tensor::from_vec(data, (1, 4, 3), &dev).unwrap();
-        // Identity projection (3→3) so the output is exactly the gathered EOS hidden.
+        // Identity projection (3→3) so the output is exactly the gathered EOS hidden — wrapped as a
+        // dense `QLinear` (the sc-9527 packed-detecting projection type; here the dense arm).
         let eye =
             Tensor::from_vec(vec![1f32, 0., 0., 0., 1., 0., 0., 0., 1.], (3, 3), &dev).unwrap();
-        let proj = Linear::new(eye, None);
+        let proj = QLinear::from_dense(candle_gen::quant::DenseLinear::Linear(
+            candle_nn::Linear::new(eye, None),
+        ));
         let pooled = pool_eos(&final_g, &token_rows, &proj).unwrap();
         assert_eq!(pooled.dims(), &[1, 3]);
         let v = pooled.flatten_all().unwrap().to_vec1::<f32>().unwrap();

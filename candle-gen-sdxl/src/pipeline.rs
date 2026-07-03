@@ -211,6 +211,25 @@ impl Clip {
             ),
         }
     }
+
+    /// The encoder's diffusers component subdir (`text_encoder` / `text_encoder_2`) — the base for its
+    /// `config.json` (packed-detect) and its **packed** weight file (`model.safetensors`, not the
+    /// dense `.fp16` name).
+    pub(crate) fn subdir(&self) -> &'static str {
+        match self {
+            Clip::L => "text_encoder",
+            Clip::BigG => "text_encoder_2",
+        }
+    }
+
+    /// The vendored CLIP config for this encoder (sc-9527): CLIP-L (`text_encoder/`) vs OpenCLIP bigG
+    /// (`text_encoder_2/`). Mirrors the stock `clip::Config::sdxl()` / `sdxl2()` the pipeline uses.
+    pub(crate) fn vendored_config(&self) -> crate::clip::Config {
+        match self {
+            Clip::L => crate::clip::Config::sdxl(),
+            Clip::BigG => crate::clip::Config::sdxl2(),
+        }
+    }
 }
 
 /// The two SDXL CLIP tokenizers (CLIP-L + CLIP-bigG), loaded+parsed **once** and cached on the
@@ -328,6 +347,34 @@ impl SdxlUnet {
     }
 }
 
+/// One SDXL CLIP text encoder, in one of two builds that share the `forward(ids) -> last hidden`
+/// contract (sc-9527):
+///
+/// - [`Self::Stock`] — the stock candle-transformers `ClipTextTransformer`, built for a **dense**
+///   diffusers snapshot. Byte-identical to the pre-sc-9527 txt2img path (zero regression on every
+///   dense SDXL/RealVisXL checkpoint).
+/// - [`Self::Vendored`] — the crate's vendored CLIP tower, whose Linear surface packed-detects through
+///   `candle_gen::quant`. Built **only** for a pre-quantized MLX tier (`SceneWorks/sdxl-base-mlx`
+///   q4/q8), where every attention / MLP `Linear` loads straight from the packed
+///   `{weight u32, scales, biases}` parts (no dense staging).
+///
+/// The vendored tower is pinned bit-identical to the stock one on a dense build by the
+/// `clip::tests::vendored_dense_matches_stock` parity test.
+enum CandleModule {
+    Stock(stable_diffusion::clip::ClipTextTransformer),
+    Vendored(crate::clip::ClipTextTransformer),
+}
+
+impl CandleModule {
+    /// The last-hidden-state forward `ids [B, S] -> [B, S, embed_dim]`, dispatched to whichever build.
+    fn forward(&self, ids: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Stock(m) => Ok(m.forward(ids)?),
+            Self::Vendored(m) => Ok(m.forward(ids)?),
+        }
+    }
+}
+
 impl Pipeline {
     /// Build the (light) pipeline handle for the SDXL snapshot `root` at the given device/dtype (f16)
     /// and request dims. This does **no** weight I/O — the config's only request-dependent fields are
@@ -398,31 +445,38 @@ impl Pipeline {
         // The tokenizer is now loaded+parsed ONCE on the generator (sc-8991 / F-011) and passed in,
         // rather than re-read from `hf_get(tok_repo, ...)` per encode. The CLIP *weights* still load and
         // drop inside this function (the sc-4987 peak-VRAM lever); only the tiny tokenizer is cached.
-        // sc-9416: the MLX SDXL tiers ALSO pack the dual CLIP text encoders (a `quantization` block in
-        // `text_encoder{,_2}/config.json` + `.scales`-packed Linears under `model.safetensors`), but the
-        // candle CLIP path is the stock dense `build_clip_transformer` — feeding it packed u32 codes
-        // would garble the conditioning. This story lands the UNet packed surface; the packed-CLIP load
-        // is a separate slice, deferred to **sc-9527**. Fail loudly on a packed CLIP snapshot rather than
-        // render garbage. (Absent this, `snapshot_file` would already error on the missing `.fp16` name;
-        // this makes the reason explicit.)
-        if clip_is_packed(&self.root, &which)? {
-            return Err(CandleError::Msg(
-                "sdxl: packed (quantized) CLIP text encoders are not yet supported on the candle path \
-                 — the packed-CLIP load is deferred to sc-9527; use a dense SDXL snapshot for the \
-                 text encoders"
-                    .into(),
-            ));
-        }
-        // sc-3674: load CLIP at the compute dtype (f16), not the spike's F32. The fp16 safetensors
-        // load directly, the forward runs f16 (diffusers loads CLIP fp16 too), and it halves the
-        // text-encoder VRAM (CLIP-bigG ~2.8→1.4 GiB) with no visible quality change. The embeddings
-        // are cast to `dtype` below.
-        let text_model = stable_diffusion::build_clip_transformer(
-            clip_cfg,
-            snapshot_file(&self.root, weights_sub)?,
-            &self.device,
-            self.dtype,
-        )?;
+        //
+        // sc-9527 (sc-9089j follow-up to sc-9416): the MLX SDXL tiers ALSO pack the dual CLIP text
+        // encoders (a `quantization` block in `text_encoder{,_2}/config.json` + `.scales`-packed Linears
+        // under `model.safetensors`). The txt2img conditioning uses only each encoder's last hidden
+        // state (`forward`), so we build the **vendored, packed-detecting** CLIP tower when the tier is
+        // packed — every Linear (attn q/k/v/out_proj, MLP fc1/fc2) loads straight from the packed parts —
+        // and the stock dense builder otherwise (byte-identical, pinned by the vendored-vs-stock parity
+        // test). The `group_size` is threaded from the component config (sc-9410).
+        let text_model: CandleModule = match detect_packed_clip(&self.root, &which)? {
+            Some((packed_file, group_size)) => {
+                let vs = candle_gen::mmap_var_builder(&[packed_file], self.dtype, &self.device)?;
+                let tower = crate::clip::ClipTextTransformer::new_gs(
+                    vs,
+                    &which.vendored_config(),
+                    group_size,
+                )?;
+                CandleModule::Vendored(tower)
+            }
+            None => {
+                // sc-3674: load CLIP at the compute dtype (f16), not the spike's F32. The fp16
+                // safetensors load directly, the forward runs f16 (diffusers loads CLIP fp16 too), and it
+                // halves the text-encoder VRAM (CLIP-bigG ~2.8→1.4 GiB) with no visible quality change.
+                // The embeddings are cast to `dtype` below.
+                let stock = stable_diffusion::build_clip_transformer(
+                    clip_cfg,
+                    snapshot_file(&self.root, weights_sub)?,
+                    &self.device,
+                    self.dtype,
+                )?;
+                CandleModule::Stock(stock)
+            }
+        };
 
         let vocab = tokenizer.get_vocab(true);
         let pad_token = clip_cfg
@@ -1026,25 +1080,29 @@ fn sdxl_stock_unet_config() -> UNet2DConditionModelConfig {
     }
 }
 
-/// Whether the CLIP encoder `which`'s component in the snapshot at `root` is a **packed** MLX tier
-/// (sc-9416): its `text_encoder{,_2}/config.json` carries a `quantization` block ([`PackedConfig`]).
-/// The candle CLIP path is stock/dense-only, so a packed CLIP is rejected (deferred to sc-9527); a
-/// dense snapshot returns `false` and loads unchanged. A missing config (e.g. a bare single-file
-/// checkpoint) is treated as dense — the downstream `snapshot_file` gives the precise "missing X" error.
-fn clip_is_packed(root: &Path, which: &Clip) -> Result<bool> {
-    let sub = match which {
-        Clip::L => "text_encoder/config.json",
-        Clip::BigG => "text_encoder_2/config.json",
-    };
-    let cfg_path = root.join(sub);
+/// Detect a **packed** MLX-tier CLIP encoder `which` in the snapshot at `root` (sc-9527, sc-9089j
+/// follow-up to sc-9416): `Some((packed_weight_file, group_size))` when
+/// `text_encoder{,_2}/config.json` carries a `quantization` block ([`PackedConfig`]) AND the packed
+/// weight file (`model.safetensors`, not the dense `.fp16` name) exists, else `None` — a dense
+/// diffusers snapshot loads through the stock builder unchanged. A missing config (e.g. a bare
+/// single-file checkpoint) is treated as dense; the downstream loader gives the precise "missing X"
+/// error. `group_size` is threaded from the config (defaulting to 64 via [`PackedConfig`], never
+/// silent-dense — the sc-9410 rule) into the vendored CLIP's Linear seam.
+pub(crate) fn detect_packed_clip(root: &Path, which: &Clip) -> Result<Option<(PathBuf, usize)>> {
+    let dir = which.subdir();
+    let cfg_path = root.join(dir).join("config.json");
     if !cfg_path.is_file() {
-        return Ok(false);
+        return Ok(None);
     }
-    let bytes =
-        std::fs::read(&cfg_path).map_err(|e| CandleError::Msg(format!("sdxl: read {sub}: {e}")))?;
+    let bytes = std::fs::read(&cfg_path)
+        .map_err(|e| CandleError::Msg(format!("sdxl: read {dir}/config.json: {e}")))?;
     let cfg: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| CandleError::Msg(format!("sdxl: parse {sub}: {e}")))?;
-    Ok(PackedConfig::from_config(&cfg).is_some())
+        .map_err(|e| CandleError::Msg(format!("sdxl: parse {dir}/config.json: {e}")))?;
+    let Some(packed) = PackedConfig::from_config(&cfg) else {
+        return Ok(None);
+    };
+    let file = snapshot_file(root, &format!("{dir}/model.safetensors"))?;
+    Ok(Some((file, packed.group_size as usize)))
 }
 
 /// Resolve a component file inside the SDXL snapshot dir, erroring clearly if absent (e.g. a
