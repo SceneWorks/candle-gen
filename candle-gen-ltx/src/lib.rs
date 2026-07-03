@@ -35,6 +35,7 @@ pub mod pipeline;
 pub mod quant;
 pub mod rope;
 pub mod text_encoder;
+pub mod tier;
 pub mod transformer;
 pub mod vae;
 pub mod vocoder;
@@ -70,10 +71,20 @@ struct Components {
     te: Arc<LtxTextEncoder>,
     avdit: Arc<AvDiT>,
     vae: Arc<LtxVideoVae>,
-    audio_decoder: Arc<AudioDecoder>,
-    vocoder: Arc<LtxVocoder>,
-    audio_sample_rate: u32,
+    /// Audio decode chain — `None` on the packed MLX tier path (sc-9545), which is **video-only**: the
+    /// tier's audio-VAE + vocoder ship in a different key layout (channels-last convs, no `decoder.`/
+    /// `vocoder.` prefix) that is a separate ingestion slice (follow-up), and the sc-9417 render AC is a
+    /// video render. The audio latent stream still runs through the joint AvDiT (cross-modal coupling
+    /// keeps the video coherent); only the audio VAE→vocoder decode is skipped.
+    audio: Option<AudioChain>,
     tokenizer: Arc<tokenizers::Tokenizer>,
+}
+
+#[derive(Clone)]
+struct AudioChain {
+    decoder: Arc<AudioDecoder>,
+    vocoder: Arc<LtxVocoder>,
+    sample_rate: u32,
 }
 
 struct Pipeline {
@@ -182,6 +193,13 @@ impl Pipeline {
     }
 
     fn load_components(&self) -> CResult<Components> {
+        // sc-9545: a packed MLX split-tier subdir (`.../q4` or `.../q8`) is ingested through the
+        // remapping VarBuilders in `tier` so the sc-9417 packed-detect seam fires on the real tier
+        // weights with no dense staging; the single-bundle dense checkpoint keeps the legacy path below.
+        if let Some(paths) = tier::TierPaths::detect(&self.root, self.gemma_override.as_deref()) {
+            return self.load_components_tier(&paths);
+        }
+
         let ltx_file = self.ltx_checkpoint()?;
         let gemma_dir = self.gemma_dir()?;
         let gemma_files = Self::safetensors_in(&gemma_dir)?;
@@ -217,9 +235,57 @@ impl Pipeline {
             te: Arc::new(te),
             avdit: Arc::new(avdit),
             vae: Arc::new(vae),
-            audio_decoder: Arc::new(audio_decoder),
-            vocoder: Arc::new(vocoder),
-            audio_sample_rate,
+            audio: Some(AudioChain {
+                decoder: Arc::new(audio_decoder),
+                vocoder: Arc::new(vocoder),
+                sample_rate: audio_sample_rate,
+            }),
+            tokenizer: Arc::new(tokenizer),
+        })
+    }
+
+    /// Load the DiT (packed) + connectors/text-projection (dense) + video VAE (dense) + Gemma TE
+    /// straight from the split MLX packed tier (sc-9545). The DiT builder applies the crate→tier key
+    /// remap so [`crate::quant::qlinear`]'s packed-detect fires on the real `.scales` siblings; the
+    /// group_size is read + validated from `quantize_config.json` (AC). **Video-only**: the tier's
+    /// audio-VAE + vocoder are a separate ingestion slice (channels-last, differently-prefixed) tracked
+    /// as a follow-up — the audio latent stream still flows through the joint AvDiT, only its final
+    /// VAE→vocoder decode is skipped.
+    fn load_components_tier(&self, paths: &tier::TierPaths) -> CResult<Components> {
+        // Read + validate the tier's group_size (AC): errors loudly if a tier ever ships a group the
+        // packed loaders don't repack at, rather than mis-aligning the MLX→GGML repack.
+        let _group = paths.validate_group_size()?;
+
+        let dit_vb = paths.dit_vb(DIT_DTYPE, &self.device)?;
+        let conn_vb = paths.connector_vb(DIT_DTYPE, &self.device)?;
+        let vae_vb = paths.vae_vb(VAE_DTYPE, &self.device)?;
+        let gemma_vb = paths.gemma_vb(DIT_DTYPE, &self.device)?;
+
+        // The DiT loader roots at `model.diffusion_model.` (the remap strips it); the connector loader
+        // is handed a `model.diffusion_model.`-prefixed builder too (the remap strips it), and the text
+        // projection sits at the connector-file root (also reached through that builder).
+        let dit_root = dit_vb.pp("model.diffusion_model");
+        let conn_root = conn_vb.pp("model.diffusion_model");
+        let avdit = AvDiT::new(dit_root.clone(), &self.av_cfg)?;
+        let te = LtxTextEncoder::new_av(
+            gemma_vb,
+            conn_root.clone(),
+            conn_root,
+            &self.gemma_cfg,
+            &self.conn_cfg,
+            &self.audio_conn_cfg,
+        )?;
+        let vae = LtxVideoVae::new(vae_vb.pp("vae"), config::LATENT_CHANNELS, 4)?;
+
+        let tok_path = paths.tokenizer_path();
+        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path)
+            .map_err(|e| CandleError::Msg(format!("ltx tier: load gemma tokenizer: {e}")))?;
+
+        Ok(Components {
+            te: Arc::new(te),
+            avdit: Arc::new(avdit),
+            vae: Arc::new(vae),
+            audio: None,
             tokenizer: Arc::new(tokenizer),
         })
     }
@@ -316,13 +382,18 @@ impl Pipeline {
         // full-video decode that OOMs the worker on large/long outputs.
         let decoded = comps.vae.decode_budgeted(&vlat)?;
         let images = pipeline::frames_to_images(&decoded)?;
-        let audio = pipeline::decode_audio_track(
-            &comps.audio_decoder,
-            &comps.vocoder,
-            &alat,
-            comps.audio_sample_rate,
-        )?;
-        Ok((images, fps, Some(audio)))
+        // Audio decode only when the audio chain is loaded (the dense bundle); the packed MLX tier is
+        // video-only (sc-9545) — its audio VAE/vocoder are a separate ingestion slice.
+        let audio = match &comps.audio {
+            Some(chain) => Some(pipeline::decode_audio_track(
+                &chain.decoder,
+                &chain.vocoder,
+                &alat,
+                chain.sample_rate,
+            )?),
+            None => None,
+        };
+        Ok((images, fps, audio))
     }
 }
 

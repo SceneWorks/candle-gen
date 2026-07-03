@@ -21,6 +21,8 @@ tokenizers = { workspace = true }
 # Deterministic CPU-seeded initial noise (sc-3673 parity).
 rand = { workspace = true }
 rand_distr = { workspace = true }
+# Parse the packed tier's `quantize_config.json` group_size (sc-9545 tier ingestion).
+serde_json = { workspace = true }
 
 [features]
 default = []
