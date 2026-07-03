@@ -347,6 +347,140 @@ fn sd35_component_parity_vs_diffusers() {
     );
 }
 
+/// **sc-9581 A/B**: prove the sc-9076 bigG pad-token fix (bigG pads with its configured `!` = 0,
+/// not eos 49407) demonstrably changes the SD3.5 conditioning AND the step-0 DiT velocity — i.e.
+/// the fix matters end-to-end, not just at the parity metric.
+///
+/// For the fixed prompt it encodes twice through the SAME loaded encoders:
+///  * **fixed**  — `encode` (bigG pad = resolved `pad_g` = `!` = 0, sc-9076);
+///  * **pre-fix** — `encode_with_pad_g(.., 49407)` (bigG padded with eos, the pre-sc-9076 behavior).
+///
+/// then aggregates each to the joint `context` and asserts:
+///  1. fixed↔pre-fix context **differs** (cosine < 1, non-trivial max-abs) — the fix is not a no-op;
+///  2. fixed is **closer to the diffusers reference** than pre-fix is (cosine_fixed > cosine_prefix),
+///     i.e. the fix moves the conditioning toward the correct diffusers output;
+///  3. (optional, `$SD35_PARITY_CUDA=1`) the one-step DiT **velocity** built from the two contexts
+///     also differs — so the fix propagates to a different latent at step 0.
+///
+/// Gating mirrors the main parity test (needs the SD3.5 snapshot + the diffusers reference). The
+/// DiT half is skipped unless `$SD35_PARITY_CUDA=1` (needs the GPU build of the 8B MMDiT). Requires
+/// the `sc9581-ab` feature (the `encode_with_pad_g` hook). Run:
+/// ```text
+/// export HF_HOME=D:/.cache/huggingface
+/// cargo test -p candle-gen-sd3 --features sc9581-ab,cuda --test component_parity \
+///     sd35_bigg_pad_token_ab -- --ignored --nocapture
+/// ```
+#[test]
+#[cfg(feature = "sc9581-ab")]
+#[ignore = "sc-9581 A/B: needs the SD3.5 snapshot + the diffusers reference (see module header)"]
+fn sd35_bigg_pad_token_ab() {
+    let root = require_hf_snapshot_dir(MODEL_REPO);
+    let refs = load_reference();
+    let cfg = Sd3Config::large();
+    let cpu = Device::Cpu;
+
+    let mut encoders = Sd3TextEncoders::load(&root, cfg.t5_seq_len, &cpu, DType::F32)
+        .unwrap_or_else(|e| panic!("load SD3.5 text encoders: {e}"));
+    // Sanity: the resolved bigG pad IS `!` = 0 (the fix), distinct from eos 49407.
+    assert_eq!(
+        encoders.pad_g(),
+        0,
+        "sc-9076: bigG must resolve pad_token `!` = 0 (got {})",
+        encoders.pad_g()
+    );
+    let prompt = read_prompt();
+
+    let enc_fixed = encoders
+        .encode(&prompt)
+        .unwrap_or_else(|e| panic!("encode (fixed pad_g=0): {e}"));
+    let enc_prefix = encoders
+        .encode_with_pad_g(&prompt, 49407)
+        .unwrap_or_else(|e| panic!("encode (pre-fix pad_g=eos): {e}"));
+
+    let ctx_fixed = aggregate(&cfg, &enc_fixed).unwrap().context;
+    let ctx_prefix = aggregate(&cfg, &enc_prefix).unwrap().context;
+    let ref_ctx = &refs["context"];
+
+    let f = flat(&ctx_fixed);
+    let p = flat(&ctx_prefix);
+    let r = flat(ref_ctx);
+
+    let cos_fixed_vs_prefix = cosine(&f, &p);
+    let maxabs_fixed_vs_prefix = max_abs_diff(&f, &p);
+    let cos_fixed_vs_ref = cosine(&f, &r);
+    let cos_prefix_vs_ref = cosine(&p, &r);
+
+    // Also isolate the bigG penultimate (the tensor the pad actually corrupts).
+    let gf = flat(&enc_fixed.clip_g_hidden);
+    let gp = flat(&enc_prefix.clip_g_hidden);
+    let gr = flat(&refs["clip_g_penultimate"]);
+    let cos_g_fixed_vs_prefix = cosine(&gf, &gp);
+    let cos_g_fixed_vs_ref = cosine(&gf, &gr);
+    let cos_g_prefix_vs_ref = cosine(&gp, &gr);
+
+    eprintln!("\n=== sc-9581 bigG pad-token A/B (fixed `!`=0 vs pre-fix eos=49407) ===");
+    eprintln!("  prompt: {prompt:?}");
+    eprintln!("  clip_g_penultimate:");
+    eprintln!("    fixed↔pre-fix   cosine={cos_g_fixed_vs_prefix:.6}");
+    eprintln!("    fixed↔diffusers cosine={cos_g_fixed_vs_ref:.6}");
+    eprintln!("    prefix↔diffusers cosine={cos_g_prefix_vs_ref:.6}");
+    eprintln!("  joint context [1, 333, 4096]:");
+    eprintln!(
+        "    fixed↔pre-fix   cosine={cos_fixed_vs_prefix:.6}  max_abs={maxabs_fixed_vs_prefix:.3e}"
+    );
+    eprintln!("    fixed↔diffusers cosine={cos_fixed_vs_ref:.6}");
+    eprintln!("    prefix↔diffusers cosine={cos_prefix_vs_ref:.6}");
+
+    // (1) the fix is NOT a no-op for this (short) prompt: the pad slots differ.
+    assert!(
+        cos_fixed_vs_prefix < 0.9999,
+        "fix appears to be a no-op: fixed↔pre-fix context cosine={cos_fixed_vs_prefix:.6} (expected < 0.9999 for a padded prompt)"
+    );
+    assert!(
+        maxabs_fixed_vs_prefix > 1e-4,
+        "fixed and pre-fix contexts are identical (max_abs={maxabs_fixed_vs_prefix:.3e})"
+    );
+    // (2) the fix moves the conditioning TOWARD diffusers.
+    assert!(
+        cos_fixed_vs_ref > cos_prefix_vs_ref,
+        "fix did not improve diffusers parity: fixed↔ref cosine={cos_fixed_vs_ref:.6} !> prefix↔ref cosine={cos_prefix_vs_ref:.6}"
+    );
+    assert!(
+        cos_g_fixed_vs_ref > cos_g_prefix_vs_ref,
+        "fix did not improve bigG penultimate parity: fixed={cos_g_fixed_vs_ref:.6} !> prefix={cos_g_prefix_vs_ref:.6}"
+    );
+
+    // (3) optional: prove it reaches the latent — the one-step DiT velocity differs.
+    if std::env::var("SD35_PARITY_CUDA").ok().as_deref() == Some("1") {
+        let (dit, device, dtype) = load_dit(&root, &cfg);
+        let latent = refs["dit_latent_in"]
+            .to_device(&device)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let pooled = refs["pooled"].to_device(&device).unwrap().to_dtype(dtype).unwrap();
+        let timestep = Tensor::new(&[read_timestep()], &device)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let cf = ctx_fixed.to_device(&device).unwrap().to_dtype(dtype).unwrap();
+        let cp = ctx_prefix.to_device(&device).unwrap().to_dtype(dtype).unwrap();
+        let vel_fixed = dit.forward(&latent, &cf, &pooled, &timestep).unwrap();
+        let vel_prefix = dit.forward(&latent, &cp, &pooled, &timestep).unwrap();
+        let vf = flat(&vel_fixed);
+        let vp = flat(&vel_prefix);
+        let vel_cos = cosine(&vf, &vp);
+        let vel_maxabs = max_abs_diff(&vf, &vp);
+        eprintln!("  step-0 DiT velocity [1,16,H,W] (bf16/CUDA):");
+        eprintln!("    fixed↔pre-fix   cosine={vel_cos:.6}  max_abs={vel_maxabs:.3e}");
+        assert!(
+            vel_maxabs > 1e-3,
+            "fix did not change the step-0 latent velocity (max_abs={vel_maxabs:.3e})"
+        );
+    }
+    eprintln!("=== sc-9581 A/B PASS: bigG pad fix changes conditioning AND improves diffusers parity ===\n");
+}
+
 /// The fixed prompt — read from the reference manifest so it stays in lockstep with the Python side.
 fn read_prompt() -> String {
     let path = reference_dir().join(format!("{TAG}_manifest.json"));

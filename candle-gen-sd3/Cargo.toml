@@ -41,6 +41,9 @@ serde_json = { workspace = true }
 default = []
 metal = ["candle-gen/metal", "candle-transformers/metal"]
 cuda = ["candle-gen/cuda", "candle-transformers/cuda"]
+# sc-9581: exposes the `encode_with_pad_g` A/B test hook so the bigG pad-token fix (sc-9076) can be
+# measured end-to-end (fixed pad `!`=0 vs pre-fix eos=49407). Test-only; never enabled in production.
+sc9581-ab = []
 
 [dev-dependencies]
 # `examples/sd3-txt2img.rs` smoke driver (C2) — encode the produced `gen_core::Image` (RGB8) to PNG.

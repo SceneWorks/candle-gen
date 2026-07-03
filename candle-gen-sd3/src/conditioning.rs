@@ -369,6 +369,49 @@ impl Sd3TextEncoders {
             t5_hidden,
         })
     }
+
+    /// A/B test hook (sc-9581): encode `prompt` exactly like [`Self::encode`] but with the CLIP-bigG
+    /// pad token forced to `pad_g_override` instead of the resolved [`Self::pad_g`]. Used only to
+    /// reproduce the pre-sc-9076 behavior (bigG padded with eos 49407) against the fixed behavior
+    /// (bigG padded with its configured `!` = 0) so a test can measure the end-to-end conditioning
+    /// difference the fix produces. Never used in production.
+    #[cfg(feature = "sc9581-ab")]
+    pub fn encode_with_pad_g(
+        &mut self,
+        prompt: &str,
+        pad_g_override: u32,
+    ) -> CandleResult<EncoderOutputs> {
+        let (clip_l_hidden, clip_l_pooled) =
+            self.encode_clip(&self.tok_l, &self.clip_l, &self.proj_l, self.pad_l, prompt)?;
+        let (clip_g_hidden, clip_g_pooled) =
+            self.encode_clip(&self.tok_g, &self.clip_g, &self.proj_g, pad_g_override, prompt)?;
+
+        let mut t5_ids: Vec<u32> = self
+            .tok_t5
+            .encode(prompt, true)
+            .map_err(|e| CandleError::Msg(format!("sd3: T5 tokenize: {e}")))?
+            .get_ids()
+            .to_vec();
+        t5_ids.truncate(self.t5_seq_len);
+        t5_ids.resize(self.t5_seq_len, T5_PAD_TOKEN_ID);
+        let t5_input = Tensor::new(t5_ids.as_slice(), &self.device)?.unsqueeze(0)?;
+        let t5_hidden = self.t5.forward(&t5_input)?.to_dtype(self.dtype)?;
+
+        Ok(EncoderOutputs {
+            clip_l_hidden,
+            clip_g_hidden,
+            clip_l_pooled,
+            clip_g_pooled,
+            t5_hidden,
+        })
+    }
+
+    /// The resolved CLIP-bigG pad token id (sc-9076/sc-9581 A/B introspection). bigG resolves to
+    /// `!` = 0; CLIP-L to `<|endoftext|>` = 49407.
+    #[cfg(feature = "sc9581-ab")]
+    pub fn pad_g(&self) -> u32 {
+        self.pad_g
+    }
 }
 
 /// Resolve the single `model.safetensors` (or first sorted shard) in a snapshot component subdir.
