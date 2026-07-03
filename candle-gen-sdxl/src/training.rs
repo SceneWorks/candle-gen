@@ -71,9 +71,7 @@ use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 use crate::denoise::decode_image;
 use crate::loaders::load_sdxl_vae;
 use crate::pipeline::{hf_get, snapshot_file, Clip, VAE_FIX_FILE, VAE_FIX_REPO, VAE_SCALE};
-use crate::unet::{
-    BlockConfig, UNet2DConditionModel, UNet2DConditionModelConfig, VaeMomentsEncoder,
-};
+use crate::unet::{sdxl_unet_config, UNet2DConditionModel, VaeMomentsEncoder};
 use crate::MODEL_ID;
 
 /// DDPM training-noise schedule length (the diffusers `num_train_timesteps`). `t` is sampled uniform
@@ -84,36 +82,6 @@ const NUM_TRAIN_TIMESTEPS: usize = 1000;
 /// `SAMPLE_PROMPT_CAP` the FlowMatch driver applies to the flow-match families — a preview is a
 /// best-effort progress signal, so a long `sample_prompts` list never blows the per-cadence cost up.
 const SAMPLE_PROMPT_CAP: usize = 4;
-
-/// The exact SDXL UNet config (`stabilityai/stable-diffusion-xl-base-1.0/unet/config.json`) — 3 blocks
-/// `320/640/1280` with transformer depths `[—, 2, 10]` and 5/10/20 attention heads, `cross_attention_dim
-/// 2048`, linear projection. Mirrors candle's `StableDiffusionConfig::sdxl` UNet sub-config so the
-/// vendored UNet loads the stock `unet/` safetensors unchanged.
-fn sdxl_unet_config() -> UNet2DConditionModelConfig {
-    let bc = |out_channels, use_cross_attn, attention_head_dim| BlockConfig {
-        out_channels,
-        use_cross_attn,
-        attention_head_dim,
-    };
-    UNet2DConditionModelConfig {
-        blocks: vec![
-            bc(320, None, 5),
-            bc(640, Some(2), 10),
-            bc(1280, Some(10), 20),
-        ],
-        center_input_sample: false,
-        cross_attention_dim: 2048,
-        downsample_padding: 1,
-        flip_sin_to_cos: true,
-        freq_shift: 0.,
-        layers_per_block: 2,
-        mid_block_scale_factor: 1.,
-        norm_eps: 1e-5,
-        norm_num_groups: 32,
-        sliced_attention_size: None,
-        use_linear_projection: true,
-    }
-}
 
 /// `"bf16"`/`"bfloat16"` → [`DType::BF16`]; anything else → [`DType::F32`] (the gen-core contract:
 /// unrecognized = f32). The adapter factors / loss / grads stay f32 regardless (master weights).
@@ -798,6 +766,7 @@ impl SdxlTrainer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::unet::{BlockConfig, UNet2DConditionModelConfig};
     use candle_core::{DType, Device};
     use candle_gen::gen_core::registry;
     use candle_nn::{VarBuilder, VarMap};
@@ -931,6 +900,34 @@ mod tests {
         }
         // Distinct seeds generally differ (not a hard guarantee, but a sanity check on the mapping).
         assert_ne!(sample_timestep(1), sample_timestep(2));
+    }
+
+    /// F-061 / sc-9045: the trainer no longer carries a private UNet config — it builds `build_unet`
+    /// from the single **exported** [`crate::unet::sdxl_unet_config`] the inference lanes share, so
+    /// train-vs-inference config drift after a candle re-pin is structurally impossible. Pin the
+    /// canonical SDXL values here (the same set `pipeline::sdxl_stock_unet_config_pins_canonical_values`
+    /// asserts) so an accidental edit to the one source of truth is caught, not silently propagated.
+    #[test]
+    fn trainer_uses_exported_unet_config() {
+        let c = sdxl_unet_config();
+        assert_eq!(c.blocks.len(), 3);
+        assert_eq!(c.blocks[0].out_channels, 320);
+        assert_eq!(c.blocks[0].use_cross_attn, None);
+        assert_eq!(c.blocks[0].attention_head_dim, 5);
+        assert_eq!(c.blocks[1].out_channels, 640);
+        assert_eq!(c.blocks[1].use_cross_attn, Some(2));
+        assert_eq!(c.blocks[1].attention_head_dim, 10);
+        assert_eq!(c.blocks[2].out_channels, 1280);
+        assert_eq!(c.blocks[2].use_cross_attn, Some(10));
+        assert_eq!(c.blocks[2].attention_head_dim, 20);
+        assert_eq!(c.cross_attention_dim, 2048);
+        assert_eq!(c.layers_per_block, 2);
+        assert_eq!(c.norm_num_groups, 32);
+        assert_eq!(c.downsample_padding, 1);
+        assert!(c.use_linear_projection);
+        assert!(!c.center_input_sample);
+        assert!(c.flip_sin_to_cos);
+        assert_eq!(c.sliced_attention_size, None);
     }
 
     /// The trainer self-registers and resolves through gen-core's trainer registry as the candle

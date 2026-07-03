@@ -141,12 +141,14 @@ pub fn preprocess_control_image(
 }
 
 /// VAE-decode final latents `[1, 4, h, w]` to an RGB8 [`Image`]: un-scale by [`VAE_SCALE`], `x/2 + 0.5`,
-/// clamp, ×255 (the candle txt2img post-process). Monolithic (no tiling) — InstantID renders are ≤1024²
-/// where the single-pass decode is within budget; the [`crate::pipeline`] tiling lever is a later
-/// optimization if InstantID grows larger outputs.
+/// clamp, ×255 (the candle txt2img post-process). The decode itself routes through the shared
+/// [`crate::pipeline::tiled_vae_decode`] (F-061 / sc-9045), so every bespoke lane that calls this —
+/// the trainer preview, the IP / edit providers — gets the same sc-4987 budgeted VAE tiling the
+/// registered [`crate::pipeline::Pipeline::decode`] path uses. The tiling only bounds peak VRAM on
+/// large latents (>512² output); ≤512² decodes are byte-identical to the prior monolithic path.
 pub fn decode_image(vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
     let unscaled = (latents / VAE_SCALE)?;
-    let img = vae.decode(&unscaled)?;
+    let img = crate::pipeline::tiled_vae_decode(vae, &unscaled)?;
     let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
     let img = (img * 255.)?
         .to_dtype(DType::U8)?

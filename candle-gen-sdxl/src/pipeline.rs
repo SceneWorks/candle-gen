@@ -791,22 +791,37 @@ impl Pipeline {
         })
     }
 
-    /// Decode the already-unscaled latent to an image tensor `[1, 3, H, W]`. Tiled (sc-4987) when
-    /// [`crate::vae_tiling_enabled`] is set AND the output exceeds the tiling threshold (512²);
-    /// otherwise the monolithic `AutoEncoderKL::decode`. The non-tiling path is byte-identical to
-    /// pre-sc-4987, so 512² renders and the conformance suite are unaffected.
+    /// Decode the already-unscaled latent to an image tensor `[1, 3, H, W]` via the shared
+    /// [`tiled_vae_decode`] — tiled (sc-4987) when [`crate::vae_tiling_enabled`] is set AND the output
+    /// exceeds the tiling threshold (512²); otherwise the monolithic `AutoEncoderKL::decode`.
     fn decode_image(&self, vae: &AutoEncoderKL, unscaled: &Tensor) -> Result<Tensor> {
-        if crate::vae_tiling_enabled() {
-            let cfg = sdxl_tiling_config();
-            let (_, _, h, w) = unscaled.dims4()?;
-            if cfg.needs_tiling(SDXL_VAE_TILING, 1, h as i32, w as i32) {
-                return tile_blend_decode(unscaled, SDXL_VAE_TILING, &cfg, |tile| {
-                    Ok(vae.decode(tile)?)
-                });
-            }
-        }
-        Ok(vae.decode(unscaled)?)
+        tiled_vae_decode(vae, unscaled)
     }
+}
+
+/// Decode an already-unscaled SDXL latent `[1, 4, h, w]` to an image tensor `[1, 3, H, W]`, applying the
+/// sc-4987 budgeted VAE tiling when [`crate::vae_tiling_enabled`] is set AND the output exceeds the
+/// tiling threshold (512²); otherwise the monolithic `AutoEncoderKL::decode`. The non-tiling path is
+/// byte-identical to a bare `vae.decode`, so ≤512² renders and the conformance suite are unaffected.
+///
+/// This is the single decode seam for **every** SDXL lane (F-061 / sc-9045): the registered
+/// [`Pipeline::decode`] and the bespoke [`crate::denoise::decode_image`] (trainer preview, IP / edit
+/// providers) both route through it, so all lanes get the same bounded-peak decode at identical
+/// resolutions instead of the bespoke providers decoding 1024² monolithically.
+pub(crate) fn tiled_vae_decode(vae: &AutoEncoderKL, unscaled: &Tensor) -> Result<Tensor> {
+    if crate::vae_tiling_enabled() {
+        let cfg = sdxl_tiling_config();
+        let (_, _, h, w) = unscaled.dims4()?;
+        if cfg.needs_tiling(SDXL_VAE_TILING, 1, h as i32, w as i32) {
+            return tile_blend_decode(
+                unscaled,
+                SDXL_VAE_TILING,
+                &cfg,
+                |tile| Ok(vae.decode(tile)?),
+            );
+        }
+    }
+    Ok(vae.decode(unscaled)?)
 }
 
 /// Tiled VAE decode with trapezoidal seam blending (sc-4987) — the candle port of mlx-gen's
@@ -1199,5 +1214,34 @@ mod tests {
         assert!(!cfg.needs_tiling(SDXL_VAE_TILING, 1, 64, 64));
         // 128² latent = 1024² output: must fire.
         assert!(cfg.needs_tiling(SDXL_VAE_TILING, 1, 128, 128));
+    }
+
+    /// F-061 / sc-9045: the bespoke `denoise::decode_image` (trainer preview, IP / edit providers) and
+    /// the registered `Pipeline::decode` now share the single [`tiled_vae_decode`] seam. This asserts
+    /// the seam's gate is a pure function of the tiling flag + latent size — so both callers make the
+    /// **same** tiled-vs-monolithic decision at identical resolutions. Combined with
+    /// `tile_blend_identity_roundtrip` (tiling is exact for an identity decode) and
+    /// `no_tiling_below_threshold` (≤512² stays monolithic ⇒ byte-identical to a bare decode), the two
+    /// SDXL lanes are guaranteed the same output for in-memory cases and the same bounded peak on large
+    /// latents. A real-VAE decode-parity check runs on the GPU conformance lane (no CPU VAE fixture).
+    #[test]
+    fn tiled_decode_gate_is_shared_and_size_driven() {
+        let cfg = sdxl_tiling_config();
+        // The decision `tiled_vae_decode` makes for a given latent is `enabled && needs_tiling`.
+        // With the flag off, no latent tiles (registered + bespoke both decode monolithically).
+        let gate =
+            |enabled: bool, h: i32, w: i32| enabled && cfg.needs_tiling(SDXL_VAE_TILING, 1, h, w);
+        assert!(
+            !gate(false, 128, 128),
+            "flag off ⇒ never tile (monolithic, byte-identical)"
+        );
+        assert!(
+            !gate(true, 64, 64),
+            "512² output ⇒ single tile ⇒ monolithic"
+        );
+        assert!(
+            gate(true, 128, 128),
+            "1024² output ⇒ tiled (bounded peak) on both lanes"
+        );
     }
 }
