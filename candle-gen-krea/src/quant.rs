@@ -176,7 +176,7 @@ impl QLinear {
                 scale.len()
             )));
         }
-        if !candle_gen::quant::is_power_of_four(group_size) || k % group_size != 0 {
+        if !candle_gen::quant::is_power_of_four(group_size) || !k.is_multiple_of(group_size) {
             return Err(candle_gen::candle_core::Error::Msg(format!(
                 "krea convrot: group_size {group_size} must be a power of four dividing K ({k})"
             )));

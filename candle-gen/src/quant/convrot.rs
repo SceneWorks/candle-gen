@@ -48,7 +48,7 @@ const H4: [[f32; 4]; 4] = [
 /// Whether `n` is a power of four (`16, 64, 256, 1024, …`) — the group sizes the RHT Kronecker
 /// construction produces. `1` (a single `4⁰`) is also accepted (an identity rotation).
 pub fn is_power_of_four(n: usize) -> bool {
-    n != 0 && n.is_power_of_two() && (n.trailing_zeros() % 2 == 0)
+    n != 0 && n.is_power_of_two() && n.trailing_zeros().is_multiple_of(2)
 }
 
 /// Build the normalized regular Hadamard `R = H_{N₀} / √N₀` (`[N₀, N₀]`, f32) on `device`, where
@@ -102,7 +102,7 @@ pub fn convrot_rotate(x: &Tensor, r: &Tensor) -> Result<Tensor> {
     let k = *dims
         .last()
         .expect("convrot_rotate: activation has a last dim");
-    if k % n0 != 0 {
+    if !k.is_multiple_of(n0) {
         candle_core::bail!("ConvRot rotate: K ({k}) is not a multiple of group size ({n0})");
     }
     let lead: usize = dims[..dims.len() - 1].iter().product();
