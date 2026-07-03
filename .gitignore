@@ -35,5 +35,8 @@ dist-*/
 /sensenova-interleave-*.png
 /sensenova-out.png
 
+# Krea A/B render artifacts (examples write these to CWD at runtime)
+krea_ab_*.png
+
 # Local Claude Code worktrees/state (never committed)
 .claude/
