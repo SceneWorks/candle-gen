@@ -46,6 +46,13 @@ impl Rotary {
         })
     }
 
+    /// Rows of the precomputed cos/sin tables — the max sequence length this Rotary was sized for.
+    /// A `narrow(0, 0, seq)` beyond this fails opaquely, so [`Qwen3TextEncoder::prompt_embeds`]
+    /// validates `seq` against it up front (sc-9386, F-077 sibling).
+    fn max_seq(&self) -> Result<usize> {
+        self.cos.dim(0)
+    }
+
     fn apply(&self, q: &Tensor, k: &Tensor) -> Result<(Tensor, Tensor)> {
         let (_, _, seq, _) = q.dims4()?;
         let cos = self.cos.narrow(0, 0, seq)?;
@@ -304,6 +311,13 @@ impl Qwen3TextEncoder {
     /// Hidden-state index 0 = embeddings; index k = output of layer k-1.
     pub fn prompt_embeds(&self, input_ids: &Tensor, attention_mask: &Tensor) -> Result<Tensor> {
         let (b, s) = input_ids.dims2()?;
+        // The RoPE cos/sin tables are precomputed to a fixed `max_sequence_length`; a longer sequence
+        // would `narrow(0, 0, seq)` past the table end and fail with an opaque candle shape error deep
+        // in `Rotary::apply`. Reject it up front with a clear length message (sc-9386, mirroring the
+        // F-077 fix in krea/boogu). NOTE the public `Flux2Pipeline::encode` path already right-truncates
+        // the prompt to `max_sequence_length` via the gen-core tokenizer, so this can only fire for a
+        // caller that hands `prompt_embeds` raw over-length ids directly.
+        check_seq_len(s, self.rotary.max_seq()?)?;
         let mask = build_mask(attention_mask, b, s, input_ids.device())?;
         let mut hidden = self.embed_tokens.forward(input_ids)?.to_dtype(DType::F32)?;
 
@@ -334,6 +348,21 @@ impl Qwen3TextEncoder {
     }
 }
 
+/// Validate a token-sequence length against the RoPE-table cap (sc-9386, F-077 sibling): a sequence
+/// longer than `max_seq` — the rows the cos/sin tables were precomputed for — returns a clear,
+/// actionable message naming the cap and the actual length, instead of the opaque `narrow` tensor
+/// shape error that would otherwise surface deep in `Rotary::apply` mid-encode. Pure so it is
+/// unit-testable without a real snapshot / weights.
+fn check_seq_len(seq: usize, max_seq: usize) -> Result<()> {
+    if seq > max_seq {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "flux2 te: prompt has {seq} tokens, exceeds max_sequence_length={max_seq} \
+             (the RoPE table is sized to this cap)"
+        )));
+    }
+    Ok(())
+}
+
 /// Additive attention mask `[B, 1, S, S]` (f32): `0` where a query `i` may attend key `j` (causal
 /// `j <= i` AND `j` not padding), `-inf` otherwise. Built host-side.
 fn build_mask(attention_mask: &Tensor, b: usize, s: usize, device: &Device) -> Result<Tensor> {
@@ -353,4 +382,48 @@ fn build_mask(attention_mask: &Tensor, b: usize, s: usize, device: &Device) -> R
         }
     }
     Tensor::from_vec(data, (b, 1, s, s), device)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_seq_len_rejects_over_cap_with_clear_message() {
+        // An over-length sequence returns an actionable length error naming the cap and the actual
+        // length — NOT the opaque tensor `narrow` error that would surface deep in `Rotary::apply`
+        // (sc-9386, F-077 sibling).
+        let err = check_seq_len(513, 512).unwrap_err().to_string();
+        assert!(err.contains("513"), "names the actual length: {err}");
+        assert!(
+            err.contains("max_sequence_length=512"),
+            "names the cap: {err}"
+        );
+        assert!(!err.contains("narrow"), "not an opaque tensor error: {err}");
+    }
+
+    #[test]
+    fn check_seq_len_accepts_at_and_below_cap() {
+        // At-limit and below-limit sequences pass validation (normal prompts are unaffected).
+        assert!(check_seq_len(512, 512).is_ok());
+        assert!(check_seq_len(1, 512).is_ok());
+        assert!(check_seq_len(0, 512).is_ok());
+    }
+
+    #[test]
+    fn rotary_max_seq_reports_table_rows_and_narrows_within_cap() -> Result<()> {
+        // The guard reads `max_seq` straight off the precomputed table; a within-cap sequence still
+        // narrows (byte-identically to before) while an over-cap one is what `check_seq_len` rejects.
+        let dev = Device::Cpu;
+        let cap = 8usize;
+        let rot = Rotary::new(4, 1e4, cap, &dev)?;
+        assert_eq!(rot.max_seq()?, cap);
+        // within-cap narrow succeeds
+        let q = Tensor::zeros((1, 2, cap - 1, 4), DType::F32, &dev)?;
+        let (rq, _) = rot.apply(&q, &q)?;
+        assert_eq!(rq.dims4()?, (1, 2, cap - 1, 4));
+        // the guard would reject a seq past the cap
+        assert!(check_seq_len(cap + 1, rot.max_seq()?).is_err());
+        Ok(())
+    }
 }
