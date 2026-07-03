@@ -79,7 +79,6 @@ use candle_transformers::models::z_image::text_encoder::{TextEncoderConfig, ZIma
 use candle_transformers::models::z_image::transformer::Config as DitConfig;
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder, VaeConfig};
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::dit::{ZImageTransformer2DModel, Z_IMAGE_ATTN_TARGETS};
 use crate::pipeline::{
@@ -257,7 +256,7 @@ fn sample_noise_latent(edge: u32, seed: u64, device: &Device) -> Result<Tensor> 
     let lat = (edge / SPATIAL_SCALE) as usize;
     let n = LATENT_CHANNELS * lat * lat;
     let mut rng = StdRng::seed_from_u64(seed);
-    let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let noise = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat, lat), &Device::Cpu)?.to_device(device)?)
 }
 

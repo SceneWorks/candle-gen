@@ -493,7 +493,6 @@ mod tests {
     use candle_nn::VarMap;
     use candle_transformers::models::flux::autoencoder::Config as AeCfg;
     use rand::{rngs::StdRng, SeedableRng};
-    use rand_distr::{Distribution, StandardNormal};
 
     /// A tiny FLUX AE config (real BFL shift/scale, `ch = 32` — the AE's `group_norm(32, ·)` floor).
     fn tiny_ae_cfg() -> AeCfg {
@@ -520,11 +519,9 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(8988);
         for var in vm.data().lock().unwrap().values() {
             let n = var.shape().elem_count();
-            let data: Vec<f32> = (0..n)
-                .map(|_| {
-                    let v: f32 = StandardNormal.sample(&mut rng);
-                    v * 0.05
-                })
+            let data: Vec<f32> = candle_gen::seeded_normal_vec(&mut rng, n)
+                .into_iter()
+                .map(|v| v * 0.05)
                 .collect();
             let t = Tensor::from_vec(data, var.shape(), dev).expect("randomize");
             var.set(&t).expect("set var");

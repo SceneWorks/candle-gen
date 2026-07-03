@@ -25,7 +25,6 @@ use candle_transformers::models::clip::text_model::ClipTextTransformer;
 use candle_transformers::models::flux::autoencoder::AutoEncoder;
 use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use candle_gen::{CandleError, Result};
 
@@ -145,7 +144,7 @@ pub(crate) fn seeded_noise(
 ) -> Result<Tensor> {
     let n = channels * lat_h * lat_w;
     let mut rng = StdRng::seed_from_u64(seed);
-    let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let noise = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(noise, (1, channels, lat_h, lat_w), &Device::Cpu)?
         .to_device(device)?
         .to_dtype(dtype)

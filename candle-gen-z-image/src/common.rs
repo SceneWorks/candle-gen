@@ -31,7 +31,6 @@ use candle_gen::{CandleError, Result};
 use candle_transformers::models::z_image::sampling::postprocess_image;
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder};
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 /// VAE spatial downscale — the latent is image/8 per side (the 4-stage AutoencoderKL has 3
 /// downsamplers). Matches `mlx-gen-z-image`'s `SPATIAL_SCALE`.
@@ -172,7 +171,7 @@ pub(crate) fn seed_noise(
 ) -> Result<Tensor> {
     let n = LATENT_CHANNELS * lat_h * lat_w;
     let mut rng = StdRng::seed_from_u64(seed);
-    let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let noise = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(
         Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
             .to_device(device)?

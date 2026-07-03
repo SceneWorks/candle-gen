@@ -56,7 +56,6 @@ use candle_gen::train::flow_match::{
 use candle_gen::train::gradient_checkpoint::checkpointed_backward;
 use candle_gen::{CandleError, Result};
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::dit_train::{LensTransformerTrain, LENS_ATTN_TARGETS};
 use crate::schedule::{cfg_rescale, lens_mu, lens_sigmas};
@@ -240,7 +239,7 @@ fn sample_noise_latent(
     let seq = latent_h * latent_w;
     let n = seq * 128;
     let mut rng = StdRng::seed_from_u64(seed);
-    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(Tensor::from_vec(data, (1, seq, 128), &Device::Cpu)?.to_device(device)?)
 }
 

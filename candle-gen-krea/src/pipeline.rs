@@ -22,7 +22,6 @@ use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress
 use candle_gen::{CandleError, Result};
 use candle_gen_qwen_image::vae::QwenVae;
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::config::Krea2Config;
 use crate::loader::Weights;
@@ -150,7 +149,7 @@ fn init_noise(height: u32, width: u32, seed: u64, device: &Device) -> Result<Ten
     );
     let n = LATENT_CHANNELS * lat_h * lat_w;
     let mut rng = StdRng::seed_from_u64(seed);
-    let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let noise = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(
         Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
             .to_device(device)?,

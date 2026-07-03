@@ -183,7 +183,7 @@ pub fn velocity_loss(v: &Tensor, target: &Tensor, mae: bool) -> candle_core::Res
 pub fn sample_noise(shape: &[usize], seed: u64, device: &Device) -> Result<Tensor> {
     let n: usize = shape.iter().product();
     let mut rng = StdRng::seed_from_u64(seed);
-    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let data = crate::seeded_normal_vec(&mut rng, n);
     Ok(Tensor::from_vec(data, shape, &Device::Cpu)?.to_device(device)?)
 }
 

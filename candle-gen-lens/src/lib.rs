@@ -50,7 +50,6 @@ use candle_gen::gen_core::{
 };
 use candle_gen::{CandleError, Result as CResult};
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use candle_gen::gen_core::sampling::TimestepConvention;
 use schedule::{cfg_rescale, lens_mu, lens_sigmas, LensSamplingDefaults, BASE, TURBO};
@@ -442,7 +441,7 @@ fn create_noise(
     let seq = latent_h * latent_w;
     let n = seq * 128;
     let mut rng = StdRng::seed_from_u64(seed);
-    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(data, (1, seq, 128), &Device::Cpu)?.to_device(device)
 }
 

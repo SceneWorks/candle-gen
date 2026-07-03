@@ -32,7 +32,6 @@ use candle_gen::{CandleError, Result as CResult};
 use candle_gen_flux2::vae::Flux2Vae;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::config::{
     Ideogram4DitConfig, Ideogram4TextEncoderConfig, DEFAULT_GUIDANCE, DEFAULT_IMG2IMG_STRENGTH,
@@ -505,7 +504,7 @@ fn to_image(decoded: &Tensor) -> CResult<Image> {
 fn create_noise(seed: u64, num_img: usize, ch: usize, device: &Device) -> CResult<Tensor> {
     let mut rng = StdRng::seed_from_u64(seed);
     let n = num_img * ch;
-    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(Tensor::from_vec(data, (1, num_img, ch), device)?)
 }
 

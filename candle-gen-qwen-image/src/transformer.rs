@@ -1035,15 +1035,12 @@ mod tests {
             dtype: DType,
             dev: &Device,
         ) -> candle_gen::candle_core::Result<Tensor> {
-            use rand_distr::{Distribution, StandardNormal};
             let n: usize = s.elem_count();
             let mut rng = self.rng.lock().unwrap();
             // Small magnitude keeps the tiny DiT numerically sane (and norm-out + RMSNorm stable).
-            let data: Vec<f32> = (0..n)
-                .map(|_| {
-                    let v: f32 = StandardNormal.sample(&mut *rng);
-                    0.05f32 * v
-                })
+            let data: Vec<f32> = candle_gen::seeded_normal_vec(&mut rng, n)
+                .into_iter()
+                .map(|v| 0.05f32 * v)
                 .collect();
             Tensor::from_vec(data, s, dev)?.to_dtype(dtype)
         }

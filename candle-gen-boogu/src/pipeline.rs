@@ -27,7 +27,6 @@ use candle_gen::{CandleError, Result};
 use candle_transformers::models::z_image::sampling::postprocess_image;
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder, VaeConfig};
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::config::BooguConfig;
 use crate::loader::Weights;
@@ -445,7 +444,7 @@ fn init_noise(height: u32, width: u32, seed: u64, step: u64, device: &Device) ->
     );
     let n = LATENT_CHANNELS * lat_h * lat_w;
     let mut rng = StdRng::seed_from_u64(seed.wrapping_add(step));
-    let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let noise = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(
         Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
             .to_device(device)?,

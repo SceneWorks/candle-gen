@@ -81,7 +81,6 @@ use candle_transformers::models::stable_diffusion::{self, StableDiffusionConfig}
 use crate::unet::{sdxl_unet_config, UNet2DConditionModel as VendoredUNet};
 use candle_gen::quant::{PackedConfig, MLX_GROUP_SIZE};
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 use tokenizers::Tokenizer;
 
 /// diffusers SDXL VAE `scaling_factor` (candle's example hardcodes the SD1.5 value 0.18215 for `Xl`;
@@ -631,7 +630,7 @@ impl Pipeline {
             // is a pure function of `(seed, request)` — same seed ⇒ same image, any launch.
             let n = 4 * lat_h * lat_w;
             let mut rng = StdRng::seed_from_u64(seed);
-            let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+            let noise = candle_gen::seeded_normal_vec(&mut rng, n);
             let init = Tensor::from_vec(noise, (1, 4, lat_h, lat_w), &Device::Cpu)?
                 .to_device(&self.device)?;
 

@@ -117,6 +117,44 @@ mod tests {
         assert_ne!(a, salted);
     }
 
+    /// Byte-identity guard for the ~40-site migration (sc-9452): the shared primitive must draw the
+    /// **exact same sequence in the exact same order** as the inline
+    /// `(0..n).map(|_| StandardNormal.sample(&mut rng)).collect()` that every provider crate previously
+    /// hand-rolled. A regression here (a different fill order, a re-seed, an extra draw) would silently
+    /// change every migrated site's seed→noise mapping. We reproduce the old inline expression verbatim
+    /// and assert equality.
+    #[test]
+    fn seeded_normal_vec_matches_inline_draw() {
+        let n = 257; // deliberately not a round number / power of two
+        for seed in [0u64, 1, 42, 8988, u64::MAX] {
+            let via_primitive = seeded_normal_vec(&mut StdRng::seed_from_u64(seed), n);
+            // The literal pre-migration inline draw.
+            let mut rng = StdRng::seed_from_u64(seed);
+            let inline: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+            assert_eq!(via_primitive, inline, "byte-identity broke for seed {seed}");
+        }
+    }
+
+    /// Pinned first-N golden values: locks the concrete `StdRng` + `StandardNormal` draw so a dependency
+    /// bump that silently changes the RNG algorithm or the normal transform is caught. Any change to
+    /// these bytes breaks reproducibility of every migrated noise-draw site and must be deliberate.
+    #[test]
+    fn seeded_normal_vec_first_values_are_pinned() {
+        let v = seeded_normal_vec(&mut StdRng::seed_from_u64(42), 4);
+        let expected = [
+            0.069_427_915_f32,
+            0.132_938_12,
+            0.262_576_37,
+            -0.225_300_88,
+        ];
+        for (got, want) in v.iter().zip(expected.iter()) {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "pinned draw drifted: got {got}, want {want}"
+            );
+        }
+    }
+
     /// The NCHW draw has the requested shape, lands on the target (CPU here) device, and is a pure
     /// function of the seed. GPU-free.
     #[test]

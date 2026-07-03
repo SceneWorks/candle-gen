@@ -23,7 +23,6 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::{CancelFlag, Image, Progress};
 use candle_gen::{CandleError, Result};
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::config::NeoChatConfig;
 use crate::distill::DistillLora;
@@ -1189,7 +1188,7 @@ fn cfg_blend(v_cond: &Tensor, v_uncond: &Tensor, scale: f32) -> CResult<Tensor> 
 fn gaussian(shape: (usize, usize, usize, usize), seed: u64, device: &Device) -> CResult<Tensor> {
     let n = shape.0 * shape.1 * shape.2 * shape.3;
     let mut rng = StdRng::seed_from_u64(seed);
-    let v: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let v = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(v, shape, &Device::Cpu)?.to_device(device)
 }
 

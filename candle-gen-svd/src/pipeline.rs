@@ -10,7 +10,6 @@ use candle_gen::gen_core::{CancelFlag, Image, Progress};
 use candle_gen::{CandleError, Result as CResult};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::config::SchedulerConfig;
 use crate::scheduler::EdmSchedule;
@@ -58,7 +57,7 @@ pub fn create_noise(
 ) -> CResult<Tensor> {
     let n = num_frames * 4 * h * w;
     let mut rng = StdRng::seed_from_u64(seed);
-    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(Tensor::from_vec(data, (1, num_frames, 4, h, w), device)?)
 }
 
@@ -70,9 +69,7 @@ pub fn seeded_normal(
 ) -> CResult<Tensor> {
     let (a, b, c, d) = shape;
     let mut rng = StdRng::seed_from_u64(seed);
-    let data: Vec<f32> = (0..a * b * c * d)
-        .map(|_| StandardNormal.sample(&mut rng))
-        .collect();
+    let data = candle_gen::seeded_normal_vec(&mut rng, a * b * c * d);
     Ok(Tensor::from_vec(data, shape, device)?)
 }
 

@@ -43,7 +43,6 @@ use candle_core::{DType, Device, Tensor, Var, D};
 use candle_nn::Module;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 use tokenizers::Tokenizer;
 
 use candle_gen::gen_core::train::{
@@ -213,7 +212,7 @@ fn sample_timestep(seed: u64) -> usize {
 fn sample_noise(shape: &[usize], seed: u64, device: &Device) -> Result<Tensor> {
     let n: usize = shape.iter().product();
     let mut rng = StdRng::seed_from_u64(seed);
-    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(Tensor::from_vec(data, shape, &Device::Cpu)?.to_device(device)?)
 }
 

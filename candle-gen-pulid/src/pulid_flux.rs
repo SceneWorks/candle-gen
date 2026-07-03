@@ -30,7 +30,6 @@ use candle_transformers::models::flux::autoencoder::AutoEncoder;
 use candle_transformers::models::flux::sampling::{get_schedule, State};
 use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
@@ -318,7 +317,7 @@ impl PulidFlux {
         let n = LATENT_CHANNELS * lat_h * lat_w;
         // sc-3673 parity: deterministic, launch-portable CPU-seeded initial noise.
         let mut rng = StdRng::seed_from_u64(req.seed);
-        let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+        let noise = candle_gen::seeded_normal_vec(&mut rng, n);
         let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
             .to_device(&self.device)?
             .to_dtype(self.dtype)?;

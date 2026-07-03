@@ -28,7 +28,7 @@ use candle_core::{DType, Device, Tensor, Var};
 use candle_nn::{Linear, Module, VarBuilder};
 use rand::distr::Uniform;
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
+use rand_distr::Distribution;
 
 use crate::quant::QLinear;
 use crate::{CandleError, Result};
@@ -533,11 +533,11 @@ fn gaussian_var(
     rng: &mut StdRng,
     device: &Device,
 ) -> Result<Var> {
-    let data: Vec<f32> = (0..rows * cols)
-        .map(|_| {
-            let z: f32 = StandardNormal.sample(rng);
-            std * z
-        })
+    // Draw the raw unit-normal sequence via the shared primitive (identical draw order/salt), then
+    // scale each sample by `std` — `N(0, std²)`.
+    let data: Vec<f32> = crate::seeded_normal_vec(rng, rows * cols)
+        .into_iter()
+        .map(|z| std * z)
         .collect();
     let t = Tensor::from_vec(data, (rows, cols), &Device::Cpu)?.to_device(device)?;
     Ok(Var::from_tensor(&t)?)

@@ -18,7 +18,6 @@ use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::gen_core::{imageops, Image, Quant};
 use candle_gen::{CandleError, Result as CResult};
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::config::{DitConfig, TIMESTEP};
 use crate::dit::Seedvr2Transformer;
@@ -75,9 +74,7 @@ fn seeded_normal5(
 ) -> CResult<Tensor> {
     let (a, b, c, d, e) = shape;
     let mut rng = StdRng::seed_from_u64(seed);
-    let data: Vec<f32> = (0..a * b * c * d * e)
-        .map(|_| StandardNormal.sample(&mut rng))
-        .collect();
+    let data = candle_gen::seeded_normal_vec(&mut rng, a * b * c * d * e);
     Ok(Tensor::from_vec(data, shape, dev)?.to_dtype(dt)?)
 }
 

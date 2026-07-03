@@ -33,7 +33,6 @@ use candle_gen::{CandleError, Result};
 use candle_transformers::models::flux::sampling::unpack;
 use candle_transformers::models::t5::T5EncoderModel;
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 use tokenizers::Tokenizer;
 
 use crate::config::{ChromaTransformerConfig, ChromaVariant};
@@ -231,7 +230,7 @@ impl Pipeline {
         let lat_w = (width as usize).div_ceil(16) * 2;
         let n = LATENT_CHANNELS * lat_h * lat_w;
         let mut rng = StdRng::seed_from_u64(seed);
-        let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+        let noise = candle_gen::seeded_normal_vec(&mut rng, n);
         let noise = Tensor::from_vec(noise, (1, LATENT_CHANNELS, lat_h, lat_w), &Device::Cpu)?
             .to_device(&self.device)?;
         pack(&noise)

@@ -20,7 +20,6 @@ use candle_gen::gen_core::Image;
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::pipeline::{kolors_alpha_schedule, VAE_SCALE};
 
@@ -52,7 +51,7 @@ pub(crate) fn initial_noise(
 ) -> Result<Tensor> {
     let n = 4 * lat_h * lat_w;
     let mut rng = StdRng::seed_from_u64(seed);
-    let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let noise = candle_gen::seeded_normal_vec(&mut rng, n);
     Ok(Tensor::from_vec(noise, (1, 4, lat_h, lat_w), &Device::Cpu)?.to_device(device)?)
 }
 

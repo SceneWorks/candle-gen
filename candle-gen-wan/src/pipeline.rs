@@ -5,7 +5,6 @@ use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::gen_core::Image;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::config::{VAE_STRIDE_SPATIAL, VAE_STRIDE_TEMPORAL};
 
@@ -29,7 +28,7 @@ pub fn create_noise(
 ) -> Result<Tensor> {
     let n = z_dim * t_lat * h_lat * w_lat;
     let mut rng = StdRng::seed_from_u64(seed);
-    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(data, (1, z_dim, t_lat, h_lat, w_lat), device)
 }
 

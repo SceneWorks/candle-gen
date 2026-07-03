@@ -7,7 +7,6 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::config::{LATENT_CHANNELS, PATCH};
 
@@ -30,7 +29,7 @@ pub fn create_noise(seed: u64, width: u32, height: u32, device: &Device) -> Resu
     let feat = LATENT_CHANNELS * PATCH * PATCH; // 64
     let n = seq * feat;
     let mut rng = StdRng::seed_from_u64(seed);
-    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(data, (1, seq, feat), &Device::Cpu)?.to_device(device)
 }
 

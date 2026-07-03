@@ -5,7 +5,6 @@ use candle_gen::candle_core::{DType, Device, Result, Tensor};
 use candle_gen::gen_core::{AudioTrack, Image};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::audio_vae::AudioDecoder;
 use crate::config::{
@@ -33,7 +32,7 @@ pub fn create_noise(
 ) -> Result<Tensor> {
     let n = LATENT_CHANNELS * t_lat * h_lat * w_lat;
     let mut rng = StdRng::seed_from_u64(seed);
-    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(data, (1, LATENT_CHANNELS, t_lat, h_lat, w_lat), device)
 }
 
@@ -64,7 +63,7 @@ pub fn create_audio_noise(seed: u64, audio_frames: usize, device: &Device) -> Re
     let mel = AUDIO_MEL_BINS as usize;
     let n = ch * audio_frames * mel;
     let mut rng = StdRng::seed_from_u64(seed.wrapping_add(2));
-    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let data = candle_gen::seeded_normal_vec(&mut rng, n);
     Tensor::from_vec(data, (1, ch, audio_frames, mel), device)
 }
 

@@ -8,7 +8,6 @@
 
 use candle_gen::candle_core::{Device, Result, Tensor};
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::config::Flux2Config;
 
@@ -37,7 +36,7 @@ pub fn create_noise(
     let c = cfg.in_channels;
     let n = c * lat_h * lat_w;
     let mut rng = StdRng::seed_from_u64(seed);
-    let data: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
+    let data = candle_gen::seeded_normal_vec(&mut rng, n);
     let chw = Tensor::from_vec(data, (1, c, lat_h, lat_w), &Device::Cpu)?;
     // pack: [1, C, H, W] -> [1, C, H*W] -> [1, H*W, C]
     let packed = chw.reshape((1, c, lat_h * lat_w))?.transpose(1, 2)?;

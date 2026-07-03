@@ -15,7 +15,6 @@ use gen_core::guidance::GuidanceOps;
 use gen_core::sampling::{LatentOps, TimestepConvention};
 use gen_core::{CancelFlag, Progress};
 use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::{CandleError, Result};
 
@@ -65,9 +64,7 @@ impl LatentOps for CandleLatentOps {
         // latent's shape/device/dtype.
         let sub = seed.wrapping_add(0x9E37_79B9_7F4A_7C15_u64.wrapping_mul(step as u64 + 1));
         let mut rng = StdRng::seed_from_u64(sub);
-        let data: Vec<f32> = (0..x.elem_count())
-            .map(|_| StandardNormal.sample(&mut rng))
-            .collect();
+        let data = crate::seeded_normal_vec(&mut rng, x.elem_count());
         let noise = ge(Tensor::from_vec(data, x.shape().clone(), x.device()))?;
         ge(noise.to_dtype(x.dtype()))
     }
