@@ -2,7 +2,7 @@
 //! (`Reference`) and mask inpaint (`Reference` + `Mask`). Loads a bf16 snapshot, a source PNG, and an
 //! optional mask, then renders one edited image and writes a PNG.
 //!
-//!   cargo run -p candle-gen-ideogram --example render_edit --features cuda -- \
+//!   cargo run -p candle-gen-ideogram --example ideogram-edit --features cuda -- \
 //!       ideogram_4 /d/ideogram-4-bf16 "a green apple on a wooden table" source.png - 0.6 \
 //!       768 768 0 42 out_img2img.png
 //!

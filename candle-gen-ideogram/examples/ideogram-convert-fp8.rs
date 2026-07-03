@@ -9,7 +9,7 @@
 //! module mapping). Tokenizer / scheduler / config / model_index are copied verbatim.
 //!
 //! Run (CPU; no CUDA needed):
-//!   cargo run -p candle-gen-ideogram --example convert_fp8 -- <src_fp8_dir> <out_bf16_dir>
+//!   cargo run -p candle-gen-ideogram --example ideogram-convert-fp8 -- <src_fp8_dir> <out_bf16_dir>
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
