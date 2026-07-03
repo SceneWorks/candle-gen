@@ -153,9 +153,17 @@ impl MidAttention {
         let k = qkv.i((.., 1))?.transpose(1, 2)?.contiguous()?;
         let v = qkv.i((.., 2))?.transpose(1, 2)?.contiguous()?;
         let scale = (self.channels as f64).powf(-0.5);
-        let attn = (q.matmul(&k.transpose(1, 2)?)? * scale)?;
-        let attn = candle_gen::candle_nn::ops::softmax_last_dim(&attn)?;
-        let o = attn.matmul(&v)?; // [B, HW, C]
+        // i32-overflow guard (sc-9116): the single-head spatial scores `[B, HW, HW]` reach `65536² ≈
+        // 4.3e9 > i32::MAX` at a 2048² decode, so chunk over the query rows (byte-identical for the
+        // common sizes). Shared helper; softmax closure keeps the exact fused `softmax_last_dim`.
+        let o = candle_gen::sdpa_budgeted_flat(
+            &q,
+            &k,
+            &v,
+            scale,
+            candle_gen::candle_nn::ops::softmax_last_dim,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?; // [B, HW, C]
         let o = o.transpose(1, 2)?.reshape((b, c, h, w))?;
         x + self.proj.forward(&o)?
     }

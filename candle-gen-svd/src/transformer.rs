@@ -72,14 +72,22 @@ impl Attention {
         let q = split(self.q.forward(x)?, lq)?;
         let k = split(self.k.forward(context)?, lk)?;
         let v = split(self.v.forward(context)?, lk)?;
-        // The UNet defaults to f32 (fp16/bf16 only via `SVD_FORCE_*`), so `q·kᵀ` does not overflow as it
-        // would in fp16 — the scores + softmax stay in the module dtype.
-        let attn = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * self.scale)?;
-        let attn = softmax_last_dim(&attn)?;
-        let o = attn
-            .matmul(&v)?
-            .transpose(1, 2)?
-            .reshape((b, lq, self.heads * self.head_dim))?;
+        // The UNet defaults to f32 (fp16/bf16 only via `SVD_FORCE_*`), so `q·kᵀ` does not overflow in
+        // VALUE as it would in fp16 — the scores + softmax stay in the module dtype. i32-overflow guard
+        // (sc-9116): the self-attn scores `[B,H,Lq,Lk]` reach `8·16384² ≈ 3.4e9 > i32::MAX` at 1024²
+        // (128×128 latent tokens), so the shared helper chunks over the query rows (byte-identical for
+        // common sizes; cross-attn to the fixed 77-token context is a single un-chunked pass).
+        let o = candle_gen::sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            self.scale,
+            None,
+            softmax_last_dim,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?
+        .transpose(1, 2)?
+        .reshape((b, lq, self.heads * self.head_dim))?;
         self.out.forward(&o)
     }
 }

@@ -282,15 +282,23 @@ fn to_heads(x: &Tensor, heads: usize, head_dim: usize, norm: Option<&RmsNorm>) -
 
 /// SDPA over `[B,H,S,D]` q/k/v → `[B, S, H·D]`, scale `head_dim^-0.5`. No RoPE (SD3.5 uses learned
 /// pos-embed only). Composable softmax so the math is portable.
+///
+/// i32-overflow guard (sc-9116): the joint `[text, image]` scores `[B,H,S,S]` reach `~38·16717² ≈
+/// 1.06e10 > i32::MAX` at a 2048² render, silently corrupting the tail rows on the candle CUDA kernels.
+/// The shared budgeted helper chunks over the query rows (byte-identical for the common sizes); the
+/// softmax closure preserves the exact composable `softmax(_, D::Minus1)`.
 fn attention(q: &Tensor, k: &Tensor, v: &Tensor, head_dim: usize) -> Result<Tensor> {
     let (b, h, s, d) = q.dims4()?;
     let scale = (head_dim as f64).powf(-0.5);
-    let q = q.contiguous()?;
-    let k_t = k.transpose(2, 3)?.contiguous()?;
-    let v = v.contiguous()?;
-    let scores = (q.matmul(&k_t)? * scale)?;
-    let probs = candle_nn::ops::softmax(&scores, D::Minus1)?;
-    let o = probs.matmul(&v)?; // [B,H,S,D]
+    let o = candle_gen::sdpa_budgeted_bhsd(
+        q,
+        k,
+        v,
+        scale,
+        None,
+        |sc| candle_nn::ops::softmax(sc, D::Minus1),
+        candle_gen::ATTN_SCORES_BUDGET,
+    )?; // [B,H,S,D]
     o.transpose(1, 2)?.reshape((b, s, h * d))
 }
 

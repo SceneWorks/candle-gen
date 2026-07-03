@@ -70,10 +70,23 @@ pub(crate) fn rms(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
 }
 
 /// Scaled-dot-product attention. `q,k,v`: `[B, H, S*, d]`; softmax upcast to f32.
+///
+/// i32-overflow guard (sc-9116): the packed video-DiT scores `[B, H, S, S]` (S = target+ref+pose+mask
+/// tokens) exceed `i32::MAX` at 1024²+ / longer clips (e.g. a 64×64 latent → ~25k tokens → `~40·25k² ≈
+/// 2.5e10`), silently corrupting the tail rows on the candle CUDA kernels. The shared budgeted helper
+/// chunks over the query rows (byte-identical for the common sizes); the softmax closure preserves the
+/// exact f32-upcast `softmax_last_dim`.
 pub(crate) fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
-    let scores = (q.matmul(&k.transpose(D::Minus2, D::Minus1)?.contiguous()?)? * scale)?;
-    let attn = softmax_last_dim(&scores.to_dtype(DType::F32)?)?.to_dtype(q.dtype())?;
-    attn.matmul(&v.contiguous()?)
+    let dt = q.dtype();
+    candle_gen::sdpa_budgeted_bhsd(
+        q,
+        k,
+        v,
+        scale,
+        None,
+        |s| softmax_last_dim(&s.to_dtype(DType::F32)?)?.to_dtype(dt),
+        candle_gen::ATTN_SCORES_BUDGET,
+    )
 }
 
 /// Patchify `[C, T, H, W]` with patch `(pt, ph, pw)` → tokens `[L, C·pt·ph·pw]` (feature order

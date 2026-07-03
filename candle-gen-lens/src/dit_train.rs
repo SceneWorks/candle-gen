@@ -164,13 +164,22 @@ impl TrainJointAttention {
         let k = Tensor::cat(&[&ik, &tk], 2)?;
         let v = Tensor::cat(&[&iv, &tv], 2)?;
         let scale = (hd as f64).powf(-0.5);
-        let mut scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
-        if let Some(m) = mask {
-            scores = scores.broadcast_add(m)?;
-        }
         // Composable SDPA in f32 (NOT the fused `softmax_last_dim` — that CustomOp has no backward).
-        let probs = softmax(&scores.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(q.dtype())?;
-        let o = probs.matmul(&v.contiguous()?)?; // [B, heads, joint, head_dim]
+        // i32-overflow guard (sc-9116): the joint `[img, txt]` scores `[B, heads, joint, joint]` reach
+        // `i32::MAX` at large edit/joint sequences (the F-003 class; training runs small today, but the
+        // math is identical to the inference twin), so the shared budgeted helper chunks over the query
+        // rows (byte-identical for common sizes). The softmax closure preserves the exact f32-upcast
+        // composable `softmax(_, D::Minus1)` so the backward is unchanged.
+        let qd = q.dtype();
+        let o = candle_gen::sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            mask,
+            |s| softmax(&s.to_dtype(DType::F32)?, D::Minus1)?.to_dtype(qd),
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?; // [B, heads, joint, head_dim]
         let joint = img_seq + txt_seq;
         let o = o.transpose(1, 2)?.reshape((b, joint, h * hd))?;
 

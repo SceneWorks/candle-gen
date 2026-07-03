@@ -66,16 +66,22 @@ impl Ideogram4Attention {
         let k = apply_rope(&k, cos, sin)?;
 
         let scale = (hd as f64).powf(-0.5);
-        let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?; // [B,H,L,L]
-
         // Uniform-segment renders pass `None` (mask is all-zeros): skip the broadcast-add entirely
-        // (sc-8992). `softmax(scores + 0) == softmax(scores)`, so this is byte-identical.
-        let scores = match mask {
-            Some(m) => scores.broadcast_add(&m.to_dtype(scores.dtype())?)?,
-            None => scores,
-        };
-        let probs = softmax_last_dim(&scores)?;
-        let o = probs.matmul(&v)?; // [B,H,L,hd]
+        // (sc-8992). `softmax(scores + 0) == softmax(scores)`, so this is byte-identical. The additive
+        // mask is `[B,1,L,L]` (per-query) — cast to the scores dtype up front so the budgeted helper's
+        // per-chunk narrow over dim-2 slices the matching query rows.
+        // i32-overflow guard (sc-9116): the image-token scores `[B,H,L,L]` reach `~24·16384² ≈ 6.4e9 >
+        // i32::MAX` at a 2048² render, so chunk over the query rows (byte-identical for common sizes).
+        let mask = mask.map(|m| m.to_dtype(q.dtype())).transpose()?;
+        let o = candle_gen::sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            mask.as_ref(),
+            softmax_last_dim,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?; // [B,H,L,hd]
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
         self.o.forward(&o)
     }

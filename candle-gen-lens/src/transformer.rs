@@ -784,18 +784,22 @@ mod tests {
         let valid = Tensor::from_vec(vec![1f32, 1., 1., 1., 1., 1., 0., 0.], (2, 4), &dev).unwrap();
         let mask = build_joint_mask(&valid, s - 4, DType::F32, &dev).unwrap();
         for m in [None, Some(&mask)] {
-            // Huge budget → single pass; tiny budget (1) → chunked into single-row blocks.
+            // Huge budget → single pass; tiny budget (1) → single-row chunks; a MID-SIZE budget forces
+            // multi-row chunks + a remainder (block=3 over s=7 → 3,3,1) — the sc-9116 hardening ask.
             let single = attention_budgeted(&q, &k, &v, d, m, usize::MAX).unwrap();
-            let chunked = attention_budgeted(&q, &k, &v, d, m, 1).unwrap();
-            assert_eq!(single.dims(), chunked.dims());
             let a = single.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            let c = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-            for (x, y) in a.iter().zip(&c) {
-                assert!(
-                    (x - y).abs() < 1e-6,
-                    "chunked attention diverged (mask={}): {x} vs {y}",
-                    m.is_some()
-                );
+            // budget = b·h·s·block = 2·2·7·3 = 84 → block = 84/(2·2·7) = 3.
+            for budget in [1usize, 84] {
+                let chunked = attention_budgeted(&q, &k, &v, d, m, budget).unwrap();
+                assert_eq!(single.dims(), chunked.dims());
+                let c = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                for (x, y) in a.iter().zip(&c) {
+                    assert!(
+                        (x - y).abs() < 1e-6,
+                        "chunked attention diverged (mask={}, budget={budget}): {x} vs {y}",
+                        m.is_some()
+                    );
+                }
             }
         }
     }

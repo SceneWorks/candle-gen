@@ -215,15 +215,26 @@ impl ZImageAttention {
         mask: Option<&Tensor>,
         scale: f64,
     ) -> Result<Tensor> {
-        let mut attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        if let Some(m) = mask {
-            let m = m.unsqueeze(1)?.unsqueeze(2)?;
-            let m = m.to_dtype(attn_weights.dtype())?;
-            let m = ((m - 1.0)? * 1e9)?;
-            attn_weights = attn_weights.broadcast_add(&m)?;
-        }
-        let attn_probs = candle_gen::candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        attn_probs.matmul(v)
+        // Build the optional additive `[B,1,1,seq]` mask up front. i32-overflow guard (sc-9116): the
+        // image-token scores `[B, n, seq, seq]` reach `~24·16384² ≈ 6.4e9 > i32::MAX` at a 2048² render
+        // (this is the CPU/CUDA `basic` fallback — the Metal path uses candle's fused `sdpa`), so chunk
+        // over the query rows (byte-identical for common sizes) via the shared helper.
+        let m = match mask {
+            Some(m) => {
+                let m = m.unsqueeze(1)?.unsqueeze(2)?.to_dtype(q.dtype())?;
+                Some(((m - 1.0)? * 1e9)?)
+            }
+            None => None,
+        };
+        candle_gen::sdpa_budgeted_bhsd(
+            q,
+            k,
+            v,
+            scale,
+            m.as_ref(),
+            candle_gen::candle_nn::ops::softmax_last_dim,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )
     }
 
     fn prepare_sdpa_mask(&self, mask: Option<&Tensor>, q: &Tensor) -> Result<Option<Tensor>> {

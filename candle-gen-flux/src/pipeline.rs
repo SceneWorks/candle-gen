@@ -70,13 +70,13 @@ use candle_transformers::models::clip::text_model::{
     Activation as ClipActivation, ClipTextConfig, ClipTextTransformer,
 };
 use candle_transformers::models::flux::autoencoder::{AutoEncoder, Config as AeConfig};
-use candle_transformers::models::flux::model::{Config as FluxConfig, Flux};
+use candle_transformers::models::flux::model::Config as FluxConfig;
 use candle_transformers::models::flux::sampling::{get_schedule, unpack, State};
-use candle_transformers::models::flux::WithForward;
 use candle_transformers::models::t5::T5EncoderModel;
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, VaeConfig};
 use tokenizers::Tokenizer;
 
+use crate::ip_dit::IpFlux;
 use crate::packed_dit::PackedFluxDit;
 use crate::packed_te::{ClipConfig, PackedClipText, PackedT5Encoder, T5Config as PackedT5Config};
 use crate::Variant;
@@ -140,7 +140,7 @@ pub(crate) enum Components {
     Stock {
         clip: Arc<ClipTextTransformer>,
         t5: Arc<Mutex<T5EncoderModel>>,
-        transformer: Arc<Flux>,
+        transformer: Arc<IpFlux>,
         vae: Arc<AutoEncoder>,
         /// T5 + CLIP tokenizers, loaded+parsed **once** at component load and reused across encodes
         /// (sc-8991 / F-011) instead of re-parsing per prompt/branch.
@@ -193,11 +193,14 @@ impl Pipeline {
             crate::flux1_load::text_encoders(&self.root, self.dtype, &self.device, "flux")?;
 
         // FLUX DiT (original BFL checkpoint) at the snapshot root; config differs only by the
-        // guidance embedding (dev embeds the guidance scale, schnell does not). The stock `Flux` over the
-        // shared DiT mmap.
+        // guidance embedding (dev embeds the guidance scale, schnell does not). Built as the vendored
+        // `IpFlux` (with `ip = None`, byte-identical to the stock `candle-transformers` `Flux::forward`)
+        // so the txt2img path picks up the sc-9116 i32-overflow-safe budgeted attention — the stock
+        // upstream `Flux` materializes an unguarded `[…,S,S]` scores tensor that overflows i32 at 2048²
+        // (S ≈ 16.9k joint tokens → `24·16.9k² ≈ 6.8e9 > i32::MAX`). The checkpoint layout is identical.
         let dit_vb =
             crate::flux1_load::dit_vb(&self.root, self.variant, self.dtype, &self.device, "flux")?;
-        let transformer = Flux::new(&flux_config(self.variant), dit_vb)?;
+        let transformer = IpFlux::new(&flux_config(self.variant), dit_vb)?;
 
         // FLUX AutoEncoder (`ae.safetensors`) at the root.
         let (vae, _vae_vb) =
@@ -555,6 +558,8 @@ impl Pipeline {
                 // returns a `candle_core::Result`; `?` bridges it into the driver's `CandleError`.
                 let t_vec = Tensor::full(t, b_sz, dev)?;
                 let out = match components {
+                    // `IpFlux::forward` with `ip = None` is byte-identical to the stock
+                    // `candle-transformers` `Flux::forward` (sc-9116) — plus the budgeted attention guard.
                     Components::Stock { transformer, .. } => transformer.forward(
                         img,
                         &state.img_ids,
@@ -563,6 +568,7 @@ impl Pipeline {
                         &t_vec,
                         &state.vec,
                         Some(&guidance_t),
+                        None,
                     )?,
                     Components::Packed { transformer, .. } => transformer.forward(
                         img,

@@ -1012,17 +1012,22 @@ mod tests {
         let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
         let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
         let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
-        // Huge budget → single pass; tiny budget (1) → chunked into single-row blocks.
+        // Huge budget → single pass; tiny budget (1) → chunked into single-row blocks; a MID-SIZE
+        // budget forces multi-row chunks + a remainder (block=3 over s=7 → 3,3,1) — the sc-9116
+        // test-hardening ask (a single-row chunk can hide an off-by-one the multi-row path would trip).
         let single = attention_budgeted(&q, &k, &v, d, usize::MAX).unwrap();
-        let chunked = attention_budgeted(&q, &k, &v, d, 1).unwrap();
-        assert_eq!(single.dims(), chunked.dims());
         let a = single.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let c = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        for (x, y) in a.iter().zip(&c) {
-            assert!(
-                (x - y).abs() < 1e-6,
-                "chunked attention diverged: {x} vs {y}"
-            );
+        // budget = b·h·s·block = 1·2·7·3 = 42 → block = 42/(1·2·7) = 3.
+        for budget in [1usize, 42] {
+            let chunked = attention_budgeted(&q, &k, &v, d, budget).unwrap();
+            assert_eq!(single.dims(), chunked.dims());
+            let c = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            for (x, y) in a.iter().zip(&c) {
+                assert!(
+                    (x - y).abs() < 1e-6,
+                    "chunked attention diverged at budget {budget}: {x} vs {y}"
+                );
+            }
         }
     }
 

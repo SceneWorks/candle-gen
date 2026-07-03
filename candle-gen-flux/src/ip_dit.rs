@@ -876,17 +876,22 @@ mod tests {
         let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
         let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
         let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
-        // Huge budget → single pass; tiny budget (1) → chunked into single-row blocks.
+        // Huge budget → single pass; tiny budget (1) → single-row chunks; a MID-SIZE budget forces
+        // multi-row chunks + a remainder (block=3 over s=7 → 3,3,1) — the sc-9116 hardening ask.
         let single = sdpa_budgeted(&q, &k, &v, usize::MAX).unwrap();
-        let chunked = sdpa_budgeted(&q, &k, &v, 1).unwrap();
-        assert_close(&single, &chunked);
+        // budget = b·h·s·block = 1·2·7·3 = 42 → block = 3.
+        for budget in [1usize, 42] {
+            assert_close(&single, &sdpa_budgeted(&q, &k, &v, budget).unwrap());
+        }
 
         let sk = 5usize;
         let kx = Tensor::randn(0f32, 1f32, (b, h, sk, d), &dev).unwrap();
         let vx = Tensor::randn(0f32, 1f32, (b, h, sk, d), &dev).unwrap();
         let single = sdpa_budgeted(&q, &kx, &vx, usize::MAX).unwrap();
-        let chunked = sdpa_budgeted(&q, &kx, &vx, 1).unwrap();
-        assert_close(&single, &chunked);
+        // budget = b·h·sk·block = 1·2·5·3 = 30 → block = 3 (chunks 3, 3, 1 over the 7 query rows).
+        for budget in [1usize, 30] {
+            assert_close(&single, &sdpa_budgeted(&q, &kx, &vx, budget).unwrap());
+        }
     }
 
     /// A tiny FLUX DiT config (real hyperparameter *shape*, minimal depth) for a CPU-only forward parity

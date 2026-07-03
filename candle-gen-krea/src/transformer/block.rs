@@ -39,13 +39,21 @@ fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
 }
 
 /// Bidirectional, unmasked scaled-dot-product attention. `q`/`k`/`v`: `[b, h, s, hd]`.
+///
+/// i32-overflow guard (sc-9116): the image-token scores `[b, h, s, s]` reach `~24·16384² ≈ 6.4e9 >
+/// i32::MAX` at a 2048² render, silently corrupting the tail rows on the candle CUDA kernels. The
+/// shared budgeted helper chunks over the query rows (byte-identical for the common sizes); the softmax
+/// closure preserves the exact fused `softmax_last_dim`.
 fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
-    let q = q.contiguous()?;
-    let k = k.contiguous()?;
-    let v = v.contiguous()?;
-    let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
-    let probs = softmax_last_dim(&scores)?;
-    probs.matmul(&v)
+    candle_gen::sdpa_budgeted_bhsd(
+        q,
+        k,
+        v,
+        scale,
+        None,
+        softmax_last_dim,
+        candle_gen::ATTN_SCORES_BUDGET,
+    )
 }
 
 // ── `+1` RMSNorm ────────────────────────────────────────────────────────────────────────────

@@ -62,6 +62,14 @@ pub use loader::{
     mmap_var_builder, resolve_weight_files, sorted_safetensors,
 };
 
+// Shared i32-overflow-safe scaled-dot-product attention (sc-9116 / epic 8979): the F-003 query-row
+// chunking guard — hoisted from the per-crate flux2/chroma/lens/qwen-image copies — so the remaining
+// audited DiT/VAE attention sites (sdxl/z-image/sd3/svd/scail2/ideogram/krea/lens-train + the
+// chroma/flux2/qwen-image VAE mid-blocks) share ONE guarded copy. candle CUDA kernels index elements
+// with i32; a scores tensor over `i32::MAX` silently corrupts its tail at large render sizes.
+pub mod attention;
+pub use attention::{sdpa_budgeted_bhsd, sdpa_budgeted_flat, ATTN_SCORES_BUDGET};
+
 // Shared VRAM-budget probe (sc-9014 / F-030): the trusted-path `nvidia-smi` resolver the video-VAE
 // decode tilers (seedvr2/wan/ltx) route through, instead of each spawning a bare
 // `Command::new("nvidia-smi")` that Windows resolves via the process search order (a PATH-hijack

@@ -182,21 +182,27 @@ impl ZImageAttention {
         let v = v.transpose(1, 2)?.contiguous()?;
 
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-
-        if let Some(m) = attention_mask {
-            // mask: (B, seq) -> (B, 1, 1, seq); 1=valid -> 0, 0=padding -> -1e9
-            let m = m
-                .unsqueeze(1)?
-                .unsqueeze(2)?
-                .to_dtype(attn_weights.dtype())?;
-            let m = ((m - 1.0)? * 1e9)?;
-            attn_weights = attn_weights.broadcast_add(&m)?;
-        }
-
-        // Composable softmax (NOT the fused `softmax_last_dim` — that CustomOp has no backward).
-        let attn_probs = candle_nn::ops::softmax(&attn_weights, D::Minus1)?;
-        let context = attn_probs.matmul(&v)?;
+        // Build the optional additive `[B,1,1,seq]` mask (1=valid → 0, 0=padding → -1e9) up front so the
+        // budgeted helper broadcasts it onto every query chunk. i32-overflow guard (sc-9116): the
+        // image-token scores `[B, n, seq, seq]` reach `~24·16384² ≈ 6.4e9 > i32::MAX` at a 2048² render,
+        // so chunk over the query rows (byte-identical for common sizes). The softmax closure keeps the
+        // composable `softmax(_, D::Minus1)` (the fused `softmax_last_dim` has no backward — trainer parity).
+        let mask = match attention_mask {
+            Some(m) => {
+                let m = m.unsqueeze(1)?.unsqueeze(2)?.to_dtype(q.dtype())?;
+                Some(((m - 1.0)? * 1e9)?)
+            }
+            None => None,
+        };
+        let context = candle_gen::sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            mask.as_ref(),
+            |s| candle_nn::ops::softmax(s, D::Minus1),
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?;
 
         // (B, n, seq, hd) -> (B, seq, dim)
         let context = context.transpose(1, 2)?.reshape((b, seq_len, ()))?;

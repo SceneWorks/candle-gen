@@ -205,15 +205,27 @@ impl CrossAttention {
             let query = query.to_dtype(DType::F32)?;
             let key = key.to_dtype(DType::F32)?;
             let value = value.to_dtype(DType::F32)?;
-            let xs = query.matmul(&(key.t()? * self.scale)?)?;
-            let xs = {
-                let _enter = self.span_softmax.enter();
-                // The composable `softmax` (not the fused `softmax_last_dim`): the fused kernel is a
-                // `CustomOp` with no backward, so grads would never reach `to_q`/`to_k` through the
-                // scores (sc-5165). Numerically identical, so the stock forward-parity test still holds.
-                nn::ops::softmax(&xs, D::Minus1)?
-            };
-            xs.matmul(&value)?.to_dtype(in_dtype)?
+            // The composable `softmax` (not the fused `softmax_last_dim`): the fused kernel is a
+            // `CustomOp` with no backward, so grads would never reach `to_q`/`to_k` through the scores
+            // (sc-5165). Numerically identical, so the stock forward-parity test still holds.
+            //
+            // i32-overflow guard (sc-9116): `query`/`key`/`value` are `[B·heads, seq, dim]` (heads folded
+            // into batch). The self-attn scores `[B·heads, seq, seq]` reach `8·65536² ≈ 3.4e10 > i32::MAX`
+            // at a 2048² render (256×256 top-block latent tokens), silently corrupting the tail rows on
+            // the candle CUDA kernels. The shared budgeted helper chunks over the query rows
+            // (byte-identical for common sizes; cross-attn to the fixed 77-token context is a single pass).
+            // `self.scale` is already applied to `key` in the un-guarded path via `key.t()·scale`; the
+            // helper applies it to the scores instead (`(q·kᵀ)·scale` == `q·(kᵀ·scale)`).
+            let _enter = self.span_softmax.enter();
+            candle_gen::sdpa_budgeted_flat(
+                &query,
+                &key,
+                &value,
+                self.scale,
+                |s| nn::ops::softmax(s, D::Minus1),
+                candle_gen::ATTN_SCORES_BUDGET,
+            )?
+            .to_dtype(in_dtype)?
         };
         self.reshape_batch_dim_to_heads(&xs)
     }
