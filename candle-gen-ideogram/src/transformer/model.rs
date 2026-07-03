@@ -52,6 +52,8 @@ pub struct Ideogram4Transformer {
 /// every token shares a segment id — the additive mask is provably all-zeros, so the per-block add is
 /// skipped entirely (softmax over `scores + 0` == softmax over `scores`, so the step is byte-identical).
 struct PreparedCond {
+    b: usize,
+    l: usize,
     indicator: Vec<i64>,
     segment_ids: Vec<i64>,
     position_ids: Vec<f32>,
@@ -195,7 +197,12 @@ impl Ideogram4Transformer {
 
         let mut guard = self.cond_cache.lock().unwrap();
         if let Some(c) = guard.as_ref() {
-            if c.indicator == ind && c.segment_ids == seg && c.position_ids == pos {
+            if c.b == b
+                && c.l == l
+                && c.indicator == ind
+                && c.segment_ids == seg
+                && c.position_ids == pos
+            {
                 return Ok((
                     c.llm_mask.clone(),
                     c.img_mask.clone(),
@@ -213,6 +220,8 @@ impl Ideogram4Transformer {
         let seg_mask = segment_mask(&seg, b, l, indicator.device())?;
 
         *guard = Some(PreparedCond {
+            b,
+            l,
             indicator: ind,
             segment_ids: seg,
             position_ids: pos,
