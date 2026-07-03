@@ -458,13 +458,25 @@ fn sd35_bigg_pad_token_ab() {
             .unwrap()
             .to_dtype(dtype)
             .unwrap();
-        let pooled = refs["pooled"].to_device(&device).unwrap().to_dtype(dtype).unwrap();
+        let pooled = refs["pooled"]
+            .to_device(&device)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
         let timestep = Tensor::new(&[read_timestep()], &device)
             .unwrap()
             .to_dtype(dtype)
             .unwrap();
-        let cf = ctx_fixed.to_device(&device).unwrap().to_dtype(dtype).unwrap();
-        let cp = ctx_prefix.to_device(&device).unwrap().to_dtype(dtype).unwrap();
+        let cf = ctx_fixed
+            .to_device(&device)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
+        let cp = ctx_prefix
+            .to_device(&device)
+            .unwrap()
+            .to_dtype(dtype)
+            .unwrap();
         let vel_fixed = dit.forward(&latent, &cf, &pooled, &timestep).unwrap();
         let vel_prefix = dit.forward(&latent, &cp, &pooled, &timestep).unwrap();
         let vf = flat(&vel_fixed);

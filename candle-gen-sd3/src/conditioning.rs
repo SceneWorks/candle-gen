@@ -383,8 +383,13 @@ impl Sd3TextEncoders {
     ) -> CandleResult<EncoderOutputs> {
         let (clip_l_hidden, clip_l_pooled) =
             self.encode_clip(&self.tok_l, &self.clip_l, &self.proj_l, self.pad_l, prompt)?;
-        let (clip_g_hidden, clip_g_pooled) =
-            self.encode_clip(&self.tok_g, &self.clip_g, &self.proj_g, pad_g_override, prompt)?;
+        let (clip_g_hidden, clip_g_pooled) = self.encode_clip(
+            &self.tok_g,
+            &self.clip_g,
+            &self.proj_g,
+            pad_g_override,
+            prompt,
+        )?;
 
         let mut t5_ids: Vec<u32> = self
             .tok_t5
