@@ -196,6 +196,168 @@ pub fn require_hf_snapshot_dir(repo: &str) -> PathBuf {
 // ---------------------------------------------------------------------------------------------------
 
 pub use gpu_peak::{used_mib, PeakSampler};
+pub use vram_probe::{VramProbe, VramReport};
+
+mod vram_probe {
+    //! sc-9094 — the per-tier VRAM measuring harness (epic 9083's packed-load rollout). Wraps the
+    //! device-level [`PeakSampler`] into the three phase quantities the manifest's per-variant
+    //! `minMemoryGb` gate is derived from:
+    //!
+    //! * **load peak** — the transient high-water mark *during* model load (weights → device,
+    //!   packed-repack, CPU-staging). For flux2-dev this is the headline: the dense CPU-stage path
+    //!   peaked ~105 GB; the packed Q4 load lands the quantized footprint on-device directly.
+    //! * **steady resident** — device VRAM after load settles, *before* denoise — the persistent
+    //!   weight + component footprint a job holds for its whole lifetime.
+    //! * **overall peak** — the max across the whole generate (load + denoise + VAE decode). This is
+    //!   the number the card must physically hold; `minMemoryGb` = this + headroom.
+    //!
+    //! All three are **device-level** `nvidia-smi memory.used` deltas over a recorded `baseline`
+    //! (WDDM reports per-process `used_memory` as `[N/A]`, and the card must fit the *whole* device's
+    //! resident bytes anyway). Run on an otherwise-idle GPU; the report prints the baseline so a
+    //! non-zero pre-run residency is visible. The sampler is an in-process helper thread (part of the
+    //! measurement, not a background job) polling every ~40 ms — fast enough to catch a multi-hundred-ms
+    //! load/decode transient.
+    //!
+    //! Usage from a provider example (load and generate are separate phases, so their peaks separate):
+    //! ```ignore
+    //! let mut probe = VramProbe::start(0);          // records the idle baseline
+    //! let load = probe.phase();                     // sample across load
+    //! let gen = registry::load(id, &spec)?;         //   ... weights → device ...
+    //! probe.end_load(load);                         // load peak recorded; steady sampled now
+    //! let run = probe.phase();                      // sample across generate
+    //! let out = gen.generate(&req, &mut cb)?;       //   ... denoise + decode ...
+    //! probe.end_gen(run);                           // overall peak recorded
+    //! println!("{}", probe.report());               // load-peak / steady / overall-peak (GB)
+    //! ```
+
+    use super::gpu_peak::{used_mib, PeakSampler};
+
+    /// MiB → GB (10⁹ bytes — the manifest's `minMemoryGb` is base-10 GB, matching the MLX footprint
+    /// numbers). `1 MiB = 2²⁰ bytes`.
+    fn mib_to_gb(mib: u64) -> f64 {
+        (mib as f64) * (1024.0 * 1024.0) / 1.0e9
+    }
+
+    /// The three phase quantities (GB) plus the idle baseline they were measured over.
+    #[derive(Clone, Copy, Debug)]
+    pub struct VramReport {
+        /// Device VRAM already resident before the run (GB) — should be ~0 on an idle GPU.
+        pub baseline_gb: f64,
+        /// Transient high-water mark during load, over baseline (GB).
+        pub load_peak_gb: f64,
+        /// Resident VRAM after load settles, before denoise, over baseline (GB).
+        pub steady_gb: f64,
+        /// Max over the whole generate (load + denoise + decode), over baseline (GB).
+        pub peak_gb: f64,
+    }
+
+    impl std::fmt::Display for VramReport {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "load-peak {:.1} GB | steady {:.1} GB | overall-peak {:.1} GB (baseline {:.1} GB)",
+                self.load_peak_gb, self.steady_gb, self.peak_gb, self.baseline_gb
+            )
+        }
+    }
+
+    /// A phase-scoped [`PeakSampler`] the caller starts around a load or generate call and hands back
+    /// to the matching `end_*` to fold its peak into the report.
+    pub struct Phase(PeakSampler);
+
+    /// The per-run VRAM probe. [`start`](Self::start) records the idle baseline; each phase is bracketed
+    /// by [`phase`](Self::phase) → the work → `end_load` / `end_gen`.
+    pub struct VramProbe {
+        gpu: usize,
+        baseline_mib: u64,
+        load_peak_mib: u64,
+        steady_mib: u64,
+        overall_peak_mib: u64,
+    }
+
+    impl VramProbe {
+        /// Record the idle device baseline (used MiB) for GPU ordinal `gpu`. A missing `nvidia-smi`
+        /// yields a 0 baseline (the deltas then read as absolute used, still monotonically useful).
+        pub fn start(gpu: usize) -> Self {
+            let baseline = used_mib(gpu).unwrap_or(0);
+            Self {
+                gpu,
+                baseline_mib: baseline,
+                load_peak_mib: baseline,
+                steady_mib: baseline,
+                overall_peak_mib: baseline,
+            }
+        }
+
+        /// Begin sampling a phase (load or generate). Keep the returned [`Phase`] alive across the work
+        /// and pass it to the matching `end_*`.
+        pub fn phase(&self) -> Phase {
+            Phase(PeakSampler::start(self.gpu))
+        }
+
+        /// Close the **load** phase: fold its peak into `load_peak`, and sample the settled resident
+        /// (`steady`) right now (load done, denoise not started). Also seeds the overall peak.
+        pub fn end_load(&mut self, phase: Phase) {
+            let load_peak = phase.0.stop();
+            self.load_peak_mib = self.load_peak_mib.max(load_peak);
+            self.overall_peak_mib = self.overall_peak_mib.max(load_peak);
+            // Steady = the instantaneous resident after load, before any denoise allocation.
+            if let Some(m) = used_mib(self.gpu) {
+                self.steady_mib = m;
+                self.overall_peak_mib = self.overall_peak_mib.max(m);
+            }
+        }
+
+        /// Close the **generate** phase: fold its peak into the overall peak.
+        pub fn end_gen(&mut self, phase: Phase) {
+            let gen_peak = phase.0.stop();
+            self.overall_peak_mib = self.overall_peak_mib.max(gen_peak);
+        }
+
+        /// The three phase quantities in GB, over the idle baseline (clamped at 0 — a slightly-lower
+        /// late sample must not read as negative usage).
+        pub fn report(&self) -> VramReport {
+            let over = |m: u64| mib_to_gb(m.saturating_sub(self.baseline_mib));
+            VramReport {
+                baseline_gb: mib_to_gb(self.baseline_mib),
+                load_peak_gb: over(self.load_peak_mib),
+                steady_gb: over(self.steady_mib),
+                peak_gb: over(self.overall_peak_mib),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn mib_to_gb_is_base10_gb() {
+            // 1024 MiB = 2³⁰ bytes ≈ 1.0737 GB (base-10).
+            assert!((mib_to_gb(1024) - 1.0737).abs() < 1e-3);
+        }
+
+        #[test]
+        fn report_is_delta_over_baseline_and_nonnegative() {
+            // A probe with a synthetic baseline: deltas subtract it, and a below-baseline sample
+            // clamps to 0 rather than going negative.
+            let mut p = VramProbe {
+                gpu: 0,
+                baseline_mib: 1000,
+                load_peak_mib: 5000,
+                steady_mib: 3000,
+                overall_peak_mib: 6000,
+            };
+            let r = p.report();
+            assert!((r.load_peak_gb - mib_to_gb(4000)).abs() < 1e-6);
+            assert!((r.steady_gb - mib_to_gb(2000)).abs() < 1e-6);
+            assert!((r.peak_gb - mib_to_gb(5000)).abs() < 1e-6);
+            // A late sample below baseline must not underflow.
+            p.steady_mib = 500;
+            assert_eq!(p.report().steady_gb, 0.0);
+        }
+    }
+}
 
 mod gpu_peak {
     //! sc-7148 — shared `nvidia-smi` peak-VRAM sampler for the video-VAE decode sweeps. Polls

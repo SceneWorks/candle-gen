@@ -98,9 +98,26 @@ fn main() -> Result<()> {
         candle_gen_sdxl::set_vae_tiling(false);
     }
 
+    // sc-9094 per-tier VRAM probe (shared `candle_gen::testkit::VramProbe`): `--vram-probe [--gpu n]`
+    // brackets load / steady / overall-peak so this driver measures the manifest `minMemoryGb`.
+    let vram_gpu: Option<usize> = if args.iter().any(|a| a == "--vram-probe") {
+        Some(
+            arg(&args, "--gpu")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+        )
+    } else {
+        None
+    };
+    let mut probe = vram_gpu.map(candle_gen::testkit::VramProbe::start);
+
     // Resolve through the registry — proves the inventory seam (THIS crate's `submit!` is linked).
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
+    let load_phase = probe.as_ref().map(|p| p.phase());
     let gen = gen_core::registry::load("sdxl", &spec)?;
+    if let (Some(p), Some(ph)) = (probe.as_mut(), load_phase) {
+        p.end_load(ph);
+    }
     println!(
         "[smoke] resolved engine id={} backend={}",
         gen.descriptor().id,
@@ -147,12 +164,19 @@ fn main() -> Result<()> {
             Progress::Decoding => println!("\n[smoke] call {}/{repeat} decoding", call + 1),
         };
         let t_call = std::time::Instant::now();
+        let gen_phase = probe.as_ref().map(|p| p.phase());
         let output = gen.generate(&req, &mut on_progress)?;
+        if let (Some(p), Some(ph)) = (probe.as_mut(), gen_phase) {
+            p.end_gen(ph);
+        }
         call_secs.push(t_call.elapsed().as_secs_f32());
         images = match output {
             GenerationOutput::Images(imgs) => imgs,
             GenerationOutput::Video { .. } => return Err("expected images, got video".into()),
         };
+    }
+    if let Some(p) = &probe {
+        println!("[vram] sdxl {width}x{height}: {}", p.report());
     }
     let gen_s = *call_secs.last().unwrap();
     if repeat > 1 {

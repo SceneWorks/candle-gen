@@ -118,7 +118,26 @@ fn main() -> Result<()> {
         };
         println!("[smoke] DiT quant = {q}");
     }
+    // sc-9094 per-tier VRAM probe: `--vram-probe` (optionally `--gpu <n>`) records device VRAM at the
+    // load / steady / overall-peak phase boundaries via the shared `candle_gen::testkit::VramProbe`, so
+    // this render driver doubles as the manifest-`minMemoryGb` measurement harness. Off by default (no
+    // nvidia-smi polling on a normal render).
+    let vram_gpu: Option<usize> = if args.iter().any(|a| a == "--vram-probe") {
+        Some(
+            arg(&args, "--gpu")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+        )
+    } else {
+        None
+    };
+    let mut probe = vram_gpu.map(candle_gen::testkit::VramProbe::start);
+
+    let load_phase = probe.as_ref().map(|p| p.phase());
     let gen = gen_core::registry::load(model_id, &spec)?;
+    if let (Some(p), Some(ph)) = (probe.as_mut(), load_phase) {
+        p.end_load(ph);
+    }
     println!(
         "[smoke] resolved engine id={} backend={}",
         gen.descriptor().id,
@@ -147,8 +166,15 @@ fn main() -> Result<()> {
     };
 
     let t = std::time::Instant::now();
+    let gen_phase = probe.as_ref().map(|p| p.phase());
     let output = gen.generate(&req, &mut on_progress)?;
+    if let (Some(p), Some(ph)) = (probe.as_mut(), gen_phase) {
+        p.end_gen(ph);
+    }
     let secs = t.elapsed().as_secs_f32();
+    if let Some(p) = &probe {
+        println!("[vram] {model_id} {width}x{height}: {}", p.report());
+    }
     let images = match output {
         GenerationOutput::Images(imgs) => imgs,
         GenerationOutput::Video { .. } => return Err("expected images, got video".into()),

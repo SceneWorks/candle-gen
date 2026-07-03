@@ -82,7 +82,26 @@ fn main() -> Result<()> {
     if let Some(q) = quant {
         spec = spec.with_quant(q);
     }
+    // sc-9094 per-tier VRAM probe (shared `candle_gen::testkit::VramProbe`): `--vram-probe [--gpu n]`
+    // brackets load / steady / overall-peak so this driver measures the manifest `minMemoryGb`. The
+    // flux2-dev headline: packed Q4 load lands the quantized footprint on-device (no ~105 GB dense
+    // CPU-staging peak), so `load-peak` here is the NEW packed-load high-water mark.
+    let vram_gpu: Option<usize> = if args.iter().any(|a| a == "--vram-probe") {
+        Some(
+            arg(&args, "--gpu")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+        )
+    } else {
+        None
+    };
+    let mut probe = vram_gpu.map(candle_gen::testkit::VramProbe::start);
+
+    let load_phase = probe.as_ref().map(|p| p.phase());
     let gen = gen_core::registry::load(id, &spec)?;
+    if let (Some(p), Some(ph)) = (probe.as_mut(), load_phase) {
+        p.end_load(ph);
+    }
     println!(
         "[smoke] resolved engine id={} backend={}",
         gen.descriptor().id,
@@ -109,8 +128,15 @@ fn main() -> Result<()> {
         Progress::Decoding => println!("\n[smoke] decoding"),
     };
     let t0 = std::time::Instant::now();
+    let gen_phase = probe.as_ref().map(|p| p.phase());
     let output = gen.generate(&req, &mut on_progress)?;
+    if let (Some(p), Some(ph)) = (probe.as_mut(), gen_phase) {
+        p.end_gen(ph);
+    }
     let secs = t0.elapsed().as_secs_f32();
+    if let Some(p) = &probe {
+        println!("[vram] {id} {width}x{height}: {}", p.report());
+    }
     let images = match output {
         GenerationOutput::Images(imgs) => imgs,
         GenerationOutput::Video { .. } => return Err("expected images, got video".into()),
