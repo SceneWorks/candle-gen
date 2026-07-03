@@ -282,6 +282,39 @@ mod cuda_impl {
             ))
         }
 
+        /// **On-device** per-output-channel int8 linear (sc-9601 perf) — the resident-weight ConvRot
+        /// forward with the dequant fold kept entirely on the GPU. Runs the exact int32 IGEMM
+        /// ([`Self::matmul_int8_staged`], `CudaStorageSlice::I32` on device), casts the accumulate `i32 →
+        /// f32` **on-device** (`Tensor::to_dtype`, via the sc-9601 vendored `cast_i32_f32` kernel), then
+        /// folds the per-row weight scale × per-tensor activation scale with a candle broadcast multiply
+        /// and casts to bf16 — **no int32→host copy, no CPU fold**. This is the fast twin of
+        /// [`Self::matmul_int8_per_channel_staged`] (which reads the int32 accumulate back to host because
+        /// stock candle-kernels ships no CUDA `i32 → f32` cast; the vendored kernel closes that gap). The
+        /// i32→f32 conversion is an exact hardware I2F (round-to-nearest, rel ≤ 6e-8 for the few outputs
+        /// beyond 2²⁴ — negligible beside int8's ~1 %). `D[m, o] = (scale_w[o]·scale_x) · acc[m, o]` → bf16.
+        pub fn matmul_int8_per_channel_staged_ondevice(
+            &self,
+            w: &DevInt8,
+            scale_w: &[f32],
+            x_i8: &Tensor,
+            scale_x: f32,
+        ) -> Result<Tensor> {
+            let x = DevInt8::stage(self, x_i8)?;
+            let n = w.rows;
+            if scale_w.len() != n {
+                candle_core::bail!(
+                    "matmul_int8_per_channel_staged_ondevice: scale_w len {} != N (out) {n}",
+                    scale_w.len()
+                );
+            }
+            let acc = self.matmul_int8_staged(w, &x)?.to_dtype(DType::F32)?; // (M, N), on device
+                                                                             // Fold the dequant scale on-device: per-row weight scale (a [1, N] row broadcast over M) times
+                                                                             // the scalar activation scale. `scale_x` is folded into the row vector so it's one multiply.
+            let row: Vec<f32> = scale_w.iter().map(|&s| s * scale_x).collect();
+            let row = Tensor::from_vec(row, (1, n), acc.device())?;
+            acc.broadcast_mul(&row)?.to_dtype(DType::BF16)
+        }
+
         /// fp8 GEMM over a **pre-staged** device weight + activation (no per-call operand clone). The
         /// bench's honest fp8 compute path.
         pub fn matmul_fp8_staged(
@@ -346,8 +379,9 @@ mod cuda_impl {
         /// happen there: candle-kernels ships **no** CUDA `i32 → f32` cast (only `u32`/`i64` have full
         /// cast coverage), so an on-device `I32` tensor cannot be `to_dtype`'d. The staged
         /// [`Self::matmul_int8_staged`] keeps the accumulate on-device for the bench (which never
-        /// casts it); this convenience path is the one production would refine with an on-device
-        /// dequant-scale kernel (sc-9300 follow-up).
+        /// casts it). The **on-device** fold that avoids this host round-trip entirely — via the
+        /// f32-output IGEMM epilogue — is [`Self::matmul_int8_per_channel_staged_ondevice`] (sc-9601);
+        /// this per-tensor convenience path keeps the host fold (it is not on a hot resident path).
         pub fn matmul_int8(
             &self,
             w_i8: &Tensor,
@@ -384,10 +418,9 @@ mod cuda_impl {
         /// differs.
         ///
         /// This is the exact `X·Wᵀ` compute for a per-channel-quantized int8 weight. For a ConvRot
-        /// checkpoint the stored `W_i8` is a *rotated* weight (`R·W`), so this reconstructs
-        /// `X·(R·W)ᵀ`, not `X·Wᵀ` — the online activation rotation `x → x·R` must be applied by the
-        /// caller before this call (the sc-9300 consume path's missing leg). The compute here is
-        /// rotation-agnostic and correct either way.
+        /// checkpoint the stored `W_i8` is the *rotated* weight `W·R`, so the consume path applies the
+        /// matching online activation rotation `RHT(x)` ([`super::convrot`], sc-9601) before this call,
+        /// making `RHT(x)·(W·R)ᵀ = x·Wᵀ`. The compute here is rotation-agnostic and correct either way.
         pub fn matmul_int8_per_channel(
             &self,
             w_i8: &Tensor,
@@ -426,7 +459,10 @@ mod cuda_impl {
         /// form the ConvRot consume path uses so the `(N, K)` int8 codes live on-device as native `i8`
         /// (1 byte/elem) rather than as an 8×-larger I64 tensor. `w` is the staged weight, `scale_w` its
         /// `[N]` per-row dequant scale, `x_i8`/`scale_x` the dynamically-quantized activation. Same fold
-        /// as [`Self::matmul_int8_per_channel`], only the weight is not re-staged per call.
+        /// as [`Self::matmul_int8_per_channel`], only the weight is not re-staged per call. This is the
+        /// **exact host fold** (int32→host); the on-device fast twin
+        /// [`Self::matmul_int8_per_channel_staged_ondevice`] (sc-9601) folds on-device via the f32-output
+        /// IGEMM and is the path the ConvRot resident forward uses when the device supports it.
         pub fn matmul_int8_per_channel_staged(
             &self,
             w: &DevInt8,
@@ -459,6 +495,23 @@ mod cuda_impl {
                 .map(|(i, &v)| v as f32 * scale_w[i % n] * scale_x)
                 .collect();
             Tensor::from_vec(host_f32, (m, n), acc.device())?.to_dtype(DType::BF16)
+        }
+
+        /// Probe (once) whether this device can cast an **int32 tensor to f32 on-device** — the capability
+        /// the on-device dequant fast path (sc-9601) needs, provided by the vendored `cast_i32_f32` kernel.
+        /// Stock candle-kernels omits the I32 source casts, so on a build without the vendored fork this
+        /// returns `false` and the caller keeps the exact int32→host fold. Runs a tiny `i32 → f32`
+        /// `to_dtype` and reports success; swallows errors deliberately (a probe, not a compute).
+        pub fn supports_ondevice_int8_dequant(&self) -> bool {
+            let dev = Device::Cuda(self.device.clone());
+            let probe = || -> Result<()> {
+                let dummy = Tensor::zeros((16, 16), DType::F32, &dev)?;
+                let (a, b) = (DevInt8::stage(self, &dummy)?, DevInt8::stage(self, &dummy)?);
+                let acc = self.matmul_int8_staged(&a, &b)?; // I32 on device
+                acc.to_dtype(DType::F32)?; // the cast_i32_f32 kernel (fails if absent)
+                Ok(())
+            };
+            probe().is_ok()
         }
 
         /// Stage an fp8 weight/activation tensor (`F8E4M3`) as an owned device buffer + its shape.
@@ -626,9 +679,15 @@ mod cuda_impl {
         }
     }
 
-    /// A `(rows, cols)` int8-code operand narrowed to an owned device `i8` buffer.
+    /// A `(rows, cols)` int8-code operand as an owned device **byte** buffer. candle has no `i8` dtype,
+    /// so the int8 codes are carried as their two's-complement `u8` byte pattern (`c as i8 as u8`);
+    /// cuBLASLt reads the buffer as `CUDA_R_8I`, so byte `b` reads back as the signed code `b as i8`.
+    /// Holding `u8` (candle's native byte dtype) is what lets a **CUDA** operand stage entirely
+    /// on-device (sc-9601 perf): the per-forward activation narrow becomes a handful of candle kernels
+    /// instead of a DtoH copy + CPU round loop + HtoD copy (the dominant cost once the dequant fold
+    /// moved on-device). A CPU operand (weights loaded to host, tests) still narrows on the host.
     pub struct DevInt8 {
-        buf: cudarc::driver::CudaSlice<i8>,
+        buf: cudarc::driver::CudaSlice<u8>,
         rows: usize,
         cols: usize,
     }
@@ -636,8 +695,30 @@ mod cuda_impl {
     impl DevInt8 {
         fn stage(lt: &CublasLt, t: &Tensor) -> Result<Self> {
             let (rows, cols) = t.dims2()?;
+            if t.device().is_cuda() {
+                // On-device narrow to the int8 byte pattern (sc-9601): round to [-127, 127], wrap the
+                // negatives into [128, 255] (two's complement: `c + 256`), then cast f32→u8. The values
+                // are exact integers so the f32→u8 cast is lossless. cuBLASLt reads these bytes as i8.
+                let codes = t.to_dtype(DType::F32)?.round()?.clamp(-I8_MAX, I8_MAX)?;
+                let neg256 = codes.lt(0f32)?.to_dtype(DType::F32)?.affine(256.0, 0.0)?;
+                let u8t = codes
+                    .add(&neg256)?
+                    .to_dtype(DType::U8)?
+                    .flatten_all()?
+                    .contiguous()?;
+                let (storage, _l) = u8t.storage_and_layout();
+                let buf = match &*storage {
+                    Storage::Cuda(cs) => match &cs.slice {
+                        CudaStorageSlice::U8(s) => s.try_clone().map_err(drv_err)?,
+                        _ => candle_core::bail!("DevInt8::stage: expected U8 storage"),
+                    },
+                    _ => candle_core::bail!("DevInt8::stage: not a CUDA tensor"),
+                };
+                return Ok(Self { buf, rows, cols });
+            }
+            // CPU operand (weights staged from host, tests): narrow on the host to the same byte pattern.
             let host = t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-            let bytes: Vec<i8> = host.iter().map(|&v| v.round() as i8).collect();
+            let bytes: Vec<u8> = host.iter().map(|&v| v.round() as i8 as u8).collect();
             let buf = lt.stream.clone_htod(&bytes).map_err(drv_err)?;
             Ok(Self { buf, rows, cols })
         }

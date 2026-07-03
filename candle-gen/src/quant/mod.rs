@@ -35,6 +35,11 @@
 
 pub mod repack;
 
+// The ConvRot online rotation leg (sc-9601): the regular-Hadamard activation rotation `RHT(x) = x·R`
+// a community INT8-ConvRot checkpoint needs before the int8 IGEMM (its stored weight is `W·R`). Pure
+// candle ops — builds everywhere (CPU tests + CUDA).
+pub mod convrot;
+
 // The cuBLASLt 8-bit GEMM compute leg (sc-9299 spike, epic 9083's 8-bit pivot): fp8 E4M3 + int8
 // IGEMM matmul over cudarc's raw cublasLt sys bindings, plus the `Fp8Linear`/`Int8Linear` linear
 // layers with dynamic per-tensor activation quant. The `CublasLt` handle is cuda-only; the small
@@ -44,6 +49,7 @@ pub mod cublaslt;
 #[cfg(feature = "cuda")]
 pub mod eight_bit_linear;
 
+pub use convrot::{convrot_rotate, is_power_of_four, regular_hadamard};
 pub use repack::{
     dequant_mlx_q4_reference, dequant_mlx_q4_reference_gs, dequant_mlx_q8, dequant_mlx_q8_gs,
     f16_exact, mlx_packed_bits, mlx_packed_bits_gs, repack_mlx_q4_to_q4_1,

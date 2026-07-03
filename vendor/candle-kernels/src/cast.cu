@@ -214,6 +214,17 @@ CAST_OP(int64_t, int64_t,  cast_i64_i64 )
 CAST_OP(int64_t, float,    cast_i64_f32)
 CAST_OP(int64_t, double,   cast_i64_f64)
 
+// sc-9601: i32 source casts. Upstream candle-kernels omits them, so candle-core's `to_dtype` builds
+// `cast_i32_f32` (cuda_backend) and fails with "named symbol not found" on an int32 tensor. The
+// INT8-ConvRot int8 IGEMM accumulates in int32 (`CudaStorageSlice::I32`); `cast_i32_f32` lets its
+// per-row dequant fold stay **on-device** (`i32 → f32`, then a candle float multiply) instead of the
+// per-forward int32→host round-trip. i32→f32 is an exact hardware I2F (round-to-nearest).
+CAST_OP(int32_t, uint32_t, cast_i32_u32)
+CAST_OP(int32_t, int64_t,  cast_i32_i64 )
+CAST_OP(int32_t, int32_t,  cast_i32_i32 )
+CAST_OP(int32_t, float,    cast_i32_f32)
+CAST_OP(int32_t, double,   cast_i32_f64)
+
 CAST_OP(float, uint8_t,  cast_f32_u8 )
 CAST_OP(float, uint32_t, cast_f32_u32)
 CAST_OP(float, int64_t,  cast_f32_i64 )

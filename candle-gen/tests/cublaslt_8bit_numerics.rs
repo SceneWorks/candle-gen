@@ -167,6 +167,70 @@ fn int8_per_channel_parity_vs_f32() {
     );
 }
 
+/// sc-9601 perf: the **on-device** per-channel dequant (`matmul_int8_per_channel_staged_ondevice`,
+/// int32 IGEMM + on-device `i32 → f32` cast + candle float fold) must match the exact int32→host fold
+/// (`matmul_int8_per_channel_staged`) — same numbers, no host round-trip. Also asserts the on-device
+/// path is actually available (the vendored `cast_i32_f32` kernel is present), so the fast path is the
+/// one that runs, not a silent fallback to the host fold.
+#[test]
+fn int8_per_channel_ondevice_matches_host_fold() {
+    let dev = match Device::cuda_if_available(0) {
+        Ok(d @ Device::Cuda(_)) => d,
+        _ => {
+            eprintln!("[sc-9601] no CUDA device; skipping on-device dequant gate");
+            return;
+        }
+    };
+    let lt = CublasLt::new(&dev).unwrap();
+    assert!(
+        lt.supports_ondevice_int8_dequant(),
+        "sc-9601: this device must cast i32→f32 on-device (vendored cast_i32_f32) for the fast path"
+    );
+
+    let (m, k, n) = (48usize, 512usize, 384usize);
+    let x = Tensor::from_vec(pseudo_random(m * k, 11), (m, k), &dev).unwrap();
+    let mut wv = pseudo_random(n * k, 12);
+    for row in 0..n {
+        let mag = 1.0 + (row as f32) * 0.25;
+        for j in 0..k {
+            wv[row * k + j] *= mag;
+        }
+    }
+    let w = Tensor::from_vec(wv, (n, k), &dev).unwrap();
+
+    let qw = candle_gen::quant::quantize_weight_int8_per_channel(&w).unwrap();
+    let qx = candle_gen::quant::quantize_activation_int8(&x).unwrap();
+    let staged = lt.stage_int8(&qw.q).unwrap();
+
+    let y_host = lt
+        .matmul_int8_per_channel_staged(&staged, &qw.scale, &qx.q, qx.scale)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let y_dev = lt
+        .matmul_int8_per_channel_staged_ondevice(&staged, &qw.scale, &qx.q, qx.scale)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+
+    let err = rel_rms(&y_dev, &y_host);
+    eprintln!("[sc-9601] on-device vs host int8 fold rel-RMS = {err:.2e} (both bf16 output)");
+    // Both fold the SAME exact int32 accumulate (one on host, one via the f32-output epilogue) and cast
+    // to bf16 — they must agree to bf16 rounding (~1e-3), not merely "close".
+    assert!(
+        err < 5e-3,
+        "on-device dequant must match the host fold to bf16 rounding, got rel-RMS {err}"
+    );
+}
+
 #[test]
 fn int8_degrades_on_activation_outlier_no_rotation() {
     let dev = match Device::cuda_if_available(0) {

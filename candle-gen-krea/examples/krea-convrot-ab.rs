@@ -9,9 +9,10 @@
 //! The canonical snapshot supplies tokenizer / Qwen3-VL TE / Qwen-Image VAE for every variant; only the
 //! DiT weights differ. sm_120 (Blackwell) here — see the sc-9300 PR for the sm_89-audience caveat.
 //!
-//! **sc-9300 A/B result: the ConvRot render is NOISE** (PSNR ≈ 8 dB vs bf16). The checkpoint's stored
-//! int8 weight is *rotated* (`R·W`), so it needs the online activation rotation `x·R` this consume path
-//! does not apply (sc-9601). This harness is the honest measurement of that NO-GO, not a passing demo.
+//! **sc-9601: the ConvRot render is now COHERENT.** The checkpoint's stored int8 weight is the rotated
+//! `W·R` (regular-Hadamard, group 256); the consume path applies the matching online `RHT(x)` before the
+//! int8 IGEMM (sc-9601), so it reconstructs `X·Wᵀ` and renders on par with the Q4 tier (target PSNR ≥ ~20
+//! dB vs bf16, up from the sc-9300 NO-GO's ≈ 8 dB). This harness is the honest A/B measurement of that GO.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -126,7 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    println!("\n==== sc-9300 Krea 2 A/B ({width}x{height}, {steps} steps, seed {seed}) ====");
+    println!("\n==== sc-9601 Krea 2 A/B ({width}x{height}, {steps} steps, seed {seed}) ====");
     println!("prompt: {prompt}");
     println!("canonical bf16: load {load_bf16:?}  render {r_bf16:?}");
     println!("INT8-ConvRot:   load {load_cr:?}  render {r_cr:?}  vs-bf16 MAD {mad:.2} max {mx} PSNR {psnr:.1} dB");

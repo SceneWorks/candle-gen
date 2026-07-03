@@ -17,11 +17,22 @@ candle-kernels = { path = "vendor/candle-kernels" }
 
 ## The only change vs upstream
 
-`build.rs` adds three `-gencode` flags to the **statically-linked quant/moe kernel** build
-(`build_lib()` → `libmoe.a`), turning its single-arch SASS object into a true **multi-arch fatbin**.
-Everything else — every `.cu`/`.cuh` source, `lib.rs`, `ffi.rs`, the generated PTX consts, `Cargo.toml`
-— is byte-for-byte upstream, so candle-core links an identical Rust/symbol surface (just a fatter
-`libmoe.a`). Diff it against the upstream rev to confirm `build.rs` is the sole delta.
+There are **two** changes vs upstream:
+
+1. `build.rs` adds three `-gencode` flags to the **statically-linked quant/moe kernel** build
+   (`build_lib()` → `libmoe.a`), turning its single-arch SASS object into a true **multi-arch fatbin**
+   (the sc-7544 Blackwell fix, detailed below).
+2. `src/cast.cu` adds the **`int32_t` source casts** (`cast_i32_f32` et al., search for `sc-9601`).
+   Upstream omits I32 source casts, but candle-core's `to_dtype` still *dispatches* `cast_i32_f32` for an
+   int32 tensor (`cuda_backend`), so without the symbol an on-device `i32 → f32` cast fails with "named
+   symbol not found". The INT8-ConvRot int8 IGEMM accumulates in int32; this cast lets its per-row
+   dequant fold stay on-device instead of a per-forward int32→host round-trip. `PTX`-embedded (goes
+   through `build_ptx()`), so no `libmoe.a` change. Upstreamable (arguably an upstream gap).
+
+Everything else — every other `.cu`/`.cuh` source, `lib.rs`, `ffi.rs`, `Cargo.toml` — is byte-for-byte
+upstream, so candle-core links an otherwise-identical Rust/symbol surface (a fatter `libmoe.a` + the new
+`cast_i32_*` PTX symbols). Diff against the upstream rev to confirm `build.rs` + the `cast.cu` i32 block
+are the sole deltas.
 
 ### Why
 
@@ -45,7 +56,8 @@ match only as long as this copy is from the **same** candle rev. **When the cand
 
 1. Re-copy `candle-kernels/` from the new rev's checkout over `vendor/candle-kernels/`.
 2. Re-apply the `build.rs` `-gencode` block above (search for `sc-7544`).
-3. Re-run the CUDA gate (`pwsh scripts/check-cuda.ps1`) — `cuda_quant_smoke` must pass on Blackwell.
+3. Re-apply the `src/cast.cu` `int32_t` cast block (search for `sc-9601`) unless upstream has added it.
+4. Re-run the CUDA gate (`pwsh scripts/check-cuda.ps1`) — `cuda_quant_smoke` must pass on Blackwell.
 
 If a bump ever lands without re-vendoring, candle-core may get **stale kernels** (subtle breakage or
 link errors). If candle/cudaforge ever gains native multi-target fatbin support, drop this vendor and

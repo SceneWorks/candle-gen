@@ -2,9 +2,11 @@
 //! leg. Each holds a *statically* quantized weight (per-tensor scale, done once at construction) and
 //! quantizes the activation **dynamically** per forward (v1: amax→scale→cast in pure candle ops, a
 //! fused kernel is a later optimization). This is the layer a provider crate would swap in for an
-//! fp8 fast tier or an INT8-ConvRot checkpoint. This layer is just the GEMM; a ConvRot checkpoint's
-//! stored weight is rotated and additionally needs the online `x·R` activation rotation upstream to be
-//! correct (the sc-9300 A/B NO-GO; the online-rotation leg is sc-9601).
+//! fp8 fast tier or an INT8-ConvRot checkpoint. This layer is just the GEMM (`X·(stored W)ᵀ`); a
+//! ConvRot checkpoint's stored weight is the *rotated* `W·R`, so its consume path applies the online
+//! `RHT(x)` activation rotation ([`super::convrot`]) upstream before calling this layer (sc-9601) — the
+//! GEMM itself stays rotation-agnostic. The per-output-channel dequant fold runs **on-device** when the
+//! device's cuBLASLt supports int8→f32 output (sc-9601 perf), else it falls back to the exact host fold.
 //!
 //! Both are `#[cfg(feature = "cuda")]` — they own a `CublasLt` handle. The weight-quant / act-quant
 //! helpers they build on are pure candle ops (see [`super::cublaslt`]) and compile everywhere.
@@ -73,9 +75,10 @@ enum WeightScale {
 /// sc-9299) or **per-output-channel** ([`Self::from_per_channel_parts`], sc-9300 — the community
 /// INT8-ConvRot consume path, where the checkpoint ships int8 codes + a `[out]` row scale). The forward
 /// is a plain IGEMM + per-row dequant — the exact `X·Wᵀ` for a per-channel-quantized weight. NB a
-/// ConvRot checkpoint's stored weight is *rotated* (`R·W`), so it additionally needs the online `x·R`
-/// activation rotation applied upstream to be correct (the sc-9300 A/B NO-GO; follow-up sc-9601). This
-/// layer is rotation-agnostic — it computes `X·(stored W)ᵀ`.
+/// ConvRot checkpoint's stored weight is the *rotated* `W·R`, so the consume path applies the online
+/// `RHT(x)` activation rotation ([`super::convrot`], sc-9601) upstream before this layer — this layer is
+/// rotation-agnostic, computing `X·(stored W)ᵀ` either way. The per-channel dequant fold runs on-device
+/// (int32 IGEMM → `cast_i32_f32` → candle float fold) when the device supports it, else the host fold.
 pub struct Int8Linear {
     w_i8: Tensor, // (N, K) int codes carried in F32 — the resident weight for the non-staged path
     /// A **pre-staged** on-device `i8` weight (sc-9300): the ConvRot consume path stages the `(N, K)`
@@ -86,6 +89,10 @@ pub struct Int8Linear {
     scale_w: WeightScale,
     bias: Option<Tensor>,
     lt: Arc<CublasLt>,
+    /// Whether this device can fold the dequant **on-device** (sc-9601) — i.e. cast the int32 accumulate
+    /// `i32 → f32` via the vendored `cast_i32_f32` kernel. When set, the per-channel staged forward folds
+    /// on-device (no int32→host round-trip); otherwise it falls back to the exact host fold. Probed once.
+    ondevice_dequant: bool,
 }
 
 impl Int8Linear {
@@ -98,6 +105,7 @@ impl Int8Linear {
             scale_w: WeightScale::PerTensor(qw.scale),
             bias,
             lt,
+            ondevice_dequant: false, // per-tensor forward uses the host fold (tests)
         })
     }
 
@@ -120,6 +128,7 @@ impl Int8Linear {
             scale_w: WeightScale::PerChannel(qw.scale),
             bias,
             lt,
+            ondevice_dequant: false, // from-dense (no staged weight) uses the host fold (tests)
         })
     }
 
@@ -144,12 +153,15 @@ impl Int8Linear {
         // Pre-stage the codes to a resident native-`i8` device buffer (1 byte/elem) so the 224
         // projections of a 12B DiT don't hold their codes as 8×-larger I64 tensors on the GPU.
         let w_staged = Some(lt.stage_int8(&w_i8)?);
+        // Probe once whether the on-device int32→f32 dequant fast path is available (sc-9601).
+        let ondevice_dequant = lt.supports_ondevice_int8_dequant();
         Ok(Self {
             w_i8,
             w_staged,
             scale_w: WeightScale::PerChannel(scale_w),
             bias,
             lt,
+            ondevice_dequant,
         })
     }
 
@@ -157,6 +169,9 @@ impl Int8Linear {
         let (flat, restore) = flatten_tokens(x)?;
         let qx = quantize_activation_int8(&flat)?;
         let y = match (&self.scale_w, &self.w_staged) {
+            (WeightScale::PerChannel(s), Some(w)) if self.ondevice_dequant => self
+                .lt
+                .matmul_int8_per_channel_staged_ondevice(w, s, &qx.q, qx.scale)?,
             (WeightScale::PerChannel(s), Some(w)) => self
                 .lt
                 .matmul_int8_per_channel_staged(w, s, &qx.q, qx.scale)?,

@@ -95,11 +95,12 @@ pub fn load_components(
 /// the native-mmdit-keyed `.safetensors` file; the DiT's 28 blocks' attn+mlp load as per-output-channel
 /// int8 (cuBLASLt IGEMM on CUDA), everything else dense bf16.
 ///
-/// **A/B NO-GO (sc-9300):** this does NOT yet render coherently — the checkpoint's int8 weights are
-/// *rotated* and reconstructing `X·Wᵀ` requires the online activation rotation the story scoped out
-/// (arXiv 2512.03673 / ComfyUI ConvRot; the render is noise without it). Kept as the wired loader +
-/// int8 compute the online-rotation follow-up (sc-9601) plugs into. This entry point is not registered
-/// as a shipping generator variant.
+/// **Coherent as of sc-9601.** The checkpoint's int8 weights are the *rotated* `W·R` (regular-Hadamard,
+/// group 256); each ConvRot projection now applies the matching online `RHT(x)` activation rotation
+/// ([`candle_gen::quant::convrot`]) before the int8 IGEMM, so `RHT(x)·(W·R)ᵀ = x·Wᵀ` and the render is
+/// coherent (the sc-9300 A/B NO-GO was the missing online leg — arXiv 2512.03673 / ComfyUI ConvRot,
+/// clean-room from the paper + the checkpoint format). The per-channel dequant fold runs on-device
+/// (sc-9601 perf). Worker wiring as a shipping generator variant stays deferred (sc-9092 pattern).
 ///
 /// **sm_89 floor (locked decision 7 / sc-9300).** The int8 IGEMM tier is only offered on compute
 /// capability ≥ 8.9 (RTX 40-series and up). On CUDA, this errors up front if the device is below the

@@ -45,44 +45,66 @@ pub enum QLinear {
     /// weight **dequantizes-on-forward** into a dense matmul (sc-7702, *not* the int8 `QMatMul` fast
     /// path).
     Packed(shared::QLinear),
-    /// A community **INT8-ConvRot** projection (sc-9300): the checkpoint ships `(N, K)` int8 codes with
-    /// a rotation folded into the stored weight + a `[N]` per-output-row `weight_scale`. On CUDA the
-    /// forward is a cuBLASLt IGEMM + per-row dequant ([`candle_gen::quant::Int8Linear`]); off-CUDA
-    /// (CPU tests / Metal) it dequantizes the weight to a dense matmul.
+    /// A community **INT8-ConvRot** projection (sc-9300 loader + sc-9601 online rotation): the checkpoint
+    /// ships `(N, K)` int8 codes for the **rotated** weight `RHT(W) = W·R` + a `[N]` per-output-row
+    /// `weight_scale`, where `R` is the regular-Hadamard transform applied block-diagonally in groups of
+    /// `group_size` (256) along `K`. The forward applies the matching **online activation rotation**
+    /// `RHT(x) = x·R` ([`candle_gen::quant::convrot_rotate`]) *before* the int8 GEMM, so
+    /// `RHT(x)·RHT(W)ᵀ = x·Wᵀ` (`R` orthogonal). On CUDA that GEMM is a cuBLASLt IGEMM + per-row dequant
+    /// ([`candle_gen::quant::Int8Linear`]); off-CUDA (CPU tests / Metal) it dequantizes the stored rotated
+    /// weight to a dense matmul.
     ///
-    /// **A/B finding (sc-9300): this alone does NOT reconstruct `X·Wᵀ`.** The stored int8 weight is a
-    /// *rotated* weight `R·W` (verified: dequantized `blocks.0.attn.wq` has cosine ≈ 0.07 with the
-    /// canonical `to_q`), so the matching **online activation rotation** `x → x·R` must run before the
-    /// IGEMM for `x·(R·W)ᵀ = x·Wᵀ` to hold. Without it the render is pure noise (the A/B render, PSNR
-    /// ≈ 8 dB vs bf16). That online rotation is the arXiv 2512.03673 / ComfyUI ConvRot leg the story
-    /// scoped out (GPL-3, clean-room reimplementation) — the follow-up sc-9601. This arm is the correct
-    /// *loader + per-channel int8 compute*; the missing rotation is what makes the consume path coherent.
+    /// **The rotation is the sc-9300 → sc-9601 fix.** Without `RHT(x)` the GEMM reconstructs
+    /// `x·(W·R)ᵀ` — noise (dequantized `blocks.0.attn.wq` has cosine ≈ 0.07 with the canonical `to_q`;
+    /// the A/B render was PSNR ≈ 8 dB vs bf16). With it the render is coherent (verified cosine 0.99991
+    /// vs the f32 reference linear). See [`candle_gen::quant::convrot`] for the recovered transform.
     ConvRotInt8(ConvRotInt8),
 }
 
-/// The stored parts of an INT8-ConvRot projection (sc-9300): the `(N, K)` int8 codes (on the CPU as
-/// `I64`, staged to a resident device `i8` inside `Int8Linear`), the `[N]` per-output-row dequant
-/// scale, and the optional dense bias (ConvRot Krea projections are bias-free, but the field keeps the
-/// type general). On CUDA a per-channel `Int8Linear` is built lazily on first forward and cached; the
-/// CPU fallback dequantizes `w[o, :] = q[o, :] · scale[o]`. The stored weight is rotated, so neither
-/// path reconstructs `X·Wᵀ` without the online `x·R` leg (the sc-9300 A/B NO-GO).
+/// The stored parts of an INT8-ConvRot projection (sc-9300 loader + sc-9601 rotation): the `(N, K)` int8
+/// codes of the **rotated** weight `W·R` (on the CPU as `I64`, staged to a resident device `i8` inside
+/// `Int8Linear`), the `[N]` per-output-row dequant scale, the ConvRot `group_size` (the regular-Hadamard
+/// order, 256), and the optional dense bias (ConvRot Krea projections are bias-free, but the field keeps
+/// the type general). On CUDA a per-channel `Int8Linear` is built lazily on first forward and cached; the
+/// CPU fallback dequantizes the rotated `w[o, :] = q[o, :] · scale[o]`. Both paths first apply the online
+/// activation rotation `RHT(x)` (built once, cached in `rot`) so the GEMM reconstructs `x·Wᵀ`.
 pub struct ConvRotInt8 {
     w_i8: Tensor,
     scale: Vec<f32>,
+    /// The regular-Hadamard order `R` was folded into the stored weight at (`convrot_groupsize`, 256).
+    group_size: usize,
     bias: Option<Tensor>,
+    /// The `[group_size, group_size]` rotation `R = H/√group_size`, built lazily on the activation's
+    /// device on first forward and cached (tiny — 256² f32 — but shouldn't rebuild per projection/step).
+    rot: std::sync::OnceLock<Tensor>,
     #[cfg(feature = "cuda")]
     lt: std::sync::OnceLock<std::sync::Arc<candle_gen::quant::Int8Linear>>,
 }
 
 impl ConvRotInt8 {
-    /// The dense `(N, K)` f32 weight the int8 codes + per-row scale represent (`w[o,:] = q[o,:]·s[o]`).
+    /// The dense `(N, K)` f32 *rotated* weight the int8 codes + per-row scale represent
+    /// (`w[o,:] = q[o,:]·s[o]` = `RHT(W)[o,:]`). Paired with the online `RHT(x)` this yields `x·Wᵀ`.
     fn dequant_dense(&self) -> Result<Tensor> {
         let n = self.w_i8.dims2()?.0;
         let scale_col = Tensor::from_vec(self.scale.clone(), (n, 1), self.w_i8.device())?;
         self.w_i8.to_dtype(DType::F32)?.broadcast_mul(&scale_col)
     }
 
+    /// The cached regular-Hadamard rotation `R` on `x`'s device (built once).
+    fn rotation(&self, x: &Tensor) -> Result<&Tensor> {
+        if let Some(r) = self.rot.get() {
+            return Ok(r);
+        }
+        let r = candle_gen::quant::regular_hadamard(self.group_size, x.device())?;
+        Ok(self.rot.get_or_init(|| r))
+    }
+
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // Online ConvRot leg (sc-9601): rotate the activation by the same regular Hadamard folded into
+        // the stored weight, so `RHT(x)·RHT(W)ᵀ = x·Wᵀ`. Runs on both the CUDA and CPU paths.
+        let r = self.rotation(x)?.clone();
+        let xr = candle_gen::quant::convrot_rotate(x, &r)?;
+
         #[cfg(feature = "cuda")]
         if x.device().is_cuda() {
             let lin = self.lt.get_or_init(|| {
@@ -99,7 +121,7 @@ impl ConvRotInt8 {
                     .expect("build Int8Linear from convrot parts"),
                 )
             });
-            return lin.forward(x);
+            return lin.forward(&xr);
         }
         // CPU / non-CUDA fallback: dequant-to-dense matmul (sc-7702-style; keeps activations full-precision).
         let in_dtype = x.dtype();
@@ -108,7 +130,7 @@ impl ConvRotInt8 {
             Some(b) => Some(b.to_dtype(in_dtype)?),
             None => None,
         };
-        Linear::new(w, bias).forward(x)
+        Linear::new(w, bias).forward(&xr.to_dtype(in_dtype)?)
     }
 }
 
@@ -135,23 +157,36 @@ impl QLinear {
         )?))
     }
 
-    /// Build an **INT8-ConvRot** projection (sc-9300) straight from the checkpoint's stored parts: the
-    /// `(N, K)` int8 codes `w_i8` (any dtype; narrowed at the int8 stage), the `[N]` per-output-row
-    /// `weight_scale`, and the optional dense `bias`. No re-quantization. **The stored weight is
-    /// rotated** (`R·W`); reconstructing `X·Wᵀ` needs the online `x·R` leg, which this arm does NOT
-    /// apply (the sc-9300 A/B NO-GO — see [`Self::ConvRotInt8`]).
-    pub fn convrot_int8(w_i8: Tensor, scale: Vec<f32>, bias: Option<Tensor>) -> Result<Self> {
-        let n = w_i8.dims2()?.0;
+    /// Build an **INT8-ConvRot** projection (sc-9300 loader + sc-9601 rotation) straight from the
+    /// checkpoint's stored parts: the `(N, K)` int8 codes `w_i8` of the **rotated** weight `W·R` (any
+    /// dtype; narrowed at the int8 stage), the `[N]` per-output-row `weight_scale`, the ConvRot
+    /// `group_size` (the regular-Hadamard order the export folded into the weight — `convrot_groupsize`,
+    /// 256), and the optional dense `bias`. No re-quantization. `group_size` must be a power of four and
+    /// divide `K`; the forward applies the online `RHT(x)` so `RHT(x)·(W·R)ᵀ = x·Wᵀ`.
+    pub fn convrot_int8(
+        w_i8: Tensor,
+        scale: Vec<f32>,
+        group_size: usize,
+        bias: Option<Tensor>,
+    ) -> Result<Self> {
+        let (n, k) = w_i8.dims2()?;
         if scale.len() != n {
             return Err(candle_gen::candle_core::Error::Msg(format!(
                 "krea convrot: weight_scale len {} != weight rows {n}",
                 scale.len()
             )));
         }
+        if !candle_gen::quant::is_power_of_four(group_size) || k % group_size != 0 {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea convrot: group_size {group_size} must be a power of four dividing K ({k})"
+            )));
+        }
         Ok(Self::ConvRotInt8(ConvRotInt8 {
             w_i8,
             scale,
+            group_size,
             bias,
+            rot: std::sync::OnceLock::new(),
             #[cfg(feature = "cuda")]
             lt: std::sync::OnceLock::new(),
         }))

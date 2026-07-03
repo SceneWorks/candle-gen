@@ -213,6 +213,17 @@ impl Weights {
         }
     }
 
+    /// Read the ConvRot `convrot_groupsize` (the regular-Hadamard order `R` was folded at) from a
+    /// projection's native `{native_base}.comfy_quant` descriptor — a small U8 JSON blob
+    /// (`{"format":"int8_tensorwise","convrot":true,"convrot_groupsize":256}`) the ComfyUI export writes
+    /// alongside each quantized weight (sc-9601). `None` when the blob is absent or lacks the field (an
+    /// older/plain int8 export); the caller then falls back to the checkpoint default (256).
+    fn get_convrot_groupsize(&self, native_base: &str) -> Option<usize> {
+        let view = self.st.get(&format!("{native_base}.comfy_quant")).ok()?;
+        let j: serde_json::Value = serde_json::from_slice(view.data()).ok()?;
+        j.get("convrot_groupsize")?.as_u64().map(|g| g as usize)
+    }
+
     /// All tensor keys in the component (for architecture validation). For a ConvRot checkpoint these
     /// are the **native** keys as stored; [`crate::convert::validate_transformer`] uses the ConvRot arm
     /// (diffusers-key resolve) rather than diffing these directly.
@@ -294,12 +305,13 @@ impl Weights {
 // a present native key, 224 of them to a quantized (`.weight_scale` sibling) projection, with no native
 // key left uncovered (the format-spike remap, verified — see the sc-9300 PR).
 //
-// **A/B NO-GO (sc-9300):** the remap + per-channel int8 loader are correct and CPU-tested, but the
-// checkpoint does NOT render coherently. Its stored int8 weight is *rotated* (`R·W`; dequantized
-// `blocks.0.attn.wq` has cosine ≈ 0.07 with the canonical `to_q`), so reconstructing `X·Wᵀ` needs the
-// matching **online activation rotation** `x·R` — the arXiv 2512.03673 / ComfyUI ConvRot leg the story
-// scoped out. Without it the render is pure noise (PSNR ≈ 8 dB vs bf16). The online-rotation leg is the
-// follow-up sc-9601 that makes this consume path viable.
+// **Coherent as of sc-9601.** The remap + per-channel int8 loader (sc-9300) are correct but not enough:
+// the stored int8 weight is the *rotated* `W·R` (dequantized `blocks.0.attn.wq` has cosine ≈ 0.07 with
+// the canonical `to_q`), so reconstructing `X·Wᵀ` needs the matching **online activation rotation**
+// `RHT(x)` — the regular-Hadamard (group 256) leg from arXiv 2512.03673 (clean-room from the paper +
+// the `comfy_quant` descriptor). The ConvRot projection now applies it before the int8 IGEMM
+// ([`crate::quant::ConvRotInt8`]), lifting the render from the sc-9300 NO-GO's noise (PSNR ≈ 8 dB) to
+// coherent (verified cosine 0.99991 vs the f32 reference linear).
 
 /// Translate a **diffusers** tensor key to the **native-mmdit** key the INT8-ConvRot checkpoint stores.
 /// Returns `None` for a key with no native counterpart (a caller then errors on the missing tensor,
@@ -460,11 +472,12 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
     if w.overlay_has(&weight_key) {
         return Ok(QLinear::dense(linear(w, base, bias)?));
     }
-    // (1.5) INT8-ConvRot (sc-9300): a ConvRot checkpoint whose native `{base}.weight_scale` sibling is
-    // present → build a per-output-channel int8 projection straight from the stored int8 codes + row
-    // scale. Detect on the *native* base derived from the diffusers `{base}.weight` remap. NB the stored
-    // codes are a *rotated* weight R·W; this arm does the correct int8 X·(R·W)ᵀ but reconstructing X·Wᵀ
-    // needs the online x·R leg that is NOT applied here (the sc-9300 A/B NO-GO; follow-up sc-9601).
+    // (1.5) INT8-ConvRot (sc-9300 loader + sc-9601 rotation): a ConvRot checkpoint whose native
+    // `{base}.weight_scale` sibling is present → build a per-output-channel int8 projection from the
+    // stored int8 codes + row scale + the `convrot_groupsize` in the `comfy_quant` descriptor. Detect on
+    // the *native* base derived from the diffusers `{base}.weight` remap. The stored codes are the
+    // *rotated* weight `W·R`; the projection's forward applies the matching online `RHT(x)` so the GEMM
+    // reconstructs `X·Wᵀ` (the sc-9601 fix that makes this consume path render coherently).
     if w.is_convrot() {
         if let Some(native_weight) = convrot_diffusers_to_native(&weight_key) {
             if let Some(native_base) = native_weight.strip_suffix(".weight") {
@@ -475,12 +488,15 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
                         .get_native_f32(&scale_key)?
                         .flatten_all()?
                         .to_vec1::<f32>()?;
+                    // The regular-Hadamard order the export rotated at (default 256 per the arXiv
+                    // 2512.03673 ConvRot default / this checkpoint) when the descriptor is absent.
+                    let group_size = w.get_convrot_groupsize(native_base).unwrap_or(256);
                     let dense_bias = if bias {
                         Some(w.get(&format!("{base}.bias"))?)
                     } else {
                         None
                     };
-                    return QLinear::convrot_int8(w_i8, scale, dense_bias);
+                    return QLinear::convrot_int8(w_i8, scale, group_size, dense_bias);
                 }
             }
         }
@@ -918,9 +934,16 @@ mod tests {
         assert!(convrot_diffusers_to_native("nonsense.key").is_none());
     }
 
-    /// Build a tiny **native-mmdit-keyed** ConvRot component: one single-stream block's attn `wq` as a
-    /// per-output-channel int8 projection (int8 codes + `weight_scale` + a `comfy_quant` blob to ignore),
-    /// plus a dense bf16 `prenorm.scale`. Returns the reference dense f32 weight the int8 codes represent.
+    /// The ConvRot regular-Hadamard order the fixtures rotate at (`64 = 4³`; the real checkpoint uses
+    /// 256, but 64 keeps the tiny `in_dim = 128` fixtures at 2 groups).
+    const CONVROT_G: usize = 64;
+
+    /// Build a tiny **native-mmdit-keyed** ConvRot component the way the real ComfyUI export does: one
+    /// single-stream block's attn `wq` as an int8 projection of the **rotated** weight `W·R` (int8 codes
+    /// of `RHT(W)` + per-row `weight_scale` + a real `comfy_quant` JSON carrying `convrot_groupsize`),
+    /// plus a dense bf16 `prenorm.scale`. Returns the **canonical un-rotated** `W` (f32) — the parity
+    /// reference the online-rotation forward must reconstruct (`RHT(x)·RHT(W)ᵀ = x·Wᵀ`). `in_dim` must be
+    /// a multiple of [`CONVROT_G`].
     fn convrot_int8_weight(out_dim: usize, in_dim: usize) -> (HashMap<String, Tensor>, Tensor) {
         let dev = Device::Cpu;
         // A ragged f32 weight (rows of different magnitude) → distinct per-row scales.
@@ -932,29 +955,31 @@ mod tests {
             }
         }
         let w = Tensor::from_vec(wv, (out_dim, in_dim), &dev).unwrap();
-        // Per-output-row int8 quant (the checkpoint's stored granularity).
-        let pc = candle_gen::quant::quantize_weight_int8_per_channel(&w).unwrap();
-        // The dense f32 weight the stored codes represent (the parity reference).
+        // Rotate the weight block-diagonally by the regular Hadamard (what the export stores): W·R.
+        let r = candle_gen::quant::regular_hadamard(CONVROT_G, &dev).unwrap();
+        let rw = candle_gen::quant::convrot_rotate(&w, &r).unwrap();
+        // Per-output-row int8 quant of the *rotated* weight (the checkpoint's stored granularity).
+        let pc = candle_gen::quant::quantize_weight_int8_per_channel(&rw).unwrap();
         let scale_col = Tensor::from_vec(pc.scale.clone(), (out_dim, 1), &dev).unwrap();
-        let ref_w =
-            pc.q.to_dtype(DType::F32)
-                .unwrap()
-                .broadcast_mul(&scale_col)
-                .unwrap();
-        // On disk: I8 codes, F32 [out,1] weight_scale, U8 comfy_quant descriptor (ignored).
+        // On disk: I8 codes of W·R, F32 [out,1] weight_scale, U8 comfy_quant JSON descriptor.
         let codes_i8 = pc.q.to_dtype(DType::I64).unwrap(); // safetensors save has no I8; I64 codes round-trip identically at the int8 stage
+        let cq = format!(
+            "{{\"format\": \"int8_tensorwise\", \"convrot\": true, \"convrot_groupsize\": {CONVROT_G}}}"
+        );
+        let cq_bytes = cq.into_bytes();
+        let cq_len = cq_bytes.len();
         let mut map = HashMap::new();
         map.insert("blocks.0.attn.wq.weight".into(), codes_i8);
-        map.insert("blocks.0.attn.wq.weight_scale".into(), scale_col.clone());
+        map.insert("blocks.0.attn.wq.weight_scale".into(), scale_col);
         map.insert(
             "blocks.0.attn.wq.comfy_quant".into(),
-            Tensor::from_vec(vec![0u8; 72], (72,), &dev).unwrap(),
+            Tensor::from_vec(cq_bytes, (cq_len,), &dev).unwrap(),
         );
         map.insert(
             "blocks.0.prenorm.scale".into(),
             Tensor::randn(0f32, 1f32, (out_dim,), &dev).unwrap(),
         );
-        (map, ref_w)
+        (map, w) // the canonical un-rotated weight is the parity reference
     }
 
     fn write_single_file(path: &Path, tensors: HashMap<String, Tensor>) {
@@ -962,19 +987,20 @@ mod tests {
         safetensors::save(&tensors, path).unwrap();
     }
 
-    /// **ConvRot detect fires on the native int8 layout via the diffusers→native remap (sc-9300).**
-    /// `linear_detect(w, "transformer_blocks.0.attn.to_q", …)` on a ConvRot checkpoint must resolve to
-    /// the native `blocks.0.attn.wq`, see its `weight_scale` sibling, and build an int8-ConvRot
-    /// projection whose forward reproduces the dense f32 weight the codes represent (dequant-dense on
-    /// CPU). The `comfy_quant` blob is ignored; there is no `.bias`.
+    /// **ConvRot detect fires on the native int8 layout and the online rotation reconstructs the
+    /// canonical weight (sc-9300 loader + sc-9601 rotation).** `linear_detect(w, "…attn.to_q", …)` on a
+    /// ConvRot checkpoint must resolve to the native `blocks.0.attn.wq`, see its `weight_scale` sibling,
+    /// read `convrot_groupsize` from the `comfy_quant` blob, and build an int8-ConvRot projection whose
+    /// forward applies the online `RHT(x)` so it reproduces `X·Wᵀ` for the **canonical un-rotated** `W`
+    /// (not the stored `W·R`). There is no `.bias`.
     #[test]
-    fn convrot_detect_fires_and_reproduces_dense_weight() -> Result<()> {
+    fn convrot_detect_fires_and_reconstructs_canonical_weight() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (64usize, 128usize);
         let (map, ref_w) = convrot_int8_weight(out_dim, in_dim);
 
         let path = std::env::temp_dir()
-            .join(format!("sc9300_convrot_{}", std::process::id()))
+            .join(format!("sc9601_convrot_{}", std::process::id()))
             .join("krea2_int8_convrot.safetensors");
         write_single_file(&path, map);
 
@@ -988,12 +1014,16 @@ mod tests {
             "a ConvRot int8 projection with a weight_scale sibling ⇒ int8 arm, not a dense fallback"
         );
 
-        // The int8 forward reproduces X·(ref_w)ᵀ within the int8 activation-quant budget.
+        // The online-rotation forward reconstructs X·Wᵀ for the CANONICAL weight within the int8 budget.
+        // Without the rotation this would be ~0.1 (the sc-9300 NO-GO); the sc-9601 leg lifts it to ~1.
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let got = lin.forward(&x)?.to_dtype(DType::F32)?;
         let want = Linear::new(ref_w, None).forward(&x)?;
         let cos = cosine(&got, &want);
-        assert!(cos > 0.99, "convrot int8 vs dense-ref cosine {cos:.5}");
+        assert!(
+            cos > 0.99,
+            "convrot online-rotation vs canonical cosine {cos:.5}"
+        );
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
         Ok(())
