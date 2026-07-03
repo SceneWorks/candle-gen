@@ -3,7 +3,7 @@
 //! [`crate::config::EXTRACTED_LAYERS`] (`0,3,…,33,35`) are **interleaved** into the
 //! `13·4096 = 53248`-wide features the DiT's `llm_cond_proj` consumes.
 //!
-//! Adapted from `candle-gen-flux2`'s `Qwen3TextEncoder` (same Qwen3 assembly: GQA 32q/8kv, bias-less
+//! Adapted from `candle-gen-flux2`'s `Flux2PromptEncoder` (same Qwen3 assembly: GQA 32q/8kv, bias-less
 //! q/k/v/o, per-head q/k RMSNorm, HF half-split RoPE, SwiGLU, pre-norm residual blocks, no final
 //! norm). Ideogram differs in exactly three ways:
 //!   * **θ = 5e6** (klein's Qwen3 is 1e6),
