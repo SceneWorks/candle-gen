@@ -100,7 +100,33 @@ pub fn expected_transformer_keys(cfg: &Krea2Config) -> Vec<String> {
 
 /// Validate a loaded transformer against `cfg`: exact key coverage (no missing, no extra) and the
 /// shapes of the dimension-bearing entry points.
+///
+/// **INT8-ConvRot (sc-9300):** a ConvRot checkpoint is native-mmdit-keyed, so the exact diffusers
+/// key-set diff would spuriously report every key missing + every native key extra. Instead validate
+/// that each expected diffusers key **resolves** to a present native tensor (via the loader's
+/// diffusers→native remap, which `w.contains` applies), then run the same shape checks (which also
+/// resolve). This proves the ConvRot file covers the full `Krea2Transformer2DModel` surface without
+/// asserting a 1:1 native key match.
 pub fn validate_transformer(w: &Weights, cfg: &Krea2Config) -> Result<()> {
+    if w.is_convrot() {
+        let missing: Vec<String> = expected_transformer_keys(cfg)
+            .into_iter()
+            .filter(|k| !w.contains(k))
+            .collect();
+        if !missing.is_empty() {
+            let head = missing
+                .iter()
+                .take(8)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea INT8-ConvRot: {} expected key(s) do not resolve to a native tensor [{head}]",
+                missing.len(),
+            )));
+        }
+        return validate_shapes(w, cfg);
+    }
     let expected: BTreeSet<String> = expected_transformer_keys(cfg).into_iter().collect();
     // A pre-quantized snapshot replaces each Linear `{base}.weight` with the packed triple
     // `{base}.weight` + `{base}.scales` + `{base}.biases`; drop the two quant-only artifacts before
@@ -130,7 +156,13 @@ pub fn validate_transformer(w: &Weights, cfg: &Krea2Config) -> Result<()> {
         )));
     }
 
-    // Shape checks on the dimension-bearing tensors (Linear weight = [out, in]).
+    validate_shapes(w, cfg)
+}
+
+/// Shape checks on the dimension-bearing entry points (Linear weight = `[out, in]`). Shared by the
+/// dense/packed path and the INT8-ConvRot path (`check_shape` resolves the diffusers key to the native
+/// key and skips a quantized weight whose on-disk shape differs — packed u32 codes or int8 codes).
+fn validate_shapes(w: &Weights, cfg: &Krea2Config) -> Result<()> {
     let h = cfg.hidden_size;
     check_shape(w, "img_in.weight", &[h, cfg.in_channels])?;
     check_shape(w, "final_layer.linear.weight", &[cfg.in_channels, h])?;
@@ -191,6 +223,20 @@ fn check_shape(w: &Weights, key: &str, expected: &[usize]) -> Result<()> {
     if let Some(base) = key.strip_suffix(".weight") {
         if w.contains(&format!("{base}.scales")) {
             return Ok(());
+        }
+    }
+    // ConvRot's per-block `scale_shift_table` is stored 1-D (`mod.lin` `[6·h]`) rather than `[6, h]`;
+    // the DiT reshapes it identically row-major, so the flat form is correct. `w.shape` resolves to
+    // the native key, so compare against the flattened `[6·h]` under ConvRot.
+    if w.is_convrot() && key.ends_with(".scale_shift_table") {
+        if let Some(shape) = w.shape(key) {
+            let flat: usize = expected.iter().product();
+            if shape == expected || shape == [flat] {
+                return Ok(());
+            }
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea INT8-ConvRot: {key} shape {shape:?}, expected {expected:?} or [{flat}]"
+            )));
         }
     }
     match w.shape(key) {

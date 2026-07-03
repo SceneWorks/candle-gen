@@ -10,7 +10,7 @@
 
 use super::cublaslt::{
     quantize_activation_fp8, quantize_activation_int8, quantize_weight_fp8, quantize_weight_int8,
-    CublasLt,
+    quantize_weight_int8_per_channel, CublasLt,
 };
 use candle_core::{Device, Result, Tensor};
 use std::sync::Arc;
@@ -56,21 +56,37 @@ impl Fp8Linear {
     }
 }
 
+/// The weight dequant granularity of an [`Int8Linear`] — the sc-9300 extension from a single
+/// per-tensor scalar to a `[out]` per-output-channel vector. Both fold `scale_w · scale_x` onto the
+/// exact int32 accumulate; per-channel simply carries one scale per output row (the granularity the
+/// community INT8-ConvRot checkpoints store, `{base}.weight_scale` `[out, 1]`).
+enum WeightScale {
+    /// One scale for the whole weight (sc-9299): `dequant = q · scale`.
+    PerTensor(f32),
+    /// One scale per output row (sc-9300): `dequant[o, :] = q[o, :] · scale[o]`.
+    PerChannel(Vec<f32>),
+}
+
 /// An int8 IGEMM linear: exact int32 accumulate, dequant scale folded on the candle side. Same
-/// dynamic-activation-quant contract as [`Fp8Linear`].
+/// dynamic-activation-quant contract as [`Fp8Linear`]. The weight scale is per-tensor ([`Self::new`],
+/// sc-9299) or **per-output-channel** ([`Self::from_per_channel_parts`], sc-9300 — the community
+/// INT8-ConvRot consume path, where the checkpoint already ships int8 codes + a `[out]` row scale and
+/// the ConvRot rotation is folded into those codes offline, so the forward is plain IGEMM + per-row
+/// dequant with no online activation transform).
 pub struct Int8Linear {
     w_i8: Tensor, // (N, K) int codes carried in F32
-    scale_w: f32,
+    scale_w: WeightScale,
     bias: Option<Tensor>,
     lt: Arc<CublasLt>,
 }
 
 impl Int8Linear {
+    /// Per-tensor int8 (sc-9299): quantize a dense `(N, K)` weight once and bind a cuBLASLt handle.
     pub fn new(weight: &Tensor, bias: Option<Tensor>, lt: Arc<CublasLt>) -> Result<Self> {
         let qw = quantize_weight_int8(weight)?;
         Ok(Self {
             w_i8: qw.q,
-            scale_w: qw.scale,
+            scale_w: WeightScale::PerTensor(qw.scale),
             bias,
             lt,
         })
@@ -80,12 +96,57 @@ impl Int8Linear {
         Self::new(weight, bias, Arc::new(CublasLt::new(dev)?))
     }
 
+    /// **Per-output-channel int8 from a dense weight** (sc-9300) — quantize `(N, K)` to int8 with a
+    /// per-row scale. The from-dense twin of [`Self::from_per_channel_parts`] (used by numerics tests
+    /// and any dense→int8 fold); a real ConvRot checkpoint uses the parts constructor instead.
+    pub fn new_per_channel(
+        weight: &Tensor,
+        bias: Option<Tensor>,
+        lt: Arc<CublasLt>,
+    ) -> Result<Self> {
+        let qw = quantize_weight_int8_per_channel(weight)?;
+        Ok(Self {
+            w_i8: qw.q,
+            scale_w: WeightScale::PerChannel(qw.scale),
+            bias,
+            lt,
+        })
+    }
+
+    /// **Per-output-channel int8 straight from the on-disk parts** (sc-9300, the ConvRot consume path):
+    /// `w_i8` is the checkpoint's `(N, K)` int8 codes (carried in any dtype the caller narrows at the
+    /// stage), `scale_w` its `[N]` per-output-row `weight_scale`. No re-quantization — the stored codes
+    /// (rotation already folded) and their row scales are used as-is.
+    pub fn from_per_channel_parts(
+        w_i8: Tensor,
+        scale_w: Vec<f32>,
+        bias: Option<Tensor>,
+        lt: Arc<CublasLt>,
+    ) -> Result<Self> {
+        let n = w_i8.dims2()?.0;
+        if scale_w.len() != n {
+            candle_core::bail!(
+                "Int8Linear::from_per_channel_parts: scale_w len {} != weight rows {n}",
+                scale_w.len()
+            );
+        }
+        Ok(Self {
+            w_i8,
+            scale_w: WeightScale::PerChannel(scale_w),
+            bias,
+            lt,
+        })
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (flat, restore) = flatten_tokens(x)?;
         let qx = quantize_activation_int8(&flat)?;
-        let y = self
-            .lt
-            .matmul_int8(&self.w_i8, self.scale_w, &qx.q, qx.scale)?;
+        let y = match &self.scale_w {
+            WeightScale::PerTensor(s) => self.lt.matmul_int8(&self.w_i8, *s, &qx.q, qx.scale)?,
+            WeightScale::PerChannel(s) => self
+                .lt
+                .matmul_int8_per_channel(&self.w_i8, s, &qx.q, qx.scale)?,
+        };
         let y = restore(y)?;
         match &self.bias {
             Some(b) => y.broadcast_add(&b.to_dtype(y.dtype())?),

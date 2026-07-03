@@ -89,6 +89,73 @@ pub fn load_components(
     })
 }
 
+/// Load Turbo components with the DiT taken from a **single-file INT8-ConvRot checkpoint** (sc-9300)
+/// instead of the snapshot's `transformer/` dir. The tokenizer / Qwen3-VL TE / Qwen-Image VAE still come
+/// from the canonical `root` snapshot (the ConvRot artifact quantizes only the DiT). `convrot_dit` is
+/// the native-mmdit-keyed `.safetensors` file; the DiT's 28 blocks' attn+mlp load as per-output-channel
+/// int8 (cuBLASLt IGEMM on CUDA), everything else dense bf16.
+///
+/// **sm_89 floor (locked decision 7 / sc-9300).** The int8 IGEMM tier is only offered on compute
+/// capability ≥ 8.9 (RTX 40-series and up). On CUDA, this errors up front if the device is below the
+/// floor rather than rendering on a card the marketing contract excludes; on non-CUDA it is a no-op
+/// (the CPU dequant-dense fallback is for tests, not a shipping path).
+pub fn load_components_convrot(
+    root: &Path,
+    convrot_dit: &Path,
+    device: &Device,
+) -> Result<Components> {
+    ensure_int8_floor(device)?;
+
+    let tok = crate::tokenizer::KreaTokenizer::from_snapshot(root, device)?;
+
+    let te_cfg = KreaTeConfig::from_snapshot(root)?;
+    let te_w = Weights::from_dir(&root.join("text_encoder"), device, TE_DTYPE)?;
+    let te = KreaTextEncoder::load(&te_w, "language_model", &te_cfg, MAX_TEXT_TOKENS)?;
+
+    let cfg = Krea2Config::from_snapshot(root)?;
+    let dit_w = Weights::from_convrot_file(convrot_dit, device, DIT_DTYPE)?;
+    crate::convert::validate_transformer(&dit_w, &cfg)?;
+    let dit = Krea2Transformer::load(&dit_w, &cfg)?;
+
+    let vae = load_vae(root, device)?;
+
+    Ok(Components {
+        tok,
+        te,
+        dit,
+        vae: Arc::new(vae),
+    })
+}
+
+/// Enforce the INT8-ConvRot sm_89 compute-capability floor (locked decision 7). Reuses the sc-9299
+/// cuBLASLt compute-cap probe (`meets_fp8_floor` ⇔ capability ≥ 8.9). A non-CUDA device is allowed (the
+/// CPU dequant path is test-only). On CUDA below the floor this errors with the marketing contract.
+#[cfg(feature = "cuda")]
+fn ensure_int8_floor(device: &Device) -> Result<()> {
+    if device.is_cuda() {
+        let lt = candle_gen::quant::CublasLt::new(device)
+            .map_err(|e| CandleError::Msg(format!("krea convrot: cublasLt probe: {e}")))?;
+        if !lt
+            .meets_fp8_floor()
+            .map_err(|e| CandleError::Msg(format!("krea convrot: compute-cap probe: {e}")))?
+        {
+            let cap = lt.compute_cap().unwrap_or((0, 0));
+            return Err(CandleError::Msg(format!(
+                "krea INT8-ConvRot requires compute capability >= 8.9 (RTX 40-series+); this device is \
+                 sm_{}{} — the ConvRot variant is not offered on older cards",
+                cap.0, cap.1
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Non-CUDA build: the int8 floor is vacuous (the CPU dequant-dense fallback is test-only).
+#[cfg(not(feature = "cuda"))]
+fn ensure_int8_floor(_device: &Device) -> Result<()> {
+    Ok(())
+}
+
 /// Render the **Turbo** (CFG-free, few-step rectified-flow Euler) text-to-image path for `req`.
 pub fn render(
     comps: &Components,

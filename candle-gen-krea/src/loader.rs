@@ -49,6 +49,10 @@ pub struct Weights {
     /// The component's `quantization` manifest, `Some` for a packed q4/q8 tier (carries the group size
     /// the packed shapes can't disambiguate), `None` for a dense bf16 tier.
     packed: Option<PackedConfig>,
+    /// True for a community **INT8-ConvRot** checkpoint (sc-9300): the file is native-mmdit-keyed, so
+    /// every diffusers-key lookup is translated to its native counterpart ([`convrot_diffusers_to_native`])
+    /// at read time, and quantized projections carry a `{native_base}.weight_scale` + int8 `.weight`.
+    convrot: bool,
 }
 
 impl Weights {
@@ -65,6 +69,7 @@ impl Weights {
             dtype,
             overlay: HashMap::new(),
             packed: read_packed_config(dir)?,
+            convrot: false,
         })
     }
 
@@ -79,16 +84,54 @@ impl Weights {
             dtype,
             overlay: HashMap::new(),
             packed: None,
+            convrot: false,
         })
     }
 
+    /// mmap a **single-file INT8-ConvRot checkpoint** (sc-9300) — the ComfyUI-exported, native-mmdit-keyed
+    /// `krea2_turbo_int8_convrot.safetensors`. `convrot` is set, so every diffusers-key lookup is
+    /// translated to the native key ([`convrot_diffusers_to_native`]) at read time and quantized
+    /// projections are int8 (per-output-row `.weight_scale`). Dense bf16 tensors (`first`/`last`/`tmlp`
+    /// /`tproj`/`txtfusion`/`txtmlp` + norms) load unchanged through the remap.
+    pub fn from_convrot_file(path: &Path, device: &Device, dtype: DType) -> Result<Self> {
+        // SAFETY: read-only mmap of a weight file; the standard candle loading path.
+        let st = unsafe { MmapedSafetensors::new(path)? };
+        Ok(Self {
+            st,
+            device: device.clone(),
+            dtype,
+            overlay: HashMap::new(),
+            packed: None,
+            convrot: true,
+        })
+    }
+
+    /// Whether this is an INT8-ConvRot checkpoint (native-mmdit-keyed, sc-9300).
+    pub fn is_convrot(&self) -> bool {
+        self.convrot
+    }
+
+    /// Resolve a **diffusers** key to the actual on-disk key: the native-mmdit key for a ConvRot
+    /// checkpoint (sc-9300), else the key unchanged. A ConvRot key with no native counterpart resolves
+    /// to itself, so the subsequent mmap load errors on the genuinely-missing tensor (as it would for a
+    /// truncated dense download) rather than silently succeeding.
+    fn resolve(&self, name: &str) -> String {
+        if self.convrot {
+            convrot_diffusers_to_native(name).unwrap_or_else(|| name.to_string())
+        } else {
+            name.to_string()
+        }
+    }
+
     /// Load `name` at the component dtype — from the [`overlay`](Weights::set_overlay) if present
-    /// (adapter-merged weight), else the mmap.
+    /// (adapter-merged weight), else the mmap (native-key-resolved for a ConvRot checkpoint).
     pub fn get(&self, name: &str) -> Result<Tensor> {
         if let Some(t) = self.overlay.get(name) {
             return t.to_device(&self.device)?.to_dtype(self.dtype);
         }
-        self.st.load(name, &self.device)?.to_dtype(self.dtype)
+        self.st
+            .load(&self.resolve(name), &self.device)?
+            .to_dtype(self.dtype)
     }
 
     /// Load `name` preserving its on-disk dtype (e.g. int `input_ids` in a parity fixture). The overlay
@@ -98,19 +141,22 @@ impl Weights {
     }
 
     /// Load `name` at its **native** stored dtype (no cast) on the component device — used for the
-    /// packed triple's u32 codes (casting would reinterpret the bit-packed nibbles). The overlay only
-    /// holds merged dense DiT weights (never u32 codes), so this stays the mmap path.
+    /// packed triple's u32 codes (casting would reinterpret the bit-packed nibbles) and the ConvRot
+    /// int8 `.weight` codes. The overlay only holds merged dense DiT weights, so this stays the mmap
+    /// path (native-key-resolved for a ConvRot checkpoint).
     pub fn get_native(&self, name: &str) -> Result<Tensor> {
-        self.st.load(name, &self.device)
+        self.st.load(&self.resolve(name), &self.device)
     }
 
     /// Load `name` forcing f32 (the `+1` norm weights and other precision-sensitive scalars) — from the
-    /// overlay if present, else the mmap.
+    /// overlay if present, else the mmap (native-key-resolved for a ConvRot checkpoint).
     pub fn get_f32(&self, name: &str) -> Result<Tensor> {
         if let Some(t) = self.overlay.get(name) {
             return t.to_device(&self.device)?.to_dtype(DType::F32);
         }
-        self.st.load(name, &self.device)?.to_dtype(DType::F32)
+        self.st
+            .load(&self.resolve(name), &self.device)?
+            .to_dtype(DType::F32)
     }
 
     /// Load `name` onto the **CPU** at its on-disk dtype. Used by the inference-side adapter merge
@@ -127,18 +173,58 @@ impl Weights {
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.overlay.contains_key(name) || self.st.get(name).is_ok()
+        self.overlay.contains_key(name) || self.st.get(&self.resolve(name)).is_ok()
     }
 
-    /// All tensor keys in the component (for architecture validation).
+    /// Whether a **raw** (already-native) key is present on-disk, bypassing the ConvRot diffusers→native
+    /// remap — used to detect a ConvRot int8 projection's `{native_base}.weight_scale` sibling (sc-9300),
+    /// which is a native-only key with no diffusers counterpart in the remap.
+    fn contains_native(&self, name: &str) -> bool {
+        self.st.get(name).is_ok()
+    }
+
+    /// Load a **raw** (already-native) key forcing f32, bypassing the diffusers→native remap — the
+    /// ConvRot per-output-row `weight_scale` (sc-9300).
+    fn get_native_f32(&self, name: &str) -> Result<Tensor> {
+        self.st.load(name, &self.device)?.to_dtype(DType::F32)
+    }
+
+    /// Load an INT8-ConvRot weight's int8 codes as an `I64` `[out, in]` tensor (sc-9300). `diffusers_key`
+    /// is the diffusers `{base}.weight`, resolved to its native key. candle's `DType` at our pin has **no
+    /// I8 variant** (only U8/U32/I16/I32/I64), so `st.load` can't decode an `I8` tensor — this reads the
+    /// raw `TensorView` bytes and reinterprets them as signed `i8 → i64` codes (the dtype the int8 stage
+    /// narrows back down). A test fixture may store the codes as `I64` directly (safetensors save has no
+    /// I8); that path loads through `st.load` unchanged.
+    fn get_int8_codes(&self, diffusers_key: &str) -> Result<Tensor> {
+        let native = self.resolve(diffusers_key);
+        let view = self.st.get(&native)?;
+        match view.dtype() {
+            // Real ComfyUI export: raw I8 bytes reinterpreted as signed codes (candle can't decode I8).
+            ::safetensors::Dtype::I8 => {
+                let shape = view.shape().to_vec();
+                let codes: Vec<i64> = view.data().iter().map(|&b| b as i8 as i64).collect();
+                Tensor::from_vec(codes, shape, &self.device)
+            }
+            // Test / any-int fixture: load whatever integer dtype it is, then widen to I64.
+            _ => self.st.load(&native, &self.device)?.to_dtype(DType::I64),
+        }
+    }
+
+    /// All tensor keys in the component (for architecture validation). For a ConvRot checkpoint these
+    /// are the **native** keys as stored; [`crate::convert::validate_transformer`] uses the ConvRot arm
+    /// (diffusers-key resolve) rather than diffing these directly.
     pub fn keys(&self) -> Vec<String> {
         self.st.tensors().into_iter().map(|(k, _)| k).collect()
     }
 
-    /// On-disk shape of `name` (for architecture validation), or `None` if absent. The overlay never
-    /// changes a weight's shape, so the mmap is authoritative.
+    /// On-disk shape of `name` (for architecture validation), or `None` if absent (native-key-resolved
+    /// for a ConvRot checkpoint). The overlay never changes a weight's shape, so the mmap is
+    /// authoritative.
     pub fn shape(&self, name: &str) -> Option<Vec<usize>> {
-        self.st.get(name).ok().map(|v| v.shape().to_vec())
+        self.st
+            .get(&self.resolve(name))
+            .ok()
+            .map(|v| v.shape().to_vec())
     }
 
     pub fn device(&self) -> &Device {
@@ -186,6 +272,95 @@ impl Weights {
         }
         self.get_cpu(weight_key)
     }
+}
+
+// ===================================================================================================
+// INT8-ConvRot native-key remap (sc-9300)
+// ===================================================================================================
+//
+// The community INT8-ConvRot checkpoint (`krea2_turbo_int8_convrot.safetensors`, a ComfyUI export) is
+// **native-mmdit-keyed**, not diffusers-keyed like the published `krea/Krea-2-Turbo` this crate's DiT
+// loads. The DiT `load()` / `validate_transformer` read diffusers keys (`transformer_blocks.N.attn.to_q`,
+// `norm_q`, `ff.gate`, `norm1`, `time_mod_proj`, `img_in`, `final_layer.*`, `text_fusion.*.ff.*`); the
+// ConvRot file stores the *reference* names (`blocks.N.attn.wq`, `qknorm.qnorm`, `mlp.gate`, `prenorm`,
+// `tproj`, `first`, `last`, `tmlp`, `txtfusion.*.mlp.*`, `txtmlp`). So a ConvRot `Weights` translates
+// every diffusers-key lookup to its native counterpart at read time — the DiT stays byte-for-byte the
+// diffusers-key module tree, and only this remap + the int8 detect arm are ConvRot-aware.
+//
+// The map was validated exhaustively against the real 878-tensor header: all 430 diffusers keys map to
+// a present native key, 224 of them to a quantized (`.weight_scale` sibling) projection, with no native
+// key left uncovered (the format-spike remap, verified — see the sc-9300 PR).
+
+/// Translate a **diffusers** tensor key to the **native-mmdit** key the INT8-ConvRot checkpoint stores.
+/// Returns `None` for a key with no native counterpart (a caller then errors on the missing tensor,
+/// exactly as it would for a truncated dense download). Shapes line up 1:1 under this map — the only
+/// reshapes (`time_mod_proj`/`scale_shift_table` flatten identically row-major) are done by the DiT.
+pub fn convrot_diffusers_to_native(key: &str) -> Option<String> {
+    // Top-level (non-block) tensors.
+    let top = match key {
+        "img_in.weight" => Some("first.weight"),
+        "img_in.bias" => Some("first.bias"),
+        "txt_in.norm.weight" => Some("txtmlp.0.scale"),
+        "txt_in.linear_1.weight" => Some("txtmlp.1.weight"),
+        "txt_in.linear_1.bias" => Some("txtmlp.1.bias"),
+        "txt_in.linear_2.weight" => Some("txtmlp.3.weight"),
+        "txt_in.linear_2.bias" => Some("txtmlp.3.bias"),
+        "time_embed.linear_1.weight" => Some("tmlp.0.weight"),
+        "time_embed.linear_1.bias" => Some("tmlp.0.bias"),
+        "time_embed.linear_2.weight" => Some("tmlp.2.weight"),
+        "time_embed.linear_2.bias" => Some("tmlp.2.bias"),
+        "time_mod_proj.weight" => Some("tproj.1.weight"),
+        "time_mod_proj.bias" => Some("tproj.1.bias"),
+        "text_fusion.projector.weight" => Some("txtfusion.projector.weight"),
+        "final_layer.linear.weight" => Some("last.linear.weight"),
+        "final_layer.linear.bias" => Some("last.linear.bias"),
+        "final_layer.norm.weight" => Some("last.norm.scale"),
+        "final_layer.scale_shift_table" => Some("last.modulation.lin"),
+        _ => None,
+    };
+    if let Some(t) = top {
+        return Some(t.to_string());
+    }
+    // Per-block leaf remap (shared by single-stream `transformer_blocks` and the two text-fusion stacks).
+    let leaf = |rest: &str| -> Option<&'static str> {
+        Some(match rest {
+            "attn.norm_q.weight" => "attn.qknorm.qnorm.scale",
+            "attn.norm_k.weight" => "attn.qknorm.knorm.scale",
+            "attn.to_q.weight" => "attn.wq.weight",
+            "attn.to_k.weight" => "attn.wk.weight",
+            "attn.to_v.weight" => "attn.wv.weight",
+            "attn.to_out.0.weight" => "attn.wo.weight",
+            "attn.to_gate.weight" => "attn.gate.weight",
+            "ff.gate.weight" => "mlp.gate.weight",
+            "ff.up.weight" => "mlp.up.weight",
+            "ff.down.weight" => "mlp.down.weight",
+            "norm1.weight" => "prenorm.scale",
+            "norm2.weight" => "postnorm.scale",
+            "scale_shift_table" => "mod.lin",
+            _ => return None,
+        })
+    };
+    // `transformer_blocks.N.<leaf>` → `blocks.N.<native-leaf>`.
+    if let Some(rest) = key.strip_prefix("transformer_blocks.") {
+        if let Some((idx, tail)) = rest.split_once('.') {
+            if idx.chars().all(|c| c.is_ascii_digit()) {
+                return leaf(tail).map(|nl| format!("blocks.{idx}.{nl}"));
+            }
+        }
+    }
+    // `text_fusion.{layerwise,refiner}_blocks.N.<leaf>` → `txtfusion.{...}.N.<native-leaf>`.
+    if let Some(rest) = key.strip_prefix("text_fusion.") {
+        for kind in ["layerwise_blocks.", "refiner_blocks."] {
+            if let Some(after) = rest.strip_prefix(kind) {
+                if let Some((idx, tail)) = after.split_once('.') {
+                    if idx.chars().all(|c| c.is_ascii_digit()) {
+                        return leaf(tail).map(|nl| format!("txtfusion.{}{idx}.{nl}", kind));
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Read `{dir}/config.json`'s `quantization` block: `Ok(Some(cfg))` for a packed tier, `Ok(None)` for
@@ -274,6 +449,30 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
     // (1) An adapter-merged dense weight in the overlay wins — load it dense (adapter compose).
     if w.overlay_has(&weight_key) {
         return Ok(QLinear::dense(linear(w, base, bias)?));
+    }
+    // (1.5) INT8-ConvRot (sc-9300): a ConvRot checkpoint whose native `{base}.weight_scale` sibling is
+    // present → build a per-output-channel int8 projection straight from the stored int8 codes + row
+    // scale. The rotation is folded into the codes offline (no online Hadamard). Detect on the *native*
+    // base derived from the diffusers `{base}.weight` remap.
+    if w.is_convrot() {
+        if let Some(native_weight) = convrot_diffusers_to_native(&weight_key) {
+            if let Some(native_base) = native_weight.strip_suffix(".weight") {
+                let scale_key = format!("{native_base}.weight_scale");
+                if w.contains_native(&scale_key) {
+                    let w_i8 = w.get_int8_codes(&weight_key)?; // raw I8 → I64 codes
+                    let scale = w
+                        .get_native_f32(&scale_key)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    let dense_bias = if bias {
+                        Some(w.get(&format!("{base}.bias"))?)
+                    } else {
+                        None
+                    };
+                    return QLinear::convrot_int8(w_i8, scale, dense_bias);
+                }
+            }
+        }
     }
     // (2) A packed tier with a `.scales` sibling → build straight from the packed parts.
     if let (Some(cfg), true) = (w.packed(), w.contains(&scales_key)) {
@@ -643,5 +842,208 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── INT8-ConvRot (sc-9300) ──────────────────────────────────────────────────────────────────
+
+    /// A byte-exact slice of the diffusers→native remap (sc-9300), pinned so a future edit to the map
+    /// can't silently drift a key. Covers the top-level renames, the single-stream block leaves, and
+    /// both text-fusion stacks — the traps (`to_out.0 → wo`, `norm1 → prenorm`, `ff.gate → mlp.gate`,
+    /// `scale_shift_table → mod.lin`, `time_mod_proj → tproj.1`).
+    #[test]
+    fn convrot_remap_pins_the_key_map() {
+        let cases = [
+            ("img_in.weight", "first.weight"),
+            ("time_mod_proj.weight", "tproj.1.weight"),
+            ("time_embed.linear_1.weight", "tmlp.0.weight"),
+            ("txt_in.norm.weight", "txtmlp.0.scale"),
+            ("txt_in.linear_2.bias", "txtmlp.3.bias"),
+            ("final_layer.linear.weight", "last.linear.weight"),
+            ("final_layer.scale_shift_table", "last.modulation.lin"),
+            (
+                "transformer_blocks.7.attn.to_q.weight",
+                "blocks.7.attn.wq.weight",
+            ),
+            (
+                "transformer_blocks.7.attn.to_out.0.weight",
+                "blocks.7.attn.wo.weight",
+            ),
+            (
+                "transformer_blocks.7.attn.to_gate.weight",
+                "blocks.7.attn.gate.weight",
+            ),
+            (
+                "transformer_blocks.7.attn.norm_q.weight",
+                "blocks.7.attn.qknorm.qnorm.scale",
+            ),
+            (
+                "transformer_blocks.7.ff.gate.weight",
+                "blocks.7.mlp.gate.weight",
+            ),
+            (
+                "transformer_blocks.7.norm1.weight",
+                "blocks.7.prenorm.scale",
+            ),
+            ("transformer_blocks.7.scale_shift_table", "blocks.7.mod.lin"),
+            (
+                "text_fusion.layerwise_blocks.1.attn.to_v.weight",
+                "txtfusion.layerwise_blocks.1.attn.wv.weight",
+            ),
+            (
+                "text_fusion.refiner_blocks.0.ff.down.weight",
+                "txtfusion.refiner_blocks.0.mlp.down.weight",
+            ),
+            ("text_fusion.projector.weight", "txtfusion.projector.weight"),
+        ];
+        for (d, n) in cases {
+            assert_eq!(
+                convrot_diffusers_to_native(d).as_deref(),
+                Some(n),
+                "remap {d} → {n}"
+            );
+        }
+        // A key with no native counterpart returns None (the caller then errors on the missing tensor).
+        assert!(convrot_diffusers_to_native("transformer_blocks.0.attn.to_q.bias").is_none());
+        assert!(convrot_diffusers_to_native("nonsense.key").is_none());
+    }
+
+    /// Build a tiny **native-mmdit-keyed** ConvRot component: one single-stream block's attn `wq` as a
+    /// per-output-channel int8 projection (int8 codes + `weight_scale` + a `comfy_quant` blob to ignore),
+    /// plus a dense bf16 `prenorm.scale`. Returns the reference dense f32 weight the int8 codes represent.
+    fn convrot_int8_weight(out_dim: usize, in_dim: usize) -> (HashMap<String, Tensor>, Tensor) {
+        let dev = Device::Cpu;
+        // A ragged f32 weight (rows of different magnitude) → distinct per-row scales.
+        let mut wv = vec![0f32; out_dim * in_dim];
+        for o in 0..out_dim {
+            let mag = 1.0 + o as f32 * 0.3;
+            for j in 0..in_dim {
+                wv[o * in_dim + j] = (((o * 7 + j * 3) % 51) as f32 / 25.0 - 1.0) * mag;
+            }
+        }
+        let w = Tensor::from_vec(wv, (out_dim, in_dim), &dev).unwrap();
+        // Per-output-row int8 quant (the checkpoint's stored granularity).
+        let pc = candle_gen::quant::quantize_weight_int8_per_channel(&w).unwrap();
+        // The dense f32 weight the stored codes represent (the parity reference).
+        let scale_col = Tensor::from_vec(pc.scale.clone(), (out_dim, 1), &dev).unwrap();
+        let ref_w =
+            pc.q.to_dtype(DType::F32)
+                .unwrap()
+                .broadcast_mul(&scale_col)
+                .unwrap();
+        // On disk: I8 codes, F32 [out,1] weight_scale, U8 comfy_quant descriptor (ignored).
+        let codes_i8 = pc.q.to_dtype(DType::I64).unwrap(); // safetensors save has no I8; I64 codes round-trip identically at the int8 stage
+        let mut map = HashMap::new();
+        map.insert("blocks.0.attn.wq.weight".into(), codes_i8);
+        map.insert("blocks.0.attn.wq.weight_scale".into(), scale_col.clone());
+        map.insert(
+            "blocks.0.attn.wq.comfy_quant".into(),
+            Tensor::from_vec(vec![0u8; 72], (72,), &dev).unwrap(),
+        );
+        map.insert(
+            "blocks.0.prenorm.scale".into(),
+            Tensor::randn(0f32, 1f32, (out_dim,), &dev).unwrap(),
+        );
+        (map, ref_w)
+    }
+
+    fn write_single_file(path: &Path, tensors: HashMap<String, Tensor>) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        safetensors::save(&tensors, path).unwrap();
+    }
+
+    /// **ConvRot detect fires on the native int8 layout via the diffusers→native remap (sc-9300).**
+    /// `linear_detect(w, "transformer_blocks.0.attn.to_q", …)` on a ConvRot checkpoint must resolve to
+    /// the native `blocks.0.attn.wq`, see its `weight_scale` sibling, and build an int8-ConvRot
+    /// projection whose forward reproduces the dense f32 weight the codes represent (dequant-dense on
+    /// CPU). The `comfy_quant` blob is ignored; there is no `.bias`.
+    #[test]
+    fn convrot_detect_fires_and_reproduces_dense_weight() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (64usize, 128usize);
+        let (map, ref_w) = convrot_int8_weight(out_dim, in_dim);
+
+        let path = std::env::temp_dir()
+            .join(format!("sc9300_convrot_{}", std::process::id()))
+            .join("krea2_int8_convrot.safetensors");
+        write_single_file(&path, map);
+
+        let w = Weights::from_convrot_file(&path, &dev, DType::F32)?;
+        assert!(w.is_convrot(), "from_convrot_file ⇒ convrot mode");
+
+        // Detect via the diffusers key — must resolve to native + fire the int8 arm.
+        let lin = linear_detect(&w, "transformer_blocks.0.attn.to_q", false)?;
+        assert!(
+            lin.is_convrot_int8(),
+            "a ConvRot int8 projection with a weight_scale sibling ⇒ int8 arm, not a dense fallback"
+        );
+
+        // The int8 forward reproduces X·(ref_w)ᵀ within the int8 activation-quant budget.
+        let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+        let got = lin.forward(&x)?.to_dtype(DType::F32)?;
+        let want = Linear::new(ref_w, None).forward(&x)?;
+        let cos = cosine(&got, &want);
+        assert!(cos > 0.99, "convrot int8 vs dense-ref cosine {cos:.5}");
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        Ok(())
+    }
+
+    /// A **dense bf16 tensor** in a ConvRot checkpoint (no `weight_scale` sibling) still loads dense —
+    /// only the quantized surface goes int8. `prenorm.scale` (→ `norm1.weight` in diffusers) resolves
+    /// and loads as a plain tensor; a dense projection detects to `Dense`.
+    #[test]
+    fn convrot_dense_tensors_load_through_remap() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (64usize, 128usize);
+        let (mut map, _ref) = convrot_int8_weight(out_dim, in_dim);
+        // Add a dense (non-quantized) native projection: no weight_scale sibling.
+        map.insert(
+            "blocks.0.attn.wk.weight".into(),
+            Tensor::randn(0f32, 1f32, (32, in_dim), &dev)?,
+        );
+        let path = std::env::temp_dir()
+            .join(format!("sc9300_convrot_dense_{}", std::process::id()))
+            .join("m.safetensors");
+        write_single_file(&path, map);
+        let w = Weights::from_convrot_file(&path, &dev, DType::F32)?;
+
+        // The dense native norm resolves through the diffusers key `norm1.weight` → `prenorm.scale`.
+        let normw = w.get("transformer_blocks.0.norm1.weight")?;
+        assert_eq!(normw.dims(), &[out_dim]);
+
+        // A projection with no weight_scale sibling stays Dense (to_k → wk, no scale).
+        let dense = linear_detect(&w, "transformer_blocks.0.attn.to_k", false)?;
+        assert!(
+            !dense.is_convrot_int8() && !dense.is_packed(),
+            "a native projection with no weight_scale sibling stays dense"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+        Ok(())
+    }
+
+    /// A non-ConvRot (dense/packed) `Weights` never remaps and never fires the int8 arm — the ConvRot
+    /// path is fully gated on the `convrot` flag, so the existing dense/packed tiers are unchanged.
+    #[test]
+    fn non_convrot_weights_never_remap_or_int8() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        // A diffusers-keyed dense weight (as a normal tier would store it).
+        map.insert(
+            "transformer_blocks.0.attn.to_q.weight".into(),
+            Tensor::randn(0f32, 1f32, (64, 128), &dev)?,
+        );
+        let dir = std::env::temp_dir().join(format!("sc9300_plain_{}", std::process::id()));
+        write_component(&dir, map, false);
+        let w = Weights::from_dir(&dir, &dev, DType::F32)?;
+        assert!(!w.is_convrot());
+        // `resolve` is the identity here: the diffusers key loads directly, no native translation.
+        assert!(w.contains("transformer_blocks.0.attn.to_q.weight"));
+        let lin = linear_detect(&w, "transformer_blocks.0.attn.to_q", false)?;
+        assert!(
+            !lin.is_convrot_int8() && !lin.is_packed(),
+            "plain tier stays dense"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        Ok(())
     }
 }

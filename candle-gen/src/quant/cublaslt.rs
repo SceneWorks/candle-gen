@@ -97,6 +97,42 @@ pub fn quantize_weight_int8(w: &Tensor) -> Result<QuantizedActivation> {
     quantize_activation_int8(w)
 }
 
+/// Result of a **per-output-channel** int8 weight quantization: the int8 codes (`F32`) plus a `[out]`
+/// scale vector such that `dequant[o, :] = q[o, :] * scale[o]`. This is the granularity a community
+/// INT8-ConvRot checkpoint stores (`{base}.weight_scale`, `[out, 1]` f32), and the strict superset of
+/// the per-tensor path (a per-tensor scale is a per-channel vector with one distinct value).
+pub struct PerChannelInt8Weight {
+    /// `(N, K)` int8 codes carried in `F32` (rounded, clamped to `[-127, 127]`).
+    pub q: Tensor,
+    /// `[N]` (per-output-row) dequant scale, `absmax_row / 127`.
+    pub scale: Vec<f32>,
+}
+
+/// Dynamic **per-output-channel** int8 weight quant — `scale[o] = absmax(row o) / 127`,
+/// `q[o, :] = round(w[o, :] / scale[o])` clamped to `[-127, 127]`. The candle-side dequant fold in
+/// [`CublasLt::matmul_int8_per_channel`] applies this `[out]` vector to the int32 accumulator.
+///
+/// This is the load-time twin of a ConvRot checkpoint's stored per-row weight scale; a loader that
+/// already has the on-disk `{base}.weight_scale` and int8 `{base}.weight` skips this and builds the
+/// [`PerChannelInt8Weight`] directly from the parts (no re-quantization). Present so an int8 tier can
+/// be produced from a dense weight for tests / a from-dense fold.
+pub fn quantize_weight_int8_per_channel(w: &Tensor) -> Result<PerChannelInt8Weight> {
+    let (n, _k) = w.dims2()?;
+    let absmax = w.abs()?.max(1)?.to_dtype(DType::F32)?; // [N]
+    let absmax_v = absmax.to_vec1::<f32>()?;
+    let scale: Vec<f32> = absmax_v
+        .iter()
+        .map(|&a| (a / I8_MAX).max(f32::MIN_POSITIVE))
+        .collect();
+    let scale_col = Tensor::from_vec(scale.clone(), (n, 1), w.device())?;
+    let q = w
+        .to_dtype(DType::F32)?
+        .broadcast_div(&scale_col)?
+        .round()?
+        .clamp(-I8_MAX, I8_MAX)?;
+    Ok(PerChannelInt8Weight { q, scale })
+}
+
 #[cfg(feature = "cuda")]
 mod cuda_impl {
     use super::*;
@@ -335,6 +371,49 @@ mod cuda_impl {
             };
             let s = scale_w * scale_x;
             let host_f32: Vec<f32> = host_i32.iter().map(|&v| v as f32 * s).collect();
+            Tensor::from_vec(host_f32, (m, n), acc.device())?.to_dtype(DType::BF16)
+        }
+
+        /// Full int8 linear with a **per-output-channel** weight scale — the community INT8-ConvRot
+        /// dequant (sc-9300): `D[m, o] = (scale_w[o] · scale_x) · (X_i8 · W_i8ᵀ)[m, o]` → bf16. The
+        /// `[N]` `scale_w` is the checkpoint's stored per-row `{base}.weight_scale`; `scale_x` is the
+        /// dynamic per-tensor activation scale. A strict superset of [`Self::matmul_int8`] (pass an
+        /// all-equal `scale_w` to recover the per-tensor fold). Like [`Self::matmul_int8`] the int32
+        /// accumulate is read back to host for the fold + bf16 cast (candle-kernels ships no CUDA
+        /// `i32 → f32` cast), so the exact accumulate is preserved and only the scale application
+        /// differs; the ConvRot rotation is *already folded into `W_i8` offline* (sc-9300 format spike),
+        /// so there is no online activation transform here — plain IGEMM + per-row dequant.
+        pub fn matmul_int8_per_channel(
+            &self,
+            w_i8: &Tensor,
+            scale_w: &[f32],
+            x_i8: &Tensor,
+            scale_x: f32,
+        ) -> Result<Tensor> {
+            let a = DevInt8::stage(self, w_i8)?;
+            let b = DevInt8::stage(self, x_i8)?;
+            let (m, n) = (b.rows, a.rows);
+            if scale_w.len() != n {
+                candle_core::bail!(
+                    "matmul_int8_per_channel: scale_w len {} != N (out) {n}",
+                    scale_w.len()
+                );
+            }
+            let acc = self.matmul_int8_staged(&a, &b)?;
+            let (storage, _l) = acc.storage_and_layout();
+            let host_i32: Vec<i32> = match &*storage {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::I32(s) => self.stream.clone_dtoh(s).map_err(drv_err)?,
+                    _ => candle_core::bail!("matmul_int8_per_channel: expected I32 accumulate"),
+                },
+                _ => candle_core::bail!("matmul_int8_per_channel: accumulate not on CUDA"),
+            };
+            // Row-major `(M, N)`: element `(row, col)` dequants by `scale_w[col] · scale_x`.
+            let host_f32: Vec<f32> = host_i32
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| v as f32 * scale_w[i % n] * scale_x)
+                .collect();
             Tensor::from_vec(host_f32, (m, n), acc.device())?.to_dtype(DType::BF16)
         }
 

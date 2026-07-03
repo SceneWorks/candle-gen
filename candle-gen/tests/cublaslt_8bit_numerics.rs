@@ -107,6 +107,67 @@ fn wellconditioned_parity_vs_f32() {
 }
 
 #[test]
+fn int8_per_channel_parity_vs_f32() {
+    let dev = match Device::cuda_if_available(0) {
+        Ok(d @ Device::Cuda(_)) => d,
+        _ => {
+            eprintln!("[sc-9300] no CUDA device; skipping per-channel numerics gate");
+            return;
+        }
+    };
+    let lt = CublasLt::new(&dev).unwrap();
+
+    // A weight whose output rows span very different magnitudes — the case per-channel exists for.
+    let (m, k, n) = (32usize, 256usize, 256usize);
+    let x = Tensor::from_vec(pseudo_random(m * k, 5), (m, k), &dev).unwrap();
+    let mut wv = pseudo_random(n * k, 6);
+    for row in 0..n {
+        let mag = 1.0 + (row as f32) * 0.5; // rows 1x .. ~128x
+        for j in 0..k {
+            wv[row * k + j] *= mag;
+        }
+    }
+    let w = Tensor::from_vec(wv, (n, k), &dev).unwrap();
+    let reference = f32_reference(&x, &w);
+
+    // Per-channel int8 weight quant (the ConvRot granularity), on-device IGEMM + per-row dequant.
+    let qw = candle_gen::quant::quantize_weight_int8_per_channel(&w).unwrap();
+    let qx = candle_gen::quant::quantize_activation_int8(&x).unwrap();
+    let y_pc = lt
+        .matmul_int8_per_channel(&qw.q, &qw.scale, &qx.q, qx.scale)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let err_pc = rel_rms(&y_pc, &reference);
+
+    // Per-TENSOR int8 on the SAME ragged weight — the scalar scale is dominated by the largest row,
+    // so the small-magnitude rows lose precision and the matmul error is materially worse.
+    let qw_pt = candle_gen::quant::quantize_weight_int8(&w).unwrap();
+    let y_pt = lt
+        .matmul_int8(&qw_pt.q, qw_pt.scale, &qx.q, qx.scale)
+        .unwrap()
+        .to_dtype(DType::F32)
+        .unwrap()
+        .flatten_all()
+        .unwrap()
+        .to_vec1::<f32>()
+        .unwrap();
+    let err_pt = rel_rms(&y_pt, &reference);
+
+    eprintln!("[sc-9300] int8 X·Wᵀ rel-RMS vs f32: per-channel={err_pc:.4} per-tensor={err_pt:.4}");
+    // Per-channel lands well under 10% on the ragged weight (per-tensor does not).
+    assert!(err_pc < 0.10, "per-channel int8 rel-RMS too high: {err_pc}");
+    assert!(
+        err_pc < err_pt,
+        "per-channel ({err_pc}) must beat per-tensor ({err_pt}) on a magnitude-ragged weight"
+    );
+}
+
+#[test]
 fn int8_degrades_on_activation_outlier_no_rotation() {
     let dev = match Device::cuda_if_available(0) {
         Ok(d @ Device::Cuda(_)) => d,

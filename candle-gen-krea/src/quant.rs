@@ -30,20 +30,78 @@
 //! untargeted projections, while an adapted projection resolves to its correct merged dense weight —
 //! there is no packed `quantize_onto` to no-op here (that is the VarBuilder crates' seam).
 
-use candle_gen::candle_core::{Result, Tensor};
+use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module};
 use candle_gen::quant as shared;
 
 /// A Linear projection that is **dense** (the loaded bf16 weight, possibly adapter-merged via the
-/// overlay) or **packed** (loaded straight from the MLX-packed tier via the shared
-/// [`candle_gen::quant::QLinear`], sc-9411). Built dense ([`Self::dense`]) or packed ([`Self::packed`]);
-/// both forwards compute `x·Wᵀ + b`.
+/// overlay), **packed** (loaded straight from the MLX-packed tier via the shared
+/// [`candle_gen::quant::QLinear`], sc-9411), or **int8-ConvRot** (a community INT8-ConvRot checkpoint's
+/// per-output-channel int8 projection, sc-9300). Built dense ([`Self::dense`]), packed
+/// ([`Self::packed`]), or int8 ([`Self::convrot_int8`]); every forward computes `x·Wᵀ + b`.
 pub enum QLinear {
     Dense(Linear),
     /// Loaded directly from the MLX-packed tier through the shared module — the resident `Q4_1`/`Q8_0`
     /// weight **dequantizes-on-forward** into a dense matmul (sc-7702, *not* the int8 `QMatMul` fast
     /// path).
     Packed(shared::QLinear),
+    /// A community **INT8-ConvRot** projection (sc-9300): the checkpoint ships `(N, K)` int8 codes with
+    /// the ConvRot rotation folded in offline + a `[N]` per-output-row `weight_scale`. On CUDA the
+    /// forward is a cuBLASLt IGEMM + per-row dequant ([`candle_gen::quant::Int8Linear`]); off-CUDA
+    /// (CPU tests / Metal) it dequantizes the weight to a dense matmul — numerically the same
+    /// `X·Wᵀ` up to the int8 activation-quant the CUDA path also applies. No online Hadamard: the
+    /// rotation is baked into the stored codes (the sc-9300 format spike found zero rotation tensors).
+    ConvRotInt8(ConvRotInt8),
+}
+
+/// The stored parts of an INT8-ConvRot projection (sc-9300): the `(N, K)` int8 codes (carried in `F32`
+/// for portability), the `[N]` per-output-row dequant scale, and the optional dense bias (ConvRot Krea
+/// projections are bias-free, but the field keeps the type general). On CUDA a `Int8Linear` is built
+/// lazily on first forward and cached; the CPU fallback dequantizes `w[o, :] = q[o, :] · scale[o]`.
+pub struct ConvRotInt8 {
+    w_i8: Tensor,
+    scale: Vec<f32>,
+    bias: Option<Tensor>,
+    #[cfg(feature = "cuda")]
+    lt: std::sync::OnceLock<std::sync::Arc<candle_gen::quant::Int8Linear>>,
+}
+
+impl ConvRotInt8 {
+    /// The dense `(N, K)` f32 weight the int8 codes + per-row scale represent (`w[o,:] = q[o,:]·s[o]`).
+    fn dequant_dense(&self) -> Result<Tensor> {
+        let n = self.w_i8.dims2()?.0;
+        let scale_col = Tensor::from_vec(self.scale.clone(), (n, 1), self.w_i8.device())?;
+        self.w_i8.to_dtype(DType::F32)?.broadcast_mul(&scale_col)
+    }
+
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if x.device().is_cuda() {
+            let lin = self.lt.get_or_init(|| {
+                std::sync::Arc::new(
+                    candle_gen::quant::Int8Linear::from_per_channel_parts(
+                        self.w_i8.clone(),
+                        self.scale.clone(),
+                        self.bias.clone(),
+                        std::sync::Arc::new(
+                            candle_gen::quant::CublasLt::new(x.device())
+                                .expect("cublasLt handle for int8 convrot"),
+                        ),
+                    )
+                    .expect("build Int8Linear from convrot parts"),
+                )
+            });
+            return lin.forward(x);
+        }
+        // CPU / non-CUDA fallback: dequant-to-dense matmul (sc-7702-style; keeps activations full-precision).
+        let in_dtype = x.dtype();
+        let w = self.dequant_dense()?.to_dtype(in_dtype)?;
+        let bias = match &self.bias {
+            Some(b) => Some(b.to_dtype(in_dtype)?),
+            None => None,
+        };
+        Linear::new(w, bias).forward(x)
+    }
 }
 
 impl QLinear {
@@ -69,12 +127,34 @@ impl QLinear {
         )?))
     }
 
-    /// `x·Wᵀ + b`. Dense delegates to `candle_nn::Linear`; packed delegates to the shared
-    /// dequant-on-forward `QLinear` (sc-7702).
+    /// Build an **INT8-ConvRot** projection (sc-9300) straight from the checkpoint's stored parts: the
+    /// `(N, K)` int8 codes `w_i8` (any dtype; narrowed at the int8 stage), the `[N]` per-output-row
+    /// `weight_scale`, and the optional dense `bias`. No re-quantization and no online rotation — the
+    /// ConvRot rotation is folded into the codes offline.
+    pub fn convrot_int8(w_i8: Tensor, scale: Vec<f32>, bias: Option<Tensor>) -> Result<Self> {
+        let n = w_i8.dims2()?.0;
+        if scale.len() != n {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea convrot: weight_scale len {} != weight rows {n}",
+                scale.len()
+            )));
+        }
+        Ok(Self::ConvRotInt8(ConvRotInt8 {
+            w_i8,
+            scale,
+            bias,
+            #[cfg(feature = "cuda")]
+            lt: std::sync::OnceLock::new(),
+        }))
+    }
+
+    /// `x·Wᵀ + b`. Dense delegates to `candle_nn::Linear`; packed to the shared dequant-on-forward
+    /// `QLinear` (sc-7702); int8-ConvRot to the cuBLASLt IGEMM (CUDA) or a dequant-dense matmul (CPU).
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         match self {
             Self::Dense(l) => l.forward(x),
             Self::Packed(l) => l.forward(x),
+            Self::ConvRotInt8(l) => l.forward(x),
         }
     }
 
@@ -83,6 +163,13 @@ impl QLinear {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_packed(&self) -> bool {
         matches!(self, Self::Packed(_))
+    }
+
+    /// Whether this projection loaded as an INT8-ConvRot int8 layer (sc-9300) — the detect-arm assertion
+    /// (a ConvRot checkpoint's quantized surface fired the int8 path, not a silent dense fallback).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_convrot_int8(&self) -> bool {
+        matches!(self, Self::ConvRotInt8(_))
     }
 }
 
