@@ -52,25 +52,15 @@ fn layer_norm(dim: usize, vb: VarBuilder) -> Result<LayerNorm> {
     Ok(LayerNorm::new_no_bias(ws, 1e-6))
 }
 
-/// Max elements in a single attention scores tensor `[…,Sq,Sk]` before [`scaled_dot_product_attention`]
-/// chunks over the query rows. candle CUDA kernels index elements with **i32**, so a scores/probs
-/// tensor exceeding `i32::MAX` (~2.147B) silently corrupts its tail — garbage attention in the trailing
-/// query rows → noise, with no error (sc-5487, the FLUX.2 fix; sc-8983 ports it here). The FLUX.1
-/// joint `[txt, img]` sequence at the largest advertised sizes pushes the 24-head scores tensor past
-/// the limit. 1.0B keeps each chunk well under it while leaving the common sizes (≤ ~0.7B at 1024²) a
-/// single un-chunked pass, so those stay byte-identical. The vendored upstream SDPA is otherwise
-/// unchanged.
-const ATTN_SCORES_BUDGET: usize = 1_000_000_000;
-
+/// i32-overflow-safe SDPA over an N-D `q`/`k`/`v` (leading dims folded to a single batch). Flattens the
+/// leading dims to `[N, Sq, D]`, delegates the budgeted query-row chunking to the shared
+/// [`candle_gen::sdpa_budgeted_flat`] (sc-9570) — which chunks once the `[N,Sq,Sk]` scores tensor would
+/// exceed [`candle_gen::ATTN_SCORES_BUDGET`] (the candle CUDA i32-index limit) — then reshapes back.
+/// scale = `1/sqrt(head_dim)`, `softmax_last_dim` closure keeps the exact fused softmax; each query row's
+/// softmax is independent, so the chunked result is byte-identical to the single pass. The FLUX.1 joint
+/// `[txt, img]` sequence at the largest advertised sizes trips the guard; the common sizes stay a single
+/// un-chunked pass. The vendored upstream SDPA is otherwise unchanged.
 pub(crate) fn scaled_dot_product_attention(q: &Tensor, k: &Tensor, v: &Tensor) -> Result<Tensor> {
-    sdpa_budgeted(q, k, v, ATTN_SCORES_BUDGET)
-}
-
-/// [`scaled_dot_product_attention`] with an explicit per-block scores-element budget (so the chunking is
-/// unit-testable with a tiny budget that forces the chunked path on small tensors). Each query row's
-/// softmax is over all keys and independent of the other rows, so the chunked result is numerically
-/// identical to the single pass.
-fn sdpa_budgeted(q: &Tensor, k: &Tensor, v: &Tensor, budget: usize) -> Result<Tensor> {
     let dim = q.dim(D::Minus1)?;
     let scale_factor = 1.0 / (dim as f64).sqrt();
     let mut batch_dims = q.dims().to_vec();
@@ -79,35 +69,18 @@ fn sdpa_budgeted(q: &Tensor, k: &Tensor, v: &Tensor, budget: usize) -> Result<Te
     let q = q.flatten_to(batch_dims.len() - 1)?;
     let k = k.flatten_to(batch_dims.len() - 1)?;
     let v = v.flatten_to(batch_dims.len() - 1)?;
-    let (n, sq, _) = q.dims3()?;
-    let sk = k.dim(1)?;
-    let k_t = k.t()?;
 
-    // The largest query block whose `[N,block,Sk]` scores tensor stays within budget (the whole `Sq`
-    // for the common sizes, so that path is the unchanged single matmul+softmax+matmul).
-    let block = if n * sq * sk <= budget {
-        sq
-    } else {
-        (budget / (n * sk)).max(1)
-    };
-
-    let attn_scores = if block >= sq {
-        let attn_weights = (q.matmul(&k_t)? * scale_factor)?;
-        candle_nn::ops::softmax_last_dim(&attn_weights)?.matmul(&v)?
-    } else {
-        let mut blocks = Vec::new();
-        let mut start = 0;
-        while start < sq {
-            let len = block.min(sq - start);
-            let attn_weights = (q.narrow(1, start, len)?.matmul(&k_t)? * scale_factor)?;
-            blocks.push(candle_nn::ops::softmax_last_dim(&attn_weights)?.matmul(&v)?);
-            start += len;
-        }
-        Tensor::cat(&blocks, 1)? // [N, Sq, dim_v]
-    };
-    batch_dims.push(attn_scores.dim(D::Minus2)?);
-    batch_dims.push(attn_scores.dim(D::Minus1)?);
-    attn_scores.reshape(batch_dims)
+    let attn = candle_gen::sdpa_budgeted_flat(
+        &q,
+        &k,
+        &v,
+        scale_factor,
+        candle_nn::ops::softmax_last_dim,
+        candle_gen::ATTN_SCORES_BUDGET,
+    )?; // [N, Sq, dim_v]
+    batch_dims.push(attn.dim(D::Minus2)?);
+    batch_dims.push(attn.dim(D::Minus1)?);
+    attn.reshape(batch_dims)
 }
 
 fn rope(pos: &Tensor, dim: usize, theta: usize) -> Result<Tensor> {
@@ -869,28 +842,39 @@ mod tests {
     fn chunked_sdpa_matches_single_pass() {
         // Per-query-row softmax is independent, so chunking over query rows (forced via a tiny budget)
         // must match the single pass bit-for-bit — the guard for the i32-overflow fix (sc-8983,
-        // ported from FLUX.2's sc-5487). Covers the self-attn `[B,H,S,D]` shape and a cross-shape
-        // `Sq != Sk` (the fn is generic over the leading batch dims and the key length).
+        // ported from FLUX.2's sc-5487). Retargeted onto the shared `candle_gen::sdpa_budgeted_flat`
+        // (sc-9570) — the crate's `scaled_dot_product_attention` folds `[B,H,S,D]` → `[B·H, S, D]` and
+        // delegates to it, with scale `1/sqrt(d)` and the fused `softmax_last_dim`. Covers the self-attn
+        // shape and a cross-shape `Sq != Sk` (the flat helper is generic over the key length).
         let dev = Device::Cpu;
         let (b, h, s, d) = (1usize, 2usize, 7usize, 4usize);
-        let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
-        let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
-        let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let n = b * h;
+        let scale = 1.0 / (d as f64).sqrt();
+        let sm = candle_nn::ops::softmax_last_dim;
+        let q = Tensor::randn(0f32, 1f32, (n, s, d), &dev).unwrap();
+        let k = Tensor::randn(0f32, 1f32, (n, s, d), &dev).unwrap();
+        let v = Tensor::randn(0f32, 1f32, (n, s, d), &dev).unwrap();
         // Huge budget → single pass; tiny budget (1) → single-row chunks; a MID-SIZE budget forces
         // multi-row chunks + a remainder (block=3 over s=7 → 3,3,1) — the sc-9116 hardening ask.
-        let single = sdpa_budgeted(&q, &k, &v, usize::MAX).unwrap();
-        // budget = b·h·s·block = 1·2·7·3 = 42 → block = 3.
+        let single = candle_gen::sdpa_budgeted_flat(&q, &k, &v, scale, sm, usize::MAX).unwrap();
+        // budget = n·s·block = 2·7·3 = 42 → block = 3.
         for budget in [1usize, 42] {
-            assert_close(&single, &sdpa_budgeted(&q, &k, &v, budget).unwrap());
+            assert_close(
+                &single,
+                &candle_gen::sdpa_budgeted_flat(&q, &k, &v, scale, sm, budget).unwrap(),
+            );
         }
 
         let sk = 5usize;
-        let kx = Tensor::randn(0f32, 1f32, (b, h, sk, d), &dev).unwrap();
-        let vx = Tensor::randn(0f32, 1f32, (b, h, sk, d), &dev).unwrap();
-        let single = sdpa_budgeted(&q, &kx, &vx, usize::MAX).unwrap();
-        // budget = b·h·sk·block = 1·2·5·3 = 30 → block = 3 (chunks 3, 3, 1 over the 7 query rows).
+        let kx = Tensor::randn(0f32, 1f32, (n, sk, d), &dev).unwrap();
+        let vx = Tensor::randn(0f32, 1f32, (n, sk, d), &dev).unwrap();
+        let single = candle_gen::sdpa_budgeted_flat(&q, &kx, &vx, scale, sm, usize::MAX).unwrap();
+        // budget = n·sk·block = 2·5·3 = 30 → block = 3 (chunks 3, 3, 1 over the 7 query rows).
         for budget in [1usize, 30] {
-            assert_close(&single, &sdpa_budgeted(&q, &kx, &vx, budget).unwrap());
+            assert_close(
+                &single,
+                &candle_gen::sdpa_budgeted_flat(&q, &kx, &vx, scale, sm, budget).unwrap(),
+            );
         }
     }
 

@@ -121,14 +121,14 @@ pub fn gated(x: &Tensor, gate: &Tensor, y: &Tensor) -> Result<Tensor> {
 /// `[img, txt]` sequence pushes the 24-head, B=2 scores tensor to ~3.8B elements, past the limit.
 /// 1.0B keeps each chunk well under it while leaving the common sizes a single un-chunked pass, so
 /// those stay byte-identical.
-const ATTN_SCORES_BUDGET: usize = 1_000_000_000;
-
 /// SDPA over `[B,H,S,head_dim]` q/k/v → `[B, S, H·head_dim]`. scale = `head_dim^-0.5`. `mask` is an
 /// optional additive mask broadcast onto the scores; it must broadcast over the query rows (the
-/// [`build_joint_mask`] shape `[B, 1, 1, Sk]`). Chunks over the query rows when the full `[B,H,Sq,Sk]`
-/// scores tensor would exceed [`ATTN_SCORES_BUDGET`] (the candle CUDA i32-index limit). Each query
-/// row's softmax is over all keys and independent of the other rows, so the chunked result is
-/// numerically identical to the single pass — only the large buckets trip it.
+/// [`build_joint_mask`] shape `[B, 1, 1, Sk]`). Delegates to the shared i32-overflow-safe
+/// [`candle_gen::sdpa_budgeted_bhsd`] (sc-9570), which chunks over the query rows once the `[B,H,Sq,Sk]`
+/// scores tensor would exceed [`candle_gen::ATTN_SCORES_BUDGET`] (the candle CUDA i32-index limit) —
+/// broadcasting the `[B,1,1,Sk]` mask identically onto every chunk. The `softmax_last_dim` closure keeps
+/// the exact fused softmax; each query row's softmax is independent, so the chunked result is
+/// byte-identical to the single pass. This crate does the head-merge transpose/reshape here.
 fn attention(
     q: &Tensor,
     k: &Tensor,
@@ -136,56 +136,18 @@ fn attention(
     head_dim: usize,
     mask: Option<&Tensor>,
 ) -> Result<Tensor> {
-    attention_budgeted(q, k, v, head_dim, mask, ATTN_SCORES_BUDGET)
-}
-
-/// [`attention`] with an explicit per-block scores-element budget (so the chunking is unit-testable with
-/// a tiny budget that forces the chunked path on small tensors).
-fn attention_budgeted(
-    q: &Tensor,
-    k: &Tensor,
-    v: &Tensor,
-    head_dim: usize,
-    mask: Option<&Tensor>,
-    budget: usize,
-) -> Result<Tensor> {
-    let (b, h, s, d) = q.dims4()?;
+    let (b, _h, s, _d) = q.dims4()?;
     let scale = (head_dim as f64).powf(-0.5);
-    let q = q.contiguous()?;
-    let k_t = k.transpose(2, 3)?.contiguous()?;
-    let v = v.contiguous()?;
-
-    // The largest query block whose `[B,H,block,S]` scores tensor stays within budget (the whole `S` for
-    // the common sizes, so that path is the unchanged single matmul+softmax+matmul).
-    let block = if b * h * s * s <= budget {
-        s
-    } else {
-        (budget / (b * h * s)).max(1)
-    };
-
-    let o = if block >= s {
-        let mut scores = (q.matmul(&k_t)? * scale)?;
-        if let Some(m) = mask {
-            scores = scores.broadcast_add(m)?;
-        }
-        let probs = softmax_last_dim(&scores)?;
-        probs.matmul(&v)? // [B,H,S,head_dim]
-    } else {
-        let mut blocks = Vec::new();
-        let mut start = 0;
-        while start < s {
-            let len = block.min(s - start);
-            let mut scores = (q.narrow(2, start, len)?.matmul(&k_t)? * scale)?;
-            if let Some(m) = mask {
-                // `[B,1,1,Sk]` broadcasts identically onto every query chunk.
-                scores = scores.broadcast_add(m)?;
-            }
-            let probs = softmax_last_dim(&scores)?;
-            blocks.push(probs.matmul(&v)?); // [B,H,len,head_dim]
-            start += len;
-        }
-        Tensor::cat(&blocks, 2)? // [B,H,S,head_dim]
-    };
+    let o = candle_gen::sdpa_budgeted_bhsd(
+        q,
+        k,
+        v,
+        scale,
+        mask,
+        softmax_last_dim,
+        candle_gen::ATTN_SCORES_BUDGET,
+    )?; // [B,H,S,head_dim]
+    let (_b, h, _s, d) = o.dims4()?;
     o.transpose(1, 2)?.reshape((b, s, h * d))
 }
 
@@ -774,23 +736,29 @@ mod tests {
     fn chunked_attention_matches_single_pass() {
         // Per-query-row softmax is independent, so chunking over query rows (forced via a tiny budget)
         // must match the single pass bit-for-bit — the guard for the i32-overflow fix (sc-8983,
-        // ported from FLUX.2's sc-5487). Checked with and without the `[B,1,1,Sk]` additive mask.
+        // ported from FLUX.2's sc-5487). Retargeted onto the shared `candle_gen::sdpa_budgeted_bhsd`
+        // (sc-9570) with this crate's exact `softmax_last_dim` closure, checked with and without the
+        // `[B,1,1,Sk]` additive mask.
         let dev = Device::Cpu;
         let (b, h, s, d) = (2usize, 2usize, 7usize, 4usize);
         let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
         let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
         let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let scale = (d as f64).powf(-0.5);
+        let sm = |x: &Tensor| softmax_last_dim(x);
         // Mask the last two "text" positions of the second batch item (build_joint_mask shape).
         let valid = Tensor::from_vec(vec![1f32, 1., 1., 1., 1., 1., 0., 0.], (2, 4), &dev).unwrap();
         let mask = build_joint_mask(&valid, s - 4, DType::F32, &dev).unwrap();
         for m in [None, Some(&mask)] {
             // Huge budget → single pass; tiny budget (1) → single-row chunks; a MID-SIZE budget forces
             // multi-row chunks + a remainder (block=3 over s=7 → 3,3,1) — the sc-9116 hardening ask.
-            let single = attention_budgeted(&q, &k, &v, d, m, usize::MAX).unwrap();
+            let single =
+                candle_gen::sdpa_budgeted_bhsd(&q, &k, &v, scale, m, sm, usize::MAX).unwrap();
             let a = single.flatten_all().unwrap().to_vec1::<f32>().unwrap();
             // budget = b·h·s·block = 2·2·7·3 = 84 → block = 84/(2·2·7) = 3.
             for budget in [1usize, 84] {
-                let chunked = attention_budgeted(&q, &k, &v, d, m, budget).unwrap();
+                let chunked =
+                    candle_gen::sdpa_budgeted_bhsd(&q, &k, &v, scale, m, sm, budget).unwrap();
                 assert_eq!(single.dims(), chunked.dims());
                 let c = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
                 for (x, y) in a.iter().zip(&c) {

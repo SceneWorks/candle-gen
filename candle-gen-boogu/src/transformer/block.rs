@@ -47,47 +47,22 @@ fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
 /// `i32::MAX`) → the trailing query rows get garbage attention → washed-out output (sc-7523). A 1.0B
 /// budget keeps each chunk's scores well under the i32 limit while leaving the T2I sizes a single
 /// un-chunked pass, so the txt2img / Base / Turbo paths stay byte-identical.
-const ATTN_SCORES_BUDGET: usize = 1_000_000_000;
-
 /// Bidirectional, unmasked scaled-dot-product attention. `q`/`k`/`v`: `[b, h, s, hd]` → `[b, h, s, hd]`.
-/// Chunks over the query rows when the full `[b,h,Sq,Sk]` scores tensor would exceed
-/// [`ATTN_SCORES_BUDGET`] (the candle CUDA i32-index limit). Each query row's softmax is over all keys and
-/// independent of the other rows, so the chunked result is numerically identical to the single pass — only
-/// the long Edit / multi-reference joint sequences trip it.
+/// Delegates to the shared i32-overflow-safe [`candle_gen::sdpa_budgeted_bhsd`] (sc-9570), which chunks
+/// over the query rows once the full `[b,h,Sq,Sk]` scores tensor would exceed
+/// [`candle_gen::ATTN_SCORES_BUDGET`] (the candle CUDA i32-index limit) — only the long Edit /
+/// multi-reference joint sequences trip it. The `softmax_last_dim` closure keeps the exact fused softmax;
+/// each query row's softmax is independent, so the chunked result is byte-identical to the single pass.
 fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
-    sdpa_budgeted(q, k, v, scale, ATTN_SCORES_BUDGET)
-}
-
-/// [`sdpa`] with an explicit per-block scores-element budget (so the chunking is unit-testable with a tiny
-/// budget that forces the chunked path on small tensors).
-fn sdpa_budgeted(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, budget: usize) -> Result<Tensor> {
-    let (b, h, s, _) = q.dims4()?;
-    let q = q.contiguous()?;
-    let k_t = k.transpose(2, 3)?.contiguous()?;
-    let v = v.contiguous()?;
-
-    // The largest query block whose `[b,h,block,s]` scores tensor stays within budget — the whole `s` for
-    // the T2I sizes, so that path stays the unchanged single matmul+softmax+matmul.
-    let block = if b * h * s * s <= budget {
-        s
-    } else {
-        (budget / (b * h * s)).max(1)
-    };
-    if block >= s {
-        let scores = (q.matmul(&k_t)? * scale)?;
-        let probs = softmax_last_dim(&scores)?;
-        return probs.matmul(&v); // [b, h, s, hd]
-    }
-    let mut blocks = Vec::new();
-    let mut start = 0;
-    while start < s {
-        let len = block.min(s - start);
-        let scores = (q.narrow(2, start, len)?.contiguous()?.matmul(&k_t)? * scale)?;
-        let probs = softmax_last_dim(&scores)?;
-        blocks.push(probs.matmul(&v)?); // [b, h, len, hd]
-        start += len;
-    }
-    Tensor::cat(&blocks, 2) // [b, h, s, hd]
+    candle_gen::sdpa_budgeted_bhsd(
+        q,
+        k,
+        v,
+        scale,
+        None,
+        softmax_last_dim,
+        candle_gen::ATTN_SCORES_BUDGET,
+    ) // [b, h, s, hd]
 }
 
 // ── GQA self-attention (standard `BooguImageAttnProcessor`) ─────────────────────────────────
@@ -572,16 +547,20 @@ mod tests {
     #[test]
     fn chunked_sdpa_matches_single_pass() {
         // Per-query-row softmax is independent, so chunking over query rows (forced via a tiny budget)
-        // must match the single pass — the guard for the i32-overflow fix (sc-7523).
+        // must match the single pass — the guard for the i32-overflow fix (sc-7523). Retargeted onto the
+        // shared `candle_gen::sdpa_budgeted_bhsd` (sc-9570) with this crate's exact `softmax_last_dim`
+        // closure and no mask.
         let dev = Device::Cpu;
         let (b, h, s, d) = (1usize, 2usize, 7usize, 4usize);
         let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
         let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
         let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
         let scale = (d as f64).powf(-0.5);
+        let sm = |x: &Tensor| softmax_last_dim(x);
         // Huge budget → single pass; tiny budget (1) → chunked into single-row blocks.
-        let single = sdpa_budgeted(&q, &k, &v, scale, usize::MAX).unwrap();
-        let chunked = sdpa_budgeted(&q, &k, &v, scale, 1).unwrap();
+        let single =
+            candle_gen::sdpa_budgeted_bhsd(&q, &k, &v, scale, None, sm, usize::MAX).unwrap();
+        let chunked = candle_gen::sdpa_budgeted_bhsd(&q, &k, &v, scale, None, sm, 1).unwrap();
         assert_eq!(single.dims(), chunked.dims());
         let a = single.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let c = chunked.flatten_all().unwrap().to_vec1::<f32>().unwrap();
