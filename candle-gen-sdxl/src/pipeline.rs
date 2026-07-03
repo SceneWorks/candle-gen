@@ -74,6 +74,12 @@ use candle_transformers::models::stable_diffusion::unet_2d::{
 };
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 use candle_transformers::models::stable_diffusion::{self, StableDiffusionConfig};
+
+// The vendored, packed-detecting SDXL UNet (sc-5165 / sc-9416): its Linear surface routes through the
+// shared `candle_gen::quant` seam, so it loads a pre-quantized MLX tier (SceneWorks/sdxl-base-mlx
+// q4/q8) straight from the packed parts. Aliased to avoid clashing with the stock (dense) UNet type.
+use crate::unet::{sdxl_unet_config, UNet2DConditionModel as VendoredUNet};
+use candle_gen::quant::{PackedConfig, MLX_GROUP_SIZE};
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 use tokenizers::Tokenizer;
@@ -249,8 +255,45 @@ pub(crate) struct Pipeline {
 /// (the sc-4987 peak-VRAM lever), so caching the UNet/VAE does not make the dual CLIP resident.
 #[derive(Clone)]
 pub(crate) struct Components {
-    pub(crate) unet: Arc<UNet2DConditionModel>,
+    pub(crate) unet: SdxlUnet,
     pub(crate) vae: Arc<AutoEncoderKL>,
+}
+
+/// The SDXL denoise UNet, in one of two builds that share the txt2img `forward(x, t, ehs)` contract
+/// (sc-9416):
+///
+/// - [`Self::Stock`] — the stock candle-transformers `UNet2DConditionModel`, built for a **dense**
+///   diffusers snapshot (bf16/f16). Byte-identical to pre-sc-9416, incl. the fused flash-attention
+///   path; this is the default for every dense SDXL/RealVisXL checkpoint (zero regression).
+/// - [`Self::Vendored`] — the crate's vendored UNet, whose Linear surface packed-detects through the
+///   shared `candle_gen::quant`. Built **only** for a pre-quantized MLX tier
+///   (`SceneWorks/sdxl-base-mlx` q4/q8), where the whole attention/FF/proj/time-embed Linear surface
+///   loads straight from the packed `{weight u32, scales, biases}` parts (no dense staging) and the
+///   convolutions + norms stay dense. Runs the math attention (the vendored flash path is a stub).
+///
+/// Both are `Arc`-shared so the seed/prompt-independent UNet is cached across `generate` calls (sc-5037)
+/// and cheaply cloned per render.
+#[derive(Clone)]
+pub(crate) enum SdxlUnet {
+    Stock(Arc<UNet2DConditionModel>),
+    Vendored(Arc<VendoredUNet>),
+}
+
+impl SdxlUnet {
+    /// The txt2img denoise forward, dispatched to whichever build. Both compute the SDXL ε-prediction
+    /// `[B, 4, h, w]` for `(latents, timestep, dual-CLIP embeddings)` — the packed vendored UNet is
+    /// pinned bit-identical to the stock UNet on a dense build by the vendored-vs-stock parity test.
+    pub(crate) fn forward(
+        &self,
+        xs: &Tensor,
+        timestep: f64,
+        encoder_hidden_states: &Tensor,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Stock(u) => Ok(u.forward(xs, timestep, encoder_hidden_states)?),
+            Self::Vendored(u) => Ok(u.forward(xs, timestep, encoder_hidden_states)?),
+        }
+    }
 }
 
 impl Pipeline {
@@ -309,6 +352,21 @@ impl Pipeline {
         };
         let tokenizer = Tokenizer::from_file(hf_get(tok_repo, "tokenizer.json")?)
             .map_err(|e| CandleError::Msg(format!("load tokenizer {tok_repo}: {e}")))?;
+        // sc-9416: the MLX SDXL tiers ALSO pack the dual CLIP text encoders (a `quantization` block in
+        // `text_encoder{,_2}/config.json` + `.scales`-packed Linears under `model.safetensors`), but the
+        // candle CLIP path is the stock dense `build_clip_transformer` — feeding it packed u32 codes
+        // would garble the conditioning. This story lands the UNet packed surface; the packed-CLIP load
+        // is a separate slice, deferred to **sc-9527**. Fail loudly on a packed CLIP snapshot rather than
+        // render garbage. (Absent this, `snapshot_file` would already error on the missing `.fp16` name;
+        // this makes the reason explicit.)
+        if clip_is_packed(&self.root, &which)? {
+            return Err(CandleError::Msg(
+                "sdxl: packed (quantized) CLIP text encoders are not yet supported on the candle path \
+                 — the packed-CLIP load is deferred to sc-9527; use a dense SDXL snapshot for the \
+                 text encoders"
+                    .into(),
+            ));
+        }
         // sc-3674: load CLIP at the compute dtype (f16), not the spike's F32. The fp16 safetensors
         // load directly, the forward runs f16 (diffusers loads CLIP fp16 too), and it halves the
         // text-encoder VRAM (CLIP-bigG ~2.8→1.4 GiB) with no visible quality change. The embeddings
@@ -359,13 +417,41 @@ impl Pipeline {
     /// — sc-3674); the f16-stable VAE (`madebyollin/sdxl-vae-fp16-fix`) resolves via `hf-hub`. The
     /// generator owns the caching of the result across calls (sc-5037); this is the cache-miss loader.
     pub(crate) fn load_components(&self, use_flash_attn: bool) -> Result<Components> {
-        let unet_file = snapshot_file(&self.root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
-        let unet = if self.adapters.is_empty() {
-            // No adapters: the stock mmap build — byte-identical to pre-sc-5165 (zero regression).
-            self.config
-                .build_unet(unet_file, &self.device, 4, use_flash_attn, self.dtype)?
-        } else {
-            self.build_unet_with_adapters(&unet_file, use_flash_attn)?
+        // sc-9416: a **packed** MLX tier (`SceneWorks/sdxl-base-mlx` q4/q8) ships its UNet under the
+        // non-`.fp16` filename with a `quantization` block in `unet/config.json` and `.scales`-packed
+        // Linear weights. Detect it and load the vendored packed-detecting UNet straight from the packed
+        // parts (no dense staging); every dense snapshot keeps the stock build below, unchanged.
+        let unet = match self.detect_packed_unet()? {
+            Some((packed_file, group_size)) => {
+                if !self.adapters.is_empty() {
+                    // Merging a trained LoRA/LoKr delta into a quantized tier is not wired (the merge is
+                    // a dense f32 fold); a packed tier + adapters is an unsupported combination rather
+                    // than a silently-unadapted render. Deferred: sc-9528.
+                    return Err(CandleError::Msg(
+                        "sdxl: LoRA/LoKr adapters on a packed (quantized) MLX tier are not supported \
+                         (adapter merge is dense-only); use a dense snapshot (sc-9528)"
+                            .into(),
+                    ));
+                }
+                SdxlUnet::Vendored(Arc::new(self.load_packed_unet(&packed_file, group_size)?))
+            }
+            None => {
+                let unet_file =
+                    snapshot_file(&self.root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
+                let unet = if self.adapters.is_empty() {
+                    // No adapters: the stock mmap build — byte-identical to pre-sc-5165 (zero regression).
+                    self.config.build_unet(
+                        unet_file,
+                        &self.device,
+                        4,
+                        use_flash_attn,
+                        self.dtype,
+                    )?
+                } else {
+                    self.build_unet_with_adapters(&unet_file, use_flash_attn)?
+                };
+                SdxlUnet::Stock(Arc::new(unet))
+            }
         };
         let vae = self.config.build_vae(
             hf_get(VAE_FIX_REPO, VAE_FIX_FILE)?,
@@ -373,9 +459,57 @@ impl Pipeline {
             self.dtype,
         )?;
         Ok(Components {
-            unet: Arc::new(unet),
+            unet,
             vae: Arc::new(vae),
         })
+    }
+
+    /// Detect a pre-quantized MLX SDXL tier at `root` (sc-9416): `Some((unet_file, group_size))` when
+    /// `unet/config.json` carries a `quantization` block ([`PackedConfig`]) and the packed weight file
+    /// exists, else `None` (a dense diffusers snapshot — the stock build). The dual CLIP text encoders
+    /// are also packed in these tiers, but the candle CLIP path is stock/dense-only; that packed-CLIP
+    /// load is deferred to **sc-9527** (see [`encode_one`](Self::encode_one)). Errors on a packed tier
+    /// whose group size the vendored UNet's Linear seam does not thread (only 64 today) rather than
+    /// silently repacking at the wrong grid.
+    fn detect_packed_unet(&self) -> Result<Option<(PathBuf, usize)>> {
+        let cfg_path = self.root.join("unet/config.json");
+        if !cfg_path.is_file() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&cfg_path)
+            .map_err(|e| CandleError::Msg(format!("sdxl: read unet/config.json: {e}")))?;
+        let cfg: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|e| CandleError::Msg(format!("sdxl: parse unet/config.json: {e}")))?;
+        let Some(packed) = PackedConfig::from_config(&cfg) else {
+            return Ok(None);
+        };
+        let group_size = packed.group_size as usize;
+        // The vendored UNet's Linear seam threads the default MLX group size (64) through its leaf
+        // constructors; a non-64 tier would repack on the wrong grid, so refuse it loudly. The SDXL MLX
+        // tiers all pack at 64, so this never fires on a real tier.
+        if group_size != MLX_GROUP_SIZE {
+            return Err(CandleError::Msg(format!(
+                "sdxl: packed tier group_size {group_size} unsupported (only {MLX_GROUP_SIZE}); \
+                 a non-64 SDXL tier needs the group threaded through the UNet blocks (sc-9528)"
+            )));
+        }
+        let file = snapshot_file(&self.root, "unet/diffusion_pytorch_model.safetensors")?;
+        Ok(Some((file, group_size)))
+    }
+
+    /// Build the vendored packed-detecting SDXL UNet from a packed MLX-tier `unet/` checkpoint
+    /// (sc-9416). One mmap'd VarBuilder feeds the whole UNet; `linear_detect` in the vendored
+    /// attention/FF/proj/time-embed sites builds a quantized `QLinear` straight from each packed
+    /// `{weight, scales, biases}` triple, while the convolutions + norms load dense. No adapter is
+    /// installed (the packed tier is inference-only), so the four attention projections' `LoraLinear`
+    /// bases are their packed `QLinear` and the forward is exactly `x·Wᵀ + b` (dequant-on-forward).
+    fn load_packed_unet(&self, unet_file: &Path, _group_size: usize) -> Result<VendoredUNet> {
+        let vs =
+            candle_gen::mmap_var_builder(&[unet_file.to_path_buf()], self.dtype, &self.device)?;
+        // The vendored `new` threads the default MLX group size (64) — validated == the config group in
+        // `detect_packed_unet` — through its packed-detecting leaves; `sdxl_unet_config` is the canonical
+        // 3-block SDXL geometry (`use_linear_projection = true`, matching the packed `proj_in/out`).
+        Ok(VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?)
     }
 
     /// Build the UNet with the [`AdapterSpec`]s merged into its weights (sc-5165). The base UNet
@@ -409,7 +543,7 @@ impl Pipeline {
         &self,
         req: &GenerationRequest,
         text_embeddings: &Tensor,
-        unet: &UNet2DConditionModel,
+        unet: &SdxlUnet,
         vae: &AutoEncoderKL,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Vec<Image>> {
@@ -544,7 +678,7 @@ impl Pipeline {
         init: &Tensor,
         policy: &LightningPolicy,
         cond: &Tensor,
-        unet: &UNet2DConditionModel,
+        unet: &SdxlUnet,
         cancel: &gen_core::runtime::CancelFlag,
         on_progress: &mut dyn FnMut(Progress),
         total: u32,
@@ -588,7 +722,7 @@ impl Pipeline {
         sampler: &str,
         init: &Tensor,
         text_embeddings: &Tensor,
-        unet: &UNet2DConditionModel,
+        unet: &SdxlUnet,
         steps: usize,
         use_guide: bool,
         guidance: f64,
@@ -789,6 +923,27 @@ fn sdxl_stock_unet_config() -> UNet2DConditionModelConfig {
     }
 }
 
+/// Whether the CLIP encoder `which`'s component in the snapshot at `root` is a **packed** MLX tier
+/// (sc-9416): its `text_encoder{,_2}/config.json` carries a `quantization` block ([`PackedConfig`]).
+/// The candle CLIP path is stock/dense-only, so a packed CLIP is rejected (deferred to sc-9527); a
+/// dense snapshot returns `false` and loads unchanged. A missing config (e.g. a bare single-file
+/// checkpoint) is treated as dense — the downstream `snapshot_file` gives the precise "missing X" error.
+fn clip_is_packed(root: &Path, which: &Clip) -> Result<bool> {
+    let sub = match which {
+        Clip::L => "text_encoder/config.json",
+        Clip::BigG => "text_encoder_2/config.json",
+    };
+    let cfg_path = root.join(sub);
+    if !cfg_path.is_file() {
+        return Ok(false);
+    }
+    let bytes =
+        std::fs::read(&cfg_path).map_err(|e| CandleError::Msg(format!("sdxl: read {sub}: {e}")))?;
+    let cfg: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| CandleError::Msg(format!("sdxl: parse {sub}: {e}")))?;
+    Ok(PackedConfig::from_config(&cfg).is_some())
+}
+
 /// Resolve a component file inside the SDXL snapshot dir, erroring clearly if absent (e.g. a
 /// single-file RealVisXL checkpoint that lacks the diffusers multi-component tree — sc-3677).
 pub(crate) fn snapshot_file(root: &Path, sub: &str) -> Result<PathBuf> {
@@ -805,6 +960,94 @@ pub(crate) fn snapshot_file(root: &Path, sub: &str) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-9416: `detect_packed_unet` returns `Some((file, group_size))` for a snapshot whose
+    /// `unet/config.json` carries a `quantization` block AND the packed weight file exists, and `None`
+    /// for a dense snapshot (no block) — the packed/dense fork the base txt2img load takes. GPU-free.
+    #[test]
+    fn detect_packed_unet_reads_quantization_block() {
+        let tmp = std::env::temp_dir().join(format!("sc9416_detect_{}", std::process::id()));
+        let unet_dir = tmp.join("unet");
+        std::fs::create_dir_all(&unet_dir).unwrap();
+        // A packed config + a (stub) packed weight file at the non-.fp16 name.
+        std::fs::write(
+            unet_dir.join("config.json"),
+            br#"{"quantization": {"bits": 4, "group_size": 64}, "cross_attention_dim": 2048}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            unet_dir.join("diffusion_pytorch_model.safetensors"),
+            b"stub",
+        )
+        .unwrap();
+
+        let pipe = Pipeline {
+            config: StableDiffusionConfig::sdxl(None, Some(1024), Some(1024)),
+            root: tmp.clone(),
+            device: Device::Cpu,
+            dtype: DType::F32,
+            adapters: vec![],
+        };
+        let got = pipe.detect_packed_unet().unwrap();
+        assert!(got.is_some(), "a quantization block ⇒ packed tier");
+        assert_eq!(got.unwrap().1, 64, "group_size threaded from config");
+
+        // A dense config (no quantization block) ⇒ None (the stock build).
+        std::fs::write(
+            unet_dir.join("config.json"),
+            br#"{"cross_attention_dim": 2048, "sample_size": 128}"#,
+        )
+        .unwrap();
+        assert!(
+            pipe.detect_packed_unet().unwrap().is_none(),
+            "no quantization block ⇒ dense (stock) build"
+        );
+
+        // A bits-only block still packs (group defaults to 64, not silent-dense — the sc-9410 rule).
+        std::fs::write(
+            unet_dir.join("config.json"),
+            br#"{"quantization": {"bits": 8}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pipe.detect_packed_unet().unwrap().map(|(_, g)| g),
+            Some(64),
+            "bits-only ⇒ packed at the default group 64"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A packed tier whose group size is not the seam's threaded 64 is rejected loudly (sc-9416 /
+    /// sc-9528) rather than silently repacking on the wrong grid.
+    #[test]
+    fn detect_packed_unet_rejects_non_64_group() {
+        let tmp = std::env::temp_dir().join(format!("sc9416_detect_g32_{}", std::process::id()));
+        let unet_dir = tmp.join("unet");
+        std::fs::create_dir_all(&unet_dir).unwrap();
+        std::fs::write(
+            unet_dir.join("config.json"),
+            br#"{"quantization": {"bits": 4, "group_size": 32}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            unet_dir.join("diffusion_pytorch_model.safetensors"),
+            b"stub",
+        )
+        .unwrap();
+        let pipe = Pipeline {
+            config: StableDiffusionConfig::sdxl(None, Some(1024), Some(1024)),
+            root: tmp.clone(),
+            device: Device::Cpu,
+            dtype: DType::F32,
+            adapters: vec![],
+        };
+        assert!(
+            pipe.detect_packed_unet().is_err(),
+            "a non-64 group_size must be rejected, not silently mis-repacked"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 
     /// sc-3677 parity: the production txt2img values the candle lane resolves an omitted field to
     /// must match the SceneWorks `SdxlDiffusersAdapter` reference (30 steps, CFG 7.0), and the

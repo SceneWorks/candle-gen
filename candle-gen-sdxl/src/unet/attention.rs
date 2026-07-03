@@ -1,18 +1,25 @@
 //! Attention Based Building Blocks
 use candle_core::{DType, IndexOp, Result, Tensor, D};
-use candle_gen::train::lora::{lora_linear, lora_linear_no_bias, LoraLinear};
+use candle_gen::quant::QLinear;
+use candle_gen::train::lora::{lora_linear_detect, lora_linear_no_bias_detect, LoraLinear};
 use candle_nn as nn;
 use candle_nn::Module;
 
+// sc-9416: every attention/FF/proj Linear in this vendored UNet packed-detects through the shared
+// `candle_gen::quant` seam — the MLX SDXL tiers (SceneWorks/sdxl-base-mlx q4/q8) pack the whole Linear
+// surface (attn `to_q/k/v/out.0`, GEGLU `ff.net.0.proj`, `ff.net.2`, and the linear `proj_in/proj_out`),
+// while convolutions + norms stay dense. A dense diffusers checkpoint has no `.scales` sibling, so
+// `linear_detect` takes the plain dense path unchanged (the vendored-vs-stock parity test still holds).
+
 #[derive(Debug)]
 struct GeGlu {
-    proj: nn::Linear,
+    proj: QLinear,
     span: tracing::Span,
 }
 
 impl GeGlu {
-    fn new(vs: nn::VarBuilder, dim_in: usize, dim_out: usize) -> Result<Self> {
-        let proj = nn::linear(dim_in, dim_out * 2, vs.pp("proj"))?;
+    fn new(vs: nn::VarBuilder, dim_in: usize, dim_out: usize, group_size: usize) -> Result<Self> {
+        let proj = QLinear::linear_detect_gs(dim_in, dim_out * 2, &vs, "proj", true, group_size)?;
         let span = tracing::span!(tracing::Level::TRACE, "geglu");
         Ok(Self { proj, span })
     }
@@ -30,7 +37,7 @@ impl Module for GeGlu {
 #[derive(Debug)]
 struct FeedForward {
     project_in: GeGlu,
-    linear: nn::Linear,
+    linear: QLinear,
     span: tracing::Span,
 }
 
@@ -39,12 +46,18 @@ impl FeedForward {
     // https://github.com/huggingface/diffusers/blob/d3d22ce5a894becb951eec03e663951b28d45135/src/diffusers/models/attention.py#L347
     /// Creates a new feed-forward layer based on some given input dimension, some
     /// output dimension, and a multiplier to be used for the intermediary layer.
-    fn new(vs: nn::VarBuilder, dim: usize, dim_out: Option<usize>, mult: usize) -> Result<Self> {
+    fn new(
+        vs: nn::VarBuilder,
+        dim: usize,
+        dim_out: Option<usize>,
+        mult: usize,
+        group_size: usize,
+    ) -> Result<Self> {
         let inner_dim = dim * mult;
         let dim_out = dim_out.unwrap_or(dim);
         let vs = vs.pp("net");
-        let project_in = GeGlu::new(vs.pp("0"), dim, inner_dim)?;
-        let linear = nn::linear(inner_dim, dim_out, vs.pp("2"))?;
+        let project_in = GeGlu::new(vs.pp("0"), dim, inner_dim, group_size)?;
+        let linear = QLinear::linear_detect_gs(inner_dim, dim_out, &vs, "2", true, group_size)?;
         let span = tracing::span!(tracing::Level::TRACE, "ff");
         Ok(Self {
             project_in,
@@ -102,6 +115,7 @@ pub struct CrossAttention {
 
 impl CrossAttention {
     // Defaults should be heads = 8, dim_head = 64, context_dim = None
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         vs: nn::VarBuilder,
         query_dim: usize,
@@ -110,14 +124,18 @@ impl CrossAttention {
         dim_head: usize,
         slice_size: Option<usize>,
         use_flash_attn: bool,
+        group_size: usize,
     ) -> Result<Self> {
         let inner_dim = dim_head * heads;
         let context_dim = context_dim.unwrap_or(query_dim);
         let scale = 1.0 / f64::sqrt(dim_head as f64);
-        let to_q = lora_linear_no_bias(query_dim, inner_dim, vs.pp("to_q"))?;
-        let to_k = lora_linear_no_bias(context_dim, inner_dim, vs.pp("to_k"))?;
-        let to_v = lora_linear_no_bias(context_dim, inner_dim, vs.pp("to_v"))?;
-        let to_out = lora_linear(inner_dim, query_dim, vs.pp("to_out.0"))?;
+        // sc-9416: the four SDXL attention projections packed-detect their frozen base — a packed MLX
+        // tier loads a `QLinear` base (inference-only, no adapter); a dense checkpoint loads the plain
+        // `nn::Linear` base exactly as before, so the LoRA/LoKr trainer + IP-adapter paths are unchanged.
+        let to_q = lora_linear_no_bias_detect(query_dim, inner_dim, &vs, "to_q", group_size)?;
+        let to_k = lora_linear_no_bias_detect(context_dim, inner_dim, &vs, "to_k", group_size)?;
+        let to_v = lora_linear_no_bias_detect(context_dim, inner_dim, &vs, "to_v", group_size)?;
+        let to_out = lora_linear_detect(inner_dim, query_dim, &vs, "to_out.0", group_size)?;
         let span = tracing::span!(tracing::Level::TRACE, "xa");
         let span_attn = tracing::span!(tracing::Level::TRACE, "xa-attn");
         let span_softmax = tracing::span!(tracing::Level::TRACE, "xa-softmax");
@@ -282,6 +300,16 @@ impl CrossAttention {
         self.ip_tokens = tokens.cloned();
         self.ip_scale = scale;
     }
+
+    /// Test-only: whether the four attention projections loaded packed (a pre-quantized MLX tier) —
+    /// used to assert sc-9416 packed-detect fired on the SDXL `to_q/k/v/out.0` key layout.
+    #[cfg(test)]
+    pub(crate) fn all_projections_packed(&self) -> bool {
+        self.to_q.is_packed()
+            && self.to_k.is_packed()
+            && self.to_v.is_packed()
+            && self.to_out.is_packed()
+    }
 }
 
 /// A basic Transformer block.
@@ -297,6 +325,7 @@ struct BasicTransformerBlock {
 }
 
 impl BasicTransformerBlock {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         vs: nn::VarBuilder,
         dim: usize,
@@ -305,6 +334,7 @@ impl BasicTransformerBlock {
         context_dim: Option<usize>,
         sliced_attention_size: Option<usize>,
         use_flash_attn: bool,
+        group_size: usize,
     ) -> Result<Self> {
         let attn1 = CrossAttention::new(
             vs.pp("attn1"),
@@ -314,8 +344,9 @@ impl BasicTransformerBlock {
             d_head,
             sliced_attention_size,
             use_flash_attn,
+            group_size,
         )?;
-        let ff = FeedForward::new(vs.pp("ff"), dim, None, 4)?;
+        let ff = FeedForward::new(vs.pp("ff"), dim, None, 4, group_size)?;
         let attn2 = CrossAttention::new(
             vs.pp("attn2"),
             dim,
@@ -324,6 +355,7 @@ impl BasicTransformerBlock {
             d_head,
             sliced_attention_size,
             use_flash_attn,
+            group_size,
         )?;
         let norm1 = nn::layer_norm(dim, 1e-5, vs.pp("norm1"))?;
         let norm2 = nn::layer_norm(dim, 1e-5, vs.pp("norm2"))?;
@@ -390,7 +422,8 @@ impl Default for SpatialTransformerConfig {
 #[derive(Debug)]
 enum Proj {
     Conv2d(nn::Conv2d),
-    Linear(nn::Linear),
+    // sc-9416: the linear projection variant (SDXL's `use_linear_projection = true`) packed-detects.
+    Linear(QLinear),
 }
 
 // Aka Transformer2DModel
@@ -413,10 +446,41 @@ impl SpatialTransformer {
         use_flash_attn: bool,
         config: SpatialTransformerConfig,
     ) -> Result<Self> {
+        Self::new_gs(
+            vs,
+            in_channels,
+            n_heads,
+            d_head,
+            use_flash_attn,
+            config,
+            candle_gen::quant::MLX_GROUP_SIZE,
+        )
+    }
+
+    /// As [`new`](Self::new), but at an explicit MLX packed `group_size` (sc-9416). The linear
+    /// `proj_in`/`proj_out` (SDXL's `use_linear_projection = true`) packed-detect; the conv-projection
+    /// variant stays dense (SDXL doesn't use it, and MLX affine-packs only Linear/matmul weights).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_gs(
+        vs: nn::VarBuilder,
+        in_channels: usize,
+        n_heads: usize,
+        d_head: usize,
+        use_flash_attn: bool,
+        config: SpatialTransformerConfig,
+        group_size: usize,
+    ) -> Result<Self> {
         let inner_dim = n_heads * d_head;
         let norm = nn::group_norm(config.num_groups, in_channels, 1e-6, vs.pp("norm"))?;
         let proj_in = if config.use_linear_projection {
-            Proj::Linear(nn::linear(in_channels, inner_dim, vs.pp("proj_in"))?)
+            Proj::Linear(QLinear::linear_detect_gs(
+                in_channels,
+                inner_dim,
+                &vs,
+                "proj_in",
+                true,
+                group_size,
+            )?)
         } else {
             Proj::Conv2d(nn::conv2d(
                 in_channels,
@@ -437,11 +501,19 @@ impl SpatialTransformer {
                 config.context_dim,
                 config.sliced_attention_size,
                 use_flash_attn,
+                group_size,
             )?;
             transformer_blocks.push(tb)
         }
         let proj_out = if config.use_linear_projection {
-            Proj::Linear(nn::linear(in_channels, inner_dim, vs.pp("proj_out"))?)
+            Proj::Linear(QLinear::linear_detect_gs(
+                in_channels,
+                inner_dim,
+                &vs,
+                "proj_out",
+                true,
+                group_size,
+            )?)
         } else {
             Proj::Conv2d(nn::conv2d(
                 inner_dim,
@@ -526,6 +598,22 @@ impl SpatialTransformer {
             block.visit_cross_attn_mut(f)?;
         }
         Ok(())
+    }
+
+    /// Test-only: whether the linear `proj_in`/`proj_out` loaded packed (sc-9416). Conv-projection
+    /// variants are never packed (MLX affine-packs only Linear weights), so this is `false` for them.
+    #[cfg(test)]
+    pub(crate) fn linear_projs_packed(&self) -> bool {
+        matches!(&self.proj_in, Proj::Linear(q) if q.is_quantized())
+            && matches!(&self.proj_out, Proj::Linear(q) if q.is_quantized())
+    }
+
+    /// Test-only: whether every transformer block's self- and cross-attention projections loaded packed.
+    #[cfg(test)]
+    pub(crate) fn all_block_attn_packed(&self) -> bool {
+        self.transformer_blocks
+            .iter()
+            .all(|b| b.attn1.all_projections_packed() && b.attn2.all_projections_packed())
     }
 }
 
@@ -677,9 +765,17 @@ mod ip_tests {
         let vb = VarBuilder::from_varmap(&VarMap::new(), DType::F32, &dev);
         let (query_dim, ctx_dim, heads, dim_head) = (16usize, 24usize, 4usize, 4usize);
         let inner = heads * dim_head; // 16
-        let mut xa =
-            CrossAttention::new(vb, query_dim, Some(ctx_dim), heads, dim_head, None, false)
-                .unwrap();
+        let mut xa = CrossAttention::new(
+            vb,
+            query_dim,
+            Some(ctx_dim),
+            heads,
+            dim_head,
+            None,
+            false,
+            candle_gen::quant::MLX_GROUP_SIZE,
+        )
+        .unwrap();
 
         let xs = Tensor::randn(0f32, 1f32, (2, 5, query_dim), &dev).unwrap(); // [B, Nq, query_dim]
         let ctx = Tensor::randn(0f32, 1f32, (2, 7, ctx_dim), &dev).unwrap(); // [B, S, cross_attention_dim]
@@ -719,5 +815,181 @@ mod ip_tests {
             maxdiff(&xa.forward(&xs, Some(&ctx)).unwrap(), &base) < 1e-6,
             "clearing the IP tokens reverts to base"
         );
+    }
+}
+
+#[cfg(test)]
+mod packed_tests {
+    //! sc-9416: the vendored SDXL UNet's Linear surface packed-detects through `candle_gen::quant`.
+    //! These build a synthetic **packed** `SpatialTransformer` checkpoint (the MLX-tier key layout:
+    //! attn `to_q/k/v/out.0`, GEGLU `ff.net.0.proj`, `ff.net.2`, linear `proj_in/proj_out` — each a
+    //! `{weight u32, scales, biases}` triple) and assert every Linear loaded packed while the
+    //! GroupNorm/LayerNorm stay dense, then forward to a coherent shape. A dense checkpoint (no
+    //! `.scales`) is covered by the vendored-vs-stock parity test.
+    use super::{SpatialTransformer, SpatialTransformerConfig};
+    use candle_core::safetensors::MmapedSafetensors;
+    use candle_core::{DType, Device, Tensor};
+    use candle_nn::VarBuilder;
+    use std::collections::HashMap;
+
+    const GS: usize = 64;
+
+    /// Pack an `[out, in]` weight as an MLX Q4 triple (LSB-first nibbles, per-group affine scales/biases).
+    fn pack(map: &mut HashMap<String, Tensor>, base: &str, out_f: usize, in_f: usize, bias: bool) {
+        let dev = Device::Cpu;
+        let codes: Vec<u8> = (0..out_f * in_f)
+            .map(|i| ((i * 5 + 3) % 16) as u8)
+            .collect();
+        let words: Vec<u32> = codes
+            .chunks_exact(8)
+            .map(|c| {
+                c.iter()
+                    .enumerate()
+                    .fold(0u32, |acc, (i, &q)| acc | ((q as u32 & 0xF) << (4 * i)))
+            })
+            .collect();
+        let groups = out_f * in_f / GS;
+        let scales: Vec<f32> = (0..groups).map(|g| 0.03125 * (g as f32 + 1.0)).collect();
+        let biases: Vec<f32> = (0..groups).map(|g| -0.25 - 0.1 * g as f32).collect();
+        let gpr = in_f / GS;
+        map.insert(
+            format!("{base}.weight"),
+            Tensor::from_vec(words, (out_f, in_f / 8), &dev).unwrap(),
+        );
+        map.insert(
+            format!("{base}.scales"),
+            Tensor::from_vec(scales, (out_f, gpr), &dev).unwrap(),
+        );
+        map.insert(
+            format!("{base}.biases"),
+            Tensor::from_vec(biases, (out_f, gpr), &dev).unwrap(),
+        );
+        if bias {
+            map.insert(
+                format!("{base}.bias"),
+                Tensor::zeros((out_f,), DType::F32, &dev).unwrap(),
+            );
+        }
+    }
+
+    fn dense(map: &mut HashMap<String, Tensor>, key: &str, shape: &[usize]) {
+        map.insert(
+            key.to_string(),
+            Tensor::ones(shape, DType::F32, &Device::Cpu).unwrap(),
+        );
+    }
+
+    /// Build a fully-packed `SpatialTransformer` (linear projection, depth 1) and assert every Linear
+    /// loaded packed (attn, FF, proj_in/out) while the norms are dense, then forward `[B,C,H,W]`.
+    #[test]
+    fn spatial_transformer_packed_detect_and_forward() {
+        let dev = Device::Cpu;
+        // in_channels == inner_dim so `use_linear_projection` shapes line up; group 64 divides 128.
+        let (channels, n_heads, d_head) = (128usize, 4usize, 32usize); // inner = 128
+        let ctx = 64usize;
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+
+        // Linear proj_in / proj_out (use_linear_projection = true, as SDXL).
+        pack(&mut map, "proj_in", channels, channels, true);
+        pack(&mut map, "proj_out", channels, channels, true);
+        // GroupNorm (dense — MLX packs no norms).
+        dense(&mut map, "norm.weight", &[channels]);
+        dense(&mut map, "norm.bias", &[channels]);
+
+        let tb = "transformer_blocks.0";
+        // attn1 (self): to_q/k/v [inner,inner], to_out.0 [inner,inner] (+bias).
+        for p in ["attn1.to_q", "attn1.to_k", "attn1.to_v"] {
+            pack(&mut map, &format!("{tb}.{p}"), channels, channels, false);
+        }
+        pack(
+            &mut map,
+            &format!("{tb}.attn1.to_out.0"),
+            channels,
+            channels,
+            true,
+        );
+        // attn2 (cross): to_q [inner,inner]; to_k/to_v [inner, ctx]; to_out.0 [inner,inner].
+        pack(
+            &mut map,
+            &format!("{tb}.attn2.to_q"),
+            channels,
+            channels,
+            false,
+        );
+        pack(&mut map, &format!("{tb}.attn2.to_k"), channels, ctx, false);
+        pack(&mut map, &format!("{tb}.attn2.to_v"), channels, ctx, false);
+        pack(
+            &mut map,
+            &format!("{tb}.attn2.to_out.0"),
+            channels,
+            channels,
+            true,
+        );
+        // FF: net.0.proj GEGLU [2*inner*4, inner]; net.2 [inner, inner*4].
+        pack(
+            &mut map,
+            &format!("{tb}.ff.net.0.proj"),
+            channels * 4 * 2,
+            channels,
+            true,
+        );
+        pack(
+            &mut map,
+            &format!("{tb}.ff.net.2"),
+            channels,
+            channels * 4,
+            true,
+        );
+        // LayerNorms (dense).
+        for n in ["norm1", "norm2", "norm3"] {
+            dense(&mut map, &format!("{tb}.{n}.weight"), &[channels]);
+            dense(&mut map, &format!("{tb}.{n}.bias"), &[channels]);
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "sc9416_sdxl_st_packed_{}.safetensors",
+            std::process::id()
+        ));
+        candle_core::safetensors::save(&map, &tmp).unwrap();
+        // SAFETY: we just wrote this file and nothing else touches it during the test.
+        let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
+        let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev.clone());
+
+        let cfg = SpatialTransformerConfig {
+            depth: 1,
+            num_groups: 32,
+            context_dim: Some(ctx),
+            sliced_attention_size: None,
+            use_linear_projection: true,
+        };
+        let xf = SpatialTransformer::new_gs(vb, channels, n_heads, d_head, false, cfg, GS).unwrap();
+
+        // Packed-detect fired on the whole Linear surface.
+        assert!(
+            xf.linear_projs_packed(),
+            "proj_in/proj_out must load packed on a packed tier"
+        );
+        assert!(
+            xf.all_block_attn_packed(),
+            "every attn projection (to_q/k/v/out.0) must load packed"
+        );
+
+        // Forward `[B, C, H, W]` with cross context — a coherent, finite output the same shape as input.
+        let x = Tensor::randn(0f32, 1f32, (1, channels, 8, 8), &dev).unwrap();
+        let context = Tensor::randn(0f32, 1f32, (1, 5, ctx), &dev).unwrap();
+        let y = xf.forward(&x, Some(&context)).unwrap();
+        assert_eq!(y.dims(), &[1, channels, 8, 8]);
+        let finite = y
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .all(|v| v.is_finite());
+        assert!(
+            finite,
+            "packed SpatialTransformer forward produced non-finite values"
+        );
+        std::fs::remove_file(&tmp).ok();
     }
 }

@@ -7,6 +7,7 @@
 //!
 use super::conv::{conv2d, Conv2d};
 use candle_core::{Result, Tensor, D};
+use candle_gen::quant::QLinear;
 use candle_nn as nn;
 use candle_nn::Module;
 
@@ -50,7 +51,10 @@ pub struct ResnetBlock2D {
     conv1: Conv2d,
     norm2: nn::GroupNorm,
     conv2: Conv2d,
-    time_emb_proj: Option<nn::Linear>,
+    // sc-9416: the `time_emb_proj` Linear packed-detects (the MLX SDXL tiers pack
+    // `resnets.*.time_emb_proj`); the surrounding convs/norms stay dense. Dense checkpoints have no
+    // `.scales` sibling, so `linear_detect` takes the plain dense path unchanged.
+    time_emb_proj: Option<QLinear>,
     conv_shortcut: Option<Conv2d>,
     span: tracing::Span,
     config: ResnetBlock2DConfig,
@@ -61,6 +65,17 @@ impl ResnetBlock2D {
         vs: nn::VarBuilder,
         in_channels: usize,
         config: ResnetBlock2DConfig,
+    ) -> Result<Self> {
+        Self::new_gs(vs, in_channels, config, candle_gen::quant::MLX_GROUP_SIZE)
+    }
+
+    /// As [`new`](Self::new), but at an explicit MLX packed `group_size` (sc-9416) for the
+    /// packed-detecting `time_emb_proj`.
+    pub fn new_gs(
+        vs: nn::VarBuilder,
+        in_channels: usize,
+        config: ResnetBlock2DConfig,
+        group_size: usize,
     ) -> Result<Self> {
         let out_channels = config.out_channels.unwrap_or(in_channels);
         let conv_cfg = nn::Conv2dConfig {
@@ -98,10 +113,13 @@ impl ResnetBlock2D {
         };
         let time_emb_proj = match config.temb_channels {
             None => None,
-            Some(temb_channels) => Some(nn::linear(
+            Some(temb_channels) => Some(QLinear::linear_detect_gs(
                 temb_channels,
                 out_channels,
-                vs.pp("time_emb_proj"),
+                &vs,
+                "time_emb_proj",
+                true,
+                group_size,
             )?),
         };
         let span = tracing::span!(tracing::Level::TRACE, "resnet2d");

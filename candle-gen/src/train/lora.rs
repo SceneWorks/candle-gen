@@ -30,6 +30,7 @@ use rand::distr::Uniform;
 use rand::{rngs::StdRng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 
+use crate::quant::QLinear;
 use crate::{CandleError, Result};
 
 /// PEFT gaussian-init standard deviation for the **LoRA** `A` factor (diffusers/PEFT
@@ -105,13 +106,50 @@ fn kron2d(a: &Tensor, b: &Tensor) -> candle_core::Result<Tensor> {
     a4.broadcast_mul(&b4)?.reshape((m * p, n * q))
 }
 
-/// A frozen base `Linear` with an optional trainable LoRA/LoKr residual. Implements
-/// [`Module`](candle_nn::Module) so it drops into a vendored model exactly where an `nn::Linear` was,
-/// and carries its own PEFT-style `path` (captured from the `VarBuilder` prefix at construction) so a
-/// [`LoraHost`] visitor can route adapters without threading prefixes through the module tree.
+/// The frozen base projection behind a [`LoraLinear`] — a plain dense `Linear` (the training default,
+/// byte-identical to pre-sc-9416) or a **GGUF-quantized** [`QLinear`] loaded straight from a
+/// pre-quantized MLX tier (sc-9416, the candle SDXL packed-load). Both compute `x·Wᵀ + b`; the packed
+/// arm dequantizes-on-forward into a dense matmul (sc-7702). A packed base is an **inference-only**
+/// tier: it carries no `Var` master-weights and is never trained, so installing an adapter on it is
+/// rejected (see [`LoraLinear::install_lora`] / [`LoraLinear::install_lokr`]).
+#[derive(Clone)]
+enum LoraBase {
+    Dense(Linear),
+    Packed(QLinear),
+}
+
+// `QLinear` holds a `QMatMul`/`QTensor` that are not `Debug`; `LoraLinear` derives `Debug` (it drops
+// into `#[derive(Debug)]` vendored modules), so summarize the base rather than recurse into the weight.
+impl std::fmt::Debug for LoraBase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dense(l) => f.debug_tuple("Dense").field(l).finish(),
+            Self::Packed(_) => f.write_str("Packed(QLinear)"),
+        }
+    }
+}
+
+impl LoraBase {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Dense(l) => l.forward(x),
+            Self::Packed(q) => q.forward(x),
+        }
+    }
+
+    fn is_packed(&self) -> bool {
+        matches!(self, Self::Packed(_))
+    }
+}
+
+/// A frozen base projection (dense or packed — [`LoraBase`]) with an optional trainable LoRA/LoKr
+/// residual. Implements [`Module`](candle_nn::Module) so it drops into a vendored model exactly where an
+/// `nn::Linear` was, and carries its own PEFT-style `path` (captured from the `VarBuilder` prefix at
+/// construction) so a [`LoraHost`] visitor can route adapters without threading prefixes through the
+/// module tree.
 #[derive(Debug, Clone)]
 pub struct LoraLinear {
-    base: Linear,
+    base: LoraBase,
     in_features: usize,
     out_features: usize,
     path: String,
@@ -132,13 +170,39 @@ impl LoraLinear {
         path: String,
     ) -> Self {
         Self {
-            base,
+            base: LoraBase::Dense(base),
             in_features,
             out_features,
             path,
             adapter: None,
             frozen: None,
         }
+    }
+
+    /// Wrap an already-built **packed** [`QLinear`] base (sc-9416) — the inference-only frozen base for
+    /// a pre-quantized MLX tier. `in_features`/`out_features` are the logical projection dims; `path`
+    /// is the PEFT module path. A packed base is never trained, so [`install_lora`](Self::install_lora)
+    /// / `install_lokr` reject it; with no adapter the forward is exactly the packed base's `x·Wᵀ + b`.
+    pub fn from_qlinear(
+        base: QLinear,
+        in_features: usize,
+        out_features: usize,
+        path: String,
+    ) -> Self {
+        Self {
+            base: LoraBase::Packed(base),
+            in_features,
+            out_features,
+            path,
+            adapter: None,
+            frozen: None,
+        }
+    }
+
+    /// Whether the frozen base is a packed (GGUF-quantized) [`QLinear`] rather than a dense `Linear`
+    /// (sc-9416). A packed base cannot host a trainable residual.
+    pub fn is_packed(&self) -> bool {
+        self.base.is_packed()
     }
 
     /// The PEFT module path (e.g. `down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q`),
@@ -170,7 +234,15 @@ impl LoraLinear {
 
     /// Install a LoRA residual. `down`/`up` are expected to be `Var`-backed (storage-sharing) f32
     /// tensors of shape `[rank, in]` / `[out, rank]`; `scale = alpha / rank`.
+    ///
+    /// A **packed** base (sc-9416) is an inference-only quantized tier with no `Var` master-weights, so
+    /// adapting it is a programmer error — guarded in debug (the training harness only ever builds dense
+    /// bases; the packed base is built only on the txt2img inference path, which installs no adapters).
     pub fn install_lora(&mut self, down: Tensor, up: Tensor, scale: f64) {
+        debug_assert!(
+            !self.base.is_packed(),
+            "cannot install a LoRA residual on a packed (quantized) base"
+        );
         self.adapter = Some(Adapter::Lora { down, up, scale });
     }
 
@@ -180,6 +252,10 @@ impl LoraLinear {
     }
 
     fn install_lokr(&mut self, w1: Tensor, w2: LokrW2, scale: f64) {
+        debug_assert!(
+            !self.base.is_packed(),
+            "cannot install a LoKr residual on a packed (quantized) base"
+        );
         self.adapter = Some(Adapter::Lokr {
             w1,
             w2,
@@ -302,6 +378,56 @@ pub fn lora_linear(in_f: usize, out_f: usize, vs: VarBuilder) -> candle_core::Re
     let path = vs.prefix();
     let base = candle_nn::linear(in_f, out_f, vs)?;
     Ok(LoraLinear::from_linear(base, in_f, out_f, path))
+}
+
+/// **Packed-detecting** biased [`LoraLinear`] (sc-9416): if `{base_key}.scales` is present in `vs` (a
+/// pre-quantized MLX tier) the frozen base is a quantized [`QLinear`] built straight from the packed
+/// parts at `group_size` (no dense weight materialized); otherwise it is the plain dense `Linear`,
+/// byte-identical to [`lora_linear`]. `base_key` is the full dotted prefix (e.g. `attn2.to_out.0`), so
+/// the `.scales`/`.biases` siblings survive the `to_out.0` nesting — the `linear_detect` contract. The
+/// packed base is inference-only (no adapter). Used by the candle SDXL packed txt2img UNet load.
+pub fn lora_linear_detect(
+    in_f: usize,
+    out_f: usize,
+    vs: &VarBuilder,
+    base_key: &str,
+    group_size: usize,
+) -> candle_core::Result<LoraLinear> {
+    let path = vs.pp(base_key).prefix();
+    let q = crate::quant::lin_gs(vs, base_key, in_f, out_f, true, group_size)?;
+    if q.is_quantized() {
+        Ok(LoraLinear::from_qlinear(q, in_f, out_f, path))
+    } else {
+        Ok(LoraLinear::from_linear(
+            candle_nn::linear(in_f, out_f, vs.pp(base_key))?,
+            in_f,
+            out_f,
+            path,
+        ))
+    }
+}
+
+/// **Packed-detecting** bias-free [`LoraLinear`] (sc-9416) — the `no_bias` analogue of
+/// [`lora_linear_detect`]. The SDXL attention `to_q`/`to_k`/`to_v` projections are bias-free.
+pub fn lora_linear_no_bias_detect(
+    in_f: usize,
+    out_f: usize,
+    vs: &VarBuilder,
+    base_key: &str,
+    group_size: usize,
+) -> candle_core::Result<LoraLinear> {
+    let path = vs.pp(base_key).prefix();
+    let q = crate::quant::lin_gs(vs, base_key, in_f, out_f, false, group_size)?;
+    if q.is_quantized() {
+        Ok(LoraLinear::from_qlinear(q, in_f, out_f, path))
+    } else {
+        Ok(LoraLinear::from_linear(
+            candle_nn::linear_no_bias(in_f, out_f, vs.pp(base_key))?,
+            in_f,
+            out_f,
+            path,
+        ))
+    }
 }
 
 /// A model that exposes its adaptable [`LoraLinear`]s for the harness to install adapters into. The
@@ -882,6 +1008,129 @@ mod tests {
     fn fixed_linear(weight: &[f32], out_f: usize, in_f: usize) -> LoraLinear {
         let w = Tensor::from_vec(weight.to_vec(), (out_f, in_f), &Device::Cpu).unwrap();
         LoraLinear::from_linear(Linear::new(w, None), in_f, out_f, "test.to_q".into())
+    }
+
+    // ---- packed base (sc-9416) ---------------------------------------------------------------
+
+    /// Build a real MLX Q4 packed triple for an `[out, in]` weight (group 64), same construction as the
+    /// `quant` module's fixtures: LSB-first nibble packing + per-group affine scales/biases.
+    fn q4_packed_triple(out_f: usize, in_f: usize) -> (Tensor, Tensor, Tensor) {
+        let dev = Device::Cpu;
+        let gs = crate::quant::MLX_GROUP_SIZE;
+        let codes: Vec<u8> = (0..out_f * in_f)
+            .map(|i| ((i * 7 + i / 13) % 16) as u8)
+            .collect();
+        let words: Vec<u32> = codes
+            .chunks_exact(8)
+            .map(|c| {
+                c.iter()
+                    .enumerate()
+                    .fold(0u32, |acc, (i, &q)| acc | ((q as u32 & 0xF) << (4 * i)))
+            })
+            .collect();
+        let groups = out_f * in_f / gs;
+        let scales: Vec<f32> = (0..groups).map(|g| 0.0625 * (g as f32 + 1.0)).collect();
+        let biases: Vec<f32> = (0..groups).map(|g| -0.5 - 0.25 * g as f32).collect();
+        let gpr = in_f / gs;
+        (
+            Tensor::from_vec(words, (out_f, in_f / 8), &dev).unwrap(),
+            Tensor::from_vec(scales, (out_f, gpr), &dev).unwrap(),
+            Tensor::from_vec(biases, (out_f, gpr), &dev).unwrap(),
+        )
+    }
+
+    /// A `LoraLinear` wrapping a **packed** `QLinear` base (sc-9416) reports `is_packed()`, and with no
+    /// adapter its forward is exactly the packed base's — the inference path a packed SDXL tier takes.
+    #[test]
+    fn packed_base_forwards_as_qlinear() {
+        let dev = Device::Cpu;
+        let (out_f, in_f) = (64usize, 128usize);
+        let (wq, s, b) = q4_packed_triple(out_f, in_f);
+        let q = QLinear::from_packed(&wq, &s, &b, None, &dev).unwrap();
+        let ll = LoraLinear::from_qlinear(q.clone(), in_f, out_f, "attn2.to_out.0".into());
+        assert!(ll.is_packed());
+        assert!(!ll.is_adapted());
+
+        let x = Tensor::randn(0f32, 1f32, (4, in_f), &dev).unwrap();
+        let a = ll.forward(&x).unwrap();
+        let bff = q.forward(&x).unwrap();
+        let dmax = (a - bff)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert_eq!(
+            dmax, 0.0,
+            "packed LoraLinear base must equal its QLinear forward"
+        );
+    }
+
+    /// A dense base reports `!is_packed()` (the training default) — the byte-identical pre-sc-9416 path.
+    #[test]
+    fn dense_base_is_not_packed() {
+        let ll = fixed_linear(&[1.0; 8], 2, 4);
+        assert!(!ll.is_packed());
+    }
+
+    /// Installing an adapter on a packed base is a programmer error (debug-guarded): a packed tier has
+    /// no `Var` master-weights to adapt. Pins the sc-9416 invariant that the packed inference path and
+    /// the training-residual path never coexist.
+    #[test]
+    #[should_panic(expected = "packed")]
+    fn install_lora_on_packed_base_panics_in_debug() {
+        let dev = Device::Cpu;
+        let (out_f, in_f) = (64usize, 128usize);
+        let (wq, s, b) = q4_packed_triple(out_f, in_f);
+        let q = QLinear::from_packed(&wq, &s, &b, None, &dev).unwrap();
+        let mut ll = LoraLinear::from_qlinear(q, in_f, out_f, "attn2.to_out.0".into());
+        let down = Tensor::zeros((4, in_f), DType::F32, &dev).unwrap();
+        let up = Tensor::zeros((out_f, 4), DType::F32, &dev).unwrap();
+        ll.install_lora(down, up, 1.0);
+    }
+
+    /// `lora_linear_detect` / `lora_linear_no_bias_detect` route to the packed base when the `.scales`
+    /// sibling is present in the VarBuilder, and to the dense base otherwise — the one-call packed-detect
+    /// contract used by the vendored SDXL attention. Uses an in-memory safetensors (no weights needed).
+    #[test]
+    fn lora_linear_detect_packed_vs_dense() {
+        use candle_core::safetensors::MmapedSafetensors;
+        let dev = Device::Cpu;
+        let (out_f, in_f) = (64usize, 128usize);
+        let (wq, s, b) = q4_packed_triple(out_f, in_f);
+        // A packed `to_out.0` triple + a dense `to_q.weight` (bias-free) sibling in one file.
+        let mut map: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
+        map.insert("to_out.0.weight".into(), wq);
+        map.insert("to_out.0.scales".into(), s);
+        map.insert("to_out.0.biases".into(), b);
+        map.insert(
+            "to_out.0.bias".into(),
+            Tensor::zeros((out_f,), DType::F32, &dev).unwrap(),
+        );
+        map.insert(
+            "to_q.weight".into(),
+            Tensor::randn(0f32, 1f32, (out_f, in_f), &dev).unwrap(),
+        );
+        let tmp = std::env::temp_dir().join(format!(
+            "sc9416_lora_detect_{}.safetensors",
+            std::process::id()
+        ));
+        candle_core::safetensors::save(&map, &tmp).unwrap();
+        // SAFETY: we just wrote this file and nothing else touches it during the test.
+        let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
+        let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev.clone());
+
+        let gs = crate::quant::MLX_GROUP_SIZE;
+        let packed = lora_linear_detect(in_f, out_f, &vb, "to_out.0", gs).unwrap();
+        assert!(packed.is_packed(), "`.scales` present ⇒ packed base");
+        let dense = lora_linear_no_bias_detect(in_f, out_f, &vb, "to_q", gs).unwrap();
+        assert!(!dense.is_packed(), "no `.scales` ⇒ dense base");
+        // The PEFT path is captured for both (the LoraHost visitor routes adapters by it).
+        assert_eq!(packed.path(), "to_out.0");
+        assert_eq!(dense.path(), "to_q");
+        std::fs::remove_file(&tmp).ok();
     }
 
     #[test]

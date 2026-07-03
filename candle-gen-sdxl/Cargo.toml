@@ -36,6 +36,8 @@ rand_distr = { workspace = true }
 # merge needs) at inference-side load (sc-5165 adapter merge). Candle's own version (0.7), matching
 # candle-gen, so the `View` impl candle-core provides for `Tensor` is the same one.
 safetensors = "0.7"
+# Parse the packed MLX tier's `unet/config.json` `quantization` block (sc-9416 packed-load detect).
+serde_json = { workspace = true }
 
 [features]
 # Pass the backend selection through to the core crate AND candle-transformers so a downstream

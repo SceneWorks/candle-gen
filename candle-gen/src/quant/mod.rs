@@ -269,6 +269,21 @@ pub enum QLinear {
     },
 }
 
+// `QMatMul`/`QTensor` are not `Debug`, so summarize rather than derive — lets `QLinear` drop into the
+// many `#[derive(Debug)]` vendored provider modules (e.g. the candle SDXL UNet, sc-9416) that hold it.
+impl std::fmt::Debug for QLinear {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dense(_) => f.write_str("QLinear::Dense"),
+            Self::Quantized { weight, bias, .. } => f
+                .debug_struct("QLinear::Quantized")
+                .field("dtype", &weight.dtype())
+                .field("bias", &bias.is_some())
+                .finish(),
+        }
+    }
+}
+
 impl QLinear {
     /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`).
     pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
@@ -306,6 +321,21 @@ impl QLinear {
         bias: bool,
     ) -> Result<Self> {
         lin(vb, base, in_dim, out_dim, bias)
+    }
+
+    /// As [`Self::linear_detect`], but at an explicit MLX packed `group_size` (sc-9410 / sc-9416) — the
+    /// packed branch repacks at `group_size` (read from the component `config.json`'s
+    /// `quantization.group_size`); the dense branch is unchanged. The SDXL MLX tiers pack at the default
+    /// 64, but a loader that reads the group from config threads it here rather than assume 64.
+    pub fn linear_detect_gs(
+        in_dim: usize,
+        out_dim: usize,
+        vb: &VarBuilder,
+        base: &str,
+        bias: bool,
+        group_size: usize,
+    ) -> Result<Self> {
+        lin_gs(vb, base, in_dim, out_dim, bias, group_size)
     }
 
     /// Build a `Quantized` projection directly from an MLX packed triple (`wq` u32 codes + `scales` +
