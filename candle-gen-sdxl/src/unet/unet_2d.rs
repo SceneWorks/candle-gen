@@ -672,10 +672,7 @@ impl UNet2DConditionModel {
     /// denoise, so call once per generation before the loop; `forward_instantid` then runs the decoupled
     /// branch. `None` reverts to plain SDXL.
     pub fn set_ip_context(&mut self, tokens: Option<&Tensor>, scale: f64) -> Result<()> {
-        self.visit_cross_attn_mut(&mut |xa| {
-            xa.set_ip(tokens, scale);
-            Ok(())
-        })
+        self.visit_cross_attn_mut(&mut |xa| xa.set_ip(tokens, scale))
     }
 
     /// Walk every cross-attention (`attn2`) in diffusers `attn_processors` order — **down blocks, then

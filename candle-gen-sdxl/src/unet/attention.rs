@@ -110,6 +110,16 @@ pub struct CrossAttention {
     // so set once per generation via [`set_ip`](CrossAttention::set_ip) rather than threaded per step.
     ip_tokens: Option<Tensor>,
     ip_scale: f64,
+    // sc-9424 (F-054 sibling): the head-shaped image-token K/V (`[B·heads, N_ip, head_dim]` each),
+    // precomputed ONCE from the constant `ip_tokens` at [`set_ip`](CrossAttention::set_ip) time and
+    // reused on every denoise step. `to_k_ip(ip_tokens)`/`to_v_ip(ip_tokens)` are step-invariant — the
+    // tokens and the projection weights never change across a render — so projecting them per step was
+    // pure wasted recompute (the identical finding F-054 fixed for the FLUX XLabs IP-Adapter). Cached
+    // here (not in a `RefCell`) because `set_ip` already runs per-render with `&mut self` and the exact
+    // constant tokens: the cache is populated at set time and cleared when the tokens are cleared/changed,
+    // so it is naturally scoped to a single render and can never serve stale K/V from a prior generate().
+    // The reuse is bit-identical to recomputing the projections each step.
+    ip_kv: Option<(Tensor, Tensor)>,
 }
 
 impl CrossAttention {
@@ -152,6 +162,7 @@ impl CrossAttention {
             to_v_ip: None,
             ip_tokens: None,
             ip_scale: 0.0,
+            ip_kv: None,
         })
     }
 
@@ -219,13 +230,12 @@ impl CrossAttention {
         let mut xs = self.attention(&query, &key, &value)?;
         // IP-Adapter decoupled branch (sc-5491): reuse the text query against the image/identity
         // tokens' own K/V, scaled and added before the output projection. A no-op (skipped) unless the
-        // K/V are installed AND tokens are set — so the training / stock path is unchanged.
-        if let (Some(to_k_ip), Some(to_v_ip), Some(ip_tokens)) =
-            (&self.to_k_ip, &self.to_v_ip, &self.ip_tokens)
-        {
-            let key_ip = self.reshape_heads_to_batch_dim(&to_k_ip.forward(ip_tokens)?)?;
-            let value_ip = self.reshape_heads_to_batch_dim(&to_v_ip.forward(ip_tokens)?)?;
-            let ip_out = self.attention(&query, &key_ip, &value_ip)?;
+        // K/V cache is populated (installed AND tokens set) — so the training / stock path is unchanged.
+        // sc-9424 (F-054 sibling): the image-token K/V are precomputed ONCE in `set_ip` (they are
+        // step-invariant) and reused here every step — bit-identical to `to_k_ip(ip_tokens)` /
+        // `to_v_ip(ip_tokens)` per step, but without the redundant per-step projection.
+        if let Some((key_ip, value_ip)) = &self.ip_kv {
+            let ip_out = self.attention(&query, key_ip, value_ip)?;
             xs = (xs + (ip_out * self.ip_scale)?)?;
         }
         self.to_out.forward(&xs)
@@ -249,14 +259,35 @@ impl CrossAttention {
     pub fn install_ip(&mut self, k_ip: Tensor, v_ip: Tensor) {
         self.to_k_ip = Some(nn::Linear::new(k_ip, None));
         self.to_v_ip = Some(nn::Linear::new(v_ip, None));
+        // sc-9424: any precomputed K/V from an earlier `set_ip` was projected with the OLD weights;
+        // drop it so the next `set_ip` rebuilds against these freshly-installed projections. (Install is
+        // a one-time load-time op that always precedes `set_ip`, so this is defensive, not hot-path.)
+        self.ip_kv = None;
     }
 
     /// Set (or clear, with `None`) the IP tokens + scale used by [`forward`](Self::forward)'s decoupled
     /// branch. Constant across the denoise, so set once per generation; the clone is cheap (the face
     /// tokens are `[B, 16, 2048]`).
-    pub fn set_ip(&mut self, tokens: Option<&Tensor>, scale: f64) {
+    ///
+    /// sc-9424 (F-054 sibling): because the image tokens are step-invariant, this also PRECOMPUTES the
+    /// head-shaped IP K/V (`to_k_ip(tokens)` / `to_v_ip(tokens)`, reshaped to `[B·heads, N_ip, head_dim]`)
+    /// ONCE here — the `forward` decoupled branch then reuses the cache every step instead of re-running
+    /// the projections per step. Clearing the tokens (or passing new ones) rebuilds/clears the cache, so
+    /// it is scoped to a single render and never serves stale K/V across `generate()` calls. Returns an
+    /// error only if the projection reshape fails; a no-op (clears the cache) when the decoupled K/V are
+    /// not installed or `tokens` is `None`.
+    pub fn set_ip(&mut self, tokens: Option<&Tensor>, scale: f64) -> Result<()> {
         self.ip_tokens = tokens.cloned();
         self.ip_scale = scale;
+        self.ip_kv = match (&self.to_k_ip, &self.to_v_ip, &self.ip_tokens) {
+            (Some(to_k_ip), Some(to_v_ip), Some(ip_tokens)) => {
+                let key_ip = self.reshape_heads_to_batch_dim(&to_k_ip.forward(ip_tokens)?)?;
+                let value_ip = self.reshape_heads_to_batch_dim(&to_v_ip.forward(ip_tokens)?)?;
+                Some((key_ip, value_ip))
+            }
+            _ => None,
+        };
+        Ok(())
     }
 
     /// Test-only: whether the four attention projections loaded packed (a pre-quantized MLX tier) —
@@ -747,25 +778,121 @@ mod ip_tests {
         let v_ip = Tensor::randn(0f32, 1f32, (inner, ctx_dim), &dev).unwrap();
         xa.install_ip(k_ip, v_ip);
         let ip_tokens = Tensor::randn(0f32, 1f32, (2, 3, ctx_dim), &dev).unwrap(); // [B, N_ip, cross_attention_dim]
-        xa.set_ip(Some(&ip_tokens), 0.0);
+        xa.set_ip(Some(&ip_tokens), 0.0).unwrap();
         assert!(
             maxdiff(&xa.forward(&xs, Some(&ctx)).unwrap(), &base) < 1e-6,
             "ip_scale=0 must equal the no-IP output"
         );
 
         // A positive scale shifts the output.
-        xa.set_ip(Some(&ip_tokens), 0.8);
+        xa.set_ip(Some(&ip_tokens), 0.8).unwrap();
         assert!(
             maxdiff(&xa.forward(&xs, Some(&ctx)).unwrap(), &base) > 1e-4,
             "ip_scale>0 must change the output"
         );
 
         // Clearing the tokens reverts to the plain cross-attention.
-        xa.set_ip(None, 0.0);
+        xa.set_ip(None, 0.0).unwrap();
         assert!(
             maxdiff(&xa.forward(&xs, Some(&ctx)).unwrap(), &base) < 1e-6,
             "clearing the IP tokens reverts to base"
         );
+    }
+
+    /// sc-9424 (F-054 sibling): the IP K/V precomputed once in `set_ip` and reused across steps must be
+    /// **bit-identical** to projecting `to_k_ip(ip_tokens)` / `to_v_ip(ip_tokens)` every step. We call
+    /// `forward` repeatedly with DISTINCT queries (as the denoise loop does — the query changes, the
+    /// image tokens do not) and compare, at each step, the cached output against a from-scratch reference
+    /// that reprojects the tokens with the same weights. Also asserts `set_ip` populates the cache and
+    /// `set_ip(None)` clears it, so the cache is scoped to a single render.
+    #[test]
+    fn ip_kv_cache_is_bit_identical_across_steps() {
+        let dev = Device::Cpu;
+        let vb = VarBuilder::from_varmap(&VarMap::new(), DType::F32, &dev);
+        let (query_dim, ctx_dim, heads, dim_head) = (16usize, 24usize, 4usize, 4usize);
+        let inner = heads * dim_head; // 16
+        let mut xa = CrossAttention::new(
+            vb,
+            query_dim,
+            Some(ctx_dim),
+            heads,
+            dim_head,
+            false,
+            candle_gen::quant::MLX_GROUP_SIZE,
+        )
+        .unwrap();
+
+        let ctx = Tensor::randn(0f32, 1f32, (2, 7, ctx_dim), &dev).unwrap();
+        let k_ip = Tensor::randn(0f32, 1f32, (inner, ctx_dim), &dev).unwrap();
+        let v_ip = Tensor::randn(0f32, 1f32, (inner, ctx_dim), &dev).unwrap();
+        xa.install_ip(k_ip.clone(), v_ip.clone());
+        let ip_tokens = Tensor::randn(0f32, 1f32, (2, 3, ctx_dim), &dev).unwrap();
+
+        // Cache is empty before `set_ip`, populated after, cleared on `set_ip(None)`.
+        assert!(xa.ip_kv.is_none(), "no cache before set_ip");
+        xa.set_ip(Some(&ip_tokens), 0.7).unwrap();
+        assert!(xa.ip_kv.is_some(), "set_ip must populate the K/V cache");
+
+        // The cached head-shaped K/V must equal a fresh reshape of the raw projections.
+        let flat = |t: &Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let want_k = xa
+            .reshape_heads_to_batch_dim(&nn::Linear::new(k_ip, None).forward(&ip_tokens).unwrap())
+            .unwrap();
+        let want_v = xa
+            .reshape_heads_to_batch_dim(&nn::Linear::new(v_ip, None).forward(&ip_tokens).unwrap())
+            .unwrap();
+        let (cached_k, cached_v) = xa.ip_kv.as_ref().unwrap();
+        assert_eq!(
+            flat(cached_k),
+            flat(&want_k),
+            "cached K must match recompute"
+        );
+        assert_eq!(
+            flat(cached_v),
+            flat(&want_v),
+            "cached V must match recompute"
+        );
+
+        // Across multiple steps (distinct queries), the cached branch equals a per-step recompute.
+        for _step in 0..3 {
+            let xs = Tensor::randn(0f32, 1f32, (2, 5, query_dim), &dev).unwrap();
+            let got = xa.forward(&xs, Some(&ctx)).unwrap();
+            // Reference: manually run the decoupled branch reprojecting the tokens THIS step.
+            let query = xa
+                .reshape_heads_to_batch_dim(&xa.to_q.forward(&xs).unwrap())
+                .unwrap();
+            let context = ctx.contiguous().unwrap();
+            let key = xa
+                .reshape_heads_to_batch_dim(&xa.to_k.forward(&context).unwrap())
+                .unwrap();
+            let value = xa
+                .reshape_heads_to_batch_dim(&xa.to_v.forward(&context).unwrap())
+                .unwrap();
+            let base = xa.attention(&query, &key, &value).unwrap();
+            let key_ip = xa
+                .reshape_heads_to_batch_dim(
+                    &xa.to_k_ip.as_ref().unwrap().forward(&ip_tokens).unwrap(),
+                )
+                .unwrap();
+            let value_ip = xa
+                .reshape_heads_to_batch_dim(
+                    &xa.to_v_ip.as_ref().unwrap().forward(&ip_tokens).unwrap(),
+                )
+                .unwrap();
+            let ip_out = xa.attention(&query, &key_ip, &value_ip).unwrap();
+            let want = xa
+                .to_out
+                .forward(&(base + (ip_out * xa.ip_scale).unwrap()).unwrap())
+                .unwrap();
+            assert_eq!(
+                flat(&got),
+                flat(&want),
+                "cached IP-K/V forward must be bit-identical to a per-step recompute"
+            );
+        }
+
+        xa.set_ip(None, 0.0).unwrap();
+        assert!(xa.ip_kv.is_none(), "set_ip(None) must clear the cache");
     }
 }
 
