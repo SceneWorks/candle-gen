@@ -136,15 +136,36 @@ impl Pipeline {
     /// carries a `quantization` block (`candle_gen::quant::PackedConfig`), which an install-time convert
     /// job writes for a packed component. On a packed tier the loader builds each Linear/embedding
     /// **directly from the packed parts** on the GPU (sc-9087, no dense CPU staging); on a dense tier it
-    /// falls back to the CPU-stage → quantize-onto-GPU path. Absent/unreadable config → not packed
-    /// (dense path), so a fixture with no `config.json` still loads.
-    pub(crate) fn component_is_packed(&self, sub: &str) -> bool {
+    /// falls back to the CPU-stage → quantize-onto-GPU path.
+    ///
+    /// A **genuinely-absent** `config.json` (file NotFound) is a legitimate dense/fixture snapshot shape
+    /// → `Ok(false)` (dense path), so a single-file fixture with no `config.json` still loads. A config
+    /// that **is present but corrupt** (I/O error, malformed JSON) is a damaged/partial download and
+    /// errors loudly naming the file, rather than silently downgrading a packed component to the dense
+    /// path (wrong tier / missing weights, no diagnostic). A well-formed config with no `quantization`
+    /// block is simply a dense tier → `Ok(false)`. Mirrors the F-073 fix (sc-9010) in qwen-edit / krea.
+    pub(crate) fn component_is_packed(&self, sub: &str) -> CResult<bool> {
         let path = self.root.join(sub).join("config.json");
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-            .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
-            .is_some()
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            // No config.json at all → legitimate dense/fixture snapshot, not packed.
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            // Present but unreadable (permissions, partial download) → surface, don't swallow.
+            Err(e) => {
+                return Err(CandleError::Msg(format!(
+                    "flux2: read {}: {e}",
+                    path.display()
+                )))
+            }
+        };
+        // Present but malformed JSON → corrupt snapshot, error rather than fall to dense.
+        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            CandleError::Msg(format!(
+                "flux2: parse {} (corrupt snapshot?): {e}",
+                path.display()
+            ))
+        })?;
+        Ok(candle_gen::quant::PackedConfig::from_config(&v).is_some())
     }
 
     /// Load the base **Mistral/Qwen3 TE + `Flux2Transformer` DiT** pair — the exact quantizable stack
@@ -205,7 +226,7 @@ impl Pipeline {
         quantize: impl FnOnce(&mut M, Quant, &Device) -> CResult<()>,
     ) -> CResult<M> {
         match self.quant {
-            Some(q) if self.component_is_packed(sub) => {
+            Some(q) if self.component_is_packed(sub)? => {
                 // Build straight on the GPU from the packed tier — the packed footprint (≈ Q4: ¼ bf16)
                 // lands directly; no dense staging.
                 let mut m = build(self.component_vb_on(sub, &self.device)?)?;
@@ -735,7 +756,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            pipe.component_is_packed("transformer"),
+            pipe.component_is_packed("transformer").unwrap(),
             "a `quantization` block ⇒ packed tier"
         );
 
@@ -743,11 +764,24 @@ mod tests {
         std::fs::create_dir_all(&dense).unwrap();
         std::fs::write(dense.join("config.json"), r#"{"hidden_size": 5120}"#).unwrap();
         assert!(
-            !pipe.component_is_packed("text_encoder"),
+            !pipe.component_is_packed("text_encoder").unwrap(),
             "no `quantization` block ⇒ dense tier"
         );
         // A component with no config.json at all → dense (fixtures still load).
-        assert!(!pipe.component_is_packed("vae"));
+        assert!(!pipe.component_is_packed("vae").unwrap());
+
+        // A config.json that is *present but corrupt* (malformed JSON, e.g. a partial download) must
+        // error loudly naming the file — NOT silently fall to the dense path (sc-9426 / F-073 sibling).
+        let corrupt = dir.join("vae_bad");
+        std::fs::create_dir_all(&corrupt).unwrap();
+        std::fs::write(corrupt.join("config.json"), b"{ not json").unwrap();
+        let err = pipe
+            .component_is_packed("vae_bad")
+            .expect_err("corrupt config.json must error, not fall to dense");
+        assert!(
+            format!("{err}").contains("config.json"),
+            "the error should name the offending file, got: {err}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
