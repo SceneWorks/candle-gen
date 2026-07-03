@@ -142,6 +142,75 @@ impl QwenRope {
     }
 }
 
+/// Per-render RoPE-table cache (sc-8992 / F-012). The image + text `(cos, sin)` tables depend only on
+/// the fixed token grids (`[(lat_h, lat_w), …]`) and `txt_seq` — not on σ / the current latent — so
+/// they are identical across every denoise step (×2 under CFG, and the control branch re-derives the
+/// same grid each step). Cache them keyed on `(grids, txt_seq)` and rebuild only when the geometry
+/// changes; hits Arc-clone the stored handles. Byte-identical to recomputing.
+///
+/// `Mutex` (not `RefCell`) because the transformers are shared as `Arc<…>` and must stay `Send + Sync`.
+pub struct RopeCache {
+    slot: std::sync::Mutex<Option<RopeCacheEntry>>,
+}
+
+struct RopeCacheEntry {
+    grids: Vec<(usize, usize)>,
+    txt_seq: usize,
+    img_cos: Tensor,
+    img_sin: Tensor,
+    txt_cos: Tensor,
+    txt_sin: Tensor,
+}
+
+impl RopeCache {
+    pub fn new() -> Self {
+        Self {
+            slot: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Build (or reuse) the image + text RoPE tables for `grids` / `txt_seq`. Recomputed only when the
+    /// geometry changes vs the cached entry. Construction is identical to calling the `QwenRope`
+    /// builders inline, so every step is byte-identical.
+    #[allow(clippy::type_complexity)]
+    pub fn tables(
+        &self,
+        rope: &QwenRope,
+        grids: &[(usize, usize)],
+        txt_seq: usize,
+        device: &Device,
+    ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        let mut guard = self.slot.lock().unwrap();
+        if let Some(c) = guard.as_ref() {
+            if c.grids.as_slice() == grids && c.txt_seq == txt_seq {
+                return Ok((
+                    c.img_cos.clone(),
+                    c.img_sin.clone(),
+                    c.txt_cos.clone(),
+                    c.txt_sin.clone(),
+                ));
+            }
+        }
+        let (img_cos, img_sin) = rope.img_cos_sin_multi(grids, device)?;
+        let (txt_cos, txt_sin) = rope.txt_cos_sin_multi(txt_seq, grids, device)?;
+        *guard = Some(RopeCacheEntry {
+            grids: grids.to_vec(),
+            txt_seq,
+            img_cos: img_cos.clone(),
+            img_sin: img_sin.clone(),
+            txt_cos: txt_cos.clone(),
+            txt_sin: txt_sin.clone(),
+        });
+        Ok((img_cos, img_sin, txt_cos, txt_sin))
+    }
+}
+
+impl Default for RopeCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Apply interleaved RoPE to `x` `[B, H, S, head_dim]` with `cos`/`sin` `[S, head_dim/2]`.
 pub fn apply_rope(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     let dtype = x.dtype();

@@ -35,8 +35,15 @@ impl Ideogram4Attention {
         })
     }
 
-    /// `x`: `[B, L, emb]`; `cos`/`sin`: `[B, L, head_dim]`; `mask`: additive `[B, 1, L, L]`.
-    pub fn forward(&self, x: &Tensor, cos: &Tensor, sin: &Tensor, mask: &Tensor) -> Result<Tensor> {
+    /// `x`: `[B, L, emb]`; `cos`/`sin`: `[B, L, head_dim]`; `mask`: optional additive `[B, 1, L, L]`
+    /// (`None` skips the add — uniform-segment path, sc-8992).
+    pub fn forward(
+        &self,
+        x: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: Option<&Tensor>,
+    ) -> Result<Tensor> {
         let (b, s, _) = x.dims3()?;
         let (nh, hd) = (self.num_heads, self.head_dim);
 
@@ -60,7 +67,13 @@ impl Ideogram4Attention {
 
         let scale = (hd as f64).powf(-0.5);
         let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?; // [B,H,L,L]
-        let scores = scores.broadcast_add(&mask.to_dtype(scores.dtype())?)?;
+
+        // Uniform-segment renders pass `None` (mask is all-zeros): skip the broadcast-add entirely
+        // (sc-8992). `softmax(scores + 0) == softmax(scores)`, so this is byte-identical.
+        let scores = match mask {
+            Some(m) => scores.broadcast_add(&m.to_dtype(scores.dtype())?)?,
+            None => scores,
+        };
         let probs = softmax_last_dim(&scores)?;
         let o = probs.matmul(&v)?; // [B,H,L,hd]
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
@@ -139,13 +152,13 @@ impl Ideogram4Block {
     }
 
     /// `x`: `[B, L, emb]`; `adaln_input`: `[B, 1, adaln_dim]`; `cos`/`sin`: `[B, L, head_dim]`;
-    /// `mask`: additive `[B, 1, L, L]`.
+    /// `mask`: optional additive `[B, 1, L, L]` (`None` = uniform segment, no masking; sc-8992).
     pub fn forward(
         &self,
         x: &Tensor,
         cos: &Tensor,
         sin: &Tensor,
-        mask: &Tensor,
+        mask: Option<&Tensor>,
         adaln_input: &Tensor,
     ) -> Result<Tensor> {
         let mod_ = self.adaln_modulation.forward(adaln_input)?; // [B,1,4*emb]

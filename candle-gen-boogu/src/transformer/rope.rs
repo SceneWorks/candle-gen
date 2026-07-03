@@ -20,6 +20,7 @@ use candle_gen::candle_core::{Device, Result, Tensor, D};
 /// Layout is `[1, cap_len + ref_len + img_len, head_dim/2]` (f32) in the joint
 /// `[instruct; ref-image; noise-image]` order. For text-to-image there is no reference image
 /// (`ref_len == 0`) and the layout collapses to `[instruct; image]`.
+#[derive(Clone)]
 pub struct RopeTables {
     cos: Tensor,
     sin: Tensor,

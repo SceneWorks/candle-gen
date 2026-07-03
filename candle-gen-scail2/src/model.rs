@@ -258,6 +258,23 @@ pub struct Scail2Dit {
     rope: ScailRope,
     cfg: Scail2Config,
     device: Device,
+    /// Per-render RoPE-table cache (sc-8992 / F-012). The packed `[additional_ref | ref | video | pose]`
+    /// `(cos, sin)` tables depend only on the fixed patch-grid geometry `(rope_t, rope_h, rope_w)`, the
+    /// additional-reference count, and the H-shift — not on σ / the current latent — so they are
+    /// identical across every denoise step (×2 under CFG) within a segment, and rebuild only when the
+    /// segment geometry changes. `Mutex` (not `RefCell`): the DiT is used behind a shared cache and must
+    /// stay `Send + Sync`.
+    rope_cache: std::sync::Mutex<Option<ScailRopeCache>>,
+}
+
+struct ScailRopeCache {
+    rope_t: usize,
+    rope_h: usize,
+    rope_w: usize,
+    addref_count: usize,
+    h_shift: usize,
+    cos: Tensor,
+    sin: Tensor,
 }
 
 impl Scail2Dit {
@@ -320,7 +337,86 @@ impl Scail2Dit {
             rope: ScailRope::new(cfg.head_dim()),
             cfg: cfg.clone(),
             device: vb.device().clone(),
+            rope_cache: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Build (or reuse) the packed `[additional_ref | ref | video | pose]` RoPE `(cos, sin)` tables for
+    /// this render's fixed geometry (sc-8992). Recomputed only when `(rope_t, rope_h, rope_w,
+    /// addref_count, h_shift)` changes (e.g. a new segment); otherwise the Arc-backed handles are
+    /// cloned. The chunk assembly is identical to computing it inline, so every step is byte-identical.
+    #[allow(clippy::too_many_arguments)]
+    fn rope_tables(
+        &self,
+        rope_t: usize,
+        rope_h: usize,
+        rope_w: usize,
+        addref_count: usize,
+        h_shift: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let mut guard = self.rope_cache.lock().unwrap();
+        if let Some(c) = guard.as_ref() {
+            if c.rope_t == rope_t
+                && c.rope_h == rope_h
+                && c.rope_w == rope_w
+                && c.addref_count == addref_count
+                && c.h_shift == h_shift
+            {
+                return Ok((c.cos.clone(), c.sin.clone()));
+            }
+        }
+        let dev = &self.device;
+        let base_video_shift = 1usize;
+        let mut cos_list: Vec<Tensor> = Vec::new();
+        let mut sin_list: Vec<Tensor> = Vec::new();
+
+        if addref_count > 0 {
+            let (c, s) =
+                self.rope
+                    .chunk((addref_count, rope_h, rope_w), (0, h_shift, 0), false, dev)?;
+            cos_list.push(c);
+            sin_list.push(s);
+        }
+
+        // ref+video tokens (one block); RoPE splits ref (1 frame) and video (rope_t frames).
+        let (rc, rs) =
+            self.rope
+                .chunk((1, rope_h, rope_w), (addref_count, h_shift, 0), false, dev)?;
+        let (vc, vs) = self.rope.chunk(
+            (rope_t, rope_h, rope_w),
+            (base_video_shift + addref_count, 0, 0),
+            false,
+            dev,
+        )?;
+        cos_list.push(rc);
+        cos_list.push(vc);
+        sin_list.push(rs);
+        sin_list.push(vs);
+
+        // pose tokens (W-shifted, freq avg-pool downsampled).
+        let (pc, psn) = self.rope.chunk(
+            (rope_t, rope_h, rope_w),
+            (base_video_shift + addref_count, 0, self.cfg.pose_w_shift),
+            true,
+            dev,
+        )?;
+        cos_list.push(pc);
+        sin_list.push(psn);
+
+        let cos_refs: Vec<&Tensor> = cos_list.iter().collect();
+        let sin_refs: Vec<&Tensor> = sin_list.iter().collect();
+        let cos = Tensor::cat(&cos_refs, 0)?; // [L_total, half_d]
+        let sin = Tensor::cat(&sin_refs, 0)?;
+        *guard = Some(ScailRopeCache {
+            rope_t,
+            rope_h,
+            rope_w,
+            addref_count,
+            h_shift,
+            cos: cos.clone(),
+            sin: sin.clone(),
+        });
+        Ok((cos, sin))
     }
 
     /// Number of transformer blocks (40 for the 14B).
@@ -441,7 +537,6 @@ impl Scail2Dit {
         } else {
             0
         };
-        let base_video_shift = 1usize;
 
         // --- patch-embed stems (ref+video share patch_embedding; mask/pose added) ---
         let refvid = Tensor::cat(&[&ref20, &x20], 1)?; // [20, 1+T, H, W]
@@ -454,10 +549,11 @@ impl Scail2Dit {
         let pose_emb = (self.patch_embedding_pose.forward(&pose_tok)?
             + self.patch_embedding_mask.forward(&dm_tok)?)?;
 
-        // --- assemble packed tokens + per-chunk RoPE: [additional_ref | ref | video | pose] ---
+        // --- assemble packed tokens: [additional_ref | ref | video | pose] ---
+        // The per-chunk RoPE is step-invariant (fixed patch geometry), so it is cached per render /
+        // segment and reused across every step (sc-8992); only the token embeddings — which fold in the
+        // per-step noised latent — are rebuilt here.
         let mut tok_list: Vec<Tensor> = Vec::new();
-        let mut cos_list: Vec<Tensor> = Vec::new();
-        let mut sin_list: Vec<Tensor> = Vec::new();
         let mut addref_count = 0usize;
 
         if let Some(ar) = inp.additional_ref_latent {
@@ -476,49 +572,20 @@ impl Scail2Dit {
             let ar_emb = (self.patch_embedding.forward(&ar_tok)?
                 + self.patch_embedding_mask.forward(&arm_tok)?)?;
             addref_count = ar_n;
-            let (c, s) =
-                self.rope
-                    .chunk((addref_count, rope_h, rope_w), (0, h_shift, 0), false, dev)?;
             tok_list.push(ar_emb);
-            cos_list.push(c);
-            sin_list.push(s);
         }
 
-        // ref+video tokens (one block); RoPE splits ref (1 frame) and video (rope_t frames).
+        // ref+video tokens (one block).
         tok_list.push(refvid_emb);
-        let (rc, rs) =
-            self.rope
-                .chunk((1, rope_h, rope_w), (addref_count, h_shift, 0), false, dev)?;
-        let (vc, vs) = self.rope.chunk(
-            (rope_t, rope_h, rope_w),
-            (base_video_shift + addref_count, 0, 0),
-            false,
-            dev,
-        )?;
-        cos_list.push(rc);
-        cos_list.push(vc);
-        sin_list.push(rs);
-        sin_list.push(vs);
-
-        // pose tokens (W-shifted, freq avg-pool downsampled).
+        // pose tokens.
         tok_list.push(pose_emb);
-        let (pc, psn) = self.rope.chunk(
-            (rope_t, rope_h, rope_w),
-            (base_video_shift + addref_count, 0, cfg.pose_w_shift),
-            true,
-            dev,
-        )?;
-        cos_list.push(pc);
-        sin_list.push(psn);
+
+        let (cos, sin) = self.rope_tables(rope_t, rope_h, rope_w, addref_count, h_shift)?;
 
         let tok_refs: Vec<&Tensor> = tok_list.iter().collect();
-        let cos_refs: Vec<&Tensor> = cos_list.iter().collect();
-        let sin_refs: Vec<&Tensor> = sin_list.iter().collect();
         let tokens = Tensor::cat(&tok_refs, 0)?; // [L_total, dim]
         let l_total = tokens.dim(0)?;
         let tokens = tokens.reshape((1, l_total, dim))?;
-        let cos = Tensor::cat(&cos_refs, 0)?; // [L_total, half_d]
-        let sin = Tensor::cat(&sin_refs, 0)?;
 
         // --- time / text / image conditioning ---
         let (e, e0) = self.time_embed(inp.t, dev)?;

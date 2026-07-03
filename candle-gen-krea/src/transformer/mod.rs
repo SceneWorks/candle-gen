@@ -44,6 +44,19 @@ pub struct Krea2Transformer {
     final_norm: RmsScale,
     final_linear: Linear,
     final_sstable: Tensor, // [1, 2, hidden]
+    /// Per-render RoPE-table cache (sc-8992 / F-012). The joint `(cos, sin)` table depends only on the
+    /// fixed geometry `(cap_len, ht, wt)` — not on the flow time / the current latent — so it is
+    /// identical across every denoise step. Cache it keyed on that geometry; hits Arc-clone the stored
+    /// handles. `Mutex` (not `RefCell`): the DiT is shared as `Arc<Krea2Transformer>` (`Send + Sync`).
+    rope_cache: std::sync::Mutex<Option<KreaRopeCache>>,
+}
+
+struct KreaRopeCache {
+    cap_len: usize,
+    ht: usize,
+    wt: usize,
+    cos: Tensor,
+    sin: Tensor,
 }
 
 impl Krea2Transformer {
@@ -98,7 +111,37 @@ impl Krea2Transformer {
             final_norm: RmsScale::load(w, "final_layer.norm.weight", eps)?,
             final_linear: linear(w, "final_layer.linear", true)?,
             final_sstable,
+            rope_cache: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Build (or reuse) the joint RoPE `(cos, sin)` table for this render's fixed geometry (sc-8992).
+    /// Recomputed only when `(cap_len, ht, wt)` changes; otherwise the Arc-backed handles are cloned.
+    /// Construction is identical to building it inline, so every step is byte-identical.
+    fn rope_tables(&self, cap_len: usize, ht: usize, wt: usize) -> Result<(Tensor, Tensor)> {
+        let mut guard = self.rope_cache.lock().unwrap();
+        if let Some(c) = guard.as_ref() {
+            if c.cap_len == cap_len && c.ht == ht && c.wt == wt {
+                return Ok((c.cos.clone(), c.sin.clone()));
+            }
+        }
+        let rope = RopeTables::build_t2i(
+            cap_len,
+            ht,
+            wt,
+            self.cfg.axes_dims_rope,
+            self.cfg.rope_theta as f64,
+            &self.device,
+        )?;
+        let (cos, sin) = rope.joint();
+        *guard = Some(KreaRopeCache {
+            cap_len,
+            ht,
+            wt,
+            cos: cos.clone(),
+            sin: sin.clone(),
+        });
+        Ok((cos, sin))
     }
 
     /// Velocity prediction.
@@ -140,15 +183,9 @@ impl Krea2Transformer {
 
         // Fuse to the joint sequence and run the single-stream stack under the joint RoPE.
         let mut combined = Tensor::cat(&[&ctx, &img], 1)?; // [b, cap+img_len, hidden]
-        let rope = RopeTables::build_t2i(
-            cap_len,
-            ht,
-            wt,
-            cfg.axes_dims_rope,
-            cfg.rope_theta as f64,
-            &self.device,
-        )?;
-        let (rcos, rsin) = rope.joint();
+
+        // The joint RoPE table is step-invariant (fixed geometry), so cache it per render (sc-8992).
+        let (rcos, rsin) = self.rope_tables(cap_len, ht, wt)?;
         for blk in &self.blocks {
             combined = blk.forward(&combined, &tvec, &rcos, &rsin)?;
         }

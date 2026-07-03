@@ -17,7 +17,7 @@ use candle_gen::candle_nn::{ops::softmax_last_dim, rms_norm, Module, RmsNorm, Va
 
 use crate::config::TransformerConfig;
 use crate::quant::QLinear;
-use crate::rope::{apply_rope, QwenRope};
+use crate::rope::{apply_rope, QwenRope, RopeCache};
 
 const EPS: f64 = 1e-6;
 
@@ -426,6 +426,7 @@ pub struct QwenTransformer {
     norm_out: NormOut,
     proj_out: QLinear,
     rope: QwenRope,
+    rope_cache: RopeCache,
     device: Device,
     dtype: DType,
 }
@@ -468,6 +469,7 @@ impl QwenTransformer {
             // proj_out maps to the packed velocity (patch²·out_channels = 64 = in_channels).
             proj_out: QLinear::linear_detect_gs(inner, cfg.in_channels, &vb, "proj_out", true, gs)?,
             rope: QwenRope::new(cfg),
+            rope_cache: RopeCache::new(),
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
@@ -520,8 +522,10 @@ impl QwenTransformer {
         let mut encoder = self.txt_in.forward(&encoder)?;
 
         let txt_seq = encoder.dim(1)?;
-        let (img_cos, img_sin) = self.rope.img_cos_sin(lat_h, lat_w, &self.device)?;
-        let (txt_cos, txt_sin) = self.rope.txt_cos_sin(txt_seq, lat_h, lat_w, &self.device)?;
+        // Step-invariant (fixed grid), so cache the RoPE tables per render (sc-8992).
+        let (img_cos, img_sin, txt_cos, txt_sin) =
+            self.rope_cache
+                .tables(&self.rope, &[(lat_h, lat_w)], txt_seq, &self.device)?;
 
         // Treat an empty slice as "no control" so the group index can't underflow. Pre-scale the (few)
         // control residuals once, before the 60-block loop.
@@ -585,8 +589,10 @@ impl QwenTransformer {
         let mut grids = Vec::with_capacity(1 + cond_grids.len());
         grids.push((lat_h, lat_w));
         grids.extend_from_slice(cond_grids);
-        let (img_cos, img_sin) = self.rope.img_cos_sin_multi(&grids, &self.device)?;
-        let (txt_cos, txt_sin) = self.rope.txt_cos_sin_multi(txt_seq, &grids, &self.device)?;
+        // Step-invariant (fixed noise + reference grids), so cache the RoPE tables per render (sc-8992).
+        let (img_cos, img_sin, txt_cos, txt_sin) =
+            self.rope_cache
+                .tables(&self.rope, &grids, txt_seq, &self.device)?;
 
         // zero_cond_t: double the temb to [real_t ; zero_t] and build the per-token select index.
         let zc = zero_cond_t && !cond_grids.is_empty();
@@ -661,6 +667,7 @@ pub struct QwenControlNet {
     /// Zero-init per-block residual projections (`inner → inner`).
     controlnet_blocks: Vec<QLinear>,
     rope: QwenRope,
+    rope_cache: RopeCache,
     device: Device,
     dtype: DType,
 }
@@ -714,6 +721,7 @@ impl QwenControlNet {
             blocks,
             controlnet_blocks,
             rope: QwenRope::new(cfg),
+            rope_cache: RopeCache::new(),
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
@@ -747,8 +755,10 @@ impl QwenControlNet {
         let mut encoder = self.txt_in.forward(&encoder)?;
 
         let txt_seq = encoder.dim(1)?;
-        let (img_cos, img_sin) = self.rope.img_cos_sin(lat_h, lat_w, &self.device)?;
-        let (txt_cos, txt_sin) = self.rope.txt_cos_sin(txt_seq, lat_h, lat_w, &self.device)?;
+        // Step-invariant (fixed grid), so cache the RoPE tables per render (sc-8992).
+        let (img_cos, img_sin, txt_cos, txt_sin) =
+            self.rope_cache
+                .tables(&self.rope, &[(lat_h, lat_w)], txt_seq, &self.device)?;
 
         let mut residuals = Vec::with_capacity(self.blocks.len());
         for (block, cn) in self.blocks.iter().zip(&self.controlnet_blocks) {
@@ -920,8 +930,10 @@ impl QwenTransformer {
         let mut encoder = self.txt_in.forward(&encoder)?;
 
         let txt_seq = encoder.dim(1)?;
-        let (img_cos, img_sin) = self.rope.img_cos_sin(lat_h, lat_w, &self.device)?;
-        let (txt_cos, txt_sin) = self.rope.txt_cos_sin(txt_seq, lat_h, lat_w, &self.device)?;
+        // Step-invariant (fixed grid), so cache the RoPE tables per render (sc-8992).
+        let (img_cos, img_sin, txt_cos, txt_sin) =
+            self.rope_cache
+                .tables(&self.rope, &[(lat_h, lat_w)], txt_seq, &self.device)?;
 
         // VACE control hints (sc-8350): computed once from the post-embedder image + text streams,
         // before the base block loop (the fork's `forward_control`), then injected per block. The hints

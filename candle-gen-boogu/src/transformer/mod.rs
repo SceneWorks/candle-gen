@@ -53,6 +53,20 @@ pub struct BooguTransformer {
     single_stream: Vec<ModBlock>,
     norm_out_lin1: QLinear,
     norm_out_lin2: QLinear,
+    /// Per-render RoPE-table cache (sc-8992 / F-012). The `RopeTables` (all its cos/sin slices) depend
+    /// only on the fixed geometry `(cap_len, ht, wt, ref_grids)` — not on the flow time / the current
+    /// latent — so it is identical across every denoise step (×2 under true-CFG). Cache it keyed on
+    /// that geometry; hits clone the (Arc-backed) tables. `Mutex` (not `RefCell`): the DiT is shared as
+    /// `Arc<BooguTransformer>` (`Send + Sync`).
+    rope_cache: std::sync::Mutex<Option<BooguRopeCache>>,
+}
+
+struct BooguRopeCache {
+    cap_len: usize,
+    ht: usize,
+    wt: usize,
+    ref_grids: Vec<(usize, usize)>,
+    rope: RopeTables,
 }
 
 impl BooguTransformer {
@@ -93,7 +107,45 @@ impl BooguTransformer {
                 .collect::<Result<_>>()?,
             norm_out_lin1: linear_detect(w, "norm_out.linear_1", true)?,
             norm_out_lin2: linear_detect(w, "norm_out.linear_2", true)?,
+            rope_cache: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Build (or reuse) the `RopeTables` for this render's fixed geometry (sc-8992). Recomputed only
+    /// when `(cap_len, ht, wt, ref_grids)` changes; otherwise the cached tables (Arc-backed) are
+    /// cloned. Construction is identical to building it inline, so every step is byte-identical.
+    fn rope_tables(
+        &self,
+        cap_len: usize,
+        ht: usize,
+        wt: usize,
+        ref_grids: &[(usize, usize)],
+        axes_dim: usize,
+        theta: f32,
+    ) -> Result<RopeTables> {
+        let mut guard = self.rope_cache.lock().unwrap();
+        if let Some(c) = guard.as_ref() {
+            if c.cap_len == cap_len
+                && c.ht == ht
+                && c.wt == wt
+                && c.ref_grids.as_slice() == ref_grids
+            {
+                return Ok(c.rope.clone());
+            }
+        }
+        let rope = if ref_grids.is_empty() {
+            RopeTables::build_t2i(cap_len, ht, wt, axes_dim, theta, &self.device)?
+        } else {
+            RopeTables::build_edit(cap_len, ref_grids, ht, wt, axes_dim, theta, &self.device)?
+        };
+        *guard = Some(BooguRopeCache {
+            cap_len,
+            ht,
+            wt,
+            ref_grids: ref_grids.to_vec(),
+            rope: rope.clone(),
+        });
+        Ok(rope)
     }
 
     /// Text-to-image velocity prediction.
@@ -179,11 +231,8 @@ impl BooguTransformer {
             ref_grids.push((rht, rwt));
         }
 
-        let rope = if ref_grids.is_empty() {
-            RopeTables::build_t2i(cap_len, ht, wt, axes_dim, theta, &self.device)?
-        } else {
-            RopeTables::build_edit(cap_len, &ref_grids, ht, wt, axes_dim, theta, &self.device)?
-        };
+        // The RoPE tables are step-invariant (fixed geometry), so cache them per render (sc-8992).
+        let rope = self.rope_tables(cap_len, ht, wt, &ref_grids, axes_dim, theta)?;
 
         let (text_cos, text_sin) = rope.text()?;
         let (noise_cos, noise_sin) = rope.image()?;

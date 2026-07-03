@@ -490,6 +490,24 @@ impl AvBlock {
     }
 }
 
+/// Per-render RoPE-table cache (sc-8992 / F-012). LTX builds **four** split-RoPE `(cos, sin)` tables
+/// per forward (video self, video↔time cross, audio self, audio↔time cross) — ~4.7M trig evals — all
+/// derived solely from the fixed `video_grid`/`audio_grid` position grids, not σ / the latents. So they
+/// are identical across every denoise step. Cache them keyed on the grids' host contents (a few hundred
+/// floats, negligible vs the trig) and rebuild only when the grids change. Byte-identical to recomputing.
+struct AvRopeCache {
+    video_grid: Vec<f32>,
+    audio_grid: Vec<f32>,
+    v_cos: Tensor,
+    v_sin: Tensor,
+    vc_cos: Tensor,
+    vc_sin: Tensor,
+    a_cos: Tensor,
+    a_sin: Tensor,
+    ac_cos: Tensor,
+    ac_sin: Tensor,
+}
+
 /// The LTX-2.3 **AudioVideo** DiT. Predicts `(video_velocity, audio_velocity)` from the two latent
 /// token streams + shared text conditioning.
 pub struct AvDiT {
@@ -498,6 +516,8 @@ pub struct AvDiT {
     blocks: Vec<AvBlock>,
     cfg: AvConfig,
     device: Device,
+    /// `Mutex` (not `RefCell`): the DiT is shared as `Arc<AvDiT>` and must stay `Send + Sync`.
+    rope_cache: std::sync::Mutex<Option<AvRopeCache>>,
 }
 
 impl AvDiT {
@@ -541,34 +561,34 @@ impl AvDiT {
             blocks,
             cfg: cfg.clone(),
             device,
+            rope_cache: std::sync::Mutex::new(None),
         })
     }
 
-    /// Joint velocity forward.
-    ///
-    /// * `*_latent` — `[B, S, 128]` patchified tokens.
-    /// * `sigma` — scalar σ (uniform T2V timestep, shared by both streams).
-    /// * `*_context` — text embeddings (video 4096, audio 2048).
-    /// * `*_grid` — position grids (video `[1,3,Tv,2]`, audio `[1,1,Ta,2]`).
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward(
+    /// Build (or reuse) the four split-RoPE tables for this render's fixed position grids (sc-8992).
+    /// Recomputed only when `video_grid`/`audio_grid` change; otherwise the Arc-backed handles are
+    /// cloned. Construction is identical to computing it inline, so every step is byte-identical.
+    #[allow(clippy::type_complexity)]
+    fn rope_tables(
         &self,
-        video_latent: &Tensor,
-        audio_latent: &Tensor,
-        sigma: f64,
-        video_context: &Tensor,
-        audio_context: &Tensor,
         video_grid: &Tensor,
         audio_grid: &Tensor,
-    ) -> Result<(Tensor, Tensor)> {
+    ) -> Result<[(Tensor, Tensor); 4]> {
+        let vkey = video_grid.flatten_all()?.to_vec1::<f32>()?;
+        let akey = audio_grid.flatten_all()?.to_vec1::<f32>()?;
+        let mut guard = self.rope_cache.lock().unwrap();
+        if let Some(c) = guard.as_ref() {
+            if c.video_grid == vkey && c.audio_grid == akey {
+                return Ok([
+                    (c.v_cos.clone(), c.v_sin.clone()),
+                    (c.vc_cos.clone(), c.vc_sin.clone()),
+                    (c.a_cos.clone(), c.a_sin.clone()),
+                    (c.ac_cos.clone(), c.ac_sin.clone()),
+                ]);
+            }
+        }
         let device = &self.device;
-        let b = video_latent.dim(0)?;
         let theta = self.cfg.video.rope_theta;
-        let ts_mult = self.cfg.video.timestep_scale_multiplier;
-
-        let v_ts = self.video.ts_embeds(sigma, ts_mult, b, device)?;
-        let a_ts = self.audio.ts_embeds(sigma, ts_mult, b, device)?;
-
         // Self RoPE (video 3-axis @4096, audio 1-axis @2048) + cross RoPE (time axis @2048 both).
         let (v_cos, v_sin) = precompute_split_freqs_nd(
             video_grid,
@@ -602,6 +622,54 @@ impl AvDiT {
             self.cfg.audio_heads,
             device,
         )?;
+        *guard = Some(AvRopeCache {
+            video_grid: vkey,
+            audio_grid: akey,
+            v_cos: v_cos.clone(),
+            v_sin: v_sin.clone(),
+            vc_cos: vc_cos.clone(),
+            vc_sin: vc_sin.clone(),
+            a_cos: a_cos.clone(),
+            a_sin: a_sin.clone(),
+            ac_cos: ac_cos.clone(),
+            ac_sin: ac_sin.clone(),
+        });
+        Ok([
+            (v_cos, v_sin),
+            (vc_cos, vc_sin),
+            (a_cos, a_sin),
+            (ac_cos, ac_sin),
+        ])
+    }
+
+    /// Joint velocity forward.
+    ///
+    /// * `*_latent` — `[B, S, 128]` patchified tokens.
+    /// * `sigma` — scalar σ (uniform T2V timestep, shared by both streams).
+    /// * `*_context` — text embeddings (video 4096, audio 2048).
+    /// * `*_grid` — position grids (video `[1,3,Tv,2]`, audio `[1,1,Ta,2]`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        video_latent: &Tensor,
+        audio_latent: &Tensor,
+        sigma: f64,
+        video_context: &Tensor,
+        audio_context: &Tensor,
+        video_grid: &Tensor,
+        audio_grid: &Tensor,
+    ) -> Result<(Tensor, Tensor)> {
+        let device = &self.device;
+        let b = video_latent.dim(0)?;
+        let ts_mult = self.cfg.video.timestep_scale_multiplier;
+
+        let v_ts = self.video.ts_embeds(sigma, ts_mult, b, device)?;
+        let a_ts = self.audio.ts_embeds(sigma, ts_mult, b, device)?;
+
+        // The four split-RoPE tables are step-invariant (fixed position grids), so cache them per
+        // render and reuse across every step (sc-8992).
+        let [(v_cos, v_sin), (vc_cos, vc_sin), (a_cos, a_sin), (ac_cos, ac_sin)] =
+            self.rope_tables(video_grid, audio_grid)?;
 
         let mut vx = self
             .video
