@@ -8,26 +8,27 @@
 //! embed.*`); the connector under `model.diffusion_model.video_embeddings_connector.*`. Runs bf16.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::candle_nn::{Linear, Module, VarBuilder};
+use candle_gen::candle_nn::VarBuilder;
 
 use crate::config::{ConnectorConfig, GemmaConfig};
 use crate::connector::Connector;
 use crate::gemma::GemmaEncoder;
+use crate::quant::{qlinear, QLinear};
 
 const RMS_EPS: f64 = 1e-6;
 
 /// The audio text head (sc-5495): a separate aggregate projection (188160 → 2048) + rescale +
 /// `audio_embeddings_connector`, sharing the same Gemma hidden states as the video head.
 struct AudioHead {
-    aggregate: Linear, // [2048, 188160] + bias
-    rescale: f64,      // √(2048 / 3840)
+    aggregate: QLinear, // [2048, 188160] + bias (packed-detected, sc-9417)
+    rescale: f64,       // √(2048 / 3840)
     connector: Connector,
 }
 
 pub struct LtxTextEncoder {
     gemma: GemmaEncoder,
-    aggregate: Linear, // [4096, 188160] + bias
-    rescale: f64,      // √(4096 / 3840)
+    aggregate: QLinear, // [4096, 188160] + bias (packed-detected, sc-9417)
+    rescale: f64,       // √(4096 / 3840)
     connector: Connector,
     audio: Option<AudioHead>,
     hidden_size: usize,
@@ -47,11 +48,16 @@ impl LtxTextEncoder {
     ) -> Result<Self> {
         let device = gemma_vb.device().clone();
         let gemma = GemmaEncoder::new(gemma_vb, gemma_cfg)?;
-        let agg = proj_vb.pp("text_embedding_projection.video_aggregate_embed");
-        let w = agg.get_unchecked("weight")?.to_dtype(DType::BF16)?;
-        let out_dim = w.dim(0)?;
-        let b = agg.get_unchecked("bias")?.to_dtype(DType::BF16)?;
-        let aggregate = Linear::new(w, Some(b));
+        // Packed-detecting aggregate projection (sc-9417): dense in the hosted tier, but routed through
+        // the shared packed-detect for the "linear_detect everywhere" superset. `out_dim` (the connector
+        // inner dim, 4096) drives the rescale — read from config, not the weight shape, so the packed
+        // path (no dense weight) needs no shape probe.
+        let out_dim = conn_cfg.inner_dim();
+        let aggregate = qlinear(
+            &proj_vb,
+            "text_embedding_projection.video_aggregate_embed",
+            true,
+        )?;
         let rescale = (out_dim as f64 / gemma_cfg.hidden_size as f64).sqrt();
         let connector = Connector::new(dit_vb, conn_cfg)?;
         Ok(Self {
@@ -84,11 +90,13 @@ impl LtxTextEncoder {
             gemma_cfg,
             conn_cfg,
         )?;
-        let agg = proj_vb.pp("text_embedding_projection.audio_aggregate_embed");
-        let w = agg.get_unchecked("weight")?.to_dtype(DType::BF16)?;
-        let out_dim = w.dim(0)?;
-        let b = agg.get_unchecked("bias")?.to_dtype(DType::BF16)?;
-        let aggregate = Linear::new(w, Some(b));
+        // Audio aggregate projection (188160 → 2048); `out_dim` = the audio connector inner dim.
+        let out_dim = audio_conn_cfg.inner_dim();
+        let aggregate = qlinear(
+            &proj_vb,
+            "text_embedding_projection.audio_aggregate_embed",
+            true,
+        )?;
         let rescale = (out_dim as f64 / gemma_cfg.hidden_size as f64).sqrt();
         let connector =
             Connector::new_with_prefix(dit_vb, audio_conn_cfg, "audio_embeddings_connector")?;

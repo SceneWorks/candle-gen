@@ -10,21 +10,18 @@
 //! bf16; the whole forward runs bf16, with attention/norms/layernorm computed in f32 for fidelity.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
-use candle_gen::candle_nn::{
-    ops::rms_norm, ops::sigmoid, ops::softmax_last_dim, Linear, Module, VarBuilder,
-};
+use candle_gen::candle_nn::{ops::rms_norm, ops::sigmoid, ops::softmax_last_dim, VarBuilder};
 
 use crate::config::AvConfig;
+use crate::quant::{qlinear, QLinear};
 use crate::rope::{apply_split_rope, precompute_split_freqs_nd, time_axis};
 
-fn linear(vb: &VarBuilder, key: &str) -> Result<Linear> {
-    let w = vb
-        .get_unchecked(&format!("{key}.weight"))?
-        .to_dtype(DType::BF16)?;
-    let b = vb
-        .get_unchecked(&format!("{key}.bias"))?
-        .to_dtype(DType::BF16)?;
-    Ok(Linear::new(w, Some(b)))
+/// Packed-detecting biased Linear (sc-9417): loads the MLX-packed AvDiT projection triple when a
+/// `{key}.scales` sibling is present (attn `to_{q,k,v,out}` + `ff.proj_in/out` are packed in the
+/// `SceneWorks/ltx-2.3-mlx` q4/q8 tiers), else the dense bf16 weight [+ bias] unchanged. Every AvDiT
+/// projection carries a bias in the checkpoint.
+fn linear(vb: &VarBuilder, key: &str) -> Result<QLinear> {
+    qlinear(vb, key, true)
 }
 
 /// `x·(1+scale)+shift`; scale/shift `[B,1,inner]` broadcast over the token axis.
@@ -78,13 +75,13 @@ fn ada_values(table: &Tensor, ts_emb: &Tensor, lo: usize, hi: usize) -> Result<V
 }
 
 struct Attention {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
+    to_q: QLinear,
+    to_k: QLinear,
+    to_v: QLinear,
+    to_out: QLinear,
     q_norm: Tensor,
     k_norm: Tensor,
-    gate: Linear,
+    gate: QLinear,
     heads: usize,
     dim_head: usize,
     eps: f64,
@@ -170,8 +167,8 @@ impl Attention {
 }
 
 struct FeedForward {
-    proj_in: Linear,
-    proj_out: Linear,
+    proj_in: QLinear,
+    proj_out: QLinear,
 }
 
 impl FeedForward {
@@ -188,9 +185,9 @@ impl FeedForward {
 }
 
 struct AdaLayerNormSingle {
-    ts_lin1: Linear,
-    ts_lin2: Linear,
-    linear: Linear,
+    ts_lin1: QLinear,
+    ts_lin2: QLinear,
+    linear: QLinear,
 }
 
 impl AdaLayerNormSingle {
@@ -241,13 +238,13 @@ struct AvTs {
 
 /// One modality's non-block modules + dims (the video or audio half of the AV DiT).
 struct AvStream {
-    patchify: Linear,
+    patchify: QLinear,
     adaln: AdaLayerNormSingle,
     prompt_adaln: AdaLayerNormSingle,
     cross_ss_adaln: AdaLayerNormSingle,
     cross_gate_adaln: AdaLayerNormSingle,
     scale_shift_table: Tensor, // (2, inner) bf16
-    proj_out: Linear,
+    proj_out: QLinear,
     inner: usize,
     coeff: usize, // adaLN row count (9 gated)
     eps: f64,

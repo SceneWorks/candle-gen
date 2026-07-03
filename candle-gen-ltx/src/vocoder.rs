@@ -30,6 +30,13 @@ fn get_opt(vb: &Vb, key: &str) -> Result<Option<Tensor>> {
     }
 }
 
+/// Load `{prefix}.weight` (f32), erroring loudly if a `{prefix}.scales` sibling is present — the vocoder
+/// convs are never MLX-affine-packed, so a `.scales` sibling would mean a tier packed a leaf we would
+/// otherwise load as u32-code garbage (sc-9417 guard, mirroring `quant::guard_no_scales`).
+fn get_conv_weight(vb: &Vb, prefix: &str) -> Result<Tensor> {
+    crate::quant::guard_no_scales(&vb.inner, prefix, DType::F32)?.contiguous()
+}
+
 /// Thin wrapper carrying the f32 `VarBuilder` (rooted at `vocoder`) + the device, so the loaders can
 /// pull raw tensors by full key (the vocoder's PyTorch names don't map onto candle's nn modules).
 struct Vb {
@@ -79,7 +86,7 @@ struct Conv1d {
 impl Conv1d {
     fn load(vb: &Vb, prefix: &str, stride: usize, padding: usize, dilation: usize) -> Result<Self> {
         Ok(Self {
-            w: get(vb, &format!("{prefix}.weight"))?,
+            w: get_conv_weight(vb, prefix)?,
             b: get_opt(vb, &format!("{prefix}.bias"))?,
             stride,
             padding,
@@ -107,7 +114,7 @@ struct ConvT1d {
 impl ConvT1d {
     fn load(vb: &Vb, prefix: &str, stride: usize, padding: usize) -> Result<Self> {
         Ok(Self {
-            w: get(vb, &format!("{prefix}.weight"))?,
+            w: get_conv_weight(vb, prefix)?,
             b: get_opt(vb, &format!("{prefix}.bias"))?,
             stride,
             padding,

@@ -11,11 +11,10 @@
 //! every layer (only the RoPE base differs). Runs bf16; RoPE + attention compute in f32 for fidelity.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
-use candle_gen::candle_nn::{
-    ops::rms_norm as candle_rms_norm, ops::softmax_last_dim, Linear, Module, VarBuilder,
-};
+use candle_gen::candle_nn::{ops::rms_norm as candle_rms_norm, ops::softmax_last_dim, VarBuilder};
 
 use crate::config::GemmaConfig;
+use crate::quant::{qembedding, qlinear, QLinear};
 
 /// Finite large-negative mask value (bf16 min, as f32) — used instead of -∞ so an all-masked row
 /// (a left-padding query position) softmaxes to a finite uniform vector rather than NaN. Those
@@ -28,11 +27,13 @@ fn norm_alpha(vb: &VarBuilder, key: &str) -> Result<Tensor> {
     (w + 1.0)?.to_dtype(DType::BF16)
 }
 
-fn linear(vb: &VarBuilder, key: &str) -> Result<Linear> {
-    let w = vb
-        .get_unchecked(&format!("{key}.weight"))?
-        .to_dtype(DType::BF16)?;
-    Ok(Linear::new(w, None))
+/// Packed-detecting bias-less Linear (sc-9417): loads the MLX-packed projection triple when a
+/// `{key}.scales` sibling is present, else the dense bf16 weight unchanged. The Gemma TE is **dense**
+/// in the hosted `SceneWorks/ltx-2.3-mlx` tier (no `.scales`), so this future-proofs the surface + is
+/// covered by the guard; the dense arm is byte-identical to the legacy read. Gemma projections are
+/// bias-less.
+fn linear(vb: &VarBuilder, key: &str) -> Result<QLinear> {
+    qlinear(vb, key, false)
 }
 
 struct GemmaLayer {
@@ -40,15 +41,15 @@ struct GemmaLayer {
     post_attn_ln: Tensor,
     pre_ff_ln: Tensor,
     post_ff_ln: Tensor,
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: QLinear,
+    k_proj: QLinear,
+    v_proj: QLinear,
+    o_proj: QLinear,
     q_norm: Tensor,
     k_norm: Tensor,
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: QLinear,
+    up_proj: QLinear,
+    down_proj: QLinear,
     rope_base: f64,
 }
 
@@ -91,8 +92,11 @@ impl GemmaEncoder {
                 rope_base,
             });
         }
-        let embed = vb
-            .get_unchecked("embed_tokens.weight")?
+        // Packed-detecting `embed_tokens` (sc-9417): dense in the hosted tier, but routed through the
+        // shared packed-detect so a future packed tier loads the table straight from the packed parts.
+        // The encoder scales + index-selects the raw table, so keep the resolved table tensor.
+        let embed = qembedding(&vb, "embed_tokens", cfg.vocab_size, cfg.hidden_size)?
+            .weight()
             .to_dtype(DType::BF16)?;
         let scale = (cfg.hidden_size as f64).sqrt();
         let embed_scale = Tensor::new(scale as f32, &device)?.to_dtype(DType::BF16)?;

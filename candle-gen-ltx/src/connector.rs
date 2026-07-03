@@ -6,33 +6,32 @@
 //! computes in f32.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::candle_nn::{ops::rms_norm, ops::softmax_last_dim, Linear, Module, VarBuilder};
+use candle_gen::candle_nn::{ops::rms_norm, ops::softmax_last_dim, VarBuilder};
 
 use crate::config::ConnectorConfig;
+use crate::quant::{qlinear, QLinear};
 use crate::rope::{apply_split_rope, precompute_connector_freqs};
 
 const EPS: f32 = 1e-6;
 
-fn linear(vb: &VarBuilder, key: &str) -> Result<Linear> {
-    let w = vb
-        .get_unchecked(&format!("{key}.weight"))?
-        .to_dtype(DType::BF16)?;
-    let b = vb
-        .get_unchecked(&format!("{key}.bias"))?
-        .to_dtype(DType::BF16)?;
-    Ok(Linear::new(w, Some(b)))
+/// Packed-detecting biased Linear (sc-9417): loads the MLX-packed triple when a `{key}.scales` sibling
+/// is present, else the dense bf16 weight [+ bias] unchanged. The connector is **dense** in the hosted
+/// `SceneWorks/ltx-2.3-mlx` tier (0 `.scales`), so this future-proofs the surface; the dense arm is
+/// byte-identical to the legacy read.
+fn linear(vb: &VarBuilder, key: &str) -> Result<QLinear> {
+    qlinear(vb, key, true)
 }
 
 struct ConnectorBlock {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
+    to_q: QLinear,
+    to_k: QLinear,
+    to_v: QLinear,
+    to_out: QLinear,
     q_norm: Tensor,
     k_norm: Tensor,
-    gate: Linear,
-    ff_in: Linear,
-    ff_out: Linear,
+    gate: QLinear,
+    ff_in: QLinear,
+    ff_out: QLinear,
 }
 
 pub struct Connector {

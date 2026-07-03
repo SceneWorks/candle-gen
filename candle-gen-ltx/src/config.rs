@@ -179,6 +179,9 @@ pub struct GemmaConfig {
     pub sliding_window_pattern: usize,
     /// Attention scale denominator (query_pre_attn_scalar = head_dim for 12B → scale 256^-0.5).
     pub query_pre_attn_scalar: f64,
+    /// Token-embedding vocabulary size (`[vocab, hidden]` table) — Gemma-3's 262144. Only used to size
+    /// the packed-detecting `embed_tokens` loader's shape hint (sc-9417).
+    pub vocab_size: usize,
 }
 
 impl GemmaConfig {
@@ -196,6 +199,7 @@ impl GemmaConfig {
             sliding_window: 1024,
             sliding_window_pattern: 6,
             query_pre_attn_scalar: 256.0,
+            vocab_size: 262_144,
         }
     }
     /// Number of hidden states produced (embeddings + one per layer) — concatenated by the text

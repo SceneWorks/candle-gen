@@ -42,9 +42,9 @@ struct CausalConv2d {
 impl CausalConv2d {
     /// `causal_height = true` → pad the full `kH−1` on top (time is causal); width is symmetric.
     fn load(vb: &VarBuilder, prefix: &str, causal_height: bool) -> Result<Self> {
-        let w = vb
-            .get_unchecked(&format!("{prefix}.weight"))?
-            .contiguous()?; // (O, I, kH, kW)
+        // Audio-VAE convs are never MLX-affine-packed; guard against an unexpected `.scales` sibling
+        // (sc-9417).
+        let w = crate::quant::guard_no_scales(vb, prefix, vb.dtype())?.contiguous()?; // (O, I, kH, kW)
         let dims = w.dims();
         let (out_c, kh, kw) = (dims[0], dims[2], dims[3]);
         let b = vb

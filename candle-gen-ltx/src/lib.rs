@@ -32,6 +32,7 @@ pub mod connector;
 pub mod conv3d;
 pub mod gemma;
 pub mod pipeline;
+pub mod quant;
 pub mod rope;
 pub mod text_encoder;
 pub mod transformer;

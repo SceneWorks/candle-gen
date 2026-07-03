@@ -12,6 +12,8 @@
 use candle_gen::candle_core::{Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 
+use crate::quant::guard_no_scales;
+
 /// A 3-D conv loaded from a `[O, I, kt, kh, kw]` weight. Temporal stride is always 1 in the LTX VAE;
 /// spatial padding is "same" (`(kh-1)/2`); temporal padding is frame-replication (causal toggle).
 pub struct CausalConv3d {
@@ -25,9 +27,10 @@ impl CausalConv3d {
     /// Load `{prefix}.weight` + `{prefix}.bias`, inferring channels + kernel dims from the weight
     /// shape `[O, I, kt, kh, kw]` (channels ride on the weights, not the config).
     pub fn load(vb: VarBuilder, prefix: &str) -> Result<Self> {
-        let w = vb
-            .get_unchecked(&format!("{prefix}.weight"))?
-            .contiguous()?;
+        // The 3-D conv weight is NEVER MLX-affine-packed (no `.scales`); guard so a tier that ever packs
+        // it errors loudly instead of loading u32 codes as garbage (sc-9417). `dtype()` preserves the
+        // vb's load dtype (VAE runs f32).
+        let w = guard_no_scales(&vb, prefix, vb.dtype())?.contiguous()?;
         let dims = w.dims();
         let (out_c, kt, kh) = (dims[0], dims[2], dims[3]);
         let bias = vb
