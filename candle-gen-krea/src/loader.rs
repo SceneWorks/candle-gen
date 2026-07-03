@@ -198,15 +198,18 @@ impl Weights {
     fn get_int8_codes(&self, diffusers_key: &str) -> Result<Tensor> {
         let native = self.resolve(diffusers_key);
         let view = self.st.get(&native)?;
+        // Build the codes on the **CPU**: the caller (Int8Linear::from_per_channel_parts) stages them
+        // to a resident native-`i8` device buffer (1 byte/elem), so materializing the wider I64 form on
+        // the GPU first would 8× the VRAM (a 12B DiT's 224 projections OOM). The CPU I64 is transient.
         match view.dtype() {
             // Real ComfyUI export: raw I8 bytes reinterpreted as signed codes (candle can't decode I8).
             ::safetensors::Dtype::I8 => {
                 let shape = view.shape().to_vec();
                 let codes: Vec<i64> = view.data().iter().map(|&b| b as i8 as i64).collect();
-                Tensor::from_vec(codes, shape, &self.device)
+                Tensor::from_vec(codes, shape, &Device::Cpu)
             }
             // Test / any-int fixture: load whatever integer dtype it is, then widen to I64.
-            _ => self.st.load(&native, &self.device)?.to_dtype(DType::I64),
+            _ => self.st.load(&native, &Device::Cpu)?.to_dtype(DType::I64),
         }
     }
 
@@ -290,6 +293,13 @@ impl Weights {
 // The map was validated exhaustively against the real 878-tensor header: all 430 diffusers keys map to
 // a present native key, 224 of them to a quantized (`.weight_scale` sibling) projection, with no native
 // key left uncovered (the format-spike remap, verified — see the sc-9300 PR).
+//
+// **A/B NO-GO (sc-9300):** the remap + per-channel int8 loader are correct and CPU-tested, but the
+// checkpoint does NOT render coherently. Its stored int8 weight is *rotated* (`R·W`; dequantized
+// `blocks.0.attn.wq` has cosine ≈ 0.07 with the canonical `to_q`), so reconstructing `X·Wᵀ` needs the
+// matching **online activation rotation** `x·R` — the arXiv 2512.03673 / ComfyUI ConvRot leg the story
+// scoped out. Without it the render is pure noise (PSNR ≈ 8 dB vs bf16). The online-rotation leg is the
+// follow-up sc-9601 that makes this consume path viable.
 
 /// Translate a **diffusers** tensor key to the **native-mmdit** key the INT8-ConvRot checkpoint stores.
 /// Returns `None` for a key with no native counterpart (a caller then errors on the missing tensor,

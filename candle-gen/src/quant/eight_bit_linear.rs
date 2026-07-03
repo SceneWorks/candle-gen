@@ -2,8 +2,9 @@
 //! leg. Each holds a *statically* quantized weight (per-tensor scale, done once at construction) and
 //! quantizes the activation **dynamically** per forward (v1: amax→scale→cast in pure candle ops, a
 //! fused kernel is a later optimization). This is the layer a provider crate would swap in for an
-//! fp8 fast tier or an INT8-ConvRot checkpoint (the rotation itself lives in sc-9300; this is just
-//! the GEMM).
+//! fp8 fast tier or an INT8-ConvRot checkpoint. This layer is just the GEMM; a ConvRot checkpoint's
+//! stored weight is rotated and additionally needs the online `x·R` activation rotation upstream to be
+//! correct (the sc-9300 A/B NO-GO; the online-rotation leg is sc-9601).
 //!
 //! Both are `#[cfg(feature = "cuda")]` — they own a `CublasLt` handle. The weight-quant / act-quant
 //! helpers they build on are pure candle ops (see [`super::cublaslt`]) and compile everywhere.
@@ -70,11 +71,18 @@ enum WeightScale {
 /// An int8 IGEMM linear: exact int32 accumulate, dequant scale folded on the candle side. Same
 /// dynamic-activation-quant contract as [`Fp8Linear`]. The weight scale is per-tensor ([`Self::new`],
 /// sc-9299) or **per-output-channel** ([`Self::from_per_channel_parts`], sc-9300 — the community
-/// INT8-ConvRot consume path, where the checkpoint already ships int8 codes + a `[out]` row scale and
-/// the ConvRot rotation is folded into those codes offline, so the forward is plain IGEMM + per-row
-/// dequant with no online activation transform).
+/// INT8-ConvRot consume path, where the checkpoint ships int8 codes + a `[out]` row scale). The forward
+/// is a plain IGEMM + per-row dequant — the exact `X·Wᵀ` for a per-channel-quantized weight. NB a
+/// ConvRot checkpoint's stored weight is *rotated* (`R·W`), so it additionally needs the online `x·R`
+/// activation rotation applied upstream to be correct (the sc-9300 A/B NO-GO; follow-up sc-9601). This
+/// layer is rotation-agnostic — it computes `X·(stored W)ᵀ`.
 pub struct Int8Linear {
-    w_i8: Tensor, // (N, K) int codes carried in F32
+    w_i8: Tensor, // (N, K) int codes carried in F32 — the resident weight for the non-staged path
+    /// A **pre-staged** on-device `i8` weight (sc-9300): the ConvRot consume path stages the `(N, K)`
+    /// codes once so the resident weight is native `i8` (1 byte/elem), not an 8×-larger I64/F32 tensor
+    /// (a 12B DiT's 224 int8 projections otherwise blow VRAM). When set, the per-channel forward uses
+    /// the staged matmul; `w_i8` then holds only the small CPU source (kept for shape queries).
+    w_staged: Option<super::cublaslt::DevInt8>,
     scale_w: WeightScale,
     bias: Option<Tensor>,
     lt: Arc<CublasLt>,
@@ -86,6 +94,7 @@ impl Int8Linear {
         let qw = quantize_weight_int8(weight)?;
         Ok(Self {
             w_i8: qw.q,
+            w_staged: None,
             scale_w: WeightScale::PerTensor(qw.scale),
             bias,
             lt,
@@ -107,6 +116,7 @@ impl Int8Linear {
         let qw = quantize_weight_int8_per_channel(weight)?;
         Ok(Self {
             w_i8: qw.q,
+            w_staged: None,
             scale_w: WeightScale::PerChannel(qw.scale),
             bias,
             lt,
@@ -116,7 +126,8 @@ impl Int8Linear {
     /// **Per-output-channel int8 straight from the on-disk parts** (sc-9300, the ConvRot consume path):
     /// `w_i8` is the checkpoint's `(N, K)` int8 codes (carried in any dtype the caller narrows at the
     /// stage), `scale_w` its `[N]` per-output-row `weight_scale`. No re-quantization — the stored codes
-    /// (rotation already folded) and their row scales are used as-is.
+    /// and their row scales are used as-is. (For a ConvRot checkpoint the codes are a *rotated* weight,
+    /// needing the online `x·R` leg upstream — sc-9601.)
     pub fn from_per_channel_parts(
         w_i8: Tensor,
         scale_w: Vec<f32>,
@@ -130,8 +141,12 @@ impl Int8Linear {
                 scale_w.len()
             );
         }
+        // Pre-stage the codes to a resident native-`i8` device buffer (1 byte/elem) so the 224
+        // projections of a 12B DiT don't hold their codes as 8×-larger I64 tensors on the GPU.
+        let w_staged = Some(lt.stage_int8(&w_i8)?);
         Ok(Self {
             w_i8,
+            w_staged,
             scale_w: WeightScale::PerChannel(scale_w),
             bias,
             lt,
@@ -141,11 +156,16 @@ impl Int8Linear {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let (flat, restore) = flatten_tokens(x)?;
         let qx = quantize_activation_int8(&flat)?;
-        let y = match &self.scale_w {
-            WeightScale::PerTensor(s) => self.lt.matmul_int8(&self.w_i8, *s, &qx.q, qx.scale)?,
-            WeightScale::PerChannel(s) => self
+        let y = match (&self.scale_w, &self.w_staged) {
+            (WeightScale::PerChannel(s), Some(w)) => self
+                .lt
+                .matmul_int8_per_channel_staged(w, s, &qx.q, qx.scale)?,
+            (WeightScale::PerChannel(s), None) => self
                 .lt
                 .matmul_int8_per_channel(&self.w_i8, s, &qx.q, qx.scale)?,
+            (WeightScale::PerTensor(s), _) => {
+                self.lt.matmul_int8(&self.w_i8, *s, &qx.q, qx.scale)?
+            }
         };
         let y = restore(y)?;
         match &self.bias {

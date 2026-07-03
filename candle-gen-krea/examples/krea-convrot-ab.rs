@@ -8,6 +8,10 @@
 //! ```
 //! The canonical snapshot supplies tokenizer / Qwen3-VL TE / Qwen-Image VAE for every variant; only the
 //! DiT weights differ. sm_120 (Blackwell) here — see the sc-9300 PR for the sm_89-audience caveat.
+//!
+//! **sc-9300 A/B result: the ConvRot render is NOISE** (PSNR ≈ 8 dB vs bf16). The checkpoint's stored
+//! int8 weight is *rotated* (`R·W`), so it needs the online activation rotation `x·R` this consume path
+//! does not apply (sc-9601). This harness is the honest measurement of that NO-GO, not a passing demo.
 
 use std::path::PathBuf;
 use std::time::Instant;

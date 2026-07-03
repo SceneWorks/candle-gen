@@ -46,18 +46,26 @@ pub enum QLinear {
     /// path).
     Packed(shared::QLinear),
     /// A community **INT8-ConvRot** projection (sc-9300): the checkpoint ships `(N, K)` int8 codes with
-    /// the ConvRot rotation folded in offline + a `[N]` per-output-row `weight_scale`. On CUDA the
+    /// a rotation folded into the stored weight + a `[N]` per-output-row `weight_scale`. On CUDA the
     /// forward is a cuBLASLt IGEMM + per-row dequant ([`candle_gen::quant::Int8Linear`]); off-CUDA
-    /// (CPU tests / Metal) it dequantizes the weight to a dense matmul — numerically the same
-    /// `X·Wᵀ` up to the int8 activation-quant the CUDA path also applies. No online Hadamard: the
-    /// rotation is baked into the stored codes (the sc-9300 format spike found zero rotation tensors).
+    /// (CPU tests / Metal) it dequantizes the weight to a dense matmul.
+    ///
+    /// **A/B finding (sc-9300): this alone does NOT reconstruct `X·Wᵀ`.** The stored int8 weight is a
+    /// *rotated* weight `R·W` (verified: dequantized `blocks.0.attn.wq` has cosine ≈ 0.07 with the
+    /// canonical `to_q`), so the matching **online activation rotation** `x → x·R` must run before the
+    /// IGEMM for `x·(R·W)ᵀ = x·Wᵀ` to hold. Without it the render is pure noise (the A/B render, PSNR
+    /// ≈ 8 dB vs bf16). That online rotation is the arXiv 2512.03673 / ComfyUI ConvRot leg the story
+    /// scoped out (GPL-3, clean-room reimplementation) — the follow-up sc-9601. This arm is the correct
+    /// *loader + per-channel int8 compute*; the missing rotation is what makes the consume path coherent.
     ConvRotInt8(ConvRotInt8),
 }
 
-/// The stored parts of an INT8-ConvRot projection (sc-9300): the `(N, K)` int8 codes (carried in `F32`
-/// for portability), the `[N]` per-output-row dequant scale, and the optional dense bias (ConvRot Krea
-/// projections are bias-free, but the field keeps the type general). On CUDA a `Int8Linear` is built
-/// lazily on first forward and cached; the CPU fallback dequantizes `w[o, :] = q[o, :] · scale[o]`.
+/// The stored parts of an INT8-ConvRot projection (sc-9300): the `(N, K)` int8 codes (on the CPU as
+/// `I64`, staged to a resident device `i8` inside `Int8Linear`), the `[N]` per-output-row dequant
+/// scale, and the optional dense bias (ConvRot Krea projections are bias-free, but the field keeps the
+/// type general). On CUDA a per-channel `Int8Linear` is built lazily on first forward and cached; the
+/// CPU fallback dequantizes `w[o, :] = q[o, :] · scale[o]`. The stored weight is rotated, so neither
+/// path reconstructs `X·Wᵀ` without the online `x·R` leg (the sc-9300 A/B NO-GO).
 pub struct ConvRotInt8 {
     w_i8: Tensor,
     scale: Vec<f32>,
@@ -129,8 +137,9 @@ impl QLinear {
 
     /// Build an **INT8-ConvRot** projection (sc-9300) straight from the checkpoint's stored parts: the
     /// `(N, K)` int8 codes `w_i8` (any dtype; narrowed at the int8 stage), the `[N]` per-output-row
-    /// `weight_scale`, and the optional dense `bias`. No re-quantization and no online rotation — the
-    /// ConvRot rotation is folded into the codes offline.
+    /// `weight_scale`, and the optional dense `bias`. No re-quantization. **The stored weight is
+    /// rotated** (`R·W`); reconstructing `X·Wᵀ` needs the online `x·R` leg, which this arm does NOT
+    /// apply (the sc-9300 A/B NO-GO — see [`Self::ConvRotInt8`]).
     pub fn convrot_int8(w_i8: Tensor, scale: Vec<f32>, bias: Option<Tensor>) -> Result<Self> {
         let n = w_i8.dims2()?.0;
         if scale.len() != n {

@@ -381,8 +381,13 @@ mod cuda_impl {
         /// all-equal `scale_w` to recover the per-tensor fold). Like [`Self::matmul_int8`] the int32
         /// accumulate is read back to host for the fold + bf16 cast (candle-kernels ships no CUDA
         /// `i32 → f32` cast), so the exact accumulate is preserved and only the scale application
-        /// differs; the ConvRot rotation is *already folded into `W_i8` offline* (sc-9300 format spike),
-        /// so there is no online activation transform here — plain IGEMM + per-row dequant.
+        /// differs.
+        ///
+        /// This is the exact `X·Wᵀ` compute for a per-channel-quantized int8 weight. For a ConvRot
+        /// checkpoint the stored `W_i8` is a *rotated* weight (`R·W`), so this reconstructs
+        /// `X·(R·W)ᵀ`, not `X·Wᵀ` — the online activation rotation `x → x·R` must be applied by the
+        /// caller before this call (the sc-9300 consume path's missing leg). The compute here is
+        /// rotation-agnostic and correct either way.
         pub fn matmul_int8_per_channel(
             &self,
             w_i8: &Tensor,
@@ -409,6 +414,45 @@ mod cuda_impl {
                 _ => candle_core::bail!("matmul_int8_per_channel: accumulate not on CUDA"),
             };
             // Row-major `(M, N)`: element `(row, col)` dequants by `scale_w[col] · scale_x`.
+            let host_f32: Vec<f32> = host_i32
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| v as f32 * scale_w[i % n] * scale_x)
+                .collect();
+            Tensor::from_vec(host_f32, (m, n), acc.device())?.to_dtype(DType::BF16)
+        }
+
+        /// Per-output-channel int8 over a **pre-staged** device weight (sc-9300) — the resident-weight
+        /// form the ConvRot consume path uses so the `(N, K)` int8 codes live on-device as native `i8`
+        /// (1 byte/elem) rather than as an 8×-larger I64 tensor. `w` is the staged weight, `scale_w` its
+        /// `[N]` per-row dequant scale, `x_i8`/`scale_x` the dynamically-quantized activation. Same fold
+        /// as [`Self::matmul_int8_per_channel`], only the weight is not re-staged per call.
+        pub fn matmul_int8_per_channel_staged(
+            &self,
+            w: &DevInt8,
+            scale_w: &[f32],
+            x_i8: &Tensor,
+            scale_x: f32,
+        ) -> Result<Tensor> {
+            let x = DevInt8::stage(self, x_i8)?;
+            let (m, n) = (x.rows, w.rows);
+            if scale_w.len() != n {
+                candle_core::bail!(
+                    "matmul_int8_per_channel_staged: scale_w len {} != N (out) {n}",
+                    scale_w.len()
+                );
+            }
+            let acc = self.matmul_int8_staged(w, &x)?;
+            let (storage, _l) = acc.storage_and_layout();
+            let host_i32: Vec<i32> = match &*storage {
+                Storage::Cuda(cs) => match &cs.slice {
+                    CudaStorageSlice::I32(s) => self.stream.clone_dtoh(s).map_err(drv_err)?,
+                    _ => candle_core::bail!(
+                        "matmul_int8_per_channel_staged: expected I32 accumulate"
+                    ),
+                },
+                _ => candle_core::bail!("matmul_int8_per_channel_staged: accumulate not on CUDA"),
+            };
             let host_f32: Vec<f32> = host_i32
                 .iter()
                 .enumerate()

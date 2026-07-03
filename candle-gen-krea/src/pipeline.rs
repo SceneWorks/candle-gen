@@ -95,6 +95,12 @@ pub fn load_components(
 /// the native-mmdit-keyed `.safetensors` file; the DiT's 28 blocks' attn+mlp load as per-output-channel
 /// int8 (cuBLASLt IGEMM on CUDA), everything else dense bf16.
 ///
+/// **A/B NO-GO (sc-9300):** this does NOT yet render coherently — the checkpoint's int8 weights are
+/// *rotated* and reconstructing `X·Wᵀ` requires the online activation rotation the story scoped out
+/// (arXiv 2512.03673 / ComfyUI ConvRot; the render is noise without it). Kept as the wired loader +
+/// int8 compute the online-rotation follow-up (sc-9601) plugs into. This entry point is not registered
+/// as a shipping generator variant.
+///
 /// **sm_89 floor (locked decision 7 / sc-9300).** The int8 IGEMM tier is only offered on compute
 /// capability ≥ 8.9 (RTX 40-series and up). On CUDA, this errors up front if the device is below the
 /// floor rather than rendering on a card the marketing contract excludes; on non-CUDA it is a no-op
