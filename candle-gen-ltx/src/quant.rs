@@ -7,8 +7,9 @@
 //! `Linear` as the MLX packed triple `{base}.weight` (u32 codes) + `{base}.scales` + `{base}.biases`
 //! (the dense `{base}.bias` rides alongside). The group size is read from the component
 //! `quantize_config.json`'s `quantization.group_size` ([`candle_gen::quant::PackedConfig`]) and threaded
-//! through the shared group-size-aware loaders ([`candle_gen::quant::QLinear::from_packed_gs`] /
-//! `QEmbedding::from_packed_dtype_gs`, Q4 → `Q4_1` lossless repack, Q8 → `Q8_0`) — the hosted tier packs
+//! through the shared group-size-aware loaders called directly here —
+//! [`candle_gen::quant::QLinear::from_packed_gs`] for Linears and [`candle_gen::quant::embedding_gs`] for
+//! `embed_tokens` (Q4 → `Q4_1` lossless repack, Q8 → `Q8_0`) — the hosted tier packs
 //! at group 64, but the loader honours whatever the config says (exactly as boogu threads its group 32).
 //! **No dense bf16 weight is ever materialized** on the packed path.
 //!
@@ -34,7 +35,11 @@
 //! The 3-D-conv VAEs, audio VAE and vocoder stay **dense** (their conv weights are never affine-packed),
 //! loaded through [`guard_no_scales`]: it loads the dense weight and **errors loudly** if a `.scales`
 //! sibling unexpectedly appears where we load dense (a tier that ever packs a conv would otherwise load
-//! u32 codes as garbage silently). The whole seam is the shared **dequant-on-forward** `QLinear`
+//! u32 codes as garbage silently). Dense parity is not uniform across the seam: the **DiT/Gemma** dense
+//! arm ([`qlinear`]/[`qembedding`]) is byte-identical to the legacy read (both cast to the bf16 DiT/Gemma
+//! builder dtype, a no-op), but [`guard_no_scales`] casts the weight to the passed `vb.dtype()` — **F32**
+//! for the VAE/audio-VAE/vocoder builders — so a bf16 on-disk weight is upcast to F32 (lossless) where the
+//! legacy per-crate read kept the on-disk dtype. The whole seam is the shared **dequant-on-forward** `QLinear`
 //! (sc-7702) — *not* candle's int8 `QMatMul` fast path, whose q8_1 activation quant NaNs on outliers.
 //!
 //! ## Scope boundary — packed-detect seam only; tier *ingestion* is a follow-up (sc-9545)
@@ -46,9 +51,11 @@
 //! tier ships one safetensors *per component* (not the crate's single bundled file) and its packed
 //! `transformer.safetensors` uses **different key names** than the dense Lightricks checkpoint
 //! (`to_out` not `to_out.0`, `ff.proj_in/out` not `net.0.proj`/`net.2`, `linear1/2` not `linear_1/2`).
-//! Resolving the `q4/` subfolder + `gemma/` shards and remapping those keys so the `.scales` siblings
-//! are found is tracked in **sc-9545** (with the real q4 packed video render). The fixtures below prove
-//! the seam fires on the **real** LTX AvDiT block-0 key layout the hf-header audit captured.
+//! Resolving the `q4/` subfolder + `gemma/` shards and remapping those keys (`to_out.0`↔`to_out` etc.) so
+//! the `.scales` siblings are found — **and the real packed GPU video render** — are deferred to and
+//! tracked by **sc-9545**; no real packed render has been run here. The tests below validate the wiring
+//! with **synthetic** packed fixtures built on the **real** AvDiT block-0 key layout the hf-header audit
+//! captured — they prove the packed-detect seam fires on that layout, not that a real tier was ingested.
 
 use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear, Module, VarBuilder};
@@ -96,7 +103,8 @@ impl Module for QLinear {
 
 /// **Packed-detecting** Linear loader for `{key}` under `vb` (sc-9417). If `{key}.scales` is present (a
 /// pre-quantized MLX tier), build a [`QLinear::Packed`] straight from the packed parts on `vb`'s device
-/// via the shared [`candle_gen::quant::lin_gs`] at [`GROUP_SIZE`] — **no dense weight is materialized**.
+/// via the shared [`candle_gen::quant::QLinear::from_packed_gs`] at [`GROUP_SIZE`] — **no dense weight is
+/// materialized**.
 /// Otherwise the **dense** path is taken unchanged: `{key}.weight` [+ `{key}.bias` when `bias`], cast to
 /// the vb dtype (bf16) exactly as the legacy per-crate `linear` did. `key` is the full dotted prefix
 /// (e.g. `attn1.to_out.0`), so the `.scales`/`.biases` siblings survive any `to_out.0`-style nesting
