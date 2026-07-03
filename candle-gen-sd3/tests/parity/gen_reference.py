@@ -23,12 +23,17 @@ Covered components (the F-001 / F-002 bug surfaces plus the broader conditioning
 Everything is computed in float32 on CPU for a deterministic, launch-portable reference. Weights are
 resolved from the local HF cache (set $HF_HOME=D:/.cache/huggingface).
 
-Run (from the crate root, in the sd35env venv):
+The generator is variant-agnostic (`--model`/`--tag`). The committed golden pairs (sc-9076 + sc-9580):
+    * sd35_large       -> stabilityai/stable-diffusion-3.5-large
+    * sd35_medium      -> stabilityai/stable-diffusion-3.5-medium        (MMDiT-X, dual-attention)
+    * sd35_large_turbo -> stabilityai/stable-diffusion-3.5-large-turbo   (guidance-distilled)
+
+Run (from the crate root, in the parity venv — torch(CPU)+diffusers+transformers+sentencepiece):
     HF_HOME=D:/.cache/huggingface python tests/parity/gen_reference.py \
-        --model stabilityai/stable-diffusion-3.5-large \
+        --model stabilityai/stable-diffusion-3.5-medium --tag sd35_medium \
         --out tests/parity/reference
 
-Outputs `<out>/sd35_large_reference.safetensors` (all tensors, f32) + `<out>/manifest.json` (the fixed
+Outputs `<out>/<tag>_reference.safetensors` (all tensors, f32) + `<out>/<tag>_manifest.json` (the fixed
 prompt, seed, timestep, latent shape, tolerances, tensor list) so the Rust harness is fully driven by
 committed metadata (no magic constants duplicated across the two sides).
 """
