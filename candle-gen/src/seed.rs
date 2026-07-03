@@ -141,12 +141,7 @@ mod tests {
     #[test]
     fn seeded_normal_vec_first_values_are_pinned() {
         let v = seeded_normal_vec(&mut StdRng::seed_from_u64(42), 4);
-        let expected = [
-            0.069_427_915_f32,
-            0.132_938_12,
-            0.262_576_37,
-            -0.225_300_88,
-        ];
+        let expected = [0.069_427_915_f32, 0.132_938_12, 0.262_576_37, -0.225_300_88];
         for (got, want) in v.iter().zip(expected.iter()) {
             assert!(
                 (got - want).abs() < 1e-6,
