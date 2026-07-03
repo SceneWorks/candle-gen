@@ -321,6 +321,50 @@ mod tests {
     use candle_core::Device;
     use std::collections::HashMap;
 
+    /// Resolve the cached `openai/clip-vit-large-patch14` snapshot dir from the HF Hub cache.
+    ///
+    /// F-071 (sc-9057): the earlier resolution hard-coded `$HOME/.cache/huggingface`, a Unix
+    /// assumption — on the Windows-primary dev box `HOME` is often unset and the cache lives at
+    /// `D:\.cache\huggingface` (`HF_HOME`). Match the established repo pattern
+    /// (`candle-gen-sensenova`'s `hf_cache_distill_lora`): honour `$HF_HUB_CACHE`, then
+    /// `$HF_HOME/hub`, then the user-home `.cache/huggingface/hub` default (`USERPROFILE` on
+    /// Windows, `HOME` elsewhere). Returns the first `snapshots/<rev>/` subdir that exists.
+    fn clip_snapshot_dir() -> PathBuf {
+        let repo_dir = "models--openai--clip-vit-large-patch14";
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Ok(c) = std::env::var("HF_HUB_CACHE") {
+            roots.push(PathBuf::from(c));
+        }
+        if let Ok(h) = std::env::var("HF_HOME") {
+            roots.push(PathBuf::from(h).join("hub"));
+        }
+        for home_var in ["USERPROFILE", "HOME"] {
+            if let Ok(home) = std::env::var(home_var) {
+                roots.push(PathBuf::from(home).join(".cache/huggingface/hub"));
+            }
+        }
+        assert!(
+            !roots.is_empty(),
+            "no HF cache root: set HF_HOME (or HF_HUB_CACHE / USERPROFILE / HOME)"
+        );
+        for snapshots in roots.iter().map(|r| r.join(repo_dir).join("snapshots")) {
+            let Ok(revs) = std::fs::read_dir(&snapshots) else {
+                continue;
+            };
+            if let Some(dir) = revs
+                .filter_map(std::result::Result::ok)
+                .map(|e| e.path())
+                .find(|p| p.is_dir())
+            {
+                return dir;
+            }
+        }
+        panic!(
+            "clip snapshot not cached: no models--openai--clip-vit-large-patch14/snapshots/<rev> \
+             under any HF cache root (HF_HUB_CACHE / HF_HOME/hub / <home>/.cache/huggingface/hub)"
+        );
+    }
+
     #[test]
     fn descriptor_advertises_clip_vit_l14() {
         let d = descriptor();
@@ -572,15 +616,7 @@ mod tests {
     #[test]
     #[ignore = "real-weight: needs the openai/clip-vit-large-patch14 snapshot in the HF cache"]
     fn real_weights_red_blue_parity() {
-        let home = std::env::var("HOME").expect("HOME");
-        let snapshots = std::path::Path::new(&home)
-            .join(".cache/huggingface/hub/models--openai--clip-vit-large-patch14/snapshots");
-        let dir = std::fs::read_dir(&snapshots)
-            .expect("clip snapshot cached")
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.path())
-            .find(|p| p.is_dir())
-            .expect("a snapshot subdir");
+        let dir = clip_snapshot_dir();
 
         let embedder = load(&LoadSpec::new(WeightsSource::Dir(dir))).expect("load clip");
         let solid = |r: u8, g: u8, b: u8| Image {
@@ -622,15 +658,7 @@ mod tests {
     #[test]
     #[ignore = "real-weight: needs the openai/clip-vit-large-patch14 snapshot in the HF cache"]
     fn real_weights_text_image_alignment_ranks_matching_colors_higher() {
-        let home = std::env::var("HOME").expect("HOME");
-        let snapshots = std::path::Path::new(&home)
-            .join(".cache/huggingface/hub/models--openai--clip-vit-large-patch14/snapshots");
-        let dir = std::fs::read_dir(&snapshots)
-            .expect("clip snapshot cached")
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.path())
-            .find(|p| p.is_dir())
-            .expect("a snapshot subdir");
+        let dir = clip_snapshot_dir();
 
         let image_embedder =
             load(&LoadSpec::new(WeightsSource::Dir(dir.clone()))).expect("load image clip");
