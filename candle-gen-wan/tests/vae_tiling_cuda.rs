@@ -32,6 +32,8 @@ fn load_vae() -> Option<(WanVae, Device)> {
     let f = PathBuf::from(snap)
         .join("vae")
         .join("diffusion_pytorch_model.safetensors");
+    // SAFETY: mmap of a read-only, process-owned weight file resolved from `$WAN_SNAPSHOT`; not
+    // mutated behind the mapping — the standard candle loading path.
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[f], DType::F32, &dev).unwrap() };
     let vae = WanVae::new(&VaeConfig::ti2v_5b(), vb).unwrap();
     Some((vae, dev))
