@@ -172,15 +172,76 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    /// Candidate locations for a real, canonical CLIP `tokenizer.json` + its
-    /// `vocab.json`/`merges.txt` siblings, used for the parity assertion when present.
-    fn canonical_clip_dirs() -> Vec<PathBuf> {
-        vec![
-            PathBuf::from(r"D:\sd35\large\tokenizer"),
-            PathBuf::from(r"D:\sd35\large\tokenizer_2"),
-            PathBuf::from(r"D:\sd35\medium\tokenizer"),
-            PathBuf::from(r"D:\sd35\medium\tokenizer_2"),
+    // Candidate CLIP tokenizer directories, resolved **portably** from the HF cache (sc-9030 / F-046).
+    //
+    // Why this exists: these used to be hardcoded `D:\sd35\…` paths that only existed on one
+    // workstation, so the parity tests silently no-op'd everywhere else (they `eprintln!`'d and
+    // returned/passed with zero assertions run — an *invisible* skip). The claimed "byte-for-byte
+    // equivalent, asserted in the crate tests" guarantee was therefore vacuous off that one box, and a
+    // `tokenizers`-crate bump could regress the synthesized tokenizer with no coverage.
+    //
+    // Two distinct sources are needed because a **stock diffusers SD3.5 snapshot** ships its CLIP
+    // `tokenizer/`+`tokenizer_2/` subdirs with only `vocab.json`+`merges.txt` (that's the whole reason
+    // this module exists) — it has **no `tokenizer.json`** to diff against. So:
+    //
+    //  - `synthesis_source_dirs` — dirs carrying `vocab.json`+`merges.txt` to *build* the synthesized
+    //    tokenizer from. The SD3.5 snapshots (`stabilityai/stable-diffusion-3.5-{large,medium}`,
+    //    `tokenizer/`+`tokenizer_2/`) plus the canonical CLIP repos qualify.
+    //  - `canonical_reference_dirs` — dirs that additionally ship a real canonical `tokenizer.json` to
+    //    assert parity *against*. Only the canonical CLIP repos (`openai/clip-vit-large-patch14` for
+    //    CLIP-L, `laion/CLIP-ViT-bigG-14-laion2B-39B-b160k` for bigG) ship all three files together —
+    //    these are the portable source of truth, mirroring `candle-gen-clip`'s F-069/F-071 resolver use.
+    //
+    // All resolution routes through the shared `candle_gen::testkit::hf_snapshot_dir` HF-cache resolver
+    // (`$HF_HUB_CACHE` → `$HF_HOME/hub` → `<home>/.cache/huggingface/hub`), so the tests run on ANY
+    // machine with the weights cached. `SD35_LARGE_PATH`/`SD35_MEDIUM_PATH` (the crate's existing C6
+    // snapshot-root overrides) take precedence for the synthesis source when set.
+
+    /// SD3.5 snapshot roots from the C6 env overrides, if set (a full diffusers snapshot dir).
+    fn sd35_env_snapshot_roots() -> Vec<PathBuf> {
+        ["SD35_LARGE_PATH", "SD35_MEDIUM_PATH"]
+            .into_iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .collect()
+    }
+
+    /// Dirs carrying `vocab.json`+`merges.txt` to synthesize the CLIP BPE from — the SD3.5 snapshot
+    /// `tokenizer/`+`tokenizer_2/` subdirs and the canonical CLIP repos.
+    fn synthesis_source_dirs() -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+
+        // SD3.5 diffusers snapshots: two CLIP tokenizer subdirs each (vocab+merges, no tokenizer.json).
+        let mut sd35_roots = sd35_env_snapshot_roots();
+        for repo in [
+            "stabilityai/stable-diffusion-3.5-large",
+            "stabilityai/stable-diffusion-3.5-medium",
+        ] {
+            if let Some(snap) = candle_gen::testkit::hf_snapshot_dir(repo) {
+                sd35_roots.push(snap);
+            }
+        }
+        for root in sd35_roots {
+            dirs.push(root.join("tokenizer"));
+            dirs.push(root.join("tokenizer_2"));
+        }
+
+        // Canonical CLIP repos also carry vocab+merges at their snapshot root.
+        dirs.extend(canonical_reference_dirs());
+        dirs
+    }
+
+    /// Dirs shipping a real canonical CLIP `tokenizer.json` (alongside `vocab.json`+`merges.txt`) to
+    /// assert synthesized-vs-canonical parity against. Only the canonical CLIP repos qualify.
+    fn canonical_reference_dirs() -> Vec<PathBuf> {
+        [
+            "openai/clip-vit-large-patch14",
+            "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k",
         ]
+        .into_iter()
+        .filter_map(candle_gen::testkit::hf_snapshot_dir)
+        .collect()
     }
 
     const PROMPTS: &[&str] = &[
@@ -203,10 +264,20 @@ mod tests {
             .to_vec()
     }
 
+    /// Real-weight parity: the synthesized CLIP BPE must be token-id-identical to the canonical
+    /// `tokenizer.json`, over a battery of prompts (both `add_special` modes and padded-length
+    /// encodes). The canonical reference comes from the canonical CLIP repos
+    /// (`openai/clip-vit-large-patch14`, `laion/CLIP-ViT-bigG-14-laion2B-39B-b160k`) — a stock SD3.5
+    /// snapshot ships no `tokenizer.json`, so it can't itself be the reference.
+    ///
+    /// `#[ignore]` — the canonical CLIP weights live outside CI (sc-9030 / F-046). Run on a machine with
+    /// the canonical CLIP snapshot(s) cached:
+    ///   cargo test -p candle-gen-sd3 synthesized_matches_canonical_clip_tokenizer -- --ignored --nocapture
     #[test]
+    #[ignore = "real-weight: needs a canonical CLIP snapshot cached (openai/clip-vit-large-patch14 or laion/CLIP-ViT-bigG-14-laion2B-39B-b160k)"]
     fn synthesized_matches_canonical_clip_tokenizer() {
         let mut exercised = 0usize;
-        for dir in canonical_clip_dirs() {
+        for dir in canonical_reference_dirs() {
             let json = dir.join("tokenizer.json");
             let vocab = dir.join("vocab.json");
             let merges = dir.join("merges.txt");
@@ -244,30 +315,38 @@ mod tests {
             }
         }
 
-        if exercised == 0 {
-            eprintln!(
-                "note: no canonical CLIP tokenizer.json found locally (checked D:\\sd35\\*); \
-                 falling back to the hardcoded-ids parity test only"
-            );
-        } else {
-            eprintln!("parity: synthesized == canonical over {exercised} CLIP tokenizer dir(s)");
-        }
+        // This test is `#[ignore]`d and only runs when explicitly requested (`--ignored`), so a
+        // caller has asserted the weights should be present. Finding zero canonical dirs is then a
+        // real failure — NOT a silent vacuous pass (the old bug: it `eprintln!`'d and returned green).
+        assert!(
+            exercised > 0,
+            "no canonical CLIP tokenizer.json found — checked the HF cache \
+             ($HF_HUB_CACHE / $HF_HOME/hub / <home>/.cache/huggingface/hub) for \
+             openai/clip-vit-large-patch14 and laion/CLIP-ViT-bigG-14-laion2B-39B-b160k; \
+             cache a canonical CLIP snapshot before running this `--ignored` test"
+        );
+        eprintln!("parity: synthesized == canonical over {exercised} CLIP tokenizer dir(s)");
     }
 
     /// Known-deterministic CLIP byte-level BPE encoding (independent of local files):
     /// the canonical CLIP tokenizer encodes `"a photo of a cat"` to the well-known id
     /// sequence wrapped by BOS(49406)/EOS(49407). This proves the synthesis is correct
     /// even on a machine without the SD3.5 snapshot — provided a vocab+merges source.
+    ///
+    /// `#[ignore]` — needs a cached SD3.5 CLIP `vocab.json`+`merges.txt` pair (sc-9030 / F-046). Run:
+    ///   cargo test -p candle-gen-sd3 synthesized_known_clip_ids -- --ignored --nocapture
     #[test]
+    #[ignore = "real-weight: needs a cached SD3.5/CLIP vocab.json+merges.txt (see synthesis_source_dirs)"]
     fn synthesized_known_clip_ids() {
-        // Find any local vocab.json + merges.txt CLIP pair to build from.
-        let Some(dir) = canonical_clip_dirs()
+        // Find any local vocab.json + merges.txt CLIP pair to build from. This test is `#[ignore]`d,
+        // so being unable to find one when explicitly run is a real failure, not a vacuous pass.
+        let dir = synthesis_source_dirs()
             .into_iter()
             .find(|d| d.join("vocab.json").is_file() && d.join("merges.txt").is_file())
-        else {
-            eprintln!("skip: no local CLIP vocab.json+merges.txt available");
-            return;
-        };
+            .expect(
+                "no cached SD3.5 CLIP vocab.json+merges.txt found (HF cache or \
+                 $SD35_LARGE_PATH/$SD35_MEDIUM_PATH) — cache the snapshot before running this `--ignored` test",
+            );
         let synth = synthesize_clip_tokenizer(&dir.join("vocab.json"), &dir.join("merges.txt"))
             .expect("synthesize");
 
@@ -280,15 +359,20 @@ mod tests {
 
     /// The loader's fallback must work against a simulated **stock** snapshot layout:
     /// a directory with ONLY vocab.json + merges.txt (no tokenizer.json).
+    ///
+    /// `#[ignore]` — needs a cached SD3.5 CLIP `vocab.json`+`merges.txt` pair (sc-9030 / F-046). Run:
+    ///   cargo test -p candle-gen-sd3 loader_fallback_on_stock_layout -- --ignored --nocapture
     #[test]
+    #[ignore = "real-weight: needs a cached SD3.5/CLIP vocab.json+merges.txt (see synthesis_source_dirs)"]
     fn loader_fallback_on_stock_layout() {
-        let Some(src) = canonical_clip_dirs()
+        // `#[ignore]`d, so a missing source when explicitly run is a real failure, not a vacuous pass.
+        let src = synthesis_source_dirs()
             .into_iter()
             .find(|d| d.join("vocab.json").is_file() && d.join("merges.txt").is_file())
-        else {
-            eprintln!("skip: no local CLIP vocab.json+merges.txt available");
-            return;
-        };
+            .expect(
+                "no cached SD3.5 CLIP vocab.json+merges.txt found (HF cache or \
+                 $SD35_LARGE_PATH/$SD35_MEDIUM_PATH) — cache the snapshot before running this `--ignored` test",
+            );
 
         let tmp = std::env::temp_dir().join(format!("sc8500_stock_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
