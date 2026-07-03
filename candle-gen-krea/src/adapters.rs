@@ -19,7 +19,7 @@
 //! (`to_q`/`to_k`/`to_v`/`to_out.0`, [`crate::train_dit::KREA_ATTN_TARGETS`]), but the *merge* surface is
 //! wider — the full set of adaptable Linears MLX's host exposes (attention incl. `to_gate` + the SwiGLU
 //! FFN `ff.<gate|up|down>`, across the single-stream `transformer_blocks` **and** the `text_fusion`
-//! blocks, [`merge_surface_keys`]) — so an ai-toolkit LoKr that adapts gate + FFN folds in fully
+//! blocks, `merge_surface_keys`) — so an ai-toolkit LoKr that adapts gate + FFN folds in fully
 //! (sc-8776). The Krea trainer writes **bare dotted** PEFT keys (`save_lora_peft(set, "", …)` — no
 //! `base_model.model.unet.` prefix); on read we also tolerate the common community prefixes
 //! ([`PEFT_PREFIXES`]), the ai-toolkit native `diffusion_model.blocks…`/`wq`/`mlp` naming
@@ -428,7 +428,7 @@ fn merge_surface_keys(cfg: &Krea2Config) -> Vec<String> {
 }
 
 /// Merge the LoRA/LoKr `specs` into the DiT `Weights` `w` (sc-7836): preload the attention-projection
-/// base weights ([`merge_surface_keys`]) onto the CPU, fold each adapter's delta in
+/// base weights (`merge_surface_keys`) onto the CPU, fold each adapter's delta in
 /// ([`merge_adapters`], f32 math matching the trainer), and install the result as `w`'s overlay so the
 /// subsequent `Krea2Transformer::load` reads the merged weights. A no-op (empty overlay) when `specs`
 /// is empty — the stock unadapted build. The engine's adapter-merge entry; [`crate::pipeline`] calls it
