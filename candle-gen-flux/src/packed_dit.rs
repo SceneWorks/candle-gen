@@ -694,6 +694,61 @@ mod tests {
         }
     }
 
+    /// Make the QK-RMSNorm scales **Q/K-asymmetric** so the parity anchors actually discriminate a
+    /// Q↔K transposition in the QKV split (sc-9443, review). QK-RMSNorm + a tiny head_dim (8) +
+    /// statistically-symmetric random-init `to_q`/`to_k` weights make Q and K interchangeable at this
+    /// config's scale: swapping which projection feeds Q vs K leaves `softmax(QKᵀ)` unchanged to well
+    /// inside 1e-4, so a wrong-QKV-split port would escape CI. The learned RMSNorm scale vectors are the
+    /// one per-channel signal that survives the (scale-invariant) RMS normalization, so we overwrite them
+    /// in the shared `VarMap` — *before* both the vendored and stock models read them — with distinct,
+    /// deterministic per-channel patterns for the query vs key norms. Correct remap still matches exactly
+    /// (both sides read the same asymmetric scales); a Q↔K swap now mismatches the channel weighting of
+    /// the attention score and diverges by O(1), tripping the tight 1e-4 anchor.
+    ///
+    /// Query norm gets an ascending ramp `1.0 + 0.5·c/(D-1)` (∈[1.0, 1.5]); key norm gets a *descending*,
+    /// sign-alternating pattern `-(1.5 - 0.5·c/(D-1))` — different magnitude curve AND different sign per
+    /// channel, so the two are not related by any permutation/scale and the swap cannot cancel out.
+    fn make_qk_asymmetric(
+        vm: &mut VarMap,
+        num_double: usize,
+        num_single: usize,
+        head_dim: usize,
+        dev: &Device,
+    ) -> Result<()> {
+        let d = head_dim;
+        let q_scale: Vec<f32> = (0..d)
+            .map(|c| 1.0 + 0.5 * (c as f32) / ((d - 1).max(1) as f32))
+            .collect();
+        let k_scale: Vec<f32> = (0..d)
+            .map(|c| {
+                let m = 1.5 - 0.5 * (c as f32) / ((d - 1).max(1) as f32);
+                if c % 2 == 0 {
+                    -m
+                } else {
+                    m
+                }
+            })
+            .collect();
+        let q = Tensor::from_vec(q_scale, d, dev)?;
+        let k = Tensor::from_vec(k_scale, d, dev)?;
+        let mut set = |name: String, v: &Tensor| vm.set_one(name, v);
+        for i in 0..num_double {
+            let s = format!("transformer_blocks.{i}.attn");
+            set(format!("{s}.norm_q.weight"), &q)?;
+            set(format!("{s}.norm_k.weight"), &k)?;
+            // The text stream carries its own QK-norm; make it asymmetric too so a Q↔K swap in the
+            // `add_q_proj`/`add_k_proj` concat is likewise caught.
+            set(format!("{s}.norm_added_q.weight"), &q)?;
+            set(format!("{s}.norm_added_k.weight"), &k)?;
+        }
+        for i in 0..num_single {
+            let s = format!("single_transformer_blocks.{i}.attn");
+            set(format!("{s}.norm_q.weight"), &q)?;
+            set(format!("{s}.norm_k.weight"), &k)?;
+        }
+        Ok(())
+    }
+
     /// Read a vendored tensor out of the populated `VarMap` by its diffusers key.
     fn t(map: &HashMap<String, Var>, key: &str) -> Tensor {
         map.get(key)
@@ -908,6 +963,14 @@ mod tests {
     ///  - a **full-network** anchor (2 double + 2 single) bounded at 5e-3 — loose enough to absorb the
     ///    documented image-FF GELU gap yet far tighter than any structural bug (a wrong RoPE / QKV split
     ///    / modulation-chunk order diverges by O(1)), so it still guards the double-block wiring.
+    ///
+    /// **Discriminating the QKV split (sc-9443, review).** QK-RMSNorm + a tiny head_dim (8) + symmetric
+    /// random-init `to_q`/`to_k` weights would make Q and K interchangeable at this scale — a Q↔K swap in
+    /// the split→fuse concat leaves the output unchanged to inside 1e-4, so the anchor would *not* catch a
+    /// transposed QKV split. To close that hole, [`make_qk_asymmetric`] overwrites the shared QK-norm
+    /// scales with distinct per-channel patterns for the query vs key norms before either model reads them
+    /// (correct remap still matches exactly; a Q↔K swap now diverges by O(1) — verified ~2.9 on the tight
+    /// anchor). See that fn for the mechanism.
     fn run_parity(num_double: usize, num_single: usize, guidance: bool, tol: f32) -> Result<f32> {
         use candle_transformers::models::flux::model::{Config as StockConfig, Flux};
         use candle_transformers::models::flux::WithForward;
@@ -918,9 +981,15 @@ mod tests {
         cfg.depth_single_blocks = num_single;
 
         // Build the vendored diffusers DiT — this populates the VarMap with diffusers-keyed weights.
-        let vm = VarMap::new();
+        let mut vm = VarMap::new();
         let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
         let vendored = PackedFluxDit::new(&cfg, num_double, num_single, vb)?;
+
+        // Make the shared QK-norm scales Q/K-asymmetric so the parity anchors actually catch a Q↔K
+        // transposition in the QKV split (sc-9443); both models read these mutated scales, so a correct
+        // remap still matches exactly. Must run before `remap_to_bfl` snapshots the VarMap.
+        let head_dim = Dims::from_config(&cfg).head_dim;
+        make_qk_asymmetric(&mut vm, num_double, num_single, head_dim, &dev)?;
 
         // Remap into the BFL layout and build the stock model from those exact weights.
         let bfl = remap_to_bfl(&vm, num_double, num_single, guidance);
