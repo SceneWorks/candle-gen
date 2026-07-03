@@ -14,9 +14,13 @@
 //! Each vendored projection is a [`crate::quant::QLinear`], which **packed-detects** the `.scales`
 //! sibling ([`QLinear::linear_detect`]): a packed tier builds the quantized weight straight from the
 //! packed parts (Q4→`Q4_1` lossless, Q8→`Q8_0` requant, dequant-on-forward — sc-7702), a dense bf16
-//! tier loads the dense weight unchanged. **The dense path is byte-identical to the stock model**
-//! (`parity_tests` pins it: built from the same weights with no `.scales`, the vendored forward matches
-//! the stock forward bit-for-bit). This model is used only when the snapshot is a packed tier
+//! tier loads the dense weight unchanged. **The dense path is byte-identical to the stock model**: the
+//! `parity_tests::vendored_dense_dit_matches_stock_forward` test (the stock-vs-vendored DiT numeric
+//! parity test tracked by sc-9443) pins it — built from the same weights with no `.scales`, the
+//! vendored forward matches the stock `ZImageTransformer2DModel` forward bit-for-bit. Unlike flux
+//! (diffusers split-QKV vs BFL fused-QKV, which needs a load-time layout remap in its parity test),
+//! z-image's vendored DiT shares the stock `z_image::transformer` layout key-for-key, so the same
+//! `VarMap` feeds both models directly with no remap. This model is used only when the snapshot is a packed tier
 //! ([`crate::pipeline`]); a dense snapshot keeps using the stock `ZImageTransformer2DModel`.
 
 use candle_gen::candle_core::{DType, Device, Module, Result, Tensor, D};
@@ -596,7 +600,9 @@ mod parity_tests {
     //! Pin the vendored DENSE path to the stock candle-transformers DiT: built from the *same*
     //! `VarMap`-backed weights (no `.scales`, so every `QLinear` takes the dense arm), the two must
     //! produce bit-identical forward output — the guard that the packed-seam vendoring changed nothing
-    //! numerically on a dense tier.
+    //! numerically on a dense tier. This is the z-image half of the stock-vs-vendored DiT numeric parity
+    //! coverage tracked by sc-9443 (the flux half lives in `candle-gen-flux` `packed_dit.rs`, where the
+    //! diffusers→BFL layout difference additionally requires a load-time QKV remap).
     use super::*;
     use candle_gen::candle_core::{Device, Tensor};
     use candle_gen::candle_nn::{VarBuilder, VarMap};
