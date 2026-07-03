@@ -19,9 +19,9 @@ use candle_core::{DType, Tensor, D};
 use candle_nn::ops::softmax_last_dim;
 use candle_nn::{LayerNorm, Linear, Module};
 
+use candle_gen::weights::Weights;
 use candle_gen::Result as GenResult;
 use candle_gen_flux::DitImageInjector;
-use candle_gen_sdxl::weights::Weights;
 
 const EPS: f64 = 1e-5;
 

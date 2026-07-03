@@ -21,9 +21,9 @@ use candle_core::{Result, Tensor, D};
 use candle_nn::ops::softmax_last_dim;
 use candle_nn::{LayerNorm, Linear, Module};
 
+use candle_gen::weights::Weights;
 use candle_gen::CandleError;
 use candle_gen::Result as GenResult;
-use candle_gen_sdxl::weights::Weights;
 
 /// Image-prompt token count (the XLabs `ImageProjModel` emits 4 tokens).
 const NUM_TOKENS: usize = 4;

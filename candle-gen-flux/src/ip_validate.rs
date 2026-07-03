@@ -28,9 +28,9 @@ use candle_core::DType;
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{Image, Progress};
+use candle_gen::weights::Weights;
 use candle_gen_sdxl::ip_adapter::preprocess_clip_image_sized;
 use candle_gen_sdxl::vision_encoder::{ClipVisionEncoder, VisionConfig};
-use candle_gen_sdxl::weights::Weights;
 
 use crate::ip_provider::{IpAdapterFlux, IpAdapterFluxPaths, IpAdapterFluxRequest};
 

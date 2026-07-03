@@ -25,8 +25,8 @@ pub mod transform;
 use candle_core::Tensor;
 use candle_nn::{LayerNorm, Linear, Module};
 
+use candle_gen::weights::Weights;
 use candle_gen::Result as GenResult;
-use candle_gen_sdxl::weights::Weights;
 
 use block::Block;
 use patch_embed::PatchEmbed;

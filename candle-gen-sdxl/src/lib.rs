@@ -60,7 +60,8 @@ pub mod ip_adapter;
 // Kolors), the one net-new model the general IP-Adapter port needs (candle-gen had only the text CLIP).
 pub mod vision_encoder;
 pub use vision_encoder::{ClipVisionEncoder, VisionConfig};
-// A small safetensors key→Tensor map for the IP-Adapter / ControlNet loads (non-VarBuilder weights).
+// The safetensors key→Tensor map for the IP-Adapter / ControlNet loads (non-VarBuilder weights).
+// Hoisted to the `candle-gen` core crate (F-060, sc-9044); re-exported here for source compatibility.
 pub mod weights;
 
 // Euler / Euler-ancestral sampler (sc-5491) — the InstantID/diffusers-SDXL solver the InstantID

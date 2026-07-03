@@ -19,9 +19,10 @@ inventory = { workspace = true }
 # encoders. Backend features are passed through below so it shares candle-gen's exact candle build.
 candle-transformers = { workspace = true }
 # Reused IP-Adapter infrastructure (sc-5872): the CLIP ViT image tower (`ClipVisionEncoder` /
-# `VisionConfig::vit_l_14`), the safetensors key→Tensor `Weights` loader (with the I64-passthrough cast
-# fix), and `preprocess_clip_image_sized` (the shared CLIP image preprocessing). Backend features are
-# forwarded below so flux + sdxl share ONE candle build (the single-rev skew gate).
+# `VisionConfig::vit_l_14`) and `preprocess_clip_image_sized` (the shared CLIP image preprocessing).
+# (The backend-generic `Weights` loader moved to the `candle-gen` core crate in F-060/sc-9044, so it is
+# no longer a reason for this dep.) Backend features are forwarded below so flux + sdxl share ONE candle
+# build (the single-rev skew gate).
 candle-gen-sdxl = { path = "../candle-gen-sdxl" }
 # candle-transformers' `flux::model::Flux` exposes no per-double-block IP-injection seam (all fields
 # private), so sc-5872 vendors + forks the FLUX DiT (`ip_dit.rs`) to add the XLabs decoupled-cross-attn

@@ -5,8 +5,8 @@
 
 use candle_core::Tensor;
 
+use candle_gen::weights::Weights;
 use candle_gen::Result as GenResult;
-use candle_gen_sdxl::weights::Weights;
 
 use crate::eva_clip::join;
 

@@ -413,7 +413,6 @@ dependencies = [
  "candle-gen",
  "candle-gen-face",
  "candle-gen-flux",
- "candle-gen-sdxl",
  "candle-nn",
  "candle-transformers",
  "rand",

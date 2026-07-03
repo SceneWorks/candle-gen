@@ -14,10 +14,10 @@ use candle_core::{IndexOp, Tensor};
 use candle_nn::{LayerNorm, Linear, Module};
 
 use candle_gen::gen_core::Image;
+use candle_gen::weights::Weights;
 use candle_gen::Result as GenResult;
 use candle_gen_sdxl::ip_adapter::preprocess_clip_image_sized;
 use candle_gen_sdxl::vision_encoder::check_layer_count;
-use candle_gen_sdxl::weights::Weights;
 use candle_gen_sdxl::{ClipVisionEncoder, VisionConfig};
 
 /// CLIP LayerNorm epsilon (the same `post_layernorm` eps the tower uses).

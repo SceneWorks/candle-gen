@@ -27,8 +27,8 @@ use candle_transformers::models::t5::T5EncoderModel;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{Image, Progress};
+use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
-use candle_gen_sdxl::weights::Weights;
 
 use crate::flux1_load;
 use crate::ip_adapter::{FluxIpAdapter, FluxIpInjector};

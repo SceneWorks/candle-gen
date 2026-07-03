@@ -15,9 +15,9 @@ use candle_core::{Tensor, D};
 use candle_nn::ops::softmax_last_dim;
 use candle_nn::{LayerNorm, Linear, Module};
 
+use candle_gen::weights::Weights;
 use candle_gen::Result as GenResult;
 use candle_gen::{CandleError, Result};
-use candle_gen_sdxl::weights::Weights;
 
 /// nn.LayerNorm default epsilon (the IDFormer/PuLID modules; NOT the EVA 1e-6).
 const EPS: f64 = 1e-5;

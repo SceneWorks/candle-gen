@@ -35,12 +35,12 @@ use rand_distr::{Distribution, StandardNormal};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{Image, Progress};
+use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
 use candle_gen_flux::{
     ae_config, clip_config, decode_latents, encode_text, flux_config, DitImageInjector, IpFlux,
     Variant,
 };
-use candle_gen_sdxl::weights::Weights;
 
 use crate::ca::PulidCa;
 use crate::eva_clip::{transform, EvaConfig, EvaVisionTransformer};

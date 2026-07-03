@@ -10,8 +10,8 @@ use candle_core::{Tensor, D};
 use candle_nn::ops::softmax_last_dim;
 use candle_nn::{LayerNorm, Linear, Module};
 
+use candle_gen::weights::Weights;
 use candle_gen::Result as GenResult;
-use candle_gen_sdxl::weights::Weights;
 
 use crate::eva_clip::rope::VisionRope;
 use crate::eva_clip::{join, layer_norm};

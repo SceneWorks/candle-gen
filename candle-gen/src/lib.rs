@@ -80,6 +80,14 @@ pub use seed::{image_seed, seeded_noise_nchw, seeded_normal_vec, STEP_RNG_SALT};
 // parameterized by each VAE's cost model + decode closure so the per-VAE numerics are unchanged.
 pub mod vae_tiling;
 
+// Shared safetensors key→`Tensor` weight map (sc-9044 / F-060): the non-`VarBuilder` loader (float
+// dtype-coerce, hard duplicate-key policy, prefix-filtered header-only reads) that the SDXL IP-Adapter/
+// ControlNet loads AND the FLUX-family IP-Adapter / PuLID EVA-CLIP towers all share. It had drifted into
+// `candle-gen-sdxl`, making that pipeline crate a de-facto commons crate that PuLID/FLUX pulled the whole
+// ~12k-LOC SDXL crate in for. Hoisted here; `candle-gen-sdxl::weights` re-exports it for compatibility.
+pub mod weights;
+pub use weights::Weights;
+
 // Poison-tolerant locking for the shared generator/component caches (sc-9015 / F-031): a panic while
 // holding a cache `Mutex` (e.g. a CUDA OOM lifted to a panic mid-decode) poisons it, after which a
 // plain `.lock().unwrap()` panics forever — one transient failure wedges a long-lived worker lane
