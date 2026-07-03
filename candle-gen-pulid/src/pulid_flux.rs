@@ -38,8 +38,8 @@ use candle_gen::gen_core::{Image, Progress};
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
 use candle_gen_flux::{
-    ae_config, clip_config, decode_latents, encode_text, flux_config, DitImageInjector, IpFlux,
-    Variant,
+    ae_config, clip_config, decode_latents, encode_text, flux_config, DitImageInjector,
+    FluxTokenizers, IpFlux, Variant,
 };
 
 use crate::ca::PulidCa;
@@ -164,8 +164,9 @@ fn l2_normalize_rows(x: &Tensor) -> candle_core::Result<Tensor> {
 /// The loaded PuLID-FLUX model: the FLUX backbone (text encoders + forked DiT + VAE) + the EVA tower +
 /// the IDFormer + the kept PuLID checkpoint (for the per-generate [`PulidCa`]) + the native face stack.
 pub struct PulidFlux {
-    /// The FLUX snapshot root (for the T5 tokenizer in `encode_text`).
-    root: PathBuf,
+    /// T5 + CLIP tokenizers, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
+    /// instead of re-parsing per prompt in `encode_text`.
+    toks: FluxTokenizers,
     device: Device,
     dtype: DType,
     clip: ClipTextTransformer,
@@ -240,8 +241,9 @@ impl PulidFlux {
         // Native face stack + BiSeNet parser (the `face_features_image` path).
         let face = candle_gen_face::load_with_parser_on(&paths.face_dir, &device)?;
 
+        let toks = FluxTokenizers::load(&root)?;
         Ok(Self {
-            root,
+            toks,
             device,
             dtype,
             clip,
@@ -302,7 +304,7 @@ impl PulidFlux {
         // Text conditioning (T5 seq + CLIP pooled).
         let (t5_emb, clip_emb) = encode_text(
             Variant::Dev,
-            &self.root,
+            &self.toks,
             &self.device,
             self.dtype,
             &self.clip,

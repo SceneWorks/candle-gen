@@ -34,18 +34,16 @@ pub(crate) fn component_vb(
     candle_gen::component_vb(root, sub, dtype, device, label)
 }
 
-/// Tokenize + encode `prompt` → `prompt_embeds` `[1, seq, 3584]` at `dit_dtype` (bf16). Mirrors the
-/// txt2img `Pipeline::encode`. `label` prefixes the error messages.
-pub(crate) fn encode(
+/// Build the Qwen-Image tokenizer from `root/tokenizer/tokenizer.json` **once**, so callers can cache
+/// it on their generator struct and reuse it across encodes (sc-8991 / F-011) rather than re-parsing
+/// `tokenizer.json` per prompt/branch. Byte-identical [`TokenizerConfig`] to the old per-encode load, so
+/// the cached tokenizer yields the same ids. `label` prefixes the error message.
+pub(crate) fn load_tokenizer(
     root: &Path,
     te_cfg: &TextEncoderConfig,
-    te: &QwenTextEncoder,
-    device: &Device,
-    dit_dtype: DType,
-    prompt: &str,
     label: &str,
-) -> Result<Tensor> {
-    let tok = TextTokenizer::from_file(
+) -> Result<TextTokenizer> {
+    TextTokenizer::from_file(
         root.join("tokenizer/tokenizer.json"),
         TokenizerConfig {
             max_length: te_cfg.max_length,
@@ -54,7 +52,20 @@ pub(crate) fn encode(
             pad_to_max_length: false,
         },
     )
-    .map_err(|e| CandleError::Msg(format!("{label}: load tokenizer: {e}")))?;
+    .map_err(|e| CandleError::Msg(format!("{label}: load tokenizer: {e}")))
+}
+
+/// Tokenize + encode `prompt` → `prompt_embeds` `[1, seq, 3584]` at `dit_dtype` (bf16). Mirrors the
+/// txt2img `Pipeline::encode`. `tok` is the caller's cached tokenizer ([`load_tokenizer`]); `label`
+/// prefixes the error messages.
+pub(crate) fn encode(
+    tok: &TextTokenizer,
+    te: &QwenTextEncoder,
+    device: &Device,
+    dit_dtype: DType,
+    prompt: &str,
+    label: &str,
+) -> Result<Tensor> {
     let out = tok
         .tokenize(prompt)
         .map_err(|e| CandleError::Msg(format!("{label}: tokenize: {e}")))?;

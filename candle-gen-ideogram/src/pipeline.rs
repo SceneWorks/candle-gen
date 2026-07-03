@@ -21,7 +21,7 @@
 //! unpatchify are done here (via [`Flux2Vae::bn_stats`] / [`Flux2Vae::decode_latent`]) rather than
 //! flux2's `decode_packed`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::candle_nn::VarBuilder;
@@ -64,8 +64,25 @@ pub struct Components {
     uncond: Option<Ideogram4Transformer>,
     te: Ideogram4TextEncoder,
     vae: Flux2Vae,
-    tokenizer_path: PathBuf,
+    /// Qwen3-VL tokenizer, loaded+parsed **once** at component load and reused across every prompt
+    /// encode (sc-8991 / F-011) instead of re-parsing `tokenizer.json` per request.
+    tokenizer: TextTokenizer,
     dit: Ideogram4DitConfig,
+}
+
+/// Build the Ideogram tokenizer from `root/tokenizer/tokenizer.json` **once** (sc-8991 / F-011).
+/// Byte-identical [`TokenizerConfig`] to the old per-encode load, so the cached ids match.
+fn build_tokenizer(root: &Path) -> CResult<TextTokenizer> {
+    TextTokenizer::from_file(
+        root.join("tokenizer/tokenizer.json"),
+        TokenizerConfig {
+            max_length: MAX_TEXT_TOKENS,
+            pad_token_id: PAD_TOKEN_ID,
+            chat_template: ChatTemplate::QwenInstruct,
+            pad_to_max_length: false,
+        },
+    )
+    .map_err(|e| CandleError::Msg(format!("ideogram: load tokenizer: {e}")))
 }
 
 fn component_vb(
@@ -110,7 +127,7 @@ pub fn load_components(root: &Path, device: &Device) -> CResult<Components> {
         uncond,
         te,
         vae,
-        tokenizer_path: root.join("tokenizer/tokenizer.json"),
+        tokenizer: build_tokenizer(root)?,
         dit,
     })
 }
@@ -147,7 +164,7 @@ pub fn load_components_turbo(root: &Path, device: &Device) -> CResult<Components
         uncond: None,
         te,
         vae,
-        tokenizer_path: root.join("tokenizer/tokenizer.json"),
+        tokenizer: build_tokenizer(root)?,
         dit,
     })
 }
@@ -156,17 +173,8 @@ impl Components {
     /// Tokenize a prompt to `input_ids` exactly as the reference `_tokenize`: the Qwen3-VL single-user
     /// chat template, `add_special_tokens=false`. Rejects > `MAX_TEXT_TOKENS`.
     fn tokenize(&self, prompt: &str) -> CResult<Vec<i32>> {
-        let tok = TextTokenizer::from_file(
-            &self.tokenizer_path,
-            TokenizerConfig {
-                max_length: MAX_TEXT_TOKENS,
-                pad_token_id: PAD_TOKEN_ID,
-                chat_template: ChatTemplate::QwenInstruct,
-                pad_to_max_length: false,
-            },
-        )
-        .map_err(|e| CandleError::Msg(format!("ideogram: load tokenizer: {e}")))?;
-        let ids = tok
+        let ids = self
+            .tokenizer
             .encode_chat_ids(prompt, false)
             .map_err(|e| CandleError::Msg(format!("ideogram: tokenize: {e}")))?;
         if ids.len() > MAX_TEXT_TOKENS {

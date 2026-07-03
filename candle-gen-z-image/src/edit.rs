@@ -124,9 +124,11 @@ impl Default for ZImageEditRequest {
 /// txt2img transformer — img2img is just a different init + start step), the decode VAE, and a VAE
 /// encoder (deterministic mean encode of the source).
 pub struct ZImageEdit {
-    root: PathBuf,
     device: Device,
     text_encoder: ZImageTextEncoder,
+    /// Qwen tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
+    /// instead of re-parsing `tokenizer.json` per prompt.
+    tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
     transformer: ZImageTransformer2DModel,
     vae: AutoEncoderKL,
     vae_encoder: VaeEncoder,
@@ -163,10 +165,11 @@ impl ZImageEdit {
             component_vb(&root, "vae", ENC_DTYPE, &device)?.pp("encoder"),
         )?;
 
+        let tokenizer = common::build_tokenizer(&root, "z-image edit")?;
         Ok(Self {
-            root,
             device,
             text_encoder,
+            tokenizer,
             transformer,
             vae,
             vae_encoder,
@@ -265,7 +268,7 @@ impl ZImageEdit {
     /// Prompt → `cap_feats` `(seq, 2560)` at bf16 via the Qwen3 encoder + the shared Qwen chat template
     /// ([`common::prompt_ids`] + [`common::encode_ids`]).
     fn text_embeddings(&self, prompt: &str) -> Result<Tensor> {
-        let ids = common::prompt_ids(&self.root, prompt, "z-image edit")?;
+        let ids = common::prompt_ids(&self.tokenizer, prompt, "z-image edit")?;
         common::encode_ids(&ids, &self.device, DTYPE, |input_ids| {
             self.text_encoder.forward(input_ids)
         })

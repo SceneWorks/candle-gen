@@ -39,13 +39,14 @@
 //! after caching; the two experts are the working set.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use candle_gen::candle_core::backprop::GradStore;
 use candle_gen::candle_core::{DType, Device, Tensor, Var};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
+use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
@@ -152,14 +153,14 @@ fn compute_loss_grads(
 /// (unlike the inference providers' f32), so it passes `out_dtype = F32` to reproduce its prior
 /// `.to_dtype(F32)` upcast of the bf16 embeds exactly.
 fn encode_caption(
-    root: &Path,
+    tok: &TextTokenizer,
     te_cfg: &TextEncoderConfig,
     te: &Umt5Encoder,
     caption: &str,
     device: &Device,
 ) -> Result<Tensor> {
     crate::text_encode::umt5_encode_padded(
-        root,
+        tok,
         te_cfg,
         te,
         caption,
@@ -396,6 +397,10 @@ impl WanMoeTrainer {
             &te_cfg,
             flow_match::component_vb(&self.root, "text_encoder", device, DType::BF16, LABEL)?,
         )?;
+        // Load+parse the UMT5 tokenizer ONCE, not once per dataset item / sample prompt (sc-8991 /
+        // F-011). Byte-identical config to the old per-caption `from_file`, so the cached ids match.
+        let tokenizer =
+            crate::text_encode::build_umt5_tokenizer(&self.root, &te_cfg, "wan trainer")?;
 
         let total = req.items.len() as u32;
         let mut cache: Vec<(Tensor, Tensor)> = Vec::with_capacity(req.items.len());
@@ -410,7 +415,7 @@ impl WanMoeTrainer {
             let img = load_image_tensor(&item.image_path, edge, device)?; // [1,3,edge,edge] in [-1,1]
             let video = img.unsqueeze(2)?; // [1,3,1,edge,edge] (T=1 still frame)
             let x0 = vae.encode(&video)?.to_dtype(DType::F32)?; // [1,16,1,h,w] normalized mean
-            let cap = encode_caption(&self.root, &te_cfg, &text_encoder, &item.caption, device)?;
+            let cap = encode_caption(&tokenizer, &te_cfg, &text_encoder, &item.caption, device)?;
             cache.push((x0, cap));
         }
 
@@ -427,7 +432,7 @@ impl WanMoeTrainer {
                 for p in cfg.sample_prompts.iter().take(SAMPLE_PROMPT_CAP) {
                     // Same conditioning call the cache loop uses → identical [1, 512, 4096] surface.
                     umt5.push(encode_caption(
-                        &self.root,
+                        &tokenizer,
                         &te_cfg,
                         &text_encoder,
                         p,

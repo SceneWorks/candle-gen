@@ -40,6 +40,9 @@ pub struct Components {
     pub dit: Scail2Dit,
     pub vae: WanVae16,
     pub clip: ScailClip,
+    /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across the pos/neg encodes
+    /// (sc-8991 / F-011) instead of re-parsing `tokenizer.json` per generate call.
+    pub tok: TextTokenizer,
 }
 
 /// One masked character reference (the primary subject or an extra character): an RGB image paired with
@@ -230,11 +233,26 @@ fn encode_text(
     Ok(embeds.reshape((l, d))?)
 }
 
-/// Run the full SCAIL-2 generation for `job` against the resident `comps`. `root` is the snapshot dir
-/// (for `tokenizer/tokenizer.json`); `cancel` is polled each denoise step.
+/// Build the SCAIL-2 UMT5 tokenizer from `root/tokenizer/tokenizer.json` **once** (sc-8991 / F-011), so
+/// the generator caches it on its `Components` and reuses it across generate calls rather than
+/// re-parsing per request. Byte-identical [`TokenizerConfig`] to the old per-generate load.
+pub fn build_tokenizer(root: &Path, te_cfg: &TextEncoderConfig) -> CResult<TextTokenizer> {
+    TextTokenizer::from_file(
+        root.join("tokenizer/tokenizer.json"),
+        TokenizerConfig {
+            max_length: te_cfg.max_length,
+            pad_token_id: te_cfg.pad_token_id,
+            chat_template: ChatTemplate::None,
+            pad_to_max_length: false,
+        },
+    )
+    .map_err(|e| CandleError::Msg(format!("scail2: load tokenizer: {e}")))
+}
+
+/// Run the full SCAIL-2 generation for `job` against the resident `comps`. `cancel` is polled each
+/// denoise step.
 #[allow(clippy::too_many_arguments)]
 pub fn generate(
-    root: &Path,
     comps: &Components,
     te_cfg: &TextEncoderConfig,
     job: &Scail2Job,
@@ -303,22 +321,14 @@ pub fn generate(
     };
 
     // --- UMT5 text encode + CLIP reference-image features (once) ---
-    let tok = TextTokenizer::from_file(
-        root.join("tokenizer/tokenizer.json"),
-        TokenizerConfig {
-            max_length: te_cfg.max_length,
-            pad_token_id: te_cfg.pad_token_id,
-            chat_template: ChatTemplate::None,
-            pad_to_max_length: false,
-        },
-    )
-    .map_err(|e| CandleError::Msg(format!("scail2: load tokenizer: {e}")))?;
+    // The tokenizer is loaded+parsed once at component load (sc-8991 / F-011) — reuse the cached one.
+    let tok = &comps.tok;
     let pad_id = te_cfg.pad_token_id.max(0) as u32;
-    let context = encode_text(&comps.te, &tok, job.prompt, pad_id, dev)?;
+    let context = encode_text(&comps.te, tok, job.prompt, pad_id, dev)?;
     let context_null = if cfg_disabled {
         context.clone()
     } else {
-        encode_text(&comps.te, &tok, job.negative_prompt, pad_id, dev)?
+        encode_text(&comps.te, tok, job.negative_prompt, pad_id, dev)?
     };
     let clip_fea = {
         let pixel = clip_preprocess(&ref_chw.reshape((1, 3, th, tw))?, 224)?;

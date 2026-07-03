@@ -84,6 +84,9 @@ pub struct Flux2Edit {
     pipe: Pipeline,
     variant: Flux2Variant,
     te: Qwen3TextEncoder,
+    /// Prompt tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
+    /// instead of re-parsing `tokenizer.json` per prompt/branch.
+    tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
     transformer: Flux2Transformer,
     vae: Flux2Vae,
 }
@@ -118,10 +121,12 @@ impl Flux2Edit {
         // per-site addition.
         let (te, transformer) = pipe.load_te_and_dit()?;
         let vae = Flux2Vae::new_with_encoder(pipe.component_vb("vae")?)?;
+        let tokenizer = pipe.build_tokenizer()?;
         Ok(Self {
             pipe,
             variant,
             te,
+            tokenizer,
             transformer,
             vae,
         })
@@ -154,14 +159,14 @@ impl Flux2Edit {
         let cfg_on = !embedded_guidance && guidance > 1.0;
 
         // Prompt embeds are seed-independent: encode once. Negative only under klein CFG.
-        let prompt_embeds = self.pipe.encode(&self.te, &req.prompt)?;
+        let prompt_embeds = self.pipe.encode(&self.te, &self.tokenizer, &req.prompt)?;
         let negative = if cfg_on {
             let neg = if req.negative.trim().is_empty() {
                 " "
             } else {
                 req.negative.as_str()
             };
-            Some(self.pipe.encode(&self.te, neg)?)
+            Some(self.pipe.encode(&self.te, &self.tokenizer, neg)?)
         } else {
             None
         };

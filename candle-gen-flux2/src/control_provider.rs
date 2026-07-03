@@ -87,6 +87,9 @@ impl Default for Flux2ControlRequest {
 pub struct Flux2Control {
     pipe: Pipeline,
     te: Qwen3TextEncoder,
+    /// Prompt tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
+    /// instead of re-parsing `tokenizer.json` per prompt.
+    tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
     transformer: Flux2ControlTransformer,
     vae: Flux2Vae,
 }
@@ -116,9 +119,11 @@ impl Flux2Control {
         let transformer = Flux2ControlTransformer::new(base, branch);
 
         let vae = Flux2Vae::new_with_encoder(pipe.component_vb("vae")?)?;
+        let tokenizer = pipe.build_tokenizer()?;
         Ok(Self {
             pipe,
             te,
+            tokenizer,
             transformer,
             vae,
         })
@@ -142,7 +147,7 @@ impl Flux2Control {
 
         // Prompt embeds (text-only Mistral) + the packed 260-ch control context are seed-independent:
         // encode once.
-        let prompt_embeds = self.pipe.encode(&self.te, &req.prompt)?;
+        let prompt_embeds = self.pipe.encode(&self.te, &self.tokenizer, &req.prompt)?;
         let control_context = self.encode_control_context(control_image, req.width, req.height)?;
 
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);

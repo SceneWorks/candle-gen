@@ -101,10 +101,11 @@ fn resolve_controlnet_file(path: &Path) -> Result<PathBuf> {
 /// The loaded Qwen-Image ControlNet model: the reused base text encoder / DiT / VAE-decoder, plus the
 /// VAE encoder (to encode the pose skeleton) and the InstantX control branch.
 pub struct QwenControl {
-    te_cfg: TextEncoderConfig,
-    root: PathBuf,
     device: Device,
     te: QwenTextEncoder,
+    /// Qwen tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
+    /// instead of re-parsing `tokenizer.json` per prompt/branch.
+    tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
     transformer: QwenTransformer,
     controlnet: QwenControlNet,
     vae: QwenVae,
@@ -142,11 +143,11 @@ impl QwenControl {
         let cn_vb = candle_gen::mmap_var_builder(&[cn_file], DIT_DTYPE, &device)?;
         let controlnet = QwenControlNet::new(&dit_cfg, CONTROL_LAYERS, cn_vb)?;
 
+        let tokenizer = control_common::load_tokenizer(&root, &te_cfg, LABEL)?;
         Ok(Self {
-            te_cfg,
-            root,
             device,
             te,
+            tokenizer,
             transformer,
             controlnet,
             vae,
@@ -158,8 +159,7 @@ impl QwenControl {
     /// the txt2img `Pipeline::encode`.
     fn encode(&self, prompt: &str) -> Result<Tensor> {
         control_common::encode(
-            &self.root,
-            &self.te_cfg,
+            &self.tokenizer,
             &self.te,
             &self.device,
             DIT_DTYPE,

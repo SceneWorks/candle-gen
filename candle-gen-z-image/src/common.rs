@@ -93,8 +93,11 @@ pub(crate) fn build_tokenizer(root: &std::path::Path, label: &str) -> Result<Tex
 
 /// Prompt → the Qwen chat-template token ids (non-empty), erroring on an empty tokenization. Shared by
 /// every conditional encode path; the caller runs its own text encoder over the ids via [`encode_ids`].
-pub(crate) fn prompt_ids(root: &std::path::Path, prompt: &str, label: &str) -> Result<Vec<i32>> {
-    let out = build_tokenizer(root, label)?
+///
+/// `tok` is the cached tokenizer ([`build_tokenizer`]) the caller holds on its `Components` — loaded
+/// once, reused across encodes (sc-8991 / F-011) rather than re-parsing `tokenizer.json` per prompt.
+pub(crate) fn prompt_ids(tok: &TextTokenizer, prompt: &str, label: &str) -> Result<Vec<i32>> {
+    let out = tok
         .tokenize(prompt)
         .map_err(|e| CandleError::Msg(format!("{label}: tokenize: {e}")))?;
     if out.ids.is_empty() {
@@ -113,16 +116,16 @@ pub(crate) fn prompt_ids(root: &std::path::Path, prompt: &str, label: &str) -> R
 /// tokenizes to the non-empty role-marker sequence the reference `mlx-gen-z-image` feeds its uncond
 /// branch. A non-empty negative prompt takes the ordinary [`prompt_ids`] path.
 pub(crate) fn uncond_ids(
-    root: &std::path::Path,
+    tok: &TextTokenizer,
     negative_prompt: &str,
     label: &str,
 ) -> Result<Vec<i32>> {
     if !negative_prompt.is_empty() {
-        return prompt_ids(root, negative_prompt, label);
+        return prompt_ids(tok, negative_prompt, label);
     }
     // `add_special_tokens = true` mirrors `tokenize`'s `encode(text, true)`. For Qwen this only governs
     // the auto-added BOS/EOS (Qwen adds none), so the ids equal the templated tokens.
-    let ids = build_tokenizer(root, label)?
+    let ids = tok
         .encode_chat_ids("", true)
         .map_err(|e| CandleError::Msg(format!("{label}: tokenize uncond: {e}")))?;
     if ids.is_empty() {

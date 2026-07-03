@@ -83,6 +83,10 @@ struct Components {
     te: Arc<Qwen3TextEncoder>,
     transformer: Arc<Flux2Transformer>,
     vae: Arc<Flux2Vae>,
+    /// Tokenizer (variant-specific pad token + chat template), loaded+parsed **once** at component load
+    /// and reused across every prompt/branch encode (sc-8991 / F-011) instead of re-parsing
+    /// `tokenizer.json` per request.
+    tokenizer: Arc<TextTokenizer>,
 }
 
 /// A txt2img pipeline handle: snapshot root + device + the f32 compute dtype. `pub(crate)` so the
@@ -247,23 +251,26 @@ impl Pipeline {
     fn load_components(&self) -> CResult<Components> {
         let (te, transformer) = self.load_te_and_dit()?;
         let vae = Flux2Vae::new(self.component_vb("vae")?)?;
+        let tokenizer = self.build_tokenizer()?;
         Ok(Components {
             te: Arc::new(te),
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
+            tokenizer: Arc::new(tokenizer),
         })
     }
 
-    /// Tokenize + encode the prompt to `prompt_embeds` `[1, 512, 3·hidden]` (f32). The tokenizer
-    /// (pad token + chat template) is variant-specific: klein uses the Qwen2 `<|endoftext|>` pad +
-    /// the Qwen no-think chat template; dev uses the Mistral `<pad>` + the `[INST]…[/INST]` template.
-    pub(crate) fn encode(&self, te: &Qwen3TextEncoder, prompt: &str) -> CResult<Tensor> {
+    /// Build the prompt tokenizer **once** (sc-8991 / F-011). The config (pad token + chat template) is
+    /// variant-specific: klein uses the Qwen2 `<|endoftext|>` pad + the Qwen no-think chat template; dev
+    /// uses the Mistral `<pad>` + the `[INST]…[/INST]` template. Callers cache the result on their
+    /// `Components` / provider struct and reuse it across encodes rather than re-parsing per prompt.
+    pub(crate) fn build_tokenizer(&self) -> CResult<TextTokenizer> {
         let (pad_token_id, chat_template) = if self.variant.is_dev() {
             (MISTRAL_PAD_TOKEN_ID, ChatTemplate::Flux2DevMistral)
         } else {
             (QWEN_PAD_TOKEN_ID, ChatTemplate::QwenInstructNoThink)
         };
-        let tok = TextTokenizer::from_file(
+        TextTokenizer::from_file(
             self.root.join("tokenizer/tokenizer.json"),
             TokenizerConfig {
                 max_length: self.cfg.max_sequence_length,
@@ -272,7 +279,17 @@ impl Pipeline {
                 pad_to_max_length: true,
             },
         )
-        .map_err(|e| CandleError::Msg(format!("flux2: load tokenizer: {e}")))?;
+        .map_err(|e| CandleError::Msg(format!("flux2: load tokenizer: {e}")))
+    }
+
+    /// Tokenize + encode the prompt to `prompt_embeds` `[1, 512, 3·hidden]` (f32). `tok` is the cached
+    /// tokenizer ([`Self::build_tokenizer`]) — parsed once, reused across encodes (sc-8991 / F-011).
+    pub(crate) fn encode(
+        &self,
+        te: &Qwen3TextEncoder,
+        tok: &TextTokenizer,
+        prompt: &str,
+    ) -> CResult<Tensor> {
         let out = tok
             .tokenize(prompt)
             .map_err(|e| CandleError::Msg(format!("flux2: tokenize: {e}")))?;
@@ -299,7 +316,7 @@ impl Pipeline {
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
 
         // Prompt embeds are seed-independent: encode once.
-        let prompt_embeds = self.encode(&comps.te, &req.prompt)?;
+        let prompt_embeds = self.encode(&comps.te, &comps.tokenizer, &req.prompt)?;
         dbg_stats("prompt_embeds", &prompt_embeds);
         // Two guidance regimes. dev is guidance-distilled: a single forward feeds the guidance scalar
         // to the DiT's embedded-guidance embedder (no negative pass). klein is distilled / true-CFG:
@@ -307,7 +324,7 @@ impl Pipeline {
         let embedded_guidance = self.variant.uses_embedded_guidance();
         let negative = if !embedded_guidance && guidance > 1.0 {
             let neg = req.negative_prompt.as_deref().unwrap_or(" ");
-            Some(self.encode(&comps.te, neg)?)
+            Some(self.encode(&comps.te, &comps.tokenizer, neg)?)
         } else {
             None
         };

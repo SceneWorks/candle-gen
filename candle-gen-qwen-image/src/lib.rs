@@ -113,6 +113,9 @@ struct Components {
     te: Arc<QwenTextEncoder>,
     transformer: Arc<QwenTransformer>,
     vae: Arc<QwenVae>,
+    /// Qwen tokenizer, loaded+parsed **once** at component load and reused across every prompt/branch
+    /// encode (sc-8991 / F-011) instead of re-parsing `tokenizer.json` per request.
+    tokenizer: Arc<TextTokenizer>,
 }
 
 struct Pipeline {
@@ -161,16 +164,7 @@ impl Pipeline {
             gs,
         )?;
         let vae = QwenVae::new(self.component_vb("vae", ENC_DTYPE)?)?;
-        Ok(Components {
-            te: Arc::new(te),
-            transformer: Arc::new(transformer),
-            vae: Arc::new(vae),
-        })
-    }
-
-    /// Tokenize + encode `prompt` → `prompt_embeds` `[1, seq, 3584]` at the DiT dtype (bf16).
-    fn encode(&self, te: &QwenTextEncoder, prompt: &str) -> CResult<Tensor> {
-        let tok = TextTokenizer::from_file(
+        let tokenizer = TextTokenizer::from_file(
             self.root.join("tokenizer/tokenizer.json"),
             TokenizerConfig {
                 max_length: self.te_cfg.max_length,
@@ -180,6 +174,17 @@ impl Pipeline {
             },
         )
         .map_err(|e| CandleError::Msg(format!("qwen-image: load tokenizer: {e}")))?;
+        Ok(Components {
+            te: Arc::new(te),
+            transformer: Arc::new(transformer),
+            vae: Arc::new(vae),
+            tokenizer: Arc::new(tokenizer),
+        })
+    }
+
+    /// Tokenize + encode `prompt` → `prompt_embeds` `[1, seq, 3584]` at the DiT dtype (bf16). `tok` is
+    /// the cached component tokenizer (sc-8991 / F-011) — parsed once at load, reused across encodes.
+    fn encode(&self, te: &QwenTextEncoder, tok: &TextTokenizer, prompt: &str) -> CResult<Tensor> {
         let out = tok
             .tokenize(prompt)
             .map_err(|e| CandleError::Msg(format!("qwen-image: tokenize: {e}")))?;
@@ -200,11 +205,11 @@ impl Pipeline {
         let guidance = req.guidance.unwrap_or(DEFAULT_GUIDANCE);
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
 
-        let pos_embeds = self.encode(&comps.te, &req.prompt)?;
+        let pos_embeds = self.encode(&comps.te, &comps.tokenizer, &req.prompt)?;
         // True CFG: build the negative branch unless guidance is a no-op (≤ 1.0).
         let neg_embeds = if guidance > 1.0 {
             let neg = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
-            Some(self.encode(&comps.te, neg)?)
+            Some(self.encode(&comps.te, &comps.tokenizer, neg)?)
         } else {
             None
         };

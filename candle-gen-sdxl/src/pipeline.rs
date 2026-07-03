@@ -209,6 +209,29 @@ impl Clip {
     }
 }
 
+/// The two SDXL CLIP tokenizers (CLIP-L + CLIP-bigG), loaded+parsed **once** and cached on the
+/// generator, reused across every `text_embeddings` call (sc-8991 / F-011) instead of re-reading the
+/// `tokenizer.json` files from the hf-hub cache and re-parsing them on each encode. Model-agnostic (the
+/// repos are fixed by [`Clip::sources`]), so a single pair serves every SDXL snapshot the generator
+/// renders. These carry no VRAM, so caching them does not affect the sc-4987 CLIP-weight peak lever.
+pub(crate) struct SdxlTokenizers {
+    tok_l: Tokenizer,
+    tok_g: Tokenizer,
+}
+
+impl SdxlTokenizers {
+    /// Load both CLIP tokenizers from their (pinned, hf-hub-cached) repos. Call once per generator.
+    pub(crate) fn load() -> Result<Self> {
+        let (tok_l_repo, _) = Clip::L.sources();
+        let (tok_g_repo, _) = Clip::BigG.sources();
+        let tok_l = Tokenizer::from_file(hf_get(tok_l_repo, "tokenizer.json")?)
+            .map_err(|e| CandleError::Msg(format!("load tokenizer {tok_l_repo}: {e}")))?;
+        let tok_g = Tokenizer::from_file(hf_get(tok_g_repo, "tokenizer.json")?)
+            .map_err(|e| CandleError::Msg(format!("load tokenizer {tok_g_repo}: {e}")))?;
+        Ok(Self { tok_l, tok_g })
+    }
+}
+
 /// Resolve a file from a (cached) HF repo — used only for the model-agnostic tokenizers + fp16-VAE-fix.
 ///
 /// sc-9013 / F-029: the download is pinned to an immutable commit SHA ([`hub_revision`]) rather than
@@ -330,9 +353,14 @@ impl Pipeline {
     /// preserving the cold-call ordering (CLIP freed before they load); on a warm call the UNet/VAE are
     /// already resident, but only one CLIP encoder is ever resident at a time (`build_unet`+VAE ≈ 7 GiB
     /// + one CLIP ≤ 1.4 GiB stays under the denoise-time peak, so the sc-4987 high-water is preserved).
-    pub(crate) fn text_embeddings(&self, prompt: &str, uncond: &str) -> Result<Tensor> {
-        let l = self.encode_one(Clip::L, prompt, uncond)?;
-        let g = self.encode_one(Clip::BigG, prompt, uncond)?;
+    pub(crate) fn text_embeddings(
+        &self,
+        toks: &SdxlTokenizers,
+        prompt: &str,
+        uncond: &str,
+    ) -> Result<Tensor> {
+        let l = self.encode_one(Clip::L, &toks.tok_l, prompt, uncond)?;
+        let g = self.encode_one(Clip::BigG, &toks.tok_g, prompt, uncond)?;
         Ok(Tensor::cat(&[l, g], D::Minus1)?)
     }
 
@@ -340,8 +368,14 @@ impl Pipeline {
     /// `max_position_embeddings`), and return the embeddings — the encoder weights are loaded into a
     /// local and **dropped when this function returns** (sc-4987), freeing its VRAM before the next
     /// encoder / the UNet load.
-    fn encode_one(&self, which: Clip, prompt: &str, uncond: &str) -> Result<Tensor> {
-        let (tok_repo, weights_sub) = which.sources();
+    fn encode_one(
+        &self,
+        which: Clip,
+        tokenizer: &Tokenizer,
+        prompt: &str,
+        uncond: &str,
+    ) -> Result<Tensor> {
+        let (_tok_repo, weights_sub) = which.sources();
         let clip_cfg = match which {
             Clip::L => &self.config.clip,
             Clip::BigG => self
@@ -350,8 +384,9 @@ impl Pipeline {
                 .as_ref()
                 .ok_or_else(|| CandleError::Msg("sdxl config missing clip2".into()))?,
         };
-        let tokenizer = Tokenizer::from_file(hf_get(tok_repo, "tokenizer.json")?)
-            .map_err(|e| CandleError::Msg(format!("load tokenizer {tok_repo}: {e}")))?;
+        // The tokenizer is now loaded+parsed ONCE on the generator (sc-8991 / F-011) and passed in,
+        // rather than re-read from `hf_get(tok_repo, ...)` per encode. The CLIP *weights* still load and
+        // drop inside this function (the sc-4987 peak-VRAM lever); only the tiny tokenizer is cached.
         // sc-9416: the MLX SDXL tiers ALSO pack the dual CLIP text encoders (a `quantization` block in
         // `text_encoder{,_2}/config.json` + `.scales`-packed Linears under `model.safetensors`), but the
         // candle CLIP path is the stock dense `build_clip_transformer` — feeding it packed u32 codes
@@ -409,7 +444,8 @@ impl Pipeline {
         let cond = text_model.forward(&encode(prompt)?)?;
         let uncond = text_model.forward(&encode(uncond)?)?;
         Ok(Tensor::cat(&[uncond, cond], 0)?.to_dtype(self.dtype)?)
-        // `text_model` + `tokenizer` drop here, freeing this encoder before the caller loads the next.
+        // `text_model` drops here, freeing this encoder's weights before the caller loads the next
+        // (sc-4987). The `tokenizer` is borrowed from the generator's cache and outlives this call.
     }
 
     /// Load the heavy [`Components`] (UNet + f16 VAE) for the given flash-attn setting. The UNet reads

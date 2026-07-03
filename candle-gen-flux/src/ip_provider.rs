@@ -136,8 +136,9 @@ fn detect_variant(flux_base: &Path) -> Result<Variant> {
 /// adapter, and the CLIP ViT-L image encoder.
 pub struct IpAdapterFlux {
     variant: Variant,
-    /// The snapshot root (for the T5 tokenizer in `encode_text`).
-    root: PathBuf,
+    /// T5 + CLIP tokenizers, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
+    /// instead of re-parsing per prompt in `encode_text`.
+    toks: crate::pipeline::FluxTokenizers,
     device: Device,
     dtype: DType,
     clip: ClipTextTransformer,
@@ -195,9 +196,10 @@ impl IpAdapterFlux {
         })?;
         let ip_encoder = FluxIpImageEncoder::from_weights(&enc_w)?;
 
+        let toks = crate::pipeline::FluxTokenizers::load(&root)?;
         Ok(Self {
             variant,
-            root,
+            toks,
             device,
             dtype,
             clip,
@@ -224,7 +226,7 @@ impl IpAdapterFlux {
         // Conditioning: text (T5 seq + CLIP pooled) and the reference image tokens (computed once).
         let (t5_emb, clip_emb) = encode_text(
             self.variant,
-            &self.root,
+            &self.toks,
             &self.device,
             self.dtype,
             &self.clip,

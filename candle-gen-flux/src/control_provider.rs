@@ -182,8 +182,9 @@ impl MeanVaeEncoder {
 /// control branch ([`FluxControlTransformer`]). `generate` takes `&self` (no per-call mutation), so one
 /// load serves many renders.
 pub struct Flux1DevControl {
-    /// The snapshot root (for the T5 tokenizer in `encode_text`).
-    root: PathBuf,
+    /// T5 + CLIP tokenizers, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
+    /// instead of re-parsing per prompt in `encode_text`.
+    toks: crate::pipeline::FluxTokenizers,
     device: Device,
     dtype: DType,
     clip: ClipTextTransformer,
@@ -245,8 +246,9 @@ impl Flux1DevControl {
         )?;
         let transformer = FluxControlTransformer::new(base, branch);
 
+        let toks = crate::pipeline::FluxTokenizers::load(&root)?;
         Ok(Self {
-            root,
+            toks,
             device,
             dtype,
             clip,
@@ -320,7 +322,7 @@ impl Flux1DevControl {
         // Conditioning (seed-independent): text (T5 seq + CLIP pooled) + the packed control latent.
         let (t5_emb, clip_emb) = encode_text(
             Variant::Dev,
-            &self.root,
+            &self.toks,
             &self.device,
             self.dtype,
             &self.clip,

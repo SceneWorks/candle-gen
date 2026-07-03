@@ -56,28 +56,17 @@ pub(crate) fn component_vb(
     candle_gen::mmap_var_builder(&files, dtype, device)
 }
 
-/// Tokenize `prompt` → UMT5-encode → zero-pad/truncate to `max_length` (512) → `[1, 512, 4096]` in
-/// `out_dtype`. The single home for the Wan text-encode routine (sc-9000 / F-020).
-///
-/// - `label` prefixes the tokenizer load / tokenize error text (e.g. `"wan"`, `"wan-14b"`,
-///   `"wan-vace"`, `"wan trainer"`).
-/// - `out_dtype` is the dtype of the returned embeds **and** the zero-pad. The three inference
-///   providers run the encoder at f32 and pass `ENC_DTYPE` (= f32), so the cast is a no-op and the
-///   pad is f32 — byte-identical to the pre-consolidation copies. The trainer loads the encoder at
-///   **bf16** and passes f32, reproducing its (previously drifted) `.to_dtype(F32)` upcast exactly.
-///
-/// See the module docs for the two load-bearing invariants (512-pad sc-3697, empty-prompt guard
-/// sc-7078) this routine guards.
-pub(crate) fn umt5_encode_padded(
+/// Build the Wan UMT5 tokenizer from `root/tokenizer/tokenizer.json` **once**, so callers can cache it
+/// on their `Components` and reuse it across every encode (sc-8991 / F-011) instead of re-parsing the
+/// multi-MB `tokenizer.json` on each prompt/branch. The [`TokenizerConfig`] here is byte-identical to
+/// the one the per-encode load used, so the cached tokenizer yields the same ids. `label` prefixes the
+/// load error (`"wan"`, `"wan-14b"`, `"wan-vace"`, `"wan trainer"`).
+pub(crate) fn build_umt5_tokenizer(
     root: &Path,
     te_cfg: &TextEncoderConfig,
-    te: &Umt5Encoder,
-    prompt: &str,
-    device: &Device,
-    out_dtype: DType,
     label: &str,
-) -> CResult<Tensor> {
-    let tok = TextTokenizer::from_file(
+) -> CResult<TextTokenizer> {
+    TextTokenizer::from_file(
         root.join("tokenizer/tokenizer.json"),
         TokenizerConfig {
             max_length: te_cfg.max_length,
@@ -86,7 +75,32 @@ pub(crate) fn umt5_encode_padded(
             pad_to_max_length: false,
         },
     )
-    .map_err(|e| CandleError::Msg(format!("{label}: load tokenizer: {e}")))?;
+    .map_err(|e| CandleError::Msg(format!("{label}: load tokenizer: {e}")))
+}
+
+/// Tokenize `prompt` → UMT5-encode → zero-pad/truncate to `max_length` (512) → `[1, 512, 4096]` in
+/// `out_dtype`. The single home for the Wan text-encode routine (sc-9000 / F-020).
+///
+/// - `tok` is the cached UMT5 tokenizer ([`build_umt5_tokenizer`]); the caller loads it once and
+///   reuses it across encodes (sc-8991 / F-011) rather than re-parsing `tokenizer.json` per prompt.
+/// - `label` prefixes the tokenize error text (e.g. `"wan"`, `"wan-14b"`, `"wan-vace"`,
+///   `"wan trainer"`).
+/// - `out_dtype` is the dtype of the returned embeds **and** the zero-pad. The three inference
+///   providers run the encoder at f32 and pass `ENC_DTYPE` (= f32), so the cast is a no-op and the
+///   pad is f32 — byte-identical to the pre-consolidation copies. The trainer loads the encoder at
+///   **bf16** and passes f32, reproducing its (previously drifted) `.to_dtype(F32)` upcast exactly.
+///
+/// See the module docs for the two load-bearing invariants (512-pad sc-3697, empty-prompt guard
+/// sc-7078) this routine guards.
+pub(crate) fn umt5_encode_padded(
+    tok: &TextTokenizer,
+    te_cfg: &TextEncoderConfig,
+    te: &Umt5Encoder,
+    prompt: &str,
+    device: &Device,
+    out_dtype: DType,
+    label: &str,
+) -> CResult<Tensor> {
     let out = tok
         .tokenize(prompt)
         .map_err(|e| CandleError::Msg(format!("{label}: tokenize: {e}")))?;
@@ -146,14 +160,16 @@ mod tests {
     }
 
     /// Build a tiny UMT5 encoder (zeros weights — enough for shape/finite/determinism assertions) plus
-    /// a minimal on-disk `tokenizer/tokenizer.json` under `dir`. Returns the config + encoder.
-    fn tiny_encoder(dir: &Path) -> (TextEncoderConfig, Umt5Encoder) {
+    /// a minimal on-disk `tokenizer/tokenizer.json` under `dir` and the matching cached tokenizer.
+    /// Returns the config + encoder + tokenizer.
+    fn tiny_encoder(dir: &Path) -> (TextEncoderConfig, Umt5Encoder, TextTokenizer) {
         let cfg = tiny_cfg();
         let vb = VarBuilder::zeros(DType::F32, &Device::Cpu);
         let te = Umt5Encoder::new(&cfg, vb).expect("tiny encoder");
         std::fs::create_dir_all(dir.join("tokenizer")).unwrap();
         std::fs::write(dir.join("tokenizer/tokenizer.json"), TINY_TOKENIZER_JSON).unwrap();
-        (cfg, te)
+        let tok = build_umt5_tokenizer(dir, &cfg, "t").expect("tiny tokenizer");
+        (cfg, te, tok)
     }
 
     // A minimal WordLevel `tokenizer.json` (a couple of words + unk), whitespace pre-tokenizer, no
@@ -177,9 +193,9 @@ mod tests {
     #[test]
     fn pads_to_max_length() {
         let tmp = tempdir();
-        let (cfg, te) = tiny_encoder(&tmp);
+        let (cfg, te, tok) = tiny_encoder(&tmp);
         let out = umt5_encode_padded(
-            &tmp,
+            &tok,
             &cfg,
             &te,
             "hello world",
@@ -197,9 +213,9 @@ mod tests {
     #[test]
     fn empty_prompt_produces_valid_padded_uncond() {
         let tmp = tempdir();
-        let (cfg, te) = tiny_encoder(&tmp);
+        let (cfg, te, tok) = tiny_encoder(&tmp);
         // The empty-prompt path (sc-7078): must NOT build a 0-length sequence, must still pad to 512.
-        let out = umt5_encode_padded(&tmp, &cfg, &te, "", &Device::Cpu, DType::F32, "t")
+        let out = umt5_encode_padded(&tok, &cfg, &te, "", &Device::Cpu, DType::F32, "t")
             .expect("empty encode");
         assert_eq!(out.dim(1).unwrap(), cfg.max_length);
         // The uncond embedding is finite (no OOB gather garbage / NaN).
@@ -210,9 +226,9 @@ mod tests {
     #[test]
     fn deterministic_for_fixed_prompt() {
         let tmp = tempdir();
-        let (cfg, te) = tiny_encoder(&tmp);
+        let (cfg, te, tok) = tiny_encoder(&tmp);
         let a = umt5_encode_padded(
-            &tmp,
+            &tok,
             &cfg,
             &te,
             "hello world",
@@ -222,7 +238,7 @@ mod tests {
         )
         .unwrap();
         let b = umt5_encode_padded(
-            &tmp,
+            &tok,
             &cfg,
             &te,
             "hello world",
@@ -241,11 +257,26 @@ mod tests {
         // The trainer loads the encoder at bf16 and upcasts to f32; here we exercise the dtype param
         // directly: an f32 encoder cast to bf16 output yields a bf16, 512-padded tensor.
         let tmp = tempdir();
-        let (cfg, te) = tiny_encoder(&tmp);
+        let (cfg, te, tok) = tiny_encoder(&tmp);
         let out =
-            umt5_encode_padded(&tmp, &cfg, &te, "hello", &Device::Cpu, DType::BF16, "t").unwrap();
+            umt5_encode_padded(&tok, &cfg, &te, "hello", &Device::Cpu, DType::BF16, "t").unwrap();
         assert_eq!(out.dtype(), DType::BF16);
         assert_eq!(out.dim(1).unwrap(), cfg.max_length);
+    }
+
+    #[test]
+    fn cached_tokenizer_matches_fresh_from_file() {
+        // sc-8991 / F-011: the cached `build_umt5_tokenizer` must yield BYTE-IDENTICAL ids to a fresh
+        // per-encode `from_file` load — caching only removes the redundant re-parse, never changes the
+        // tokenization output. Cover a normal prompt AND the empty (uncond) short-circuit.
+        let tmp = tempdir();
+        let (cfg, _te, cached) = tiny_encoder(&tmp);
+        for prompt in ["hello world", ""] {
+            let fresh = build_umt5_tokenizer(&tmp, &cfg, "t").expect("fresh tokenizer");
+            let cached_ids = cached.tokenize(prompt).unwrap().ids;
+            let fresh_ids = fresh.tokenize(prompt).unwrap().ids;
+            assert_eq!(cached_ids, fresh_ids, "prompt {prompt:?}");
+        }
     }
 
     #[test]

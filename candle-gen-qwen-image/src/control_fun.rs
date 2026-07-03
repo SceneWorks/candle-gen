@@ -105,10 +105,11 @@ fn resolve_controlnet_files(path: &Path) -> Result<Vec<PathBuf>> {
 /// The loaded Qwen-Image 2512-Fun control model: the reused base text encoder / DiT / VAE-decoder, plus
 /// the VAE encoder (to encode the control hint) and the VACE control branch.
 pub struct QwenFunControl {
-    te_cfg: TextEncoderConfig,
-    root: PathBuf,
     device: Device,
     te: QwenTextEncoder,
+    /// Qwen tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
+    /// instead of re-parsing `tokenizer.json` per prompt/branch.
+    tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
     transformer: QwenTransformer,
     controlnet: QwenFunControlBranch,
     vae: QwenVae,
@@ -148,11 +149,11 @@ impl QwenFunControl {
         let controlnet =
             QwenFunControlBranch::new(&dit_cfg, &CONTROL_LAYERS, CONTROL_IN_DIM, cn_vb)?;
 
+        let tokenizer = control_common::load_tokenizer(&root, &te_cfg, LABEL)?;
         Ok(Self {
-            te_cfg,
-            root,
             device,
             te,
+            tokenizer,
             transformer,
             controlnet,
             vae,
@@ -164,8 +165,7 @@ impl QwenFunControl {
     /// the txt2img `Pipeline::encode`.
     fn encode(&self, prompt: &str) -> Result<Tensor> {
         control_common::encode(
-            &self.root,
-            &self.te_cfg,
+            &self.tokenizer,
             &self.te,
             &self.device,
             DIT_DTYPE,

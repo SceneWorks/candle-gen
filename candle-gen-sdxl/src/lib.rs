@@ -151,7 +151,7 @@ mod training;
 pub use training::{load_trainer, trainer_descriptor, SdxlTrainer};
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::{DType, Device};
 use candle_gen::gen_core::{
@@ -232,6 +232,10 @@ pub struct SdxlGenerator {
     /// shared and `generate` takes `&self`; the lock is held only to read/populate the cache (a
     /// cheap `Arc` clone or a one-time load), never across the denoise.
     components: Mutex<Option<(bool, Components)>>,
+    /// Cached dual CLIP tokenizers, loaded+parsed once and reused across `generate` calls (sc-8991 /
+    /// F-011) rather than re-reading `tokenizer.json` from the hf-hub cache on every text encode. Shared
+    /// behind an `Arc` (model-agnostic); `lock_recover` mirrors the components-cache poison recovery.
+    tokenizers: Mutex<Option<Arc<pipeline::SdxlTokenizers>>>,
 }
 
 impl SdxlGenerator {
@@ -252,6 +256,20 @@ impl SdxlGenerator {
         let comps = pipe.load_components(flash)?;
         *guard = Some((flash, comps.clone()));
         Ok(comps)
+    }
+
+    /// Get the cached dual CLIP tokenizers, loading (and caching) them on a miss (sc-8991 / F-011). The
+    /// tokenizers are model-agnostic (fixed hf-hub repos) so a single pair serves every request; parsing
+    /// them once here removes the tens-of-ms `tokenizer.json` re-parse the per-encode load did. Uses the
+    /// F-031 `lock_recover` idiom (a prior panic while locked must not poison every later `generate`).
+    fn tokenizers(&self) -> gen_core::Result<Arc<pipeline::SdxlTokenizers>> {
+        let mut guard = candle_gen::lock_recover(&self.tokenizers);
+        if let Some(toks) = guard.as_ref() {
+            return Ok(toks.clone());
+        }
+        let toks = Arc::new(pipeline::SdxlTokenizers::load()?);
+        *guard = Some(toks.clone());
+        Ok(toks)
     }
 }
 
@@ -310,7 +328,8 @@ impl Generator for SdxlGenerator {
         // (sc-5037). On a warm call the UNet/VAE are already resident, but CLIP loads one encoder at a
         // time, so the footprint stays under the denoise-time peak.
         let negative = req.negative_prompt.as_deref().unwrap_or("");
-        let text_embeddings = pipe.text_embeddings(&req.prompt, negative)?;
+        let tokenizers = self.tokenizers()?;
+        let text_embeddings = pipe.text_embeddings(&tokenizers, &req.prompt, negative)?;
         let components = self.components(&pipe)?;
         let images = pipe.render(
             req,
@@ -411,6 +430,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         dtype: DType::F16,
         adapters: spec.adapters.clone(),
         components: Mutex::new(None),
+        tokenizers: Mutex::new(None),
     }))
 }
 

@@ -70,6 +70,8 @@ use candle_transformers::models::z_image::transformer::{
 };
 use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEncoder, VaeConfig};
 
+use candle_gen::gen_core::tokenizer::TextTokenizer;
+
 use crate::common::{self, ResizePolicy};
 use crate::packed_dit::ZImageTransformer2DModel as PackedDit;
 use crate::packed_te::ZImageTextEncoder as PackedTe;
@@ -214,6 +216,9 @@ pub(crate) struct Components {
     text_encoder: Arc<TextEnc>,
     transformer: Arc<DiT>,
     vae: Arc<AutoEncoderKL>,
+    /// Qwen tokenizer, loaded+parsed **once** at component load and reused across every prompt/uncond
+    /// encode (sc-8991 / F-011) instead of re-parsing `tokenizer.json` per branch.
+    tokenizer: Arc<TextTokenizer>,
 }
 
 impl Pipeline {
@@ -295,10 +300,12 @@ impl Pipeline {
             AutoEncoderKL::new(&VaeConfig::z_image(), self.component_vb("vae")?)?
         };
 
+        let tokenizer = common::build_tokenizer(&self.root, "z-image")?;
         Ok(Components {
             text_encoder: Arc::new(text_encoder),
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
+            tokenizer: Arc::new(tokenizer),
         })
     }
 
@@ -478,8 +485,13 @@ impl Pipeline {
 
     /// Prompt → `cap_feats` `(seq, 2560)`. Tokenizes with the shared Qwen chat template
     /// ([`common::prompt_ids`]) and runs the Qwen3 encoder.
-    pub(crate) fn text_embeddings(&self, te: &TextEnc, prompt: &str) -> Result<Tensor> {
-        let ids = common::prompt_ids(&self.root, prompt, "z-image")?;
+    pub(crate) fn text_embeddings(
+        &self,
+        te: &TextEnc,
+        tok: &TextTokenizer,
+        prompt: &str,
+    ) -> Result<Tensor> {
+        let ids = common::prompt_ids(tok, prompt, "z-image")?;
         self.encode_cap(te, &ids)
     }
 
@@ -488,8 +500,13 @@ impl Pipeline {
     /// QwenInstruct chat-template scaffolding rather than the empty-short-circuiting `tokenize` (the
     /// sc-8646 fix — a plain `tokenize("")` yields `(1, 0)` before the template and breaks the empty
     /// negative prompt). A non-empty negative prompt takes the ordinary conditional path.
-    pub(crate) fn uncond_embeddings(&self, te: &TextEnc, negative_prompt: &str) -> Result<Tensor> {
-        let ids = common::uncond_ids(&self.root, negative_prompt, "z-image")?;
+    pub(crate) fn uncond_embeddings(
+        &self,
+        te: &TextEnc,
+        tok: &TextTokenizer,
+        negative_prompt: &str,
+    ) -> Result<Tensor> {
+        let ids = common::uncond_ids(tok, negative_prompt, "z-image")?;
         self.encode_cap(te, &ids)
     }
 
@@ -507,7 +524,8 @@ impl Pipeline {
         let lat_w = (req.width / SPATIAL_SCALE) as usize;
 
         // Text embeddings are seed- and image-independent: encode once for the whole batch.
-        let cap = self.text_embeddings(&components.text_encoder, &req.prompt)?;
+        let cap =
+            self.text_embeddings(&components.text_encoder, &components.tokenizer, &req.prompt)?;
 
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
@@ -630,10 +648,11 @@ impl Pipeline {
 
         // Text embeddings are seed- and image-independent: encode once for the whole batch. The uncond
         // branch (negative prompt, empty when unset) is only encoded when CFG is active.
-        let cap = self.text_embeddings(&components.text_encoder, &req.prompt)?;
+        let cap =
+            self.text_embeddings(&components.text_encoder, &components.tokenizer, &req.prompt)?;
         let neg_cap = if cfg_on {
             let neg = req.negative_prompt.as_deref().unwrap_or("");
-            Some(self.uncond_embeddings(&components.text_encoder, neg)?)
+            Some(self.uncond_embeddings(&components.text_encoder, &components.tokenizer, neg)?)
         } else {
             None
         };
@@ -849,18 +868,30 @@ mod tests {
         // The fix now lives in the shared `common::uncond_ids`: an empty negative prompt tokenizes via
         // the QwenInstruct chat template to a non-empty sequence, distinct from a real prompt — while
         // `common::prompt_ids("")` still errors on the empty short-circuit (the trap is real).
-        let uncond_ids = common::uncond_ids(root, "", "z-image").expect("encode empty uncond");
+        let uncond_ids = common::uncond_ids(&tok, "", "z-image").expect("encode empty uncond");
         assert!(
             !uncond_ids.is_empty(),
             "empty uncond must tokenize via the chat template to a non-empty sequence"
         );
         assert!(
-            common::prompt_ids(root, "", "z-image").is_err(),
+            common::prompt_ids(&tok, "", "z-image").is_err(),
             "an empty prompt through the conditional path must still error"
         );
         let real_ids =
-            common::uncond_ids(root, "a red fox", "z-image").expect("encode real prompt");
+            common::uncond_ids(&tok, "a red fox", "z-image").expect("encode real prompt");
         assert_ne!(uncond_ids, real_ids, "uncond scaffolding != a real prompt");
+
+        // sc-8991 / F-011: the cached tokenizer must yield the SAME ids as a fresh `from_file` load —
+        // caching removes the re-parse, never changes tokenization. Cover a real prompt + empty uncond.
+        let fresh = common::build_tokenizer(root, "z-image").expect("fresh tokenizer");
+        assert_eq!(
+            common::uncond_ids(&tok, "", "z-image").unwrap(),
+            common::uncond_ids(&fresh, "", "z-image").unwrap(),
+        );
+        assert_eq!(
+            common::prompt_ids(&tok, "a red fox", "z-image").unwrap(),
+            common::prompt_ids(&fresh, "a red fox", "z-image").unwrap(),
+        );
     }
 
     /// The base static **shift=6.0** schedule (built `set_timesteps(steps, None)`) must: have

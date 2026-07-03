@@ -142,12 +142,17 @@ pub(crate) enum Components {
         t5: Arc<Mutex<T5EncoderModel>>,
         transformer: Arc<Flux>,
         vae: Arc<AutoEncoder>,
+        /// T5 + CLIP tokenizers, loaded+parsed **once** at component load and reused across encodes
+        /// (sc-8991 / F-011) instead of re-parsing per prompt/branch.
+        toks: Arc<FluxTokenizers>,
     },
     Packed {
         clip: Arc<PackedClipText>,
         t5: Arc<PackedT5Encoder>,
         transformer: Arc<PackedFluxDit>,
         vae: Arc<AutoEncoderKL>,
+        /// T5 + CLIP tokenizers, loaded+parsed **once** at component load (sc-8991 / F-011).
+        toks: Arc<FluxTokenizers>,
     },
 }
 
@@ -203,6 +208,7 @@ impl Pipeline {
             t5: Arc::new(Mutex::new(t5)),
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
+            toks: Arc::new(FluxTokenizers::load(&self.root)?),
         })
     }
 
@@ -238,6 +244,7 @@ impl Pipeline {
             t5: Arc::new(t5),
             transformer: Arc::new(transformer),
             vae: Arc::new(vae),
+            toks: Arc::new(FluxTokenizers::load(&self.root)?),
         })
     }
 
@@ -365,33 +372,36 @@ impl Pipeline {
         prompt: &str,
     ) -> Result<(Tensor, Tensor)> {
         match comps {
-            Components::Stock { clip, t5, .. } => encode_text(
+            Components::Stock { clip, t5, toks, .. } => encode_text(
                 self.variant,
-                &self.root,
+                toks,
                 &self.device,
                 self.dtype,
                 clip,
                 t5,
                 prompt,
             ),
-            Components::Packed { clip, t5, .. } => self.encode_text_packed(clip, t5, prompt),
+            Components::Packed { clip, t5, toks, .. } => {
+                self.encode_text_packed(clip, t5, toks, prompt)
+            }
         }
     }
 
     /// Encode `prompt` for the packed tier: the vendored [`PackedT5Encoder`] sequence + the
     /// [`PackedClipText`] pooled vector. The tokenizers are the same two the stock path uses (T5 from
     /// the snapshot `tokenizer_2/`, CLIP vendored), padded identically, so the only difference is which
-    /// model runs the ids — parity with `encode_text`.
+    /// model runs the ids — parity with `encode_text`. `toks` is the cached [`FluxTokenizers`] (sc-8991
+    /// / F-011).
     fn encode_text_packed(
         &self,
         clip: &PackedClipText,
         t5: &PackedT5Encoder,
+        toks: &FluxTokenizers,
         prompt: &str,
     ) -> Result<(Tensor, Tensor)> {
         // T5 sequence — same tokenizer + padding as `encode_text`.
-        let t5_tok = Tokenizer::from_file(self.root.join("tokenizer_2/tokenizer.json"))
-            .map_err(|e| CandleError::Msg(format!("flux: load T5 tokenizer: {e}")))?;
-        let mut t5_ids: Vec<u32> = t5_tok
+        let mut t5_ids: Vec<u32> = toks
+            .t5
             .encode(prompt, true)
             .map_err(|e| CandleError::Msg(format!("flux: T5 tokenize: {e}")))?
             .get_ids()
@@ -401,10 +411,8 @@ impl Pipeline {
         let t5_emb = t5.forward(&t5_input, self.dtype)?;
 
         // CLIP pooled vector — vendored tokenizer, natural length (EOT pool).
-        const CLIP_TOKENIZER_JSON: &[u8] = include_bytes!("../assets/clip_tokenizer.json");
-        let clip_tok = Tokenizer::from_bytes(CLIP_TOKENIZER_JSON)
-            .map_err(|e| CandleError::Msg(format!("flux: load vendored CLIP tokenizer: {e}")))?;
-        let clip_ids: Vec<u32> = clip_tok
+        let clip_ids: Vec<u32> = toks
+            .clip
             .encode(prompt, true)
             .map_err(|e| CandleError::Msg(format!("flux: CLIP tokenize: {e}")))?
             .get_ids()
@@ -619,14 +627,41 @@ fn flux_vae_config() -> VaeConfig {
     VaeConfig::z_image()
 }
 
+/// The vendored CLIP tokenizer JSON (bundled at compile time). Shared by the stock and packed encode
+/// paths — parsing it once (in [`FluxTokenizers::load`]) instead of per-encode is part of the sc-8991 /
+/// F-011 fix.
+const CLIP_TOKENIZER_JSON: &[u8] = include_bytes!("../assets/clip_tokenizer.json");
+
+/// FLUX's two prompt tokenizers — the disk-loaded T5 (`tokenizer_2/tokenizer.json`) and the vendored
+/// CLIP — loaded+parsed **once** and cached on the caller's `Components` / provider struct, reused
+/// across every prompt/branch encode (sc-8991 / F-011) rather than re-parsing per request. Same files +
+/// same parse as the old per-encode load, so the token ids are byte-identical.
+pub struct FluxTokenizers {
+    t5: Tokenizer,
+    clip: Tokenizer,
+}
+
+impl FluxTokenizers {
+    /// Load both tokenizers from the snapshot `root` (T5 from `tokenizer_2/`, CLIP from the vendored
+    /// bytes). Call once at component load.
+    pub fn load(root: &Path) -> Result<Self> {
+        let t5 = Tokenizer::from_file(root.join("tokenizer_2/tokenizer.json"))
+            .map_err(|e| CandleError::Msg(format!("flux: load T5 tokenizer: {e}")))?;
+        let clip = Tokenizer::from_bytes(CLIP_TOKENIZER_JSON)
+            .map_err(|e| CandleError::Msg(format!("flux: load vendored CLIP tokenizer: {e}")))?;
+        Ok(Self { t5, clip })
+    }
+}
+
 /// Encode `prompt` into FLUX's two conditioning tensors for `variant`: the T5 sequence `(1, L, 4096)`
 /// and the CLIP pooled vector `(1, 768)`, both at `dtype`. Shared by the txt2img
 /// [`Pipeline::text_embeddings`] and the IP-Adapter provider ([`crate::ip_provider`]) so the two never
 /// drift on the parity-critical tokenization (T5 padded to the variant length; the vendored CLIP
-/// tokenizer). `t5` is locked only for the once-per-request encode.
+/// tokenizer). `toks` is the cached [`FluxTokenizers`] (sc-8991 / F-011). `t5` is locked only for the
+/// once-per-request encode.
 pub fn encode_text(
     variant: Variant,
-    root: &Path,
+    toks: &FluxTokenizers,
     device: &Device,
     dtype: DType,
     clip: &ClipTextTransformer,
@@ -634,9 +669,8 @@ pub fn encode_text(
     prompt: &str,
 ) -> Result<(Tensor, Tensor)> {
     // T5 sequence.
-    let t5_tok = Tokenizer::from_file(root.join("tokenizer_2/tokenizer.json"))
-        .map_err(|e| CandleError::Msg(format!("flux: load T5 tokenizer: {e}")))?;
-    let mut t5_ids: Vec<u32> = t5_tok
+    let mut t5_ids: Vec<u32> = toks
+        .t5
         .encode(prompt, true)
         .map_err(|e| CandleError::Msg(format!("flux: T5 tokenize: {e}")))?
         .get_ids()
@@ -652,10 +686,8 @@ pub fn encode_text(
     .to_dtype(dtype)?;
 
     // CLIP pooled vector.
-    const CLIP_TOKENIZER_JSON: &[u8] = include_bytes!("../assets/clip_tokenizer.json");
-    let clip_tok = Tokenizer::from_bytes(CLIP_TOKENIZER_JSON)
-        .map_err(|e| CandleError::Msg(format!("flux: load vendored CLIP tokenizer: {e}")))?;
-    let clip_ids: Vec<u32> = clip_tok
+    let clip_ids: Vec<u32> = toks
+        .clip
         .encode(prompt, true)
         .map_err(|e| CandleError::Msg(format!("flux: CLIP tokenize: {e}")))?
         .get_ids()

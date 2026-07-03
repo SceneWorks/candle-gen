@@ -69,6 +69,9 @@ struct Components {
     te: Arc<Umt5Encoder>,
     dit: Arc<WanTransformer>,
     vae: Arc<WanVae>,
+    /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across every prompt/branch
+    /// encode (sc-8991 / F-011) rather than re-parsing `tokenizer.json` per request.
+    tok: Arc<candle_gen::gen_core::tokenizer::TextTokenizer>,
 }
 
 struct Pipeline {
@@ -106,21 +109,23 @@ impl Pipeline {
         let te = Umt5Encoder::new(&self.te_cfg, self.component_vb("text_encoder", ENC_DTYPE)?)?;
         let dit = WanTransformer::new(&self.dit_cfg, self.component_vb("transformer", DIT_DTYPE)?)?;
         let vae = WanVae::new(&self.vae_cfg, self.component_vb("vae", VAE_DTYPE)?)?;
+        let tok = text_encode::build_umt5_tokenizer(&self.root, &self.te_cfg, "wan")?;
         Ok(Components {
             te: Arc::new(te),
             dit: Arc::new(dit),
             vae: Arc::new(vae),
+            tok: Arc::new(tok),
         })
     }
 
     /// Tokenize + UMT5-encode `prompt` → `[1, 512, 4096]` (f32, zero-padded to `max_length`). Shared
     /// Wan text-encode routine (sc-9000 / F-020); ENC_DTYPE (= f32) output is byte-identical to the
     /// pre-consolidation copy.
-    fn encode(&self, te: &Umt5Encoder, prompt: &str) -> CResult<Tensor> {
+    fn encode(&self, comps: &Components, prompt: &str) -> CResult<Tensor> {
         text_encode::umt5_encode_padded(
-            &self.root,
+            &comps.tok,
             &self.te_cfg,
-            te,
+            &comps.te,
             prompt,
             &self.device,
             ENC_DTYPE,
@@ -146,11 +151,11 @@ impl Pipeline {
         let shift = flow_shift(req.scheduler_shift);
 
         // Text encode (pos + optional neg for CFG), then project to the DiT context once.
-        let pos_embeds = self.encode(&comps.te, &req.prompt)?;
+        let pos_embeds = self.encode(comps, &req.prompt)?;
         let ctx_pos = comps.dit.embed_text(&pos_embeds)?;
         let ctx_neg = if guidance > 1.0 {
             let neg = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
-            Some(comps.dit.embed_text(&self.encode(&comps.te, neg)?)?)
+            Some(comps.dit.embed_text(&self.encode(comps, neg)?)?)
         } else {
             None
         };

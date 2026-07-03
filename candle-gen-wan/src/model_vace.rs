@@ -55,6 +55,9 @@ struct Components {
     te: Arc<Umt5Encoder>,
     dit: Arc<WanVaceTransformer>,
     vae: Arc<WanVae16>,
+    /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across encodes (sc-8991 /
+    /// F-011) instead of re-parsing `tokenizer.json` per prompt/branch.
+    tok: Arc<candle_gen::gen_core::tokenizer::TextTokenizer>,
 }
 
 struct Pipeline {
@@ -94,21 +97,23 @@ impl Pipeline {
             WanVaceTransformer::new(&self.vace_cfg, self.component_vb("transformer", DIT_DTYPE)?)?;
         // The control encode needs the VAE encoder.
         let vae = WanVae16::new_with_encoder(&self.vae_cfg, self.component_vb("vae", VAE_DTYPE)?)?;
+        let tok = crate::text_encode::build_umt5_tokenizer(&self.root, &self.te_cfg, "wan-vace")?;
         Ok(Components {
             te: Arc::new(te),
             dit: Arc::new(dit),
             vae: Arc::new(vae),
+            tok: Arc::new(tok),
         })
     }
 
     /// Tokenize + UMT5-encode `prompt` → `[1, 512, 4096]` (f32), zero-padded to `max_length` (the DiT
     /// cross-attends over the 512-padded context — the same rule as the base Wan). Shared Wan
     /// text-encode routine (sc-9000 / F-020).
-    fn encode(&self, te: &Umt5Encoder, prompt: &str) -> CResult<Tensor> {
+    fn encode(&self, comps: &Components, prompt: &str) -> CResult<Tensor> {
         crate::text_encode::umt5_encode_padded(
-            &self.root,
+            &comps.tok,
             &self.te_cfg,
-            te,
+            &comps.te,
             prompt,
             &self.device,
             ENC_DTYPE,
@@ -175,13 +180,13 @@ impl Pipeline {
         let num_ref = references.len();
 
         // Stage 1: UMT5 text encode + project to the DiT context.
-        let pos = self.encode(&comps.te, &req.prompt)?;
+        let pos = self.encode(comps, &req.prompt)?;
         let ctx_pos = comps.dit.embed_text(&pos)?;
         let ctx_neg = if cfg_disabled {
             None
         } else {
             let neg = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
-            Some(comps.dit.embed_text(&self.encode(&comps.te, neg)?)?)
+            Some(comps.dit.embed_text(&self.encode(comps, neg)?)?)
         };
 
         // Stage 2: z16 VAE-encode the control + mask → the 96-ch control latent.

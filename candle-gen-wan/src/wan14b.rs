@@ -111,6 +111,9 @@ struct Components {
     /// `transformer_2/` — the **low-noise** expert (timestep < boundary).
     low: Arc<WanTransformer>,
     vae: Arc<WanVae16>,
+    /// UMT5 tokenizer, loaded+parsed **once** at component load and reused across encodes (sc-8991 /
+    /// F-011) instead of re-parsing `tokenizer.json` per prompt/branch.
+    tok: Arc<candle_gen::gen_core::tokenizer::TextTokenizer>,
 }
 
 struct Pipeline {
@@ -204,22 +207,24 @@ impl Pipeline {
             Variant::I2v => WanVae16::new_with_encoder(&self.vae_cfg, vae_vb)?,
             Variant::T2v => WanVae16::new(&self.vae_cfg, vae_vb)?,
         };
+        let tok = crate::text_encode::build_umt5_tokenizer(&self.root, &self.te_cfg, "wan-14b")?;
         Ok(Components {
             te: Arc::new(te),
             high: Arc::new(high),
             low: Arc::new(low),
             vae: Arc::new(vae),
+            tok: Arc::new(tok),
         })
     }
 
     /// Tokenize + UMT5-encode `prompt` → `[1, 512, 4096]` (f32), zero-padded to `max_length` (the DiT
     /// cross-attends over the 512-padded context — the same rule as the 5B, sc-3697). Shared Wan
     /// text-encode routine (sc-9000 / F-020).
-    fn encode(&self, te: &Umt5Encoder, prompt: &str) -> CResult<Tensor> {
+    fn encode(&self, comps: &Components, prompt: &str) -> CResult<Tensor> {
         crate::text_encode::umt5_encode_padded(
-            &self.root,
+            &comps.tok,
             &self.te_cfg,
-            te,
+            &comps.te,
             prompt,
             &self.device,
             ENC_DTYPE,
@@ -298,13 +303,13 @@ impl Pipeline {
         // guidance — so UMT5-encode + project the negative for an expert only when its own guidance
         // enables CFG. At guidance <= 1.0 the denoise loop never touches `*_neg`, so the 24-layer UMT5
         // forward over the negative and its projection are pure waste (sc-8993).
-        let pos = self.encode(&comps.te, &req.prompt)?;
+        let pos = self.encode(comps, &req.prompt)?;
         let high_pos = comps.high.embed_text(&pos)?;
         let low_pos = comps.low.embed_text(&pos)?;
         // Shared UMT5 negative encode, computed once if either expert has CFG active.
         let neg = if cfg_active(g_high) || cfg_active(g_low) {
             let neg_prompt = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
-            Some(self.encode(&comps.te, neg_prompt)?)
+            Some(self.encode(comps, neg_prompt)?)
         } else {
             None
         };

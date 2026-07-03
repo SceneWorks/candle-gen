@@ -390,13 +390,15 @@ impl ZImageControlTransformer {
 /// transformer (vendored base DiT + control stack), the decode VAE, and the VAE encoder (to encode the
 /// pose skeleton into the control context).
 pub struct ZImageControl {
-    root: PathBuf,
     device: Device,
     /// Base (undistilled, full-CFG) vs Turbo (distilled, no-CFG) treatment (sc-8680). Selected at load
     /// from [`ZImageControlPaths::base`]; drives the scheduler (shift 6.0 vs 3.0), the default step
     /// count, and whether the denoise runs real CFG.
     base: bool,
     text_encoder: ZImageTextEncoder,
+    /// Qwen tokenizer, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
+    /// instead of re-parsing `tokenizer.json` per prompt/uncond branch.
+    tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
     transformer: ZImageControlTransformer,
     vae: AutoEncoderKL,
     vae_encoder: VaeEncoder,
@@ -433,11 +435,12 @@ impl ZImageControl {
             component_vb(&root, "vae", ENC_DTYPE, &device)?.pp("encoder"),
         )?;
 
+        let tokenizer = common::build_tokenizer(&root, "z-image control")?;
         Ok(Self {
-            root,
             device,
             base: paths.base,
             text_encoder,
+            tokenizer,
             transformer,
             vae,
             vae_encoder,
@@ -669,7 +672,7 @@ impl ZImageControl {
     /// Prompt → `cap_feats` `(seq, 2560)` at bf16 via the Qwen3 encoder + the shared Qwen chat template
     /// ([`common::prompt_ids`] + [`common::encode_ids`]).
     fn text_embeddings(&self, prompt: &str) -> Result<Tensor> {
-        let ids = common::prompt_ids(&self.root, prompt, "z-image control")?;
+        let ids = common::prompt_ids(&self.tokenizer, prompt, "z-image control")?;
         common::encode_ids(&ids, &self.device, DTYPE, |input_ids| {
             self.text_encoder.forward(input_ids)
         })
@@ -680,7 +683,7 @@ impl ZImageControl {
     /// through the QwenInstruct chat-template scaffolding rather than the empty-short-circuiting
     /// `tokenize` (the sc-8646 fix). Mirrors [`crate::pipeline::Pipeline::uncond_embeddings`].
     fn uncond_embeddings(&self, negative_prompt: &str) -> Result<Tensor> {
-        let ids = common::uncond_ids(&self.root, negative_prompt, "z-image control")?;
+        let ids = common::uncond_ids(&self.tokenizer, negative_prompt, "z-image control")?;
         common::encode_ids(&ids, &self.device, DTYPE, |input_ids| {
             self.text_encoder.forward(input_ids)
         })

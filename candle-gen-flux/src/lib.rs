@@ -77,7 +77,9 @@ pub use ip_dit::{Config as FluxConfig, DitImageInjector, IpFlux};
 // FLUX backbone helpers shared with the PuLID provider so the two never drift on the parity-critical
 // tokenization / VAE decode / config (the candle twin of `mlx-gen-flux`'s shared `Flux1` surface). The
 // IP-Adapter provider reaches these as `pub(crate)`; PuLID is a separate crate, hence `pub`.
-pub use pipeline::{ae_config, clip_config, decode_latents, encode_text, flux_config};
+pub use pipeline::{
+    ae_config, clip_config, decode_latents, encode_text, flux_config, FluxTokenizers,
+};
 
 /// FLUX XLabs IP-Adapter real-weight GPU validation (sc-5872) — env-driven, `#[ignore]`d integration
 /// test (the analog of the SDXL/Kolors IP-Adapter Phase-5 harnesses).

@@ -165,7 +165,14 @@ impl Scail2 {
             component_vb(&self.root, &self.device, "clip")?,
             &ClipVisionConfig::vit_h_14(),
         )?;
-        Ok(Components { te, dit, vae, clip })
+        let tok = crate::generate::build_tokenizer(&self.root, &TextEncoderConfig::umt5_xxl())?;
+        Ok(Components {
+            te,
+            dit,
+            vae,
+            clip,
+            tok,
+        })
     }
 
     fn components(&self) -> CResult<Arc<Components>> {
@@ -367,7 +374,6 @@ impl Scail2 {
         let comps = self.components()?;
         let te_cfg = TextEncoderConfig::umt5_xxl();
         crate::generate::generate(
-            &self.root,
             &comps,
             &te_cfg,
             &job,
