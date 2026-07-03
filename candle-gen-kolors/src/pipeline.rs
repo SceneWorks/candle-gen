@@ -20,20 +20,19 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::sampling::{
-    schedule_sigmas, AlphaSchedule, DiscreteModelSampling, Scheduler, Solver,
-};
+use candle_gen::gen_core::sampling::{AlphaSchedule, Scheduler, Solver};
 use candle_gen::gen_core::{self, GenerationRequest, Image, Progress};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
 use candle_gen::image_seed;
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::stable_diffusion::vae::{AutoEncoderKL, AutoEncoderKLConfig};
-use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use crate::chatglm3::ChatGlmModel;
+// Shared pipeline scaffolding (sc-9001 / F-021) — the time_ids / noise / decode / CFG-encode /
+// curated-σ blocks that were triplicated across this pipeline + the control / IP providers.
+use crate::common::{self, CuratedSetup};
 use crate::config::{ChatGlmConfig, DEFAULT_GUIDANCE, DEFAULT_STEPS};
 use crate::sampler::KolorsEulerSampler;
 use crate::tokenizer::KolorsTokenizer;
@@ -167,19 +166,13 @@ impl Pipeline {
         let sampler = KolorsEulerSampler::new(steps).map_err(CandleError::Msg)?;
 
         // Conditioning is seed-independent — encode once. CFG batch is [uncond, cond] (candle's chunk
-        // order); without guidance only the positive branch is built.
-        let (pos_ctx, pos_pooled) = self.encode(components, &req.prompt)?;
-        let (context, pooled) = if use_guide {
-            let (neg_ctx, neg_pooled) = self.encode(components, negative)?;
-            (
-                Tensor::cat(&[&neg_ctx, &pos_ctx], 0)?,
-                Tensor::cat(&[&neg_pooled, &pos_pooled], 0)?,
-            )
-        } else {
-            (pos_ctx, pos_pooled)
-        };
-        let batch = if use_guide { 2 } else { 1 };
-        let time_ids = self.build_time_ids(batch, h, w)?;
+        // order); without guidance only the positive branch is built. The ChatGLM3 encode stays local
+        // (it threads `components`); the shared helper owns only the identical CFG-concat convention.
+        let (context, pooled, batch) =
+            common::cfg_batch_context(&req.prompt, negative, use_guide, |p| {
+                self.encode(components, p)
+            })?;
+        let time_ids = common::build_time_ids(&self.device, batch, h, w)?;
 
         // The Kolors `encoder_hid_proj` (ChatGLM3 4096 → cross-attention 2048) is step-invariant, so
         // project the CFG-batched context ONCE here rather than every denoise step (sc-9040 / F-056),
@@ -192,7 +185,7 @@ impl Pipeline {
         let mut images = Vec::with_capacity(req.count as usize);
         for index in 0..req.count {
             let seed = image_seed(base_seed, index);
-            let noise = self.initial_noise(seed, lat_h, lat_w)?;
+            let noise = common::initial_noise(&self.device, seed, lat_h, lat_w)?;
 
             let latents = if let Some(name) = curated {
                 self.denoise_curated(
@@ -245,7 +238,7 @@ impl Pipeline {
             };
 
             on_progress(Progress::Decoding);
-            images.push(self.decode(&components.vae, &latents)?);
+            images.push(common::decode(&components.vae, &latents)?);
         }
         Ok(images)
     }
@@ -278,18 +271,14 @@ impl Pipeline {
         seed: u64,
         on_progress: &mut dyn FnMut(Progress),
     ) -> Result<Tensor> {
-        let sched = kolors_alpha_schedule()?;
-        let ms = DiscreteModelSampling::sdxl(&sched);
-        // Native curated schedule = ComfyUI's default (`normal`); the scheduler axis overrides it.
-        let native = schedule_sigmas(Scheduler::Normal, &ms, steps);
-        let sigmas = candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, steps, &native);
-        // VE prior: unit noise · σ_max (sigmas[0]); kept f32 through the sampler.
-        let latents = (init * sigmas[0] as f64)?;
+        // Shared curated-σ setup (sc-9001): the Kolors DiscreteModelSampling + σ-table + VE-σ prior,
+        // identical across the three entry points. `init` is the raw seeded noise (lifted to σ-space).
+        let setup = CuratedSetup::new(req.scheduler.as_deref(), steps, init)?;
         let out = candle_gen::run_curated_sampler(
             Some(sampler),
-            &ms,
-            &sigmas,
-            latents,
+            &setup.model_sampling,
+            &setup.sigmas,
+            setup.prior,
             seed,
             &req.cancel,
             on_progress,
@@ -323,52 +312,13 @@ impl Pipeline {
         Ok(out.to_dtype(DType::F32)?)
     }
 
-    /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])` via the ChatGLM3 encoder.
+    /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])` via the ChatGLM3 encoder. Stays
+    /// local (not in [`crate::common`]) because it threads the cached [`Components`]; the shared
+    /// [`common::cfg_batch_context`] takes this as a closure so the CFG-concat convention is the only
+    /// shared piece — the ChatGLM3 tokenize/encode specifics stay per-site.
     fn encode(&self, components: &Components, prompt: &str) -> Result<(Tensor, Tensor)> {
         let tokens = components.tokenizer.encode(prompt)?;
         Ok(components.chatglm.encode_prompt(&tokens)?)
-    }
-
-    /// The SDXL micro-conditioning `time_ids` = `(H, W, 0, 0, H, W)` per row, f32 `[batch, 6]`.
-    fn build_time_ids(&self, batch: usize, height: u32, width: u32) -> Result<Tensor> {
-        let (hf, wf) = (height as f32, width as f32);
-        let row = [hf, wf, 0.0, 0.0, hf, wf];
-        let mut v = Vec::with_capacity(batch * 6);
-        for _ in 0..batch {
-            v.extend_from_slice(&row);
-        }
-        Ok(Tensor::from_vec(v, (batch, 6), &self.device)?)
-    }
-
-    /// sc-3673 deterministic, launch-portable initial noise `[1, 4, lat_h, lat_w]`: N(0,1) from a
-    /// fixed-algorithm CPU RNG seeded by `seed`, moved to the device.
-    fn initial_noise(&self, seed: u64, lat_h: usize, lat_w: usize) -> Result<Tensor> {
-        let n = 4 * lat_h * lat_w;
-        let mut rng = StdRng::seed_from_u64(seed);
-        let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
-        Ok(Tensor::from_vec(noise, (1, 4, lat_h, lat_w), &Device::Cpu)?.to_device(&self.device)?)
-    }
-
-    /// VAE-decode latents `[1, 4, H/8, W/8]` → an RGB8 [`Image`] (un-scale by [`VAE_SCALE`],
-    /// `x/2 + 0.5`, clamp, ×255).
-    fn decode(&self, vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
-        let unscaled = (latents / VAE_SCALE)?;
-        let img = vae.decode(&unscaled)?;
-        let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
-        let img = (img * 255.)?
-            .to_dtype(DType::U8)?
-            .i(0)?
-            .to_device(&Device::Cpu)?;
-        let (c, h, w) = img.dims3()?;
-        if c != 3 {
-            return Err(CandleError::Msg(format!("expected 3 channels, got {c}")));
-        }
-        let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
-        Ok(Image {
-            width: w as u32,
-            height: h as u32,
-            pixels,
-        })
     }
 }
 

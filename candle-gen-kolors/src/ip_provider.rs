@@ -30,15 +30,12 @@
 
 use std::path::{Path, PathBuf};
 
-use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{self as nn, Linear, Module, VarBuilder};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::sampling::{schedule_sigmas, DiscreteModelSampling, Scheduler};
 use candle_gen::gen_core::{Image, Progress};
 use candle_gen::{CandleError, Result};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
-use rand::{rngs::StdRng, SeedableRng};
-use rand_distr::{Distribution, StandardNormal};
 
 use candle_gen_sdxl::ip_adapter::{load_ip_kv_pairs, IpImageEncoder, Resampler, ResamplerConfig};
 use candle_gen_sdxl::vision_encoder::{check_layer_count, ClipVisionEncoder, VisionConfig};
@@ -46,8 +43,9 @@ use candle_gen_sdxl::weights::Weights;
 use candle_gen_sdxl::{denoise_curated, sdxl_unet_config, UNet2DConditionModel};
 
 use crate::chatglm3::ChatGlmModel;
+use crate::common::{self, CuratedSetup};
 use crate::config::ChatGlmConfig;
-use crate::pipeline::{curated_route, kolors_alpha_schedule, sdxl_vae_config, VAE_SCALE};
+use crate::pipeline::{curated_route, sdxl_vae_config};
 use crate::sampler::KolorsEulerSampler;
 use crate::tokenizer::KolorsTokenizer;
 
@@ -242,22 +240,15 @@ impl IpAdapterKolors {
         // Everything that borrows `&self`, computed into owned values BEFORE the `&mut self.unet`
         // `set_ip_context` (so the disjoint-field borrows don't overlap — the SDXL/InstantID pattern).
         // CFG batch is [neg, pos] = uncond-first (the Kolors txt2img convention); without guidance only
-        // the positive branch is built.
-        let (pos_ctx, pos_pooled) = self.encode(&req.prompt)?;
-        let (context, pooled) = if use_guide {
-            let (neg_ctx, neg_pooled) = self.encode(&req.negative)?;
-            (
-                Tensor::cat(&[&neg_ctx, &pos_ctx], 0)?,
-                Tensor::cat(&[&neg_pooled, &pos_pooled], 0)?,
-            )
-        } else {
-            (pos_ctx, pos_pooled)
-        };
-        let batch = if use_guide { 2 } else { 1 };
+        // the positive branch is built. Shared CFG-concat (sc-9001); the ChatGLM3 encode stays local
+        // (its immutable `&self` borrow ends before the `&mut self.unet` call below).
+        let (context, pooled, batch) =
+            common::cfg_batch_context(&req.prompt, &req.negative, use_guide, |p| self.encode(p))?;
         // Project the ChatGLM3 context to the cross-attention width once up front — the vendored UNet
         // (unlike `KolorsUNet`) has no `encoder_hid_proj`, so its context must already be 2048-wide.
         let projected = self.encoder_hid_proj.forward(&context)?;
-        let time_ids = self.build_time_ids(batch, req.height, req.width)?;
+        let time_ids = common::build_time_ids(&self.device, batch, req.height, req.width)?;
+        // The IP lane's genuine drift: the CFG-batched (uncond zeros-first) reference image tokens.
         let ip_tokens = self.ip_tokens(reference, use_guide)?;
 
         let (lat_h, lat_w) = ((req.height / 8) as usize, (req.width / 8) as usize);
@@ -276,21 +267,18 @@ impl IpAdapterKolors {
 
         let latents = if let Some(sampler_name) = curated {
             // k-diffusion VE-σ sampling over the Kolors `DiscreteModelSampling`. A scheduler-only curated
-            // run keeps `euler_discrete` (a non-solver alias) ⇒ the driver's euler fallback (N3).
-            let sched = kolors_alpha_schedule()?;
-            let ms = DiscreteModelSampling::sdxl(&sched);
-            let native = schedule_sigmas(Scheduler::Normal, &ms, req.steps);
-            let sigmas =
-                candle_gen::resolve_schedule(req.scheduler.as_deref(), &ms, req.steps, &native);
-            let prior = (self.initial_noise(req.seed, lat_h, lat_w)? * sigmas[0] as f64)?;
+            // run keeps `euler_discrete` (a non-solver alias) ⇒ the driver's euler fallback (N3). Shared
+            // curated-σ setup (sc-9001) from the SAME launch-portable seeded noise as the native path.
+            let noise = common::initial_noise(&self.device, req.seed, lat_h, lat_w)?;
+            let setup = CuratedSetup::new(req.scheduler.as_deref(), req.steps, &noise)?;
             // Pure IP: no ControlNet branch (`controls = &[]`); `projected` is the UNet cross-attn
             // conditioning (and fills the unused `controlnet_encoder` slot).
             denoise_curated(
                 &self.unet,
                 Some(sampler_name),
-                &ms,
-                &sigmas,
-                prior,
+                &setup.model_sampling,
+                &setup.sigmas,
+                setup.prior,
                 &projected,
                 &pooled,
                 &time_ids,
@@ -304,7 +292,7 @@ impl IpAdapterKolors {
             )?
         } else {
             let sampler = KolorsEulerSampler::new(req.steps).map_err(CandleError::Msg)?;
-            let noise = self.initial_noise(req.seed, lat_h, lat_w)?;
+            let noise = common::initial_noise(&self.device, req.seed, lat_h, lat_w)?;
             let mut latents = (noise * sampler.init_noise_sigma() as f64)?;
             let total = sampler.num_steps() as u32;
             for i in 0..sampler.num_steps() {
@@ -343,29 +331,20 @@ impl IpAdapterKolors {
         };
 
         on_progress(Progress::Decoding);
-        self.decode(&latents)
+        common::decode(&self.vae, &latents)
     }
 
-    /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])` via the ChatGLM3 encoder.
+    /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])` via the ChatGLM3 encoder. Stays
+    /// local (borrows `&self.tokenizer` / `&self.chatglm`); passed as a closure to the shared
+    /// [`common::cfg_batch_context`], so only the CFG convention is shared, not the ChatGLM3 plumbing.
     fn encode(&self, prompt: &str) -> Result<(Tensor, Tensor)> {
         let tokens = self.tokenizer.encode(prompt)?;
         Ok(self.chatglm.encode_prompt(&tokens)?)
     }
 
-    /// The SDXL micro-conditioning `time_ids` = `(H, W, 0, 0, H, W)` per row, f32 `[batch, 6]` (the
-    /// Kolors txt2img value — original == target, no crop).
-    fn build_time_ids(&self, batch: usize, height: u32, width: u32) -> Result<Tensor> {
-        let (hf, wf) = (height as f32, width as f32);
-        let row = [hf, wf, 0.0, 0.0, hf, wf];
-        let mut v = Vec::with_capacity(batch * 6);
-        for _ in 0..batch {
-            v.extend_from_slice(&row);
-        }
-        Ok(Tensor::from_vec(v, (batch, 6), &self.device)?)
-    }
-
     /// Build the CFG-batched IP tokens from the reference image. **Uncond-first**: under CFG the uncond
     /// row is literal **zero tokens** (the IP-Adapter convention) stacked *before* the positive row.
+    /// The IP lane's genuine drift — NOT shared with the txt2img / control lanes.
     fn ip_tokens(&self, reference: &Image, use_guide: bool) -> Result<Tensor> {
         let tokens = self.ip_encoder.tokens(reference, &self.device)?; // [1, 16, 2048]
         if use_guide {
@@ -374,37 +353,6 @@ impl IpAdapterKolors {
         } else {
             Ok(tokens)
         }
-    }
-
-    /// sc-3673 deterministic, launch-portable initial noise `[1, 4, lat_h, lat_w]`: N(0,1) from a
-    /// fixed-algorithm CPU RNG seeded by `seed`, moved to the device (matches the txt2img pipeline).
-    fn initial_noise(&self, seed: u64, lat_h: usize, lat_w: usize) -> Result<Tensor> {
-        let n = 4 * lat_h * lat_w;
-        let mut rng = StdRng::seed_from_u64(seed);
-        let noise: Vec<f32> = (0..n).map(|_| StandardNormal.sample(&mut rng)).collect();
-        Ok(Tensor::from_vec(noise, (1, 4, lat_h, lat_w), &Device::Cpu)?.to_device(&self.device)?)
-    }
-
-    /// VAE-decode latents `[1, 4, H/8, W/8]` → an RGB8 [`Image`] (un-scale by [`VAE_SCALE`], `x/2 + 0.5`,
-    /// clamp, ×255) — the txt2img pipeline's decode.
-    fn decode(&self, latents: &Tensor) -> Result<Image> {
-        let unscaled = (latents / VAE_SCALE)?;
-        let img = self.vae.decode(&unscaled)?;
-        let img = ((img / 2.)? + 0.5)?.clamp(0f32, 1f32)?;
-        let img = (img * 255.)?
-            .to_dtype(DType::U8)?
-            .i(0)?
-            .to_device(&Device::Cpu)?;
-        let (c, h, w) = img.dims3()?;
-        if c != 3 {
-            return Err(CandleError::Msg(format!("expected 3 channels, got {c}")));
-        }
-        let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
-        Ok(Image {
-            width: w as u32,
-            height: h as u32,
-            pixels,
-        })
     }
 }
 

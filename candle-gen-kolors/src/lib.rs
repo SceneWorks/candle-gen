@@ -19,6 +19,9 @@
 //! `backend` is `"candle"` and `mac_only` is `false`.
 
 mod chatglm3;
+// Shared Kolors pipeline scaffolding (sc-9001 / F-021): the time_ids / initial-noise / decode /
+// CFG-batched-encode / curated-σ-prior blocks that were copy-pasted across the three entry points.
+mod common;
 mod config;
 mod pipeline;
 mod sampler;
