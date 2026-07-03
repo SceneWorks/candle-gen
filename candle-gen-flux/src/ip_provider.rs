@@ -222,6 +222,7 @@ impl IpAdapterFlux {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        validate_request(req)?;
 
         // Conditioning: text (T5 seq + CLIP pooled) and the reference image tokens (computed once).
         let (t5_emb, clip_emb) = encode_text(
@@ -335,9 +336,52 @@ impl IpAdapterFlux {
     }
 }
 
+/// Validate the seed-independent request knobs before any tensor work. The empty-prompt guard
+/// (sc-9171, the sc-8646 bug class) mirrors the flux1 **control** provider
+/// ([`crate::control_provider`]) and the registered flux1 txt2img `validate`. flux1-IP conditions on
+/// **T5 + CLIP** (`encode_text`): an empty prompt reaches the T5 encoder as an all-pad sequence and
+/// CLIP as bare BOS/EOS, i.e. degenerate identity-free conditioning rather than the intended
+/// text-plus-reference blend. Rejecting it up front turns a silent quality collapse (or, on the CLIP
+/// side, the deeper `"empty CLIP tokenization"` error in `encode_text`) into a clean, actionable
+/// validation error. The provider is a single distilled forward (no true-CFG), so there is no
+/// negative/uncond prompt — the exposure is solely the positive prompt.
+fn validate_request(req: &IpAdapterFluxRequest) -> Result<()> {
+    if req.prompt.trim().is_empty() {
+        return Err(CandleError::Msg(
+            "flux ip-adapter: prompt is required".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The empty-prompt guard (sc-9171, the sc-8646 bug class): an empty or whitespace-only prompt is
+    /// a clean validation error — never a degenerate all-pad T5 / bare CLIP encode — while a real
+    /// prompt passes. flux1-IP conditions on T5+CLIP, so this is a genuinely degenerate site (unlike
+    /// the CLIP-fixed-pad SDXL edit/IP or ChatGLM-framed Kolors-IP siblings audited in sc-9171).
+    #[test]
+    fn validate_request_rejects_empty_prompt() {
+        let empty = IpAdapterFluxRequest::default();
+        assert!(empty.prompt.is_empty());
+        let err = validate_request(&empty).unwrap_err();
+        assert!(err.to_string().contains("prompt is required"), "{err}");
+
+        let whitespace = IpAdapterFluxRequest {
+            prompt: " \t\n".into(),
+            ..Default::default()
+        };
+        let err = validate_request(&whitespace).unwrap_err();
+        assert!(err.to_string().contains("prompt is required"), "{err}");
+
+        let ok = IpAdapterFluxRequest {
+            prompt: "a portrait".into(),
+            ..Default::default()
+        };
+        assert!(validate_request(&ok).is_ok());
+    }
 
     /// The request defaults match the FLUX dev IP-Adapter knobs (1024², 25 steps, guidance 3.5, ip 0.7).
     #[test]
