@@ -219,7 +219,6 @@ fn tokenizer_json_path(root: &Path) -> Result<PathBuf> {
 /// encoder (reference dual-latent), the image processor + tokenizer.
 pub struct QwenEdit {
     device: Device,
-    te_cfg: TextEncoderConfig,
     vl_encoder: QwenVisionLanguageEncoder,
     transformer: QwenTransformer,
     vae: QwenVae,
@@ -254,7 +253,6 @@ impl QwenEdit {
         Ok(Self {
             zero_cond_t: read_zero_cond_t(root)?,
             device,
-            te_cfg,
             vl_encoder,
             transformer,
             vae,
@@ -413,7 +411,6 @@ impl QwenEdit {
             },
         )?;
 
-        let _ = &self.te_cfg; // kept for symmetry with the other providers' config plumbing
         on_progress(Progress::Decoding);
         let lat = pipeline::unpack_latents(&latents, req.width, req.height)?;
         let decoded = self.vae.decode(&lat)?;

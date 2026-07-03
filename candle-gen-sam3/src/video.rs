@@ -427,12 +427,11 @@ impl Sam3VideoModel {
                 }
             }
         }
-        // tracks: unmatched if non-empty and no det IoU >= trk_assoc; empty if zero-area.
+        // tracks: unmatched if non-empty and no det IoU >= trk_assoc (zero-area tracks are neither
+        // matched nor unmatched — the reference `_associate_det_trk` drops them from both lists).
         for j in 0..m {
             let matched = (0..n).any(|i| iou[i][j] >= TRK_ASSOC_IOU_THRESH);
-            if !trk_nonempty[j] {
-                a.empty_trk.push(self.obj_ids[j]);
-            } else if !matched {
+            if trk_nonempty[j] && !matched {
                 a.unmatched_trk.push(self.obj_ids[j]);
             }
         }
@@ -706,7 +705,6 @@ struct DetFrame {
 struct Assoc {
     new_det_inds: Vec<usize>,
     unmatched_trk: Vec<i32>,
-    empty_trk: Vec<i32>,
     det_to_matched_trk: Vec<Vec<i32>>,
     trk_id_to_max_iou_high_conf_det: BTreeMap<i32, usize>,
 }

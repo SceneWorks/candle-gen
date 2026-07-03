@@ -440,9 +440,8 @@ impl DecUpBlock {
             x = r.forward(&x, num_frames)?;
         }
         if let Some(conv) = &self.upsample {
-            let (n, c, h, w) = x.dims4()?;
+            let (_, _, h, w) = x.dims4()?;
             let up = x.upsample_nearest2d(h * 2, w * 2)?;
-            let _ = (n, c);
             x = conv.forward(&up)?;
         }
         Ok(x)

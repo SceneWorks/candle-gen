@@ -36,12 +36,10 @@ fn gated(x: &Tensor, out: &Tensor, gate: &Tensor) -> Result<Tensor> {
 
 /// Weightless RMSNorm (unit weight) over the last axis, in f32.
 fn rms_noweight(x: &Tensor, eps: f64) -> Result<Tensor> {
-    let dim = x.dim(D::Minus1)?;
     let xf = x.to_dtype(DType::F32)?.contiguous()?;
     let inv = (xf.sqr()?.mean_keepdim(D::Minus1)? + eps)?
         .sqrt()?
         .recip()?;
-    let _ = dim;
     xf.broadcast_mul(&inv)?.to_dtype(x.dtype())
 }
 

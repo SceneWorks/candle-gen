@@ -50,7 +50,6 @@ struct GemmaLayer {
     gate_proj: QLinear,
     up_proj: QLinear,
     down_proj: QLinear,
-    rope_base: f64,
 }
 
 pub struct GemmaEncoder {
@@ -70,11 +69,6 @@ impl GemmaEncoder {
         for i in 0..cfg.num_layers {
             let lb = vb.pp(format!("layers.{i}"));
             let attn = lb.pp("self_attn");
-            let rope_base = if cfg.is_global_layer(i) {
-                cfg.rope_theta_global
-            } else {
-                cfg.rope_theta_local
-            };
             layers.push(GemmaLayer {
                 input_ln: norm_alpha(&lb, "input_layernorm.weight")?,
                 post_attn_ln: norm_alpha(&lb, "post_attention_layernorm.weight")?,
@@ -89,7 +83,6 @@ impl GemmaEncoder {
                 gate_proj: linear(&lb.pp("mlp"), "gate_proj")?,
                 up_proj: linear(&lb.pp("mlp"), "up_proj")?,
                 down_proj: linear(&lb.pp("mlp"), "down_proj")?,
-                rope_base,
             });
         }
         // Packed-detecting `embed_tokens` (sc-9417): dense in the hosted tier, but routed through the
@@ -261,7 +254,6 @@ impl GemmaEncoder {
             } else {
                 (&cos_l, &sin_l)
             };
-            let _ = layer.rope_base; // base is encoded by the table selection above
             h = self.layer_forward(layer, &h, &mask, cos, sin)?;
             if i < self.cfg.num_layers - 1 {
                 hiddens.push(h.clone());

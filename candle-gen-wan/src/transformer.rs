@@ -56,11 +56,10 @@ struct Attention {
     num_heads: usize,
     head_dim: usize,
     eps: f64,
-    is_cross: bool,
 }
 
 impl Attention {
-    fn new(cfg: &TransformerConfig, vb: VarBuilder, is_cross: bool) -> Result<Self> {
+    fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.dim;
         Ok(Self {
             to_q: linear(cfg.dim, inner, vb.pp("to_q"))?,
@@ -72,7 +71,6 @@ impl Attention {
             num_heads: cfg.num_heads,
             head_dim: cfg.head_dim,
             eps: cfg.eps,
-            is_cross,
         })
     }
 
@@ -106,7 +104,6 @@ impl Attention {
         let out = out
             .transpose(1, 2)?
             .reshape((b, s, self.num_heads * self.head_dim))?;
-        let _ = self.is_cross;
         self.to_out.forward(&out)
     }
 }
@@ -144,13 +141,13 @@ impl Block {
             scale_shift_table: vb
                 .get((1, 6, cfg.dim), "scale_shift_table")?
                 .to_dtype(DType::F32)?,
-            attn1: Attention::new(cfg, vb.pp("attn1"), false)?,
+            attn1: Attention::new(cfg, vb.pp("attn1"))?,
             norm2_w: vb
                 .pp("norm2")
                 .get(cfg.dim, "weight")?
                 .to_dtype(DType::F32)?,
             norm2_b: vb.pp("norm2").get(cfg.dim, "bias")?.to_dtype(DType::F32)?,
-            attn2: Attention::new(cfg, vb.pp("attn2"), true)?,
+            attn2: Attention::new(cfg, vb.pp("attn2"))?,
             ffn: Ffn::new(cfg, vb.pp("ffn"))?,
             eps: cfg.eps,
         })
