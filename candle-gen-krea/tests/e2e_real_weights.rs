@@ -131,6 +131,14 @@ fn turbo_engine_renders_coherent_1024() {
     render(1024, 1024);
 }
 
+/// sc-9592 regression lock: at 1536² the DiT scores tensor is `48·9216² ≈ 4.1e9 > i32::MAX`, which
+/// faulted (CUDA_ERROR_ILLEGAL_ADDRESS) before the sc-9116 query-row chunking guarded `sdpa`.
+#[test]
+#[ignore = "needs the real snapshot (KREA_TURBO_DIR); larger footprint — run if it fits"]
+fn turbo_engine_renders_coherent_1536() {
+    render(1536, 1536);
+}
+
 #[test]
 #[ignore = "needs the real snapshot (KREA_TURBO_DIR); larger footprint — run if it fits"]
 fn turbo_engine_renders_coherent_2048() {
