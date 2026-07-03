@@ -11,12 +11,11 @@
 //! `WanRMS_norm` is a **channel-L2 normalization** over the channel axis (`x / max(‖x‖₂, 1e-12) ·
 //! √C · γ`), NOT GroupNorm; weights ship as `.gamma`.
 
-use candle_gen::candle_core::{DType, Error, Result, Tensor};
+use candle_gen::candle_core::{DType, Result, Tensor};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::tiling::{
-    budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig, VaeTiling,
-};
+use candle_gen::gen_core::tiling::{TileCandidates, TilingConfig, VaeTiling};
+use candle_gen::vae_tiling;
 
 use crate::config::{VaeConfig, LATENTS_MEAN, LATENTS_STD};
 use crate::conv3d::{CausalConv3d, Ctx};
@@ -500,81 +499,14 @@ impl WanVae {
     /// selector never tiles the temporal axis here); a temporal `cfg` would split the causal stream at
     /// tile boundaries and is not bit-exact vs. the streaming [`decode`].
     pub fn decode_tiled(&self, z: &Tensor, cfg: &TilingConfig) -> Result<Tensor> {
-        let (_b, _c, f, h, w) = z.dims5()?;
-        if !cfg.needs_tiling(VaeTiling::WAN22, f as i32, h as i32, w as i32) {
-            return self.decode(z);
-        }
-        let plan = cfg.plan(VaeTiling::WAN22, f as i32, h as i32, w as i32);
-        let dev = z.device();
-
-        // Full-size accumulators (mirrors the LTX/mlx pad-and-accumulate); add each tile in turn.
-        // `output` carries the batch; `weights` stays b=1 and broadcasts on the final divide. With a
-        // spatial-only `cfg`, `plan.t` is a single full-extent temporal tile (all-ones mask), so the
-        // temporal loop runs once and each `decode` call streams the whole clip.
-        let mut output: Option<Tensor> = None; // [B, 3, out_f, out_h, out_w]
-        let mut weights: Option<Tensor> = None; // [1, 1, out_f, out_h, out_w]
-
-        for t in &plan.t {
-            for hh in &plan.h {
-                for ww in &plan.w {
-                    let tile = z
-                        .narrow(2, t.start as usize, (t.end - t.start) as usize)?
-                        .narrow(3, hh.start as usize, (hh.end - hh.start) as usize)?
-                        .narrow(4, ww.start as usize, (ww.end - ww.start) as usize)?;
-                    let dec = self.decode(&tile)?; // [B, 3, td, hd, wd] (streamed, clamped)
-                    let (_, _, td, hd, wd) = dec.dims5()?;
-                    let at = td.min((t.out_stop - t.out_start) as usize);
-                    let ah = hd.min((hh.out_stop - hh.out_start) as usize);
-                    let aw = wd.min((ww.out_stop - ww.out_start) as usize);
-
-                    // 1-D trapezoidal masks → outer product [1, 1, at, ah, aw].
-                    let tm = Tensor::from_slice(&t.mask[..at], (1, 1, at, 1, 1), dev)?;
-                    let hm = Tensor::from_slice(&hh.mask[..ah], (1, 1, 1, ah, 1), dev)?;
-                    let wm = Tensor::from_slice(&ww.mask[..aw], (1, 1, 1, 1, aw), dev)?;
-                    let blend = tm.broadcast_mul(&hm)?.broadcast_mul(&wm)?;
-
-                    let dec = dec.narrow(2, 0, at)?.narrow(3, 0, ah)?.narrow(4, 0, aw)?;
-                    let weighted = dec.broadcast_mul(&blend)?;
-
-                    // Place each tile at its output offset by zero-padding to the full output shape.
-                    let (pt0, pt1) = (
-                        t.out_start as usize,
-                        plan.out_f as usize - (t.out_start as usize + at),
-                    );
-                    let (ph0, ph1) = (
-                        hh.out_start as usize,
-                        plan.out_h as usize - (hh.out_start as usize + ah),
-                    );
-                    let (pw0, pw1) = (
-                        ww.out_start as usize,
-                        plan.out_w as usize - (ww.out_start as usize + aw),
-                    );
-                    let pad5 = |x: &Tensor| -> Result<Tensor> {
-                        x.pad_with_zeros(2, pt0, pt1)?
-                            .pad_with_zeros(3, ph0, ph1)?
-                            .pad_with_zeros(4, pw0, pw1)
-                    };
-                    let weighted_full = pad5(&weighted)?;
-                    let blend_full = pad5(&blend)?;
-
-                    output = Some(match output {
-                        None => weighted_full,
-                        Some(acc) => acc.add(&weighted_full)?,
-                    });
-                    weights = Some(match weights {
-                        None => blend_full,
-                        Some(acc) => acc.add(&blend_full)?,
-                    });
-                }
-            }
-        }
-
-        let output =
-            output.ok_or_else(|| Error::Msg("wan vae22: tile-decode plan had no tiles".into()))?;
-        let weights =
-            weights.ok_or_else(|| Error::Msg("wan vae22: tile-decode plan had no tiles".into()))?;
-        // Normalize by the summed blend weight (clamped away from 0), broadcasting [1,1,F,H,W] over C.
-        output.broadcast_div(&weights.maximum(1e-8f64)?)
+        // The tile/narrow/blend/pad-accumulate/normalize DRIVER is shared with the LTX half in
+        // `candle_gen::vae_tiling::decode_tiled` (sc-9006 / F-026). What stays wan-specific: the
+        // `VaeTiling::WAN22` geometry and the per-frame-streaming `decode` closure. With a
+        // spatial-only `cfg`, `plan.t` is a single full-extent temporal tile, so the temporal loop
+        // runs once and each `decode` call streams the whole clip.
+        vae_tiling::decode_tiled(VaeTiling::WAN22, "wan z48 vae22", z, cfg, |tile| {
+            self.decode(tile)
+        })
     }
 
     /// **Memory-bounded** decode (sc-7111): derive the decoded output dims from the latent geometry
@@ -642,10 +574,11 @@ impl WanVae {
 
 // --- sc-7111 / sc-6894: budgeted z48 vae22 spatial-tiling for the candle decode -------------------
 //
-// Mirrors the candle LTX half (sc-7076, `candle-gen-ltx::vae`): the shared `gen_core::tiling::
-// budgeted_plan` selector + a z48-vae22 cost model + a CUDA-VRAM budget source. The selector and tile
-// geometry are byte-identical to the mlx side (pure gen-core); only the cost CONSTANTS and the budget
-// source are backend-specific.
+// Mirrors the candle LTX half (sc-7076, `candle-gen-ltx::vae`): the shared budgeted-tiling DRIVER +
+// budget resolver + selector now live ONCE in `candle_gen::vae_tiling` (sc-9006 / F-026, de-duped from
+// the byte-near-identical wan/ltx copies); this module supplies only the wan-specific cost CONSTANTS,
+// the spatial-only candidate grid, and the streaming cost model. The tile geometry itself is pure
+// gen-core (`gen_core::tiling`), byte-identical to the mlx side.
 //
 // **Structural difference from mlx-gen-wan** (why this is a spatial-only mirror, not a 1:1 port): the
 // candle `decode` STREAMS one latent frame at a time (`WanVae::decode`), so the temporal axis is
@@ -656,6 +589,8 @@ impl WanVae {
 // per-output-voxel (the whole tile) as in the mlx vae22 model.
 
 const GIB_F64: f64 = 1024.0 * 1024.0 * 1024.0;
+/// Env override read by the shared [`vae_tiling::safe_budget_gib`] resolver.
+const WAN22_VAE_BUDGET_ENV: &str = "WAN_VAE_BUDGET_GIB";
 /// Fraction of total VRAM treated as safe (matches the candle-gen-ltx 0.85 / seedvr2 convention).
 const WAN22_VAE_BUDGET_SAFE_FRAC: f64 = 0.85;
 /// Fallback budget when neither the env override nor `nvidia-smi` yields a value.
@@ -719,17 +654,11 @@ fn estimated_wan22_decode_peak_gib(
 /// [`candle_gen::gpu::nvidia_smi_min_total_gib`] — an absolute System32/CUDA_PATH binary, never a bare
 /// `PATH` lookup; sc-9014 / F-030) → [`WAN22_VAE_DEFAULT_BUDGET_GIB`].
 pub fn wan22_vae_safe_budget_gib() -> f64 {
-    if let Ok(raw) = std::env::var("WAN_VAE_BUDGET_GIB") {
-        if let Ok(gib) = raw.trim().parse::<f64>() {
-            if gib > 0.0 {
-                return gib;
-            }
-        }
-    }
-    match candle_gen::gpu::nvidia_smi_min_total_gib() {
-        Some(total) => total * WAN22_VAE_BUDGET_SAFE_FRAC,
-        None => WAN22_VAE_DEFAULT_BUDGET_GIB,
-    }
+    vae_tiling::safe_budget_gib(
+        WAN22_VAE_BUDGET_ENV,
+        WAN22_VAE_BUDGET_SAFE_FRAC,
+        WAN22_VAE_DEFAULT_BUDGET_GIB,
+    )
 }
 
 /// **Memory-budgeted** spatial tiling for the z48 vae22 decode — routes the shared [`budgeted_plan`]
@@ -753,12 +682,16 @@ fn plan_wan22_tiling(
     out_frames: i32,
     safe_gib: f64,
 ) -> Result<Option<TilingConfig>> {
+    // Shared budgeted selector + error mapping (sc-9006 / F-026); wan-specific: the spatial-only
+    // candidate grid (no temporal candidates — `decode` streams temporally) and the streaming
+    // cost model `estimated_wan22_decode_peak_gib`.
     let candidates = TileCandidates {
         spatial_px: &WAN22_VAE_SPATIAL_PX,
         spatial_overlap_px: 64,
         temporal: &WAN22_VAE_TEMPORAL_FR,
     };
-    budgeted_plan(
+    vae_tiling::plan_tiling(
+        "wan z48 vae22 decode",
         height,
         width,
         out_frames,
@@ -766,24 +699,6 @@ fn plan_wan22_tiling(
         candidates,
         estimated_wan22_decode_peak_gib,
     )
-    .map_err(|e| match e {
-        TilingBudgetError::AccumulatorsExceedBudget {
-            projected_gib,
-            safe_gib,
-        } => Error::Msg(format!(
-            "wan z48 vae22 decode: assembling a {width}×{height}×{out_frames} video needs ~{projected_gib:.0} \
-             GB just for the output buffers, over the ~{safe_gib:.0} GB safe VRAM budget. Reduce the \
-             resolution or frame count."
-        )),
-        TilingBudgetError::SmallestTileExceedsBudget {
-            projected_gib,
-            safe_gib,
-        } => Error::Msg(format!(
-            "wan z48 vae22 decode: a {width}×{height}×{out_frames} video peaks at ~{projected_gib:.0} GB even \
-             with the smallest spatial tile, over the ~{safe_gib:.0} GB safe VRAM budget. Reduce the \
-             resolution or frame count."
-        )),
-    })
 }
 
 #[cfg(test)]

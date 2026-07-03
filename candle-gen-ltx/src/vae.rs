@@ -12,11 +12,10 @@
 //! `Up` with temporal stride 2 doubles then drops the first frame, so latent T=7 → 49 pixel frames;
 //! spatial 15 → 480 px (×2×2×2 then unpatchify ×4).
 
-use candle_gen::candle_core::{Error, Result, Tensor};
+use candle_gen::candle_core::{Result, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::tiling::{
-    budgeted_plan, TileCandidates, TilingBudgetError, TilingConfig, VaeTiling,
-};
+use candle_gen::gen_core::tiling::{TileCandidates, TilingConfig, VaeTiling};
+use candle_gen::vae_tiling;
 
 use crate::conv3d::CausalConv3d;
 
@@ -219,80 +218,14 @@ impl LtxVideoVae {
     /// temporal mapping handles the geometry, but byte-parity vs. a full single-pass decode must be
     /// confirmed on real weights + CUDA (the Mac dev host can only compile-check this).
     pub fn decode_tiled(&self, latent: &Tensor, cfg: &TilingConfig) -> Result<Tensor> {
-        let (_b, _c, f, h, w) = latent.dims5()?;
-        if !cfg.needs_tiling(VaeTiling::LTX, f as i32, h as i32, w as i32) {
-            return self.decode(latent);
-        }
-        let plan = cfg.plan(VaeTiling::LTX, f as i32, h as i32, w as i32);
-        let dev = latent.device();
-
-        // Full-size accumulators (the reference allocates these too); pad-and-add each tile in turn.
-        // `output` carries the batch; `weights` stays `b=1` and broadcasts on the final divide.
-        let mut output: Option<Tensor> = None; // [B, 3, out_f, out_h, out_w]
-        let mut weights: Option<Tensor> = None; // [1, 1, out_f, out_h, out_w]
-
-        for t in &plan.t {
-            for hh in &plan.h {
-                for ww in &plan.w {
-                    let tile = latent
-                        .narrow(2, t.start as usize, (t.end - t.start) as usize)?
-                        .narrow(3, hh.start as usize, (hh.end - hh.start) as usize)?
-                        .narrow(4, ww.start as usize, (ww.end - ww.start) as usize)?;
-                    let dec = self.decode(&tile)?; // [B, 3, td, hd, wd]
-                    let (_, _, td, hd, wd) = dec.dims5()?;
-                    let at = td.min((t.out_stop - t.out_start) as usize);
-                    let ah = hd.min((hh.out_stop - hh.out_start) as usize);
-                    let aw = wd.min((ww.out_stop - ww.out_start) as usize);
-
-                    // 1-D trapezoidal masks → outer product [1, 1, at, ah, aw].
-                    let tm = Tensor::from_slice(&t.mask[..at], (1, 1, at, 1, 1), dev)?;
-                    let hm = Tensor::from_slice(&hh.mask[..ah], (1, 1, 1, ah, 1), dev)?;
-                    let wm = Tensor::from_slice(&ww.mask[..aw], (1, 1, 1, 1, aw), dev)?;
-                    let blend = tm.broadcast_mul(&hm)?.broadcast_mul(&wm)?;
-
-                    let dec = dec.narrow(2, 0, at)?.narrow(3, 0, ah)?.narrow(4, 0, aw)?;
-                    let weighted = dec.broadcast_mul(&blend)?;
-
-                    // Place each tile at its output offset by zero-padding to the full output shape.
-                    // `out_start + a* <= out_stop <= out_*`, so the right pad never underflows.
-                    let (pt0, pt1) = (
-                        t.out_start as usize,
-                        plan.out_f as usize - (t.out_start as usize + at),
-                    );
-                    let (ph0, ph1) = (
-                        hh.out_start as usize,
-                        plan.out_h as usize - (hh.out_start as usize + ah),
-                    );
-                    let (pw0, pw1) = (
-                        ww.out_start as usize,
-                        plan.out_w as usize - (ww.out_start as usize + aw),
-                    );
-                    let pad5 = |x: &Tensor| -> Result<Tensor> {
-                        x.pad_with_zeros(2, pt0, pt1)?
-                            .pad_with_zeros(3, ph0, ph1)?
-                            .pad_with_zeros(4, pw0, pw1)
-                    };
-                    let weighted_full = pad5(&weighted)?;
-                    let blend_full = pad5(&blend)?;
-
-                    output = Some(match output {
-                        None => weighted_full,
-                        Some(acc) => acc.add(&weighted_full)?,
-                    });
-                    weights = Some(match weights {
-                        None => blend_full,
-                        Some(acc) => acc.add(&blend_full)?,
-                    });
-                }
-            }
-        }
-
-        let output =
-            output.ok_or_else(|| Error::Msg("ltx vae: tile-decode plan had no tiles".into()))?;
-        let weights =
-            weights.ok_or_else(|| Error::Msg("ltx vae: tile-decode plan had no tiles".into()))?;
-        // Normalize by the summed blend weight (clamped away from 0), broadcasting [1,1,F,H,W] over C.
-        output.broadcast_div(&weights.maximum(1e-8f64)?)
+        // The tile/narrow/blend/pad-accumulate/normalize DRIVER is shared with the wan half in
+        // `candle_gen::vae_tiling::decode_tiled` (sc-9006 / F-026). What stays ltx-specific: the
+        // `VaeTiling::LTX` geometry (×32 spatial / ×8 causal temporal) and the single-pass `decode`
+        // closure. Unlike wan, `cfg` may carry a temporal tile (ltx `decode` is not per-frame
+        // streaming); the shared driver's `plan.t` loop handles both.
+        vae_tiling::decode_tiled(VaeTiling::LTX, "ltx vae", latent, cfg, |tile| {
+            self.decode(tile)
+        })
     }
 
     /// **Memory-bounded** decode (sc-7076): derive the decoded output dims from the latent geometry
@@ -315,11 +248,15 @@ impl LtxVideoVae {
 
 // --- sc-7076 / sc-6894: budgeted LTX VAE decode (candle) ------------------------------------------
 //
-// Mirrors mlx-gen-ltx's budgeted decode: the shared `gen_core::tiling::budgeted_plan` selector + an
-// LTX cost model + a CUDA-VRAM budget source. The selector and geometry are byte-identical to the mlx
-// side (pure gen-core); only the cost CONSTANTS and the budget source are backend-specific.
+// The shared budgeted-tiling DRIVER + budget resolver + selector now live ONCE in
+// `candle_gen::vae_tiling` (sc-9006 / F-026, de-duped from the byte-near-identical wan/ltx copies);
+// this module supplies only the LTX-specific cost CONSTANTS, the spatial+temporal candidate grid, and
+// the cost model. The tile geometry itself is pure gen-core (`gen_core::tiling`), byte-identical to
+// the mlx side.
 
 const GIB_F64: f64 = 1024.0 * 1024.0 * 1024.0;
+/// Env override read by the shared [`vae_tiling::safe_budget_gib`] resolver.
+const LTX_VAE_BUDGET_ENV: &str = "LTX_VAE_BUDGET_GIB";
 /// Fraction of total VRAM treated as safe (matches the mlx 0.85 + candle-gen-seedvr2 convention).
 const LTX_VAE_BUDGET_SAFE_FRAC: f64 = 0.85;
 /// Fallback budget when neither the env override nor `nvidia-smi` yields a value.
@@ -376,17 +313,11 @@ fn estimated_ltx_decode_peak_gib(
 /// [`candle_gen::gpu::nvidia_smi_min_total_gib`] — an absolute System32/CUDA_PATH binary, never a bare
 /// `PATH` lookup; sc-9014 / F-030) → [`LTX_VAE_DEFAULT_BUDGET_GIB`].
 pub fn ltx_vae_safe_budget_gib() -> f64 {
-    if let Ok(raw) = std::env::var("LTX_VAE_BUDGET_GIB") {
-        if let Ok(gib) = raw.trim().parse::<f64>() {
-            if gib > 0.0 {
-                return gib;
-            }
-        }
-    }
-    match candle_gen::gpu::nvidia_smi_min_total_gib() {
-        Some(total) => total * LTX_VAE_BUDGET_SAFE_FRAC,
-        None => LTX_VAE_DEFAULT_BUDGET_GIB,
-    }
+    vae_tiling::safe_budget_gib(
+        LTX_VAE_BUDGET_ENV,
+        LTX_VAE_BUDGET_SAFE_FRAC,
+        LTX_VAE_DEFAULT_BUDGET_GIB,
+    )
 }
 
 /// **Memory-budgeted** tiling for the LTX VAE decode — routes the shared [`budgeted_plan`] selector
@@ -407,12 +338,15 @@ fn plan_ltx_tiling(
     out_frames: i32,
     safe_gib: f64,
 ) -> Result<Option<TilingConfig>> {
+    // Shared budgeted selector + error mapping (sc-9006 / F-026); ltx-specific: the spatial+temporal
+    // candidate grid and the `estimated_ltx_decode_peak_gib` cost model.
     let candidates = TileCandidates {
         spatial_px: &LTX_VAE_SPATIAL_PX,
         spatial_overlap_px: 64,
         temporal: &LTX_VAE_TEMPORAL_FR,
     };
-    budgeted_plan(
+    vae_tiling::plan_tiling(
+        "ltx vae decode",
         height,
         width,
         out_frames,
@@ -420,24 +354,6 @@ fn plan_ltx_tiling(
         candidates,
         estimated_ltx_decode_peak_gib,
     )
-    .map_err(|e| match e {
-        TilingBudgetError::AccumulatorsExceedBudget {
-            projected_gib,
-            safe_gib,
-        } => Error::Msg(format!(
-            "ltx vae decode: assembling a {width}×{height}×{out_frames} video needs ~{projected_gib:.0} \
-             GB just for the output buffers, over the ~{safe_gib:.0} GB safe VRAM budget. Reduce the \
-             resolution or frame count."
-        )),
-        TilingBudgetError::SmallestTileExceedsBudget {
-            projected_gib,
-            safe_gib,
-        } => Error::Msg(format!(
-            "ltx vae decode: a {width}×{height}×{out_frames} video peaks at ~{projected_gib:.0} GB even \
-             with the smallest tile, over the ~{safe_gib:.0} GB safe VRAM budget. Reduce the resolution \
-             or frame count."
-        )),
-    })
 }
 
 #[cfg(test)]

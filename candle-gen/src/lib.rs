@@ -73,6 +73,13 @@ pub use sampler::{
 pub mod seed;
 pub use seed::{image_seed, seeded_noise_nchw, seeded_normal_vec, STEP_RNG_SALT};
 
+// Shared budgeted video-VAE tiling machinery (sc-9006 / F-026): the tile/narrow/blend/pad-accumulate/
+// normalize DRIVER + the `<PREFIX>_VAE_BUDGET_GIB` budget resolver + the budgeted-plan selector that
+// were copied byte-near-identically between candle-gen-wan (z48 vae22) and candle-gen-ltx. The pure
+// tile GEOMETRY stays in `gen_core::tiling`; this module owns the candle-side execution of a plan,
+// parameterized by each VAE's cost model + decode closure so the per-VAE numerics are unchanged.
+pub mod vae_tiling;
+
 use thiserror::Error;
 
 /// The candle-backed crate error. gen-core cannot name candle types, so device/tensor failures
