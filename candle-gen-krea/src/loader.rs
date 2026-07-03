@@ -64,7 +64,7 @@ impl Weights {
             device: device.clone(),
             dtype,
             overlay: HashMap::new(),
-            packed: read_packed_config(dir),
+            packed: read_packed_config(dir)?,
         })
     }
 
@@ -188,13 +188,36 @@ impl Weights {
     }
 }
 
-/// Read `{dir}/config.json`'s `quantization` block, `None` when absent/unreadable (a dense tier — a
-/// single-file fixture with no `config.json` still loads dense). Mirrors boogu's `read_packed_config`
+/// Read `{dir}/config.json`'s `quantization` block: `Ok(Some(cfg))` for a packed tier, `Ok(None)` for
+/// a dense tier (a genuinely-absent `config.json` — a single-file fixture — still loads dense).
+///
+/// A **present-but-corrupt** `config.json` (I/O error or malformed JSON — e.g. a partial download)
+/// returns an `Err` naming the file rather than silently swallowing to the dense path, so a damaged
+/// packed snapshot surfaces instead of loading the wrong (dense) tier with no diagnostic (sc-9426,
+/// F-073 sibling — the `component_is_packed` twin in flux2). Mirrors boogu's `read_packed_config`
 /// (sc-9410) and z-image's `component_is_packed` (sc-9408).
-fn read_packed_config(dir: &Path) -> Option<PackedConfig> {
-    let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    PackedConfig::from_config(&v)
+fn read_packed_config(dir: &Path) -> Result<Option<PackedConfig>> {
+    let path = dir.join("config.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        // No config.json at all → legitimate dense / single-file fixture tier.
+        Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // Present but unreadable (permissions, partial download) → surface, don't swallow.
+        Err(e) => {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea: read {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    // Present but malformed JSON → corrupt snapshot, error rather than fall to dense.
+    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        candle_gen::candle_core::Error::Msg(format!(
+            "krea: parse {} (corrupt snapshot?): {e}",
+            path.display()
+        ))
+    })?;
+    Ok(PackedConfig::from_config(&v))
 }
 
 /// Reconstruct the **dense** f32 grid a packed triple (`{base}.weight` u32 codes + `.scales` +
@@ -565,5 +588,60 @@ mod tests {
         assert_eq!(dev_max, 0.0, "dense tier base is the on-disk weight");
         std::fs::remove_dir_all(&ddir).ok();
         Ok(())
+    }
+
+    /// `read_packed_config` distinguishes absent-vs-corrupt (sc-9426, F-073 sibling — the flux2
+    /// `component_is_packed` twin): a `quantization` block → packed `Some`, a plain config or a
+    /// genuinely-absent `config.json` → dense `None` (unchanged), but a *present-but-corrupt*
+    /// `config.json` (malformed JSON, e.g. a partial download) errors loudly naming the file instead
+    /// of silently swallowing to the dense path.
+    #[test]
+    fn read_packed_config_absent_vs_corrupt() {
+        let dir = std::env::temp_dir().join(format!("sc9426_krea_cfg_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A `quantization` block → packed tier.
+        let packed = dir.join("packed");
+        std::fs::create_dir_all(&packed).unwrap();
+        std::fs::write(
+            packed.join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+        )
+        .unwrap();
+        assert!(
+            read_packed_config(&packed).unwrap().is_some(),
+            "a `quantization` block ⇒ packed tier"
+        );
+
+        // A plain config with no `quantization` block → dense.
+        let dense = dir.join("dense");
+        std::fs::create_dir_all(&dense).unwrap();
+        std::fs::write(dense.join("config.json"), r#"{"hidden_size": 6144}"#).unwrap();
+        assert!(
+            read_packed_config(&dense).unwrap().is_none(),
+            "no `quantization` block ⇒ dense tier"
+        );
+
+        // No `config.json` at all → dense (single-file fixtures still load).
+        let absent = dir.join("absent");
+        std::fs::create_dir_all(&absent).unwrap();
+        assert!(
+            read_packed_config(&absent).unwrap().is_none(),
+            "absent config.json ⇒ dense (unchanged)"
+        );
+
+        // A config.json that is *present but corrupt* (malformed JSON) → error naming the file, NOT a
+        // silent dense fallback.
+        let corrupt = dir.join("corrupt");
+        std::fs::create_dir_all(&corrupt).unwrap();
+        std::fs::write(corrupt.join("config.json"), b"{ not json").unwrap();
+        let err = read_packed_config(&corrupt)
+            .expect_err("corrupt config.json must error, not fall to dense");
+        assert!(
+            format!("{err}").contains("config.json"),
+            "the error should name the offending file, got: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
