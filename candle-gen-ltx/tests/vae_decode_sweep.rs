@@ -108,6 +108,8 @@ fn ltx_vae_decode_sweep() {
 
     let dev = Device::new_cuda(gpu).expect("cuda device");
     // mmap the dense checkpoint as f32 (VAE_DTYPE); only the `vae.*` keys are realized below.
+    // SAFETY: mmap of a read-only, process-owned weight file resolved from our snapshot; not mutated
+    // behind the mapping — the standard candle loading path.
     let vb = unsafe {
         VarBuilder::from_mmaped_safetensors(&[&ckpt], DType::F32, &dev)
             .expect("mmap LTX checkpoint")
