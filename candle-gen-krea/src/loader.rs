@@ -462,8 +462,9 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
     }
     // (1.5) INT8-ConvRot (sc-9300): a ConvRot checkpoint whose native `{base}.weight_scale` sibling is
     // present → build a per-output-channel int8 projection straight from the stored int8 codes + row
-    // scale. The rotation is folded into the codes offline (no online Hadamard). Detect on the *native*
-    // base derived from the diffusers `{base}.weight` remap.
+    // scale. Detect on the *native* base derived from the diffusers `{base}.weight` remap. NB the stored
+    // codes are a *rotated* weight R·W; this arm does the correct int8 X·(R·W)ᵀ but reconstructing X·Wᵀ
+    // needs the online x·R leg that is NOT applied here (the sc-9300 A/B NO-GO; follow-up sc-9601).
     if w.is_convrot() {
         if let Some(native_weight) = convrot_diffusers_to_native(&weight_key) {
             if let Some(native_base) = native_weight.strip_suffix(".weight") {
