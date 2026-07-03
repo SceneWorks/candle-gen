@@ -26,72 +26,14 @@
 //! deterministic overlay resolution — it must pick the Union file, not a Tile-lite sibling), then run
 //! `control_validate::real_weight_control_base -- --ignored --nocapture`.
 
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::Progress;
+use candle_gen::testkit::{env_path, mean_abs_diff, read_ppm, write_ppm};
 
 use crate::control::{ZImageControl, ZImageControlPaths, ZImageControlRequest};
-
-fn env_path(key: &str) -> PathBuf {
-    PathBuf::from(std::env::var(key).unwrap_or_else(|_| panic!("set {key}")))
-}
-
-/// Minimal P6 PPM reader (tolerant of a single comment line).
-fn read_ppm(path: &Path) -> Image {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let mut i = 0usize;
-    let mut tok = || -> String {
-        loop {
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            if i < bytes.len() && bytes[i] == b'#' {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            } else {
-                break;
-            }
-        }
-        let start = i;
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        String::from_utf8_lossy(&bytes[start..i]).to_string()
-    };
-    assert_eq!(tok(), "P6", "not a binary PPM");
-    let w: usize = tok().parse().expect("ppm width");
-    let h: usize = tok().parse().expect("ppm height");
-    let _max: usize = tok().parse().expect("ppm maxval");
-    i += 1;
-    let pixels = bytes[i..i + w * h * 3].to_vec();
-    Image {
-        width: w as u32,
-        height: h as u32,
-        pixels,
-    }
-}
-
-fn write_ppm(path: &Path, img: &Image) {
-    let mut out = format!("P6\n{} {}\n255\n", img.width, img.height).into_bytes();
-    out.extend_from_slice(&img.pixels);
-    std::fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-}
-
-/// Mean absolute per-pixel difference (0..255) between two same-size images.
-fn mean_abs_diff(a: &Image, b: &Image) -> f32 {
-    assert_eq!(a.pixels.len(), b.pixels.len());
-    let sum: u64 = a
-        .pixels
-        .iter()
-        .zip(&b.pixels)
-        .map(|(x, y)| (*x as i32 - *y as i32).unsigned_abs() as u64)
-        .sum();
-    sum as f32 / a.pixels.len() as f32
-}
 
 #[test]
 #[ignore = "real-weight GPU validation; set ZIMG_CTRL_BASE/ZIMG_CTRL_NET/ZIMG_CTRL_POSE/ZIMG_CTRL_OUT"]

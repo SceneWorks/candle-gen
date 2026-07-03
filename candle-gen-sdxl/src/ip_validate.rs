@@ -20,7 +20,7 @@
 //! cargo test -p candle-gen-sdxl --features cuda --release ip_validate::real_weight -- --ignored --nocapture
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -28,60 +28,15 @@ use candle_core::DType;
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{Image, Progress};
+// The sdxl-local `cosine` is a BARE dot product (inputs are already L2-normalized by
+// `ClipMetric::feature`), so map it to the shared `cosine_dot` — NOT `cosine`, which would
+// re-normalize and change the metric.
+use candle_gen::testkit::{cosine_dot as cosine, env_path, read_ppm, write_ppm};
 
 use crate::ip_adapter::preprocess_clip_image_sized;
 use crate::ip_provider::{IpAdapterSdxl, IpAdapterSdxlPaths, IpAdapterSdxlRequest};
 use crate::vision_encoder::{ClipVisionEncoder, VisionConfig};
 use crate::weights::Weights;
-
-fn env_path(key: &str) -> PathBuf {
-    PathBuf::from(std::env::var(key).unwrap_or_else(|_| panic!("set {key}")))
-}
-
-/// Minimal P6 PPM reader (binary `P6\n<w> <h>\n<max>\n<rgb bytes>`), tolerant of a single comment line
-/// and arbitrary header whitespace — enough for hand-prepared reference images (the `image` dep here is
-/// built codec-less).
-fn read_ppm(path: &Path) -> Image {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let mut i = 0usize;
-    let mut tok = || -> String {
-        // skip whitespace + comments
-        loop {
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            if i < bytes.len() && bytes[i] == b'#' {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            } else {
-                break;
-            }
-        }
-        let start = i;
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        String::from_utf8_lossy(&bytes[start..i]).to_string()
-    };
-    assert_eq!(tok(), "P6", "not a binary PPM");
-    let w: usize = tok().parse().expect("ppm width");
-    let h: usize = tok().parse().expect("ppm height");
-    let _max: usize = tok().parse().expect("ppm maxval");
-    i += 1; // single whitespace after maxval, before the pixel block
-    let pixels = bytes[i..i + w * h * 3].to_vec();
-    Image {
-        width: w as u32,
-        height: h as u32,
-        pixels,
-    }
-}
-
-fn write_ppm(path: &Path, img: &Image) {
-    let mut out = format!("P6\n{} {}\n255\n", img.width, img.height).into_bytes();
-    out.extend_from_slice(&img.pixels);
-    std::fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-}
 
 /// A standalone CLIP ViT-H feature extractor for the cosine metric (independent of the model's private
 /// encoder): preprocess → penultimate → mean-pool over tokens → L2-normalize. Returns a 1280-vec.
@@ -126,10 +81,6 @@ impl ClipMetric {
         let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
         v.iter().map(|x| x / norm).collect()
     }
-}
-
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
 /// Drive the real SDXL IP-Adapter stack: a with-IP vs no-IP ablation (the IP run must score a higher

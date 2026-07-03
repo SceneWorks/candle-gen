@@ -15,7 +15,7 @@
 //! temporal axis is already memory-bounded — the per-tile activation spike scales with one output
 //! *frame's* area (`tile_h·tile_w`), not the whole tile's volume. The sweep therefore tiles **only the
 //! spatial axes** and reports `bytes_per_frame_px` (fits `FRAME`) alongside `bytes_per_out_vox`
-//! (bounds `ACCUM`). Peak is sampled device-wide via `nvidia-smi` (see `common/gpu_peak.rs`).
+//! (bounds `ACCUM`). Peak is sampled device-wide via `nvidia-smi` (see `candle_gen::testkit`).
 //!
 //! ```text
 //! set CUDA_VISIBLE_DEVICES=0
@@ -34,11 +34,9 @@ use std::time::Instant;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::tiling::TilingConfig;
+use candle_gen::testkit::{used_mib, PeakSampler};
 use candle_gen_wan::config::VaeConfig;
 use candle_gen_wan::vae::{auto_tiling_budgeted_wan22, WanVae};
-
-#[path = "common/gpu_peak.rs"]
-mod gpu_peak;
 
 fn env_usize(var: &str, default: usize) -> usize {
     std::env::var(var)
@@ -134,14 +132,14 @@ fn wan_z48_vae_decode_sweep() {
     };
     let frame_px = tile_h * tile_w;
 
-    let baseline_mib = gpu_peak::used_mib(gpu).unwrap_or(0);
+    let baseline_mib = used_mib(gpu).unwrap_or(0);
     println!(
         "\n=== wan z48 sweep [gpu {gpu}]: out {out_w}x{out_h}x{out_f}  latent[z48,T{t_lat},{h_lat},{w_lat}]  \
          tiled={}  cfg={cfg:?}  baseline={baseline_mib} MiB ===",
         cfg.is_some(),
     );
 
-    let sampler = gpu_peak::PeakSampler::start(gpu);
+    let sampler = PeakSampler::start(gpu);
     let t = Instant::now();
     let video = match &cfg {
         Some(c) => vae.decode_tiled(&latent, c).unwrap(),

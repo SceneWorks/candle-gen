@@ -27,47 +27,58 @@ use candle_gen_flux2::convert_and_assemble;
 use candle_gen_flux2::transformer::Flux2Transformer;
 
 /// Base FLUX.2-klein-9B diffusers snapshot (env `CANDLE_FLUX2_SNAPSHOT` or the HF cache).
+///
+/// F-069/F-071 (sc-9055/sc-9057): the HF-cache roots come from the shared
+/// [`candle_gen::testkit::hf_cache_roots`] so this honours `$HF_HUB_CACHE` / `$HF_HOME` (not just the
+/// Unix `$HOME/.cache` default). The base-specific `transformer/` predicate is kept.
 fn base_snapshot() -> PathBuf {
     if let Ok(p) = std::env::var("CANDLE_FLUX2_SNAPSHOT") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .expect("USERPROFILE/HOME");
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-9B/snapshots");
-    std::fs::read_dir(&snaps)
-        .expect("base snapshot dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir() && p.join("transformer").is_dir())
-        .expect("a base snapshot dir with transformer/")
+    for snaps in candle_gen::testkit::hf_cache_roots()
+        .into_iter()
+        .map(|r| r.join("models--black-forest-labs--FLUX.2-klein-9B/snapshots"))
+    {
+        let Ok(revs) = std::fs::read_dir(&snaps) else {
+            continue;
+        };
+        if let Some(dir) = revs
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.is_dir() && p.join("transformer").is_dir())
+        {
+            return dir;
+        }
+    }
+    panic!("no base FLUX.2-klein-9B snapshot with transformer/ under any HF cache root")
 }
 
 /// wikeeyang true_v2 single-file transformer, bf16 (env `CANDLE_FLUX2_TRUE_V2_FILE` or the HF cache).
 /// This is the exact file the SceneWorks manifest's `convertSourceFile` targets.
+///
+/// F-069/F-071: HF-cache roots via the shared [`candle_gen::testkit::hf_cache_roots`] (honours
+/// `$HF_HUB_CACHE` / `$HF_HOME`). The specific `*-bf16.safetensors` filename predicate is kept.
 fn true_v2_bf16_file() -> PathBuf {
     if let Ok(p) = std::env::var("CANDLE_FLUX2_TRUE_V2_FILE") {
         return PathBuf::from(p);
     }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .expect("USERPROFILE/HOME");
-    let snaps = PathBuf::from(home)
-        .join(".cache/huggingface/hub/models--wikeeyang--Flux2-Klein-9B-True-V2/snapshots");
-    let snap = std::fs::read_dir(&snaps)
-        .expect("true_v2 snapshot dir")
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| p.is_dir())
-        .expect("a true_v2 snapshot dir");
-    let file = snap.join("Flux2-Klein-9B-True-v2-bf16.safetensors");
-    assert!(
-        file.is_file(),
-        "missing bf16 single file: {}",
-        file.display()
-    );
-    file
+    for snaps in candle_gen::testkit::hf_cache_roots()
+        .into_iter()
+        .map(|r| r.join("models--wikeeyang--Flux2-Klein-9B-True-V2/snapshots"))
+    {
+        let Ok(revs) = std::fs::read_dir(&snaps) else {
+            continue;
+        };
+        for snap in revs.filter_map(|e| e.ok()).map(|e| e.path()) {
+            let file = snap.join("Flux2-Klein-9B-True-v2-bf16.safetensors");
+            if file.is_file() {
+                return file;
+            }
+        }
+    }
+    panic!(
+        "missing wikeeyang true_v2 Flux2-Klein-9B-True-v2-bf16.safetensors under any HF cache root"
+    )
 }
 
 #[test]

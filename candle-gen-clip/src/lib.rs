@@ -323,46 +323,14 @@ mod tests {
 
     /// Resolve the cached `openai/clip-vit-large-patch14` snapshot dir from the HF Hub cache.
     ///
-    /// F-071 (sc-9057): the earlier resolution hard-coded `$HOME/.cache/huggingface`, a Unix
-    /// assumption — on the Windows-primary dev box `HOME` is often unset and the cache lives at
-    /// `D:\.cache\huggingface` (`HF_HOME`). Match the established repo pattern
-    /// (`candle-gen-sensenova`'s `hf_cache_distill_lora`): honour `$HF_HUB_CACHE`, then
-    /// `$HF_HOME/hub`, then the user-home `.cache/huggingface/hub` default (`USERPROFILE` on
-    /// Windows, `HOME` elsewhere). Returns the first `snapshots/<rev>/` subdir that exists.
+    /// F-071 (sc-9057) + F-069 (sc-9055): the earlier resolution hard-coded `$HOME/.cache/huggingface`,
+    /// a Unix assumption — on the Windows-primary dev box `HOME` is often unset and the cache lives at
+    /// `D:\.cache\huggingface` (`HF_HOME`). This now routes onto the single shared resolver
+    /// [`candle_gen::testkit::require_hf_snapshot_dir`], which honours `$HF_HUB_CACHE`, then
+    /// `$HF_HOME/hub`, then the user-home `.cache/huggingface/hub` default (`USERPROFILE` on Windows,
+    /// `HOME` elsewhere), returning the first `snapshots/<rev>/` subdir that exists.
     fn clip_snapshot_dir() -> PathBuf {
-        let repo_dir = "models--openai--clip-vit-large-patch14";
-        let mut roots: Vec<PathBuf> = Vec::new();
-        if let Ok(c) = std::env::var("HF_HUB_CACHE") {
-            roots.push(PathBuf::from(c));
-        }
-        if let Ok(h) = std::env::var("HF_HOME") {
-            roots.push(PathBuf::from(h).join("hub"));
-        }
-        for home_var in ["USERPROFILE", "HOME"] {
-            if let Ok(home) = std::env::var(home_var) {
-                roots.push(PathBuf::from(home).join(".cache/huggingface/hub"));
-            }
-        }
-        assert!(
-            !roots.is_empty(),
-            "no HF cache root: set HF_HOME (or HF_HUB_CACHE / USERPROFILE / HOME)"
-        );
-        for snapshots in roots.iter().map(|r| r.join(repo_dir).join("snapshots")) {
-            let Ok(revs) = std::fs::read_dir(&snapshots) else {
-                continue;
-            };
-            if let Some(dir) = revs
-                .filter_map(std::result::Result::ok)
-                .map(|e| e.path())
-                .find(|p| p.is_dir())
-            {
-                return dir;
-            }
-        }
-        panic!(
-            "clip snapshot not cached: no models--openai--clip-vit-large-patch14/snapshots/<rev> \
-             under any HF cache root (HF_HUB_CACHE / HF_HOME/hub / <home>/.cache/huggingface/hub)"
-        );
+        candle_gen::testkit::require_hf_snapshot_dir("openai/clip-vit-large-patch14")
     }
 
     #[test]

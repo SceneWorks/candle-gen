@@ -25,54 +25,17 @@
 //! destabilizes InstantID's strong conditioning collapses the face toward 0 / undetectable. The mlx
 //! baseline lands euler/heun ~0.79, dpmpp_2m ~0.63.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use candle_gen::gen_core::{Image, WeightsSource};
+use candle_gen::testkit::{cosine, env_path, read_ppm};
 use candle_gen_instantid::{letterbox, InstantId, InstantIdPaths, InstantIdRequest};
-
-/// A required env path (panics with a clear message if unset — this test is opt-in).
-fn env_path(key: &str) -> PathBuf {
-    PathBuf::from(std::env::var(key).unwrap_or_else(|_| panic!("set ${key} (see the module docs)")))
-}
 
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
-}
-
-/// Minimal P6 (binary) PPM reader — the `image` dep here is built without codecs, so the harness owns
-/// image IO (same as `src/validate.rs`). Parses `P6 <w> <h> <maxval>` then `w*h*3` raw RGB bytes.
-fn read_ppm(path: &Path) -> Image {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    assert_eq!(&bytes[0..2], b"P6", "{} is not a P6 PPM", path.display());
-    let mut nums = [0usize; 3];
-    let mut n = 0;
-    let mut i = 2usize;
-    while n < 3 {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let start = i;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-        nums[n] = std::str::from_utf8(&bytes[start..i])
-            .unwrap()
-            .parse()
-            .unwrap();
-        n += 1;
-    }
-    let (w, h, maxval) = (nums[0], nums[1], nums[2]);
-    assert_eq!(maxval, 255, "only 8-bit PPM supported");
-    let pixels = bytes[i + 1..].to_vec(); // one whitespace byte after maxval, then raw RGB
-    assert_eq!(pixels.len(), w * h * 3, "PPM body size mismatch");
-    Image {
-        width: w as u32,
-        height: h as u32,
-        pixels,
-    }
 }
 
 /// Optional P6 PPM dump (set `IID_OUT` to a dir) so a failing run can be eyeballed — the same escape
@@ -86,14 +49,6 @@ fn dump_ppm(img: &Image, name: &str) {
     let mut out = format!("P6\n{} {}\n255\n", img.width, img.height).into_bytes();
     out.extend_from_slice(&img.pixels);
     let _ = std::fs::write(path, out);
-}
-
-/// Cosine similarity of two (un-normalized) ArcFace embeddings.
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f64 = a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum();
-    let na: f64 = a.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-    let nb: f64 = b.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-    (dot / (na * nb + 1e-12)) as f32
 }
 
 #[test]

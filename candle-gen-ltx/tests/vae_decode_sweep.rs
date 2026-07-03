@@ -33,11 +33,9 @@ use std::time::Instant;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::tiling::{SpatialTiling, TemporalTiling, TilingConfig};
+use candle_gen::testkit::{used_mib, PeakSampler};
 use candle_gen_ltx::config::LATENT_CHANNELS;
 use candle_gen_ltx::vae::{auto_tiling_budgeted_ltx, LtxVideoVae};
-
-#[path = "common/gpu_peak.rs"]
-mod gpu_peak;
 
 fn env_usize(var: &str, default: usize) -> usize {
     std::env::var(var)
@@ -181,14 +179,14 @@ fn ltx_vae_decode_sweep() {
     };
     let tile_vox = tile_f * tile_h * tile_w;
 
-    let baseline_mib = gpu_peak::used_mib(gpu).unwrap_or(0);
+    let baseline_mib = used_mib(gpu).unwrap_or(0);
     println!(
         "\n=== ltx sweep [gpu {gpu}]: out {out_w}x{out_h}x{out_f}  latent[z{LATENT_CHANNELS},T{t_lat},{h_lat},{w_lat}]  \
          tiled={}  cfg={cfg:?}  baseline={baseline_mib} MiB ===",
         cfg.is_some(),
     );
 
-    let sampler = gpu_peak::PeakSampler::start(gpu);
+    let sampler = PeakSampler::start(gpu);
     let t = Instant::now();
     let video = match &cfg {
         Some(c) => vae.decode_tiled(&latent, c).unwrap(),

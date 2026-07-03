@@ -26,9 +26,8 @@
 //! The default path itself stays byte-exact (covered by the unit gates); here we prove the curated route
 //! is wired through the conditioning and behaves.
 
-use std::path::PathBuf;
-
 use candle_gen::gen_core::{Image, Progress};
+use candle_gen::testkit::env_path_opt as env_path;
 use candle_gen_kolors::{
     IpAdapterKolors, IpAdapterKolorsPaths, IpAdapterKolorsRequest, KolorsControl,
     KolorsControlPaths, KolorsControlRequest,
@@ -39,10 +38,6 @@ const STEPS: usize = 8;
 const SEED: u64 = 7;
 const PROMPT: &str = "a person standing in a sunlit park, photorealistic, sharp focus, high detail";
 const NEGATIVE: &str = "lowres, blurry, deformed, disfigured, cartoon, painting";
-
-fn env_path(key: &str) -> Option<PathBuf> {
-    std::env::var(key).ok().map(PathBuf::from)
-}
 
 /// A deterministic synthetic RGB8 image (pose skeleton / reference stand-in). The conditioning
 /// *adherence* numbers would only be meaningful with real images, but the coherence + distinctness gate

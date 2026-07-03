@@ -40,6 +40,10 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 [features]
 # Default works on Mac with NO extra features: candle-core defaults to the CPU backend.
 default = []
+# Test-support helpers (sc-9055 / F-069): the shared `testkit` module (PPM IO / cosine / env-path /
+# GPU peak-VRAM / HF-cache resolution). Test-only — provider crates enable it under
+# `[dev-dependencies]` (or a test-only feature) so it never compiles into a production build.
+testkit = []
 # Apple Metal GPU backend — builds on Mac. NOT in `default` so the plain `cargo check` stays CPU.
 metal = ["candle-core/metal", "candle-nn/metal"]
 # NVIDIA CUDA backend (Windows target). MUST NOT be in `default` — it needs the CUDA toolkit and

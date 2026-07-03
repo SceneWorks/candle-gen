@@ -15,56 +15,14 @@
 //! cargo test -p candle-gen-qwen-image --features cuda --release vision_validate::real_weight -- --ignored --nocapture
 //! ```
 
-use std::path::{Path, PathBuf};
-
 use candle_gen::candle_core::Tensor;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
-use candle_gen::gen_core::Image;
+use candle_gen::testkit::{env_path, read_ppm};
 
 use crate::config::TextEncoderConfig;
 use crate::image_processor::{ImageInput, QwenImageProcessor};
 use crate::vision_language::load_vision_language_encoder;
 use crate::vl_tokenizer::{preprocess_edit_image, tokenize_edit_text};
-
-fn env_path(key: &str) -> PathBuf {
-    PathBuf::from(std::env::var(key).unwrap_or_else(|_| panic!("set {key}")))
-}
-
-/// Minimal P6 PPM reader (tolerant of a single comment line).
-fn read_ppm(path: &Path) -> Image {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let mut i = 0usize;
-    let mut tok = || -> String {
-        loop {
-            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            if i < bytes.len() && bytes[i] == b'#' {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            } else {
-                break;
-            }
-        }
-        let start = i;
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        String::from_utf8_lossy(&bytes[start..i]).to_string()
-    };
-    assert_eq!(tok(), "P6", "not a binary PPM");
-    let w: usize = tok().parse().expect("ppm width");
-    let h: usize = tok().parse().expect("ppm height");
-    let _max: usize = tok().parse().expect("ppm maxval");
-    i += 1;
-    let pixels = bytes[i..i + w * h * 3].to_vec();
-    Image {
-        width: w as u32,
-        height: h as u32,
-        pixels,
-    }
-}
 
 /// `(mean, std)` of a tensor's f32 values.
 fn stats(t: &Tensor) -> (f32, f32) {

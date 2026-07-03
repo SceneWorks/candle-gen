@@ -22,81 +22,22 @@
 
 #![cfg(test)]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{Image, Progress, WeightsSource};
+use candle_gen::testkit::{cosine, env_path, read_ppm, write_ppm};
 use candle_gen::CandleError;
 
 use crate::model::{InstantId, InstantIdPaths, InstantIdRequest};
 use crate::openpose::BodyPoint;
 
-/// A required env path (panics with a clear message if unset — these tests are opt-in).
-fn env_path(key: &str) -> PathBuf {
-    PathBuf::from(
-        std::env::var(key).unwrap_or_else(|_| panic!("set ${key} (see validate.rs module docs)")),
-    )
-}
-
 /// An optional env path.
 fn env_opt(key: &str) -> Option<PathBuf> {
     std::env::var(key).ok().map(PathBuf::from)
-}
-
-/// Minimal P6 (binary) PPM reader — the harness owns image IO since the `image` dep here is built
-/// without codecs. Parses `P6 <w> <h> <maxval>` (whitespace-separated) then `w*h*3` raw RGB bytes.
-fn read_ppm(path: &Path) -> Image {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    assert_eq!(&bytes[0..2], b"P6", "{} is not a P6 PPM", path.display());
-    // Tokenize the three ASCII header numbers starting after the magic.
-    let mut nums = [0usize; 3];
-    let mut n = 0;
-    let mut i = 2usize;
-    while n < 3 {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let start = i;
-        while i < bytes.len() && bytes[i].is_ascii_digit() {
-            i += 1;
-        }
-        nums[n] = std::str::from_utf8(&bytes[start..i])
-            .unwrap()
-            .parse()
-            .unwrap();
-        n += 1;
-    }
-    let (w, h, maxval) = (nums[0], nums[1], nums[2]);
-    assert_eq!(maxval, 255, "only 8-bit PPM supported");
-    let pixels = bytes[i + 1..].to_vec(); // single whitespace byte after maxval, then raw RGB
-    assert_eq!(pixels.len(), w * h * 3, "PPM body size mismatch");
-    Image {
-        width: w as u32,
-        height: h as u32,
-        pixels,
-    }
-}
-
-/// Write a P6 PPM (converted to PNG out-of-band for viewing).
-fn write_ppm(path: &Path, img: &Image) {
-    let mut out = format!("P6\n{} {}\n255\n", img.width, img.height).into_bytes();
-    out.extend_from_slice(&img.pixels);
-    std::fs::write(path, out).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-}
-
-/// Cosine similarity of two equal-length embeddings (ArcFace embeddings are not pre-normalized).
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if na == 0.0 || nb == 0.0 {
-        0.0
-    } else {
-        dot / (na * nb)
-    }
 }
 
 /// Re-embed the largest face in `img` and report its cosine to `ref_emb`. Returns `-1.0` (with a
