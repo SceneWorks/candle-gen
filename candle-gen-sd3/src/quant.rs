@@ -4,7 +4,9 @@
 //!
 //! - **Packed tier (sc-9414, the fast path).** The hosted `SceneWorks/sd3.5-*-mlx` q4/q8 tiers store
 //!   each quantized DiT `Linear` as the MLX packed triple (`{base}.weight` u32 codes, `{base}.scales`,
-//!   `{base}.biases`; group size 64, the MLX default the shared loaders assume). [`QLinear::linear_detect`]
+//!   `{base}.biases`; group size 64, the MLX default the shared loaders assume — the pipeline asserts the
+//!   parsed `quantization.group_size == 64` before taking this path so a future group-32 tier fails LOUD
+//!   rather than silently repacking to garbage, sc-9474). [`QLinear::linear_detect`]
 //!   packed-**detects** the `.scales` sibling and builds the quantized weight **straight from the packed
 //!   parts** on the DiT device via the shared [`candle_gen::quant::lin`] loader (Q4 → `Q4_1` lossless
 //!   repack, Q8 → `Q8_0` requant). **No dense bf16 weight is ever materialized** — the q4 MMDiT lands

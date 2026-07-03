@@ -4,7 +4,9 @@
 //!
 //! - **Packed tier (sc-9413, the fast path).** The hosted `SceneWorks/lens-mlx` / `lens-turbo-mlx`
 //!   q4/q8 tiers store each quantized DiT `Linear` as the MLX packed triple `{base}.weight` (u32
-//!   codes) + `{base}.scales` + `{base}.biases` (group size 64, the default). [`QLinear::linear_detect`]
+//!   codes) + `{base}.scales` + `{base}.biases` (group size 64, the default — the pipeline asserts the
+//!   parsed `quantization.group_size == 64` at load so a future group-32 tier fails LOUD rather than
+//!   silently repacking to garbage through the group-64 shared loaders, sc-9474). [`QLinear::linear_detect`]
 //!   packed-**detects** the `.scales` sibling and builds the quantized weight **straight from the
 //!   packed parts** on the DiT device (Q4 → `Q4_1` lossless repack, Q8 → `Q8_0` requant). **No dense
 //!   bf16 weight is ever materialized** — the q4 DiT lands directly from the packed parts, with no

@@ -196,7 +196,28 @@ impl Pipeline {
         // `quantization` block). Adapters merge into *dense* `transformer/` keys, so an adapter merge is
         // incompatible with a packed tier — fall back to the dense CPU-stage path when adapters are
         // present (the hosted packed tiers ship no LoRA-mergeable dense keys anyway).
-        let packed_tier = self.adapters.is_empty() && self.transformer_is_packed();
+        let packed_cfg = self.transformer_packed_config();
+        let packed_tier = self.adapters.is_empty() && packed_cfg.is_some();
+        // sc-9474: the shared packed loaders (`QLinear::linear_detect` / `linear_detect_dense`) repack
+        // at the MLX default group size 64, which every hosted `sd3.5-*-mlx` tier uses. The parsed
+        // `PackedConfig.group_size` is threaded here as a LOUD guard so a hypothetical future group-32
+        // tier (as boogu's is) fails at load rather than silently repacking to garbage. If a non-64 SD3.5
+        // tier is ever shipped, thread `group_size` through `Sd3Transformer::new` into the `*_gs` shared
+        // entry points (`linear_detect_gs` / `lin_gs`), as candle-gen-boogu (sc-9410) does.
+        if packed_tier {
+            if let Some(cfg) = &packed_cfg {
+                if cfg.group_size != candle_gen::quant::MLX_GROUP_SIZE as i32 {
+                    return Err(CandleError::Msg(format!(
+                        "sd3 packed transformer/ tier declares quantization.group_size = {} but the \
+                         candle-gen-sd3 packed loaders assume the MLX default {} (sc-9474). Thread the \
+                         parsed group_size through Sd3Transformer::new into the shared `*_gs` entry \
+                         points (as candle-gen-boogu does) before loading this tier.",
+                        cfg.group_size,
+                        candle_gen::quant::MLX_GROUP_SIZE,
+                    )));
+                }
+            }
+        }
         let transformer = match self.quant {
             // sc-9414 packed path: build the MMDiT **directly on the GPU** from the MLX-packed tier —
             // each projection packed-detects its `.scales` sibling and lands its Q4_1/Q8_0 footprint
@@ -265,20 +286,22 @@ impl Pipeline {
         candle_gen::mmap_var_builder(&files, self.dtype, device)
     }
 
-    /// Whether the `transformer/` component is a **pre-quantized MLX-packed tier** — its `config.json`
-    /// carries a `quantization` block ([`candle_gen::quant::PackedConfig`]), which the `sd3.5-*-mlx`
-    /// convert job writes for the packed DiT. On a packed tier the loader builds each Linear directly
-    /// from the packed parts on the GPU (sc-9414, no dense CPU staging); on a dense tier it falls back to
-    /// the CPU-stage → quantize-onto-GPU path. Absent/unreadable config → not packed (dense path), so a
-    /// fixture with no `config.json` still loads. (The SD3.5 tier packs at the MLX default group size 64,
-    /// which the shared loaders assume, so only the packed *presence* is consulted here.)
-    fn transformer_is_packed(&self) -> bool {
+    /// The `transformer/` component's parsed [`candle_gen::quant::PackedConfig`] when it is a
+    /// **pre-quantized MLX-packed tier** — its `config.json` carries a `quantization` block, which the
+    /// `sd3.5-*-mlx` convert job writes for the packed DiT. On a packed tier the loader builds each Linear
+    /// directly from the packed parts on the GPU (sc-9414, no dense CPU staging); on a dense tier it falls
+    /// back to the CPU-stage → quantize-onto-GPU path. Absent/unreadable config → `None` (dense path), so
+    /// a fixture with no `config.json` still loads.
+    ///
+    /// The parsed `group_size` is threaded to [`load_components`](Self::load_components), which asserts it
+    /// is the MLX default 64 (the group size the shared packed loaders assume) so a future group-32 tier
+    /// fails LOUD rather than silently repacking to garbage (sc-9474). Every hosted SD3.5 tier packs at 64.
+    fn transformer_packed_config(&self) -> Option<candle_gen::quant::PackedConfig> {
         let path = self.root.join("transformer").join("config.json");
         std::fs::read_to_string(&path)
             .ok()
             .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
             .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
-            .is_some()
     }
 
     /// The DiT [`VarBuilder`] on `device`: the stock mmap build when no adapters are present, else the
@@ -535,6 +558,59 @@ mod tests {
             shifted[mid],
             unshifted[mid]
         );
+    }
+
+    /// **The parsed packed `group_size` is threaded, not discarded** (sc-9474). A `transformer/config.json`
+    /// carrying `quantization: { bits, group_size }` parses into a `PackedConfig` whose `group_size` is the
+    /// on-disk value (32 here, boogu's group size) — proving `transformer_packed_config` no longer throws
+    /// the group size away. A dense config (no `quantization`) parses to `None`, and a default group-64
+    /// pack round-trips to 64. `load_components` uses this to reject a non-64 tier LOUD (the shared SD3.5
+    /// packed loaders assume the MLX default 64).
+    #[test]
+    fn transformer_packed_config_threads_parsed_group_size() {
+        let tmp = std::env::temp_dir().join(format!(
+            "sc9474_sd3_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let tdir = tmp.join("transformer");
+        std::fs::create_dir_all(&tdir).unwrap();
+        let write_cfg = |json: &str| std::fs::write(tdir.join("config.json"), json).unwrap();
+        let pipe = |root: &Path| {
+            Pipeline::load(
+                root,
+                &Device::Cpu,
+                DType::F32,
+                Variant::Large,
+                Some(Quant::Q4),
+                &[],
+            )
+        };
+
+        // group-32 pack: the group size survives the parse (would previously be discarded).
+        write_cfg(r#"{"quantization": {"bits": 4, "group_size": 32}}"#);
+        let cfg32 = pipe(&tmp).transformer_packed_config();
+        assert_eq!(
+            cfg32.map(|c| c.group_size),
+            Some(32),
+            "parsed group_size must be threaded, not discarded"
+        );
+
+        // group-64 (the MLX default every hosted SD3.5 tier uses) round-trips to 64.
+        write_cfg(r#"{"quantization": {"bits": 4, "group_size": 64}}"#);
+        assert_eq!(
+            pipe(&tmp).transformer_packed_config().map(|c| c.group_size),
+            Some(candle_gen::quant::MLX_GROUP_SIZE as i32)
+        );
+
+        // A dense config (no `quantization`) ⇒ None (dense path, no guard).
+        write_cfg(r#"{"in_channels": 16}"#);
+        assert!(pipe(&tmp).transformer_packed_config().is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Turbo's 4-step schedule starts at 1.0 and is strictly decreasing to 0.

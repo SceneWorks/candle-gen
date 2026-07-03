@@ -31,6 +31,10 @@ rand_distr = { workspace = true }
 # merge needs) at inference-side load (sc-5116 LoRA/LoKr merge). Candle's own version (0.7), matching
 # candle-gen, so the `View` impl candle-core provides for `Tensor` is the same one.
 safetensors = "0.7"
+# Parse the packed-tier `quantization: { bits, group_size }` block out of a component `config.json`
+# (sc-9474) — the parsed group size is threaded into a LOUD load-time guard so a future non-64 tier
+# fails rather than silently repacking to garbage. Same workspace pin as candle-gen / candle-gen-sd3.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # The trainer e2e/conformance gates (tests/trainer_*.rs) write tiny PNG datasets and drive the gen-core

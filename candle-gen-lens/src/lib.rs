@@ -152,6 +152,41 @@ impl Pipeline {
         candle_gen::mmap_var_builder(&files, dtype, &self.device)
     }
 
+    /// The parsed [`candle_gen::quant::PackedConfig`] of a snapshot sub-dir's `config.json`, when it is a
+    /// **pre-quantized MLX-packed tier** (its `config.json` carries a `quantization` block). `None` when
+    /// the config is absent/unreadable or dense. Used by [`load_components`](Self::load_components) to
+    /// thread the parsed `group_size` into a LOUD guard (sc-9474): the shared packed loaders
+    /// (`QLinear::linear_detect` for the DiT, `repack_packed_weight` for the encoder experts) repack at
+    /// the MLX default group size 64 that every hosted `SceneWorks/lens-mlx` tier uses, so a hypothetical
+    /// future group-32 tier fails at load rather than silently repacking u32 codes to garbage.
+    fn packed_group_size(&self, sub: &str) -> Option<i32> {
+        let path = self.root.join(sub).join("config.json");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
+            .map(|c| c.group_size)
+    }
+
+    /// Assert a packed component's declared `group_size` is the MLX default 64 the shared packed loaders
+    /// assume (sc-9474). A dense/absent config is `None` and skips the guard. A future non-64 tier must
+    /// thread the parsed group size through the shared `*_gs` entry points (as candle-gen-boogu, sc-9410)
+    /// before it can load.
+    fn guard_packed_group_size(&self, sub: &str) -> CResult<()> {
+        if let Some(gs) = self.packed_group_size(sub) {
+            let default = candle_gen::quant::MLX_GROUP_SIZE as i32;
+            if gs != default {
+                return Err(CandleError::Msg(format!(
+                    "lens {sub}/ packed tier declares quantization.group_size = {gs} but the \
+                     candle-gen-lens packed loaders assume the MLX default {default} (sc-9474). Thread \
+                     the parsed group_size through the shared `*_gs` entry points (as candle-gen-boogu \
+                     does) before loading this tier."
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// The DiT `VarBuilder` with any [`AdapterSpec`]s merged into its weights (sc-5116). With no
     /// adapters this is the stock mmap path; with adapters the `transformer/` shards load into a CPU
     /// map, each LoRA/LoKr delta is folded in ([`adapters::merge_adapters`], f32 math), then the DiT
@@ -174,6 +209,12 @@ impl Pipeline {
     fn load_components(&self) -> CResult<Components> {
         let tokenizer =
             LensTokenizer::from_file(self.root.join("tokenizer").join("tokenizer.json"))?;
+        // sc-9474: both already-quantize→packed conversions below (the encoder MoE experts via
+        // `repack_packed_weight`, the DiT projections via `QLinear::linear_detect`) repack at the MLX
+        // default group size 64. Assert the parsed `quantization.group_size` matches before loading, so a
+        // future group-32 tier (as boogu's is) fails LOUD instead of silently repacking to garbage.
+        self.guard_packed_group_size("text_encoder")?;
+        self.guard_packed_group_size("transformer")?;
         let encoder = GptOssTextEncoder::new_quant(
             &EncoderConfig::gpt_oss_20b(),
             self.component_vb("text_encoder", ENC_DTYPE)?,
@@ -791,6 +832,58 @@ mod integration_tests {
             };
             assert_eq!((def.steps, def.guidance), (steps, g));
         }
+    }
+
+    /// **The parsed packed `group_size` is threaded into a LOUD guard, not discarded** (sc-9474). A
+    /// `transformer/` (or `text_encoder/`) `config.json` carrying `quantization: { bits, group_size }`
+    /// parses to its on-disk group size; the guard passes for the MLX default 64 (every hosted
+    /// `SceneWorks/lens-mlx` tier) and errors for a group-32 tier rather than silently repacking u32 codes
+    /// to garbage through the group-64 shared loaders. A dense/absent config skips the guard.
+    #[test]
+    fn packed_group_size_guard_rejects_non_default() {
+        let root = std::env::temp_dir().join(format!(
+            "sc9474_lens_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let sub_dir = root.join("transformer");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        let write_cfg = |json: &str| std::fs::write(sub_dir.join("config.json"), json).unwrap();
+        let pipe = || Pipeline::load(&root, &Device::Cpu, Vec::new(), Some(Quant::Q4), None);
+
+        // group-64 (the MLX default): the parsed group size survives and the guard passes.
+        write_cfg(r#"{"quantization": {"bits": 4, "group_size": 64}}"#);
+        assert_eq!(
+            pipe().packed_group_size("transformer"),
+            Some(candle_gen::quant::MLX_GROUP_SIZE as i32),
+            "parsed group_size must be threaded, not discarded"
+        );
+        assert!(
+            pipe().guard_packed_group_size("transformer").is_ok(),
+            "group-64 (the default) must pass the guard"
+        );
+
+        // group-32 (boogu's group size): the guard fails LOUD instead of silently repacking to garbage.
+        write_cfg(r#"{"quantization": {"bits": 4, "group_size": 32}}"#);
+        assert_eq!(pipe().packed_group_size("transformer"), Some(32));
+        assert!(
+            pipe().guard_packed_group_size("transformer").is_err(),
+            "a group-32 tier must be rejected LOUD, not silently repacked (sc-9474)"
+        );
+
+        // A dense config (no `quantization`) ⇒ None ⇒ the guard is skipped.
+        write_cfg(r#"{"in_channels": 128}"#);
+        assert!(pipe().packed_group_size("transformer").is_none());
+        assert!(pipe().guard_packed_group_size("transformer").is_ok());
+
+        // An absent config dir ⇒ None ⇒ skipped (a dense snapshot with no packed config still loads).
+        assert!(pipe().packed_group_size("text_encoder").is_none());
+        assert!(pipe().guard_packed_group_size("text_encoder").is_ok());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
