@@ -140,13 +140,25 @@ impl Attention {
             let (kc, ks) = k_rope.unwrap_or((cos, sin));
             kh = apply_split_rope(&kh, kc, ks)?;
         }
-        // Attention in f32.
+        // Attention in f32. i32-overflow guard (sc-9116): the video-DiT self-attn scores `[b,h,s,s]`
+        // reach `i32::MAX` at max_size 1280 / long clips (49 frames → 40·40·7 = 11200 tokens →
+        // `32·11200² ≈ 4.0e9 > i32::MAX`, growing with clip length), silently corrupting the tail rows
+        // on the candle CUDA kernels. The shared budgeted helper chunks over the query rows
+        // (byte-identical for common sizes; cross-attn to the fixed text context is a single un-chunked
+        // pass). Softmax closure preserves the exact fused `softmax_last_dim`.
         let scale = 1.0 / (self.dim_head as f64).sqrt();
         let qf = qh.to_dtype(DType::F32)?.contiguous()?;
         let kf = kh.to_dtype(DType::F32)?.contiguous()?;
         let vf = vh.to_dtype(DType::F32)?.contiguous()?;
-        let scores = (qf.matmul(&kf.transpose(2, 3)?)? * scale)?;
-        let out = softmax_last_dim(&scores)?.matmul(&vf)?; // (b,h,s,d)
+        let out = candle_gen::sdpa_budgeted_bhsd(
+            &qf,
+            &kf,
+            &vf,
+            scale,
+            None,
+            softmax_last_dim,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?; // (b,h,s,d)
         let (b, s, _) = x.dims3()?;
         let inner = self.heads * self.dim_head;
         let mut out = out

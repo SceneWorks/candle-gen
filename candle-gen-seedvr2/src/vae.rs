@@ -127,11 +127,26 @@ impl Attention3d {
         let xn = gn(&xs, &self.gn_w, &self.gn_b, self.groups, self.eps)?
             .transpose(1, 2)?
             .contiguous()?; // [B*T, H*W, C]
-        let q = self.to_q.forward(&xn)?.reshape((b * t, 1, h * wd, c))?;
-        let k = self.to_k.forward(&xn)?.reshape((b * t, 1, h * wd, c))?;
-        let v = self.to_v.forward(&xn)?.reshape((b * t, 1, h * wd, c))?;
+
+        // Single-head full-frame spatial self-attention: q/k/v are `[B*T, H*W, C]`.
+        let q = self.to_q.forward(&xn)?; // [B*T, H*W, C]
+        let k = self.to_k.forward(&xn)?;
+        let v = self.to_v.forward(&xn)?;
         let scale = (c as f64).powf(-0.5);
-        let o = nn::sdpa(&q, &k, &v, scale)?.reshape((b * t, h * wd, c))?;
+        // i32-overflow guard (sc-9116): this is the seedvr2 *VAE* mid-block — FULL-FRAME (not the DiT's
+        // windowed attn), and decode is NOT tiled. seedvr2 is an upscaler (max_size 4096, spatial_scale
+        // 8 → latent side up to 512 → HW up to 262144), so the single-head scores `[B*T, HW, HW]` reach
+        // `262144² ≈ 6.9e10 ≫ i32::MAX` (overflows above ~1650² output), silently corrupting the tail
+        // rows on the candle CUDA kernels. Chunk over the query rows (byte-identical below budget); the
+        // softmax closure matches `nn::sdpa`'s exact fused `softmax_last_dim`.
+        let o = candle_gen::sdpa_budgeted_flat(
+            &q,
+            &k,
+            &v,
+            scale,
+            candle_gen::candle_nn::ops::softmax_last_dim,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?; // [B*T, H*W, C]
         let o = self.to_out.forward(&o)?;
         // back to NCTHW
         let o = o

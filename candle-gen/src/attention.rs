@@ -213,6 +213,30 @@ mod tests {
     }
 
     #[test]
+    fn bhsd_per_query_mask_chunked_matches_single_pass() {
+        // A FULL per-query `[B,1,Sq,Sk]` additive mask (ideogram's `[B,1,L,L]` shape) exercises the
+        // narrow-slice branch: each query chunk must see its OWN mask rows (`narrow(2, start, len)`),
+        // not the whole mask. A mid-size budget (block=3 over s=7 → 3,3,1) forces the multi-row narrow.
+        let dev = Device::Cpu;
+        let (b, h, s, d) = (1usize, 2usize, 7usize, 4usize);
+        let q = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let k = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        let v = Tensor::randn(0f32, 1f32, (b, h, s, d), &dev).unwrap();
+        // Distinct per-(query,key) bias so a wrong (un-narrowed / mis-aligned) slice would diverge.
+        let mask = Tensor::randn(0f32, 1f32, (b, 1, s, s), &dev).unwrap();
+        let sm = |x: &Tensor| softmax_last_dim(x);
+        let single = sdpa_budgeted_bhsd(&q, &k, &v, 0.5, Some(&mask), sm, usize::MAX).unwrap();
+        approx_eq(
+            &single,
+            &sdpa_budgeted_bhsd(&q, &k, &v, 0.5, Some(&mask), sm, 1).unwrap(),
+        );
+        approx_eq(
+            &single,
+            &sdpa_budgeted_bhsd(&q, &k, &v, 0.5, Some(&mask), sm, 42).unwrap(),
+        );
+    }
+
+    #[test]
     fn flat_chunked_matches_single_pass() {
         // The 3-D (heads-folded / single-head VAE) shape, same invariant.
         let dev = Device::Cpu;
