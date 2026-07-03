@@ -106,25 +106,26 @@ impl TemporalDown {
     }
 
     fn reset_cache(&self) {
-        *self.cache.lock().unwrap() = None;
+        // sc-9015 / F-031: recover from a poisoned lock (reset-on-miss streaming cache).
+        *candle_gen::lock_recover(&self.cache) = None;
     }
 
     fn forward(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
         let last = x.narrow(2, x.dim(2)? - 1, 1)?.contiguous()?;
         if ctx.first_chunk {
             // First chunk: passthrough (no temporal downsample), stash the last frame for next chunk.
-            *self.cache.lock().unwrap() = Some(last);
+            // sc-9015 / F-031: recover from a poisoned lock (overwrite-on-miss streaming cache).
+            *candle_gen::lock_recover(&self.cache) = Some(last);
             return Ok(x.clone());
         }
-        let prev = self
-            .cache
-            .lock()
-            .unwrap()
+        // sc-9015 / F-031: recover from a poisoned lock; the `.expect` below is on the cached
+        // `Option`, not the lock (a warmed cache is a real precondition on the non-first chunk).
+        let prev = candle_gen::lock_recover(&self.cache)
             .clone()
             .expect("TemporalDown: non-first chunk needs a warmed cache");
         let xcat = Tensor::cat(&[&prev, x], 2)?; // T+1 frames; cache supplies the 1 causal context frame
         let out = self.strided_conv(&xcat)?;
-        *self.cache.lock().unwrap() = Some(last);
+        *candle_gen::lock_recover(&self.cache) = Some(last);
         Ok(out)
     }
 

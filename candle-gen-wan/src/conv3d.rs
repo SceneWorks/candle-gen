@@ -84,7 +84,9 @@ impl CausalConv3d {
 
     /// Drop any streaming `feat_cache` (call before/after a streaming decode).
     pub fn reset_cache(&self) {
-        *self.cache.lock().unwrap() = None;
+        // sc-9015 / F-031: recover from a poisoned lock (reset-on-miss streaming cache; a prior
+        // panic while locked must not brick every later decode).
+        *candle_gen::lock_recover(&self.cache) = None;
     }
 
     /// `x`: `[B, C, T, H, W]` → `[B, O, T, H, W]` (spatial "same", temporal causal).
@@ -95,7 +97,7 @@ impl CausalConv3d {
         let xpad = if self.kd > 1 {
             let want = self.kd - 1; // left context frames needed
             if ctx.streaming {
-                let old_cache = self.cache.lock().unwrap().clone();
+                let old_cache = candle_gen::lock_recover(&self.cache).clone();
                 let old_n = old_cache
                     .as_ref()
                     .map(|c| c.dim(2))
@@ -115,7 +117,7 @@ impl CausalConv3d {
                 // Update the cache to the last `want` frames of the input history.
                 let hn = cat_cx.dim(2)?;
                 let keep = want.min(hn);
-                *self.cache.lock().unwrap() =
+                *candle_gen::lock_recover(&self.cache) =
                     Some(cat_cx.narrow(2, hn - keep, keep)?.contiguous()?);
                 xpad
             } else {

@@ -321,10 +321,9 @@ pub struct LtxGenerator {
 
 impl LtxGenerator {
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        let mut guard = self
-            .components
-            .lock()
-            .expect("ltx components cache mutex poisoned");
+        // sc-9015 / F-031: recover from a poisoned lock (overwrite-on-miss cache; a prior panic
+        // while locked must not turn every later `generate` into a panic).
+        let mut guard = candle_gen::lock_recover(&self.components);
         if let Some(c) = guard.as_ref() {
             return Ok(c.clone());
         }

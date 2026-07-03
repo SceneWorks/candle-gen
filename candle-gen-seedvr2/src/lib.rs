@@ -127,7 +127,9 @@ fn reference_image(req: &GenerationRequest) -> Option<&Image> {
 
 impl Seedvr2Generator {
     fn pipeline(&self) -> gen_core::Result<std::sync::Arc<Seedvr2Pipeline>> {
-        let mut guard = self.pipe.lock().expect("seedvr2 pipeline mutex poisoned");
+        // sc-9015 / F-031: recover from a poisoned lock (overwrite-on-miss cache; a prior panic
+        // while locked must not turn every later `generate` into a panic).
+        let mut guard = candle_gen::lock_recover(&self.pipe);
         if let Some(p) = guard.as_ref() {
             return Ok(p.clone());
         }
@@ -210,7 +212,16 @@ impl Generator for Seedvr2Generator {
             });
         }
 
-        let image = reference_image(req).expect("validated");
+        // sc-9015 / F-031: `validate` above guarantees a Reference image on the non-video path, but
+        // return an `Err` rather than `.expect(...)`-panicking if that coupling ever breaks — a
+        // panic here would unwind through the shared `Arc<dyn Generator>` instead of surfacing as a
+        // recoverable error (and could poison the pipeline lock on the way out).
+        let image = reference_image(req).ok_or_else(|| {
+            gen_core::Error::Msg(format!(
+                "{}: requires a Reference image (image upscale)",
+                self.descriptor.id
+            ))
+        })?;
         let mut out = Vec::with_capacity(req.count as usize);
         for i in 0..req.count {
             if req.cancel.is_cancelled() {

@@ -80,6 +80,13 @@ pub use seed::{image_seed, seeded_noise_nchw, seeded_normal_vec, STEP_RNG_SALT};
 // parameterized by each VAE's cost model + decode closure so the per-VAE numerics are unchanged.
 pub mod vae_tiling;
 
+// Poison-tolerant locking for the shared generator/component caches (sc-9015 / F-031): a panic while
+// holding a cache `Mutex` (e.g. a CUDA OOM lifted to a panic mid-decode) poisons it, after which a
+// plain `.lock().unwrap()` panics forever — one transient failure wedges a long-lived worker lane
+// into a permanent panic loop. `lock_recover` treats a poisoned overwrite-on-miss cache as usable.
+pub mod sync;
+pub use sync::lock_recover;
+
 use thiserror::Error;
 
 /// The candle-backed crate error. gen-core cannot name candle types, so device/tensor failures

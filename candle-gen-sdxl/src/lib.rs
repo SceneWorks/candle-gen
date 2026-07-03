@@ -240,10 +240,9 @@ impl SdxlGenerator {
     /// (concurrent first-callers serialize on it) but released before the caller's denoise.
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
         let flash = cfg!(feature = "flash-attn") && flash_attn_enabled();
-        let mut guard = self
-            .components
-            .lock()
-            .expect("sdxl components cache mutex poisoned");
+        // sc-9015 / F-031: recover from a poisoned lock (overwrite-on-miss cache; a prior panic
+        // while locked must not turn every later `generate` into a panic).
+        let mut guard = candle_gen::lock_recover(&self.components);
         if let Some((cached_flash, comps)) = guard.as_ref() {
             if *cached_flash == flash {
                 return Ok(comps.clone());
