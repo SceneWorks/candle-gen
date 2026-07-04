@@ -225,6 +225,8 @@ fn run_dev(args: &[String], c: &Common, quant: Option<Quant>) -> Result<()> {
         steps: c.steps as usize,
         guidance: c.guidance,
         seed: c.seed,
+        // Native VAE: this example exercises the edit pipeline, not the optional PiD SR (sc-8044).
+        use_pid: false,
         cancel: CancelFlag::new(),
     };
 
@@ -333,6 +335,8 @@ fn run_klein(args: &[String], c: &Common) -> Result<()> {
         steps: c.steps as usize,
         guidance: c.guidance,
         seed: c.seed,
+        // Native VAE: this example exercises the edit pipeline, not the optional PiD SR (sc-8044).
+        use_pid: false,
         cancel: CancelFlag::new(),
     };
     let mut prog = step_progress("edit");

@@ -23,7 +23,10 @@ use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::{schedule_sigmas, DiscreteModelSampling, Scheduler, Solver};
 use candle_gen::gen_core::{Image, Progress};
 // Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
-use candle_gen::{CandleError, Result, STEP_RNG_SALT};
+// `LatentDecoder` is the decode seam the optional PiD student implements (epic 7840, sc-8044).
+use candle_gen::gen_core::PidWeights;
+use candle_gen::{CandleError, LatentDecoder, Result, STEP_RNG_SALT};
+use candle_gen_pid::{PidDecoder, PidEngine};
 
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -39,7 +42,7 @@ use crate::sampler::EulerAncestralSampler;
 use crate::unet::UNet2DConditionModel;
 use crate::vision_encoder::{check_layer_count, ClipVisionEncoder, VisionConfig};
 use crate::weights::Weights;
-use crate::{conditioning::SdxlConditioner, AutoEncoderKL};
+use crate::{conditioning::SdxlConditioner, AutoEncoderKL, PID_BACKBONE};
 
 /// The IP-Adapter compute dtype — fp16, matching the production SDXL path (the VAE is the f16-stable
 /// `madebyollin/sdxl-vae-fp16-fix`; the CLIP image encoder runs at this dtype too).
@@ -81,6 +84,10 @@ pub struct IpAdapterSdxlRequest {
     /// re-shapes σ. A non-default scheduler alone also engages the curated path.
     pub scheduler: Option<String>,
     pub seed: u64,
+    /// Opt into the PiD super-resolving decoder (epic 7840, sc-8044): when `true` **and** the model was
+    /// loaded with [`with_pid`](IpAdapterSdxl::with_pid), the final latent is decoded by the `sdxl` PiD
+    /// student (4× SR → 2K/4K) instead of the native VAE. `false` (default) keeps the byte-exact VAE decode.
+    pub use_pid: bool,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -98,6 +105,7 @@ impl Default for IpAdapterSdxlRequest {
             sampler: None,
             scheduler: None,
             seed: 0,
+            use_pid: false,
             cancel: CancelFlag::default(),
         }
     }
@@ -144,6 +152,10 @@ pub struct IpAdapterSdxl {
     ip_encoder: IpImageEncoder,
     vae: AutoEncoderKL,
     sampler: EulerAncestralSampler,
+    /// Optional PiD super-resolving decoder (epic 7840, sc-8044), attached via [`with_pid`](Self::with_pid).
+    /// Composes the SDXL VAE, so it loads the SAME `sdxl` student ([`PID_BACKBONE`]) as the registered
+    /// SDXL provider.
+    pid: Option<PidEngine>,
     device: Device,
 }
 
@@ -188,8 +200,39 @@ impl IpAdapterSdxl {
             ip_encoder,
             vae,
             sampler: EulerAncestralSampler::sdxl(),
+            pid: None,
             device,
         })
+    }
+
+    /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). Same [`PidWeights`] load-spec
+    /// as the registry SDXL provider; the IP-Adapter composes the SDXL VAE so it loads the **same**
+    /// [`PID_BACKBONE`] (`sdxl`) student. A `use_pid = true` request then decodes through it (4× SR) instead
+    /// of the native VAE; without it, `use_pid` errors loudly. Call after [`load`](Self::load).
+    pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
+        self.pid = Some(PidEngine::from_spec(pid, PID_BACKBONE, &self.device)?);
+        Ok(self)
+    }
+
+    /// Mint the per-generation PiD decoder when the request opted in (`use_pid`) and a student is loaded;
+    /// `None` keeps the native VAE decode. Errors loudly if `use_pid` is set without a prior
+    /// [`with_pid`](Self::with_pid). A clean-latent (σ=0) decoder bound to the prompt + seed; the request
+    /// cancel threads in for a cancellable SR decode.
+    fn pid_decoder_for(&self, req: &IpAdapterSdxlRequest) -> Result<Option<PidDecoder>> {
+        if !req.use_pid {
+            return Ok(None);
+        }
+        let engine = self.pid.as_ref().ok_or_else(|| {
+            CandleError::Msg(
+                "sdxl ip-adapter: use_pid was requested but no PiD decoder is loaded (call with_pid)"
+                    .into(),
+            )
+        })?;
+        Ok(Some(
+            engine
+                .decoder(&req.prompt, 0.0, req.seed)?
+                .with_cancel(req.cancel.clone()),
+        ))
     }
 
     /// Reference-image T2I: condition the SDXL generation on `reference`'s CLIP-ViT-H identity tokens
@@ -283,7 +326,11 @@ impl IpAdapterSdxl {
             )?
         };
         on_progress(Progress::Decoding);
-        decode_image(&self.vae, &latents, None)
+        // Decode the final latent: native SDXL VAE by default, or the `sdxl` PiD student (4× SR) when this
+        // generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8044).
+        let pid_decoder = self.pid_decoder_for(req)?;
+        let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+        decode_image(&self.vae, &latents, pid_ref)
     }
 
     /// Build the CFG-batched IP tokens from the reference image. **Uncond-first**: under CFG the uncond

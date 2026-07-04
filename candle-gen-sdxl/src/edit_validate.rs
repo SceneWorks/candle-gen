@@ -98,6 +98,8 @@ fn real_weight_edit() {
         guidance: 5.0,
         strength: 0.8,
         seed: 12345,
+        // Native VAE: this harness validates the edit/inpaint pipeline, not the optional PiD SR (sc-8044).
+        use_pid: false,
         cancel: CancelFlag::new(),
     };
     let mut noop = |_p: Progress| {};

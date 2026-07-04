@@ -30,8 +30,9 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{self as nn, Linear, Module, VarBuilder};
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{Image, PidWeights, Progress};
 use candle_gen::{CandleError, Result};
+use candle_gen_pid::{PidDecoder, PidEngine};
 use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 
 use candle_gen_sdxl::{
@@ -97,6 +98,11 @@ pub struct KolorsControlRequest {
     /// name re-shapes σ. A non-default scheduler alone also engages the curated path.
     pub scheduler: Option<String>,
     pub seed: u64,
+    /// Opt into the PiD super-resolving decoder (epic 7840, sc-8044): when `true` **and** the model was
+    /// loaded with [`with_pid`](KolorsControl::with_pid), the final latent is decoded by the `sdxl` PiD
+    /// student (4× SR → 2K/4K) instead of the native SDXL VAE (Kolors composes the SDXL VAE). `false`
+    /// (default) keeps the VAE decode.
+    pub use_pid: bool,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -114,6 +120,7 @@ impl Default for KolorsControlRequest {
             sampler: None,
             scheduler: None,
             seed: 0,
+            use_pid: false,
             cancel: CancelFlag::default(),
         }
     }
@@ -162,6 +169,9 @@ pub struct KolorsControl {
     cn_encoder_hid_proj: Linear,
     controlnet: ControlNet,
     vae: AutoEncoderKL,
+    /// Optional PiD super-resolving decoder (epic 7840, sc-8044), attached via [`with_pid`](Self::with_pid).
+    /// Kolors composes the SDXL VAE, so it loads the `sdxl` student (same tag as the base Kolors provider).
+    pid: Option<PidEngine>,
     device: Device,
 }
 
@@ -208,8 +218,41 @@ impl KolorsControl {
             cn_encoder_hid_proj,
             controlnet,
             vae,
+            pid: None,
             device,
         })
+    }
+
+    /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). Same [`PidWeights`] load-spec
+    /// as the registry Kolors/SDXL provider; Kolors composes the SDXL VAE, so it loads the `sdxl` student.
+    /// A `use_pid = true` request then decodes through it (4× SR) instead of the native VAE; without it,
+    /// `use_pid` errors loudly. Call after [`load`](Self::load).
+    pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
+        // Kolors reuses the SDXL VAE latent space, so the PiD backbone tag is `sdxl` (the base Kolors
+        // provider's `pipeline::PID_BACKBONE`).
+        self.pid = Some(PidEngine::from_spec(pid, "sdxl", &self.device)?);
+        Ok(self)
+    }
+
+    /// Mint the per-generation PiD decoder when the request opted in (`use_pid`) and a student is loaded;
+    /// `None` keeps the native VAE decode. Errors loudly if `use_pid` is set without a prior
+    /// [`with_pid`](Self::with_pid). A clean-latent (σ=0) decoder bound to the prompt + seed; the request
+    /// cancel threads in for a cancellable SR decode.
+    fn pid_decoder_for(&self, req: &KolorsControlRequest) -> Result<Option<PidDecoder>> {
+        if !req.use_pid {
+            return Ok(None);
+        }
+        let engine = self.pid.as_ref().ok_or_else(|| {
+            CandleError::Msg(
+                "kolors control: use_pid was requested but no PiD decoder is loaded (call with_pid)"
+                    .into(),
+            )
+        })?;
+        Ok(Some(
+            engine
+                .decoder(&req.prompt, 0.0, req.seed)?
+                .with_cancel(req.cancel.clone()),
+        ))
     }
 
     /// Strict-pose T2I: condition the Kolors generation on `skeleton` (a rendered OpenPose image at the
@@ -345,9 +388,11 @@ impl KolorsControl {
         };
 
         on_progress(Progress::Decoding);
-        // Pose-control lane does not carry a PiD decoder (base txt2img is the shipping PiD path,
-        // epic 7840 / sc-7853); native SDXL VAE decode.
-        common::decode(&self.vae, None, &latents)
+        // Decode the final latent: native SDXL VAE by default, or the `sdxl` PiD student (4× SR) when this
+        // generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8044). Kolors
+        // composes the SDXL VAE, so it shares the `sdxl` student with the base Kolors provider.
+        let pid_decoder = self.pid_decoder_for(req)?;
+        common::decode(&self.vae, pid_decoder.as_ref(), &latents)
     }
 
     /// Encode one prompt → `(context [1, 256, 4096], pooled [1, 4096])` via the ChatGLM3 encoder. Stays

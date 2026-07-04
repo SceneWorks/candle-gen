@@ -59,6 +59,8 @@ fn real_weight_control() {
         sampler: None,
         scheduler: None,
         seed: 12345,
+        // Native VAE: this harness validates the pose-control pipeline, not the optional PiD SR (sc-8044).
+        use_pid: false,
         cancel: CancelFlag::new(),
     };
 

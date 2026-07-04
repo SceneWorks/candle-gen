@@ -33,13 +33,14 @@ use rand::{rngs::StdRng, SeedableRng};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{Image, PidWeights, Progress};
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
 use candle_gen_flux::{
     ae_config, clip_config, decode_latents, encode_text, flux_config, DitImageInjector,
     FluxTokenizers, IpFlux, Variant,
 };
+use candle_gen_pid::{PidDecoder, PidEngine};
 
 use crate::ca::PulidCa;
 use crate::eva_clip::{transform, EvaConfig, EvaVisionTransformer};
@@ -97,6 +98,11 @@ pub struct PulidFluxRequest {
     /// time-shifted `get_schedule`; a curated scheduler name re-strides σ over the dev time-shift `mu`.
     pub scheduler: Option<String>,
     pub seed: u64,
+    /// Opt into the PiD super-resolving decoder (epic 7840, sc-8044): when `true` **and** the model was
+    /// loaded with [`with_pid`](PulidFlux::with_pid), the final latent is decoded by the `flux` PiD student
+    /// (4× SR → 2K/4K) instead of the native FLUX.1 VAE. PiD is a *generative* decoder, so face likeness
+    /// may shift — the user judges per-generation. `false` (default) keeps the byte-exact VAE decode.
+    pub use_pid: bool,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -113,6 +119,7 @@ impl Default for PulidFluxRequest {
             sampler: None,
             scheduler: None,
             seed: 0,
+            use_pid: false,
             cancel: CancelFlag::default(),
         }
     }
@@ -180,6 +187,9 @@ pub struct PulidFlux {
     /// (`pulid_encoder.*` is already consumed by `idformer`).
     pulid: Weights,
     face: candle_gen_face::CandleFaceAnalysis,
+    /// Optional PiD super-resolving decoder (epic 7840, sc-8044), attached via [`with_pid`](Self::with_pid).
+    /// PuLID composes the FLUX.1-dev VAE, so it loads the `flux` student (same tag as the base FLUX provider).
+    pid: Option<PidEngine>,
 }
 
 impl PulidFlux {
@@ -253,7 +263,38 @@ impl PulidFlux {
             idformer,
             pulid,
             face,
+            pid: None,
         })
+    }
+
+    /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). Same [`PidWeights`] load-spec
+    /// as the registry FLUX.1 provider; PuLID composes the FLUX.1-dev VAE, so it loads the `flux` student.
+    /// A `use_pid = true` request then decodes through it (4× SR) instead of the native VAE; without it,
+    /// `use_pid` errors loudly. Face likeness may shift under the generative decode — the user's per-gen
+    /// call. Call after [`load`](Self::load).
+    pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
+        self.pid = Some(PidEngine::from_spec(pid, "flux", &self.device)?);
+        Ok(self)
+    }
+
+    /// Mint the per-generation PiD decoder when the request opted in (`use_pid`) and a student is loaded;
+    /// `None` keeps the native VAE decode. Errors loudly if `use_pid` is set without a prior
+    /// [`with_pid`](Self::with_pid). A clean-latent (σ=0) decoder bound to the prompt + seed; the request
+    /// cancel threads in for a cancellable SR decode.
+    fn pid_decoder_for(&self, req: &PulidFluxRequest) -> Result<Option<PidDecoder>> {
+        if !req.use_pid {
+            return Ok(None);
+        }
+        let engine = self.pid.as_ref().ok_or_else(|| {
+            CandleError::Msg(
+                "pulid: use_pid was requested but no PiD decoder is loaded (call with_pid)".into(),
+            )
+        })?;
+        Ok(Some(
+            engine
+                .decoder(&req.prompt, 0.0, req.seed)?
+                .with_cancel(req.cancel.clone()),
+        ))
     }
 
     /// Reference face (RGB [`Image`]) → `id_embedding` `[1,32,2048]` (f32). Mirrors PuLID's
@@ -339,11 +380,13 @@ impl PulidFlux {
             on_progress,
         )?;
         on_progress(Progress::Decoding);
-        // PuLID is a bespoke face-ID provider outside the PiD toggle scope (epic 7840 / sc-7853): pass
-        // `None` so it keeps the native FLUX VAE decode.
+        // Decode the final latent: native FLUX.1 VAE by default, or the `flux` PiD student (4× SR) when
+        // this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8044). PiD is a
+        // generative decoder, so face likeness may shift — the user's per-gen call.
+        let pid_decoder = self.pid_decoder_for(req)?;
         decode_latents(
             &self.vae,
-            None,
+            pid_decoder.as_ref(),
             &latents,
             req.height as usize,
             req.width as usize,

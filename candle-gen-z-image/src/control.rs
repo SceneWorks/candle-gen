@@ -42,8 +42,9 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::{self as nn, Linear, Module, VarBuilder};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{Image, PidWeights, Progress};
 use candle_gen::{CandleError, Result};
+use candle_gen_pid::{PidDecoder, PidEngine};
 use candle_transformers::models::z_image::preprocess::prepare_inputs;
 use candle_transformers::models::z_image::scheduler::{
     calculate_shift, FlowMatchEulerDiscreteScheduler, SchedulerConfig, BASE_IMAGE_SEQ_LEN,
@@ -168,6 +169,11 @@ pub struct ZImageControlRequest {
     /// Turbo mode.
     pub negative_prompt: Option<String>,
     pub seed: u64,
+    /// Opt into the PiD super-resolving decoder (epic 7840, sc-8044): when `true` **and** the model was
+    /// loaded with [`with_pid`](ZImageControl::with_pid), the final latent is decoded by the `zimage-turbo`
+    /// PiD student (the FLUX.1 latent space; 4× SR → 2K/4K) instead of the native Z-Image VAE. `false`
+    /// (default) keeps the VAE decode.
+    pub use_pid: bool,
     pub cancel: CancelFlag,
 }
 
@@ -182,6 +188,7 @@ impl Default for ZImageControlRequest {
             guidance: None,
             negative_prompt: None,
             seed: 0,
+            use_pid: false,
             cancel: CancelFlag::default(),
         }
     }
@@ -404,6 +411,10 @@ pub struct ZImageControl {
     vae_encoder: VaeEncoder,
     vae_shift: f64,
     vae_scale: f64,
+    /// Optional PiD super-resolving decoder (epic 7840, sc-8044), attached via [`with_pid`](Self::with_pid).
+    /// Z-Image's latent space is FLUX.1's; PiD's `zimage-turbo` tag aliases the `flux` checkpoint (same tag
+    /// as the base Z-Image provider).
+    pid: Option<PidEngine>,
 }
 
 impl ZImageControl {
@@ -446,7 +457,41 @@ impl ZImageControl {
             vae_encoder,
             vae_shift: vae_cfg.shift_factor,
             vae_scale: vae_cfg.scaling_factor,
+            pid: None,
         })
+    }
+
+    /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). Same [`PidWeights`] load-spec
+    /// as the registry Z-Image provider; Z-Image's latent space is FLUX.1's, so PiD's `zimage-turbo`
+    /// backbone tag (aliasing the `flux` checkpoint) is used. A `use_pid = true` request then decodes
+    /// through it (4× SR) instead of the native VAE; without it, `use_pid` errors loudly. Call after
+    /// [`load`](Self::load).
+    pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
+        // Z-Image reuses the FLUX.1 latent space; `zimage-turbo` aliases the `flux` PiD checkpoint (the
+        // base Z-Image provider's `pipeline::PID_BACKBONE`).
+        self.pid = Some(PidEngine::from_spec(pid, "zimage-turbo", &self.device)?);
+        Ok(self)
+    }
+
+    /// Mint the per-generation PiD decoder when the request opted in (`use_pid`) and a student is loaded;
+    /// `None` keeps the native VAE decode. Errors loudly if `use_pid` is set without a prior
+    /// [`with_pid`](Self::with_pid). A clean-latent (σ=0) decoder bound to the prompt + seed; the request
+    /// cancel threads in for a cancellable SR decode.
+    fn pid_decoder_for(&self, req: &ZImageControlRequest) -> Result<Option<PidDecoder>> {
+        if !req.use_pid {
+            return Ok(None);
+        }
+        let engine = self.pid.as_ref().ok_or_else(|| {
+            CandleError::Msg(
+                "z-image control: use_pid was requested but no PiD decoder is loaded (call with_pid)"
+                    .into(),
+            )
+        })?;
+        Ok(Some(
+            engine
+                .decoder(&req.prompt, 0.0, req.seed)?
+                .with_cancel(req.cancel.clone()),
+        ))
     }
 
     /// Strict-pose generation: condition the Z-Image generation on `skeleton` (a rendered OpenPose /
@@ -541,7 +586,10 @@ impl ZImageControl {
         }
 
         on_progress(Progress::Decoding);
-        self.decode(&latents)
+        // Decode the final latent: native Z-Image VAE by default, or the `zimage-turbo` PiD student (4× SR)
+        // when this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8044).
+        let pid_decoder = self.pid_decoder_for(req)?;
+        self.decode(&latents, pid_decoder.as_ref())
     }
 
     /// The **base** (undistilled, full-CFG) control denoise (sc-8680) — the candle sibling of
@@ -666,7 +714,10 @@ impl ZImageControl {
         )?;
 
         on_progress(Progress::Decoding);
-        self.decode(&latents)
+        // Decode the final latent: native Z-Image VAE by default, or the `zimage-turbo` PiD student (4× SR)
+        // when this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8044).
+        let pid_decoder = self.pid_decoder_for(req)?;
+        self.decode(&latents, pid_decoder.as_ref())
     }
 
     /// Deterministic, launch-portable initial latent noise (sc-3673, shared [`common::seed_noise`]).
@@ -728,11 +779,10 @@ impl ZImageControl {
         Ok(context.to_dtype(DTYPE)?)
     }
 
-    /// VAE-decode the final latents `(1, 16, 1, h, w)` → an RGB8 [`Image`] (the shared txt2img decode).
-    /// The control lane does not carry a PiD decoder (base txt2img is the shipping PiD path, epic 7840
-    /// / sc-7853); native VAE decode.
-    fn decode(&self, latents: &Tensor) -> Result<Image> {
-        common::decode(&self.vae, None, latents)
+    /// VAE-decode the final latents `(1, 16, 1, h, w)` → an RGB8 [`Image`] (the shared txt2img decode),
+    /// or — when a `pid` decoder is supplied (epic 7840, sc-8044) — the `zimage-turbo` PiD student (4× SR).
+    fn decode(&self, latents: &Tensor, pid: Option<&PidDecoder>) -> Result<Image> {
+        common::decode(&self.vae, pid, latents)
     }
 }
 

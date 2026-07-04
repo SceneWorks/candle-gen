@@ -31,7 +31,10 @@ use candle_gen::gen_core::imageops::{resize_lanczos_u8, resize_nearest_u8};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::{Image, Progress};
 // Shared ancestral-step RNG salt (`seed + STEP_RNG_SALT`) — one home in `candle-gen` (sc-9043 / F-059).
-use candle_gen::{CandleError, Result, STEP_RNG_SALT};
+// `LatentDecoder` is the decode seam the optional PiD student implements (epic 7840, sc-8044).
+use candle_gen::gen_core::PidWeights;
+use candle_gen::{CandleError, LatentDecoder, Result, STEP_RNG_SALT};
+use candle_gen_pid::{PidDecoder, PidEngine};
 
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -41,7 +44,7 @@ use crate::denoise::{decode_image, text_time_ids, SPATIAL_SCALE};
 use crate::loaders::{load_instantid_unet, load_sdxl_vae, load_sdxl_vae_encoder};
 use crate::sampler::EulerAncestralSampler;
 use crate::unet::{UNet2DConditionModel, VaeMomentsEncoder};
-use crate::AutoEncoderKL;
+use crate::{AutoEncoderKL, PID_BACKBONE};
 
 /// The edit compute dtype — fp16, matching the production SDXL path (the f16-stable VAE + UNet).
 const DTYPE: DType = DType::F16;
@@ -77,6 +80,12 @@ pub struct SdxlEditRequest {
     /// `round(steps·strength)` steps). 1.0 ≈ full regeneration; 0.0 ≈ the source unchanged.
     pub strength: f32,
     pub seed: u64,
+    /// Opt into the PiD super-resolving decoder (epic 7840, sc-8044): when `true` **and** the model was
+    /// loaded with [`with_pid`](SdxlEdit::with_pid), the final (mask-blended) latent is decoded by the
+    /// `sdxl` PiD student (4× SR → 2K/4K) instead of the native VAE. The inpaint/outpaint mask blend runs
+    /// in latent space and ends in a single decode, so PiD sees the same final latent as the native path
+    /// — the output is just higher-resolution. `false` (default) keeps the byte-exact VAE decode.
+    pub use_pid: bool,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -92,6 +101,7 @@ impl Default for SdxlEditRequest {
             guidance: 5.0,
             strength: DEFAULT_EDIT_STRENGTH,
             seed: 0,
+            use_pid: false,
             cancel: CancelFlag::default(),
         }
     }
@@ -106,6 +116,10 @@ pub struct SdxlEdit {
     vae: AutoEncoderKL,
     vae_encoder: VaeMomentsEncoder,
     sampler: EulerAncestralSampler,
+    /// Optional PiD super-resolving decoder (epic 7840, sc-8044), attached via [`with_pid`](Self::with_pid).
+    /// SDXL edit composes the SDXL VAE, so it loads the SAME `sdxl` student ([`PID_BACKBONE`]) as the
+    /// registered SDXL provider — no edit-specific PiD checkpoint.
+    pid: Option<PidEngine>,
     device: Device,
 }
 
@@ -126,8 +140,41 @@ impl SdxlEdit {
             vae,
             vae_encoder,
             sampler: EulerAncestralSampler::sdxl(),
+            pid: None,
             device,
         })
+    }
+
+    /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). `pid` is the same
+    /// [`PidWeights`] load-spec the registry SDXL provider consumes (`LoadSpec::pid`). SDXL edit composes
+    /// the SDXL VAE, so it loads the **same** [`PID_BACKBONE`] (`sdxl`) tag. After this, a request with
+    /// `use_pid = true` decodes through the student (4× SR → 2K/4K) instead of the native VAE; without it,
+    /// `use_pid` errors loudly (never a silent VAE fallback). Call after [`load`](Self::load).
+    pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
+        self.pid = Some(PidEngine::from_spec(pid, PID_BACKBONE, &self.device)?);
+        Ok(self)
+    }
+
+    /// Mint the per-generation PiD decoder when the request opted in (`use_pid`) and a student is loaded;
+    /// `None` keeps the native VAE decode. Errors loudly if `use_pid` is set without a prior
+    /// [`with_pid`](Self::with_pid). The edit denoise runs to the clean σ=0 latent, so a clean-latent
+    /// (σ=0) decoder bound to the prompt + seed is correct; the request cancel threads in for a
+    /// cancellable SR decode.
+    fn pid_decoder_for(&self, req: &SdxlEditRequest) -> Result<Option<PidDecoder>> {
+        if !req.use_pid {
+            return Ok(None);
+        }
+        let engine = self.pid.as_ref().ok_or_else(|| {
+            CandleError::Msg(
+                "sdxl edit: use_pid was requested but no PiD decoder is loaded (call with_pid)"
+                    .into(),
+            )
+        })?;
+        Ok(Some(
+            engine
+                .decoder(&req.prompt, 0.0, req.seed)?
+                .with_cancel(req.cancel.clone()),
+        ))
     }
 
     /// **img2img**: regenerate `source` toward `req.prompt` at `req.strength`.
@@ -211,7 +258,11 @@ impl SdxlEdit {
             on_progress,
         )?;
         on_progress(Progress::Decoding);
-        decode_image(&self.vae, &latents, None)
+        // Decode the final (mask-blended) latent: native SDXL VAE by default, or the `sdxl` PiD student
+        // (4× SR) when this generation opted in (`req.use_pid`) and `with_pid` loaded one (sc-8044).
+        let pid_decoder = self.pid_decoder_for(req)?;
+        let pid_ref = pid_decoder.as_ref().map(|d| d as &dyn LatentDecoder);
+        decode_image(&self.vae, &latents, pid_ref)
     }
 
     /// VAE-encode `source` (resized to the render size, LANCZOS, normalized to `[-1,1]` NCHW) to the

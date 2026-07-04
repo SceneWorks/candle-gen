@@ -27,14 +27,16 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::imageops::resize_lanczos_u8;
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{Image, Progress, Quant};
-use candle_gen::{CandleError, Result};
+use candle_gen::gen_core::{Image, PidWeights, Progress, Quant};
+// `LatentDecoder` brings the `PidDecoder::decode` trait method into scope (sc-8044).
+use candle_gen::{CandleError, LatentDecoder, Result};
+use candle_gen_pid::{PidDecoder, PidEngine};
 
 use crate::config::{Flux2Variant, DEFAULT_GUIDANCE, DEFAULT_STEPS, SIZE_MULTIPLE};
 use crate::text_encoder::Flux2PromptEncoder;
 use crate::transformer::Flux2Transformer;
 use crate::vae::Flux2Vae;
-use crate::{pipeline, to_image, Pipeline};
+use crate::{pipeline, to_image, Pipeline, PID_BACKBONE};
 
 /// Path to the FLUX.2 edit snapshot — just the diffusers snapshot dir (`text_encoder/`,
 /// `transformer/`, `vae/`, `tokenizer/`), the same snapshot the txt2img path loads. klein at
@@ -57,6 +59,10 @@ pub struct Flux2EditRequest {
     /// Guidance scale. 1.0 (klein default) = a single CFG-free forward; > 1.0 adds a negative pass.
     pub guidance: f32,
     pub seed: u64,
+    /// Opt into the PiD super-resolving decoder (epic 7840, sc-8044): when `true` **and** the model was
+    /// loaded with [`with_pid`](Flux2Edit::with_pid), the final latent is decoded by the `flux2` PiD
+    /// student (4× SR → 2K/4K) instead of the native FLUX.2 VAE. `false` (default) keeps the VAE decode.
+    pub use_pid: bool,
     /// Cooperative cancellation, checked before each denoise step (the engine contract).
     pub cancel: CancelFlag,
 }
@@ -71,6 +77,7 @@ impl Default for Flux2EditRequest {
             steps: DEFAULT_STEPS as usize,
             guidance: DEFAULT_GUIDANCE,
             seed: 0,
+            use_pid: false,
             cancel: CancelFlag::default(),
         }
     }
@@ -89,6 +96,10 @@ pub struct Flux2Edit {
     tokenizer: candle_gen::gen_core::tokenizer::TextTokenizer,
     transformer: Flux2Transformer,
     vae: Flux2Vae,
+    /// Optional PiD super-resolving decoder (epic 7840, sc-8044), attached via [`with_pid`](Self::with_pid).
+    /// FLUX.2 edit composes the FLUX.2 VAE, so it loads the SAME `flux2` student ([`PID_BACKBONE`]) as the
+    /// registered FLUX.2 provider.
+    pid: Option<PidEngine>,
 }
 
 impl Flux2Edit {
@@ -131,7 +142,38 @@ impl Flux2Edit {
             tokenizer,
             transformer,
             vae,
+            pid: None,
         })
+    }
+
+    /// Attach the optional PiD super-resolving decoder (epic 7840, sc-8044). Same [`PidWeights`] load-spec
+    /// as the registry FLUX.2 provider; edit composes the FLUX.2 VAE so it loads the **same**
+    /// [`PID_BACKBONE`] (`flux2`) student. A `use_pid = true` request then decodes through it (4× SR)
+    /// instead of the native VAE; without it, `use_pid` errors loudly. Call after [`load`](Self::load).
+    pub fn with_pid(mut self, pid: &PidWeights) -> Result<Self> {
+        self.pid = Some(PidEngine::from_spec(pid, PID_BACKBONE, &self.pipe.device)?);
+        Ok(self)
+    }
+
+    /// Mint the per-generation PiD decoder when the request opted in (`use_pid`) and a student is loaded;
+    /// `None` keeps the native VAE decode. Errors loudly if `use_pid` is set without a prior
+    /// [`with_pid`](Self::with_pid). A clean-latent (σ=0) decoder bound to the prompt + seed; the request
+    /// cancel threads in for a cancellable SR decode.
+    fn pid_decoder_for(&self, req: &Flux2EditRequest) -> Result<Option<PidDecoder>> {
+        if !req.use_pid {
+            return Ok(None);
+        }
+        let engine = self.pid.as_ref().ok_or_else(|| {
+            CandleError::Msg(
+                "flux2 edit: use_pid was requested but no PiD decoder is loaded (call with_pid)"
+                    .into(),
+            )
+        })?;
+        Ok(Some(
+            engine
+                .decoder(&req.prompt, 0.0, req.seed)?
+                .with_cancel(req.cancel.clone()),
+        ))
     }
 
     /// Generate one edited image. `references` (≥ 1) condition the denoise via reference token concat;
@@ -245,7 +287,14 @@ impl Flux2Edit {
 
         on_progress(Progress::Decoding);
         let packed = pipeline::unpack_latents(&latents, req.width, req.height)?;
-        let decoded = self.vae.decode_packed(&packed)?; // [1,3,H,W] in [-1,1]
+        // Decode the final latent: native FLUX.2 VAE by default, or the `flux2` PiD student (4× SR) when
+        // this generation opted in (`req.use_pid`) and `with_pid` loaded one (sc-8044). Both take the same
+        // unpacked latent and emit `[-1, 1]` pixels (PiD at 4×); `to_image` reads the size from the tensor.
+        let pid_decoder = self.pid_decoder_for(req)?;
+        let decoded = match &pid_decoder {
+            Some(pid) => pid.decode(&packed)?,        // [1,3,4H,4W]
+            None => self.vae.decode_packed(&packed)?, // [1,3,H,W] in [-1,1]
+        };
         to_image(&decoded)
     }
 

@@ -21,6 +21,10 @@ candle-gen-flux = { path = "../candle-gen-flux" }
 # 512-d ArcFace embedding, and `face_features_image` (BiSeNet bg-whitened grayscale crop) feeds the
 # EVA tower — `load_with_parser` wires the parser.
 candle-gen-face = { path = "../candle-gen-face" }
+# The optional PiD super-resolving decoder (epic 7840, sc-8044): `with_pid` loads a `PidEngine` and
+# decodes the final FLUX.1 latent through the `flux` student (4× SR) instead of the native VAE when
+# `req.use_pid` is set. PuLID composes the FLUX.1-dev VAE, so it reuses the same `flux` checkpoint.
+candle-gen-pid = { path = "../candle-gen-pid" }
 # FLUX building blocks reused for the backbone load (dual CLIP-L + T5-XXL text encoders, the
 # AutoEncoder VAE) — PuLID loads these exactly as the FLUX IP-Adapter provider does.
 candle-transformers = { workspace = true }
@@ -49,10 +53,12 @@ metal = [
     "candle-transformers/metal",
     "candle-gen-flux/metal",
     "candle-gen-face/metal",
+    "candle-gen-pid/metal",
 ]
 cuda = [
     "candle-gen/cuda",
     "candle-transformers/cuda",
     "candle-gen-flux/cuda",
     "candle-gen-face/cuda",
+    "candle-gen-pid/cuda",
 ]

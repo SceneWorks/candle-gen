@@ -96,6 +96,8 @@ fn run_control_validation(
         guidance,
         negative_prompt: negative.map(str::to_string),
         seed: 12345,
+        // Native VAE: this harness validates the pose-control pipeline, not the optional PiD SR (sc-8044).
+        use_pid: false,
         cancel: CancelFlag::new(),
     };
 

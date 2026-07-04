@@ -242,6 +242,8 @@ fn main() -> Result<()> {
         guidance,
         control_scale,
         seed,
+        // Native VAE: this example exercises the control pipeline, not the optional PiD SR (sc-8044).
+        use_pid: false,
         cancel: CancelFlag::new(),
     };
     let mut on_progress = |p: Progress| {
