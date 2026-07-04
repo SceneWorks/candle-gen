@@ -526,17 +526,17 @@ impl Pipeline {
         // parts (no dense staging); every dense snapshot keeps the stock build below, unchanged.
         let unet = match self.detect_packed_unet()? {
             Some((packed_file, group_size)) => {
-                if !self.adapters.is_empty() {
-                    // Merging a trained LoRA/LoKr delta into a quantized tier is not wired (the merge is
-                    // a dense f32 fold); a packed tier + adapters is an unsupported combination rather
-                    // than a silently-unadapted render. Deferred: sc-9528.
-                    return Err(CandleError::Msg(
-                        "sdxl: LoRA/LoKr adapters on a packed (quantized) MLX tier are not supported \
-                         (adapter merge is dense-only); use a dense snapshot (sc-9528)"
-                            .into(),
-                    ));
-                }
-                SdxlUnet::Vendored(Arc::new(self.load_packed_unet(&packed_file, group_size)?))
+                // sc-9528: a packed tier WITH a trained LoRA/LoKr now folds via dequant → merge →
+                // keep-dense (option a). The delta cannot be added to the u32-packed weights directly
+                // and SDXL merges (not residuals) for chaos-sensitivity, so the adapted Linears are
+                // dequantized, the delta is folded through `adapters::merge_adapters` (shared, verbatim),
+                // and only those adapted layers are served dense — every unadapted layer stays packed.
+                let vendored = if self.adapters.is_empty() {
+                    self.load_packed_unet(&packed_file, group_size)?
+                } else {
+                    self.load_packed_unet_with_adapters(&packed_file, group_size)?
+                };
+                SdxlUnet::Vendored(Arc::new(vendored))
             }
             None => {
                 let unet_file =
@@ -602,6 +602,11 @@ impl Pipeline {
         // constructors; a non-64 tier would repack on the wrong grid, so refuse it loudly. The SDXL MLX
         // tiers all pack at 64, so this never fires on a real tier.
         if group_size != MLX_GROUP_SIZE {
+            // sc-9528 kept this loud reject: the vendored UNet's top-level `new` → blocks → leaves chain
+            // threads only the default group 64 (the leaf `*_gs` constructors exist, but wiring a non-64
+            // group through the many nested block constructors is the same infeasibility lens/sd3 hit in
+            // sc-9474). A non-64 SDXL MLX tier does not exist today; refuse it rather than repack on the
+            // wrong grid. The adapter fold ([`crate::packed_adapters`]) asserts gs==64 for the same reason.
             return Err(CandleError::Msg(format!(
                 "sdxl: packed tier group_size {group_size} unsupported (only {MLX_GROUP_SIZE}); \
                  a non-64 SDXL tier needs the group threaded through the UNet blocks (sc-9528)"
@@ -623,6 +628,35 @@ impl Pipeline {
         // The vendored `new` threads the default MLX group size (64) — validated == the config group in
         // `detect_packed_unet` — through its packed-detecting leaves; `sdxl_unet_config` is the canonical
         // 3-block SDXL geometry (`use_linear_projection = true`, matching the packed `proj_in/out`).
+        Ok(VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?)
+    }
+
+    /// Build the vendored packed UNet from a packed MLX-tier checkpoint with the [`AdapterSpec`]s folded
+    /// in (sc-9528 — the sc-9089j follow-up deferred from sc-9416). Since a trained LoRA/LoKr delta
+    /// cannot be added to the u32-packed weights, and SDXL merges rather than adds a forward-time
+    /// residual (chaos-sensitivity, see [`crate::adapters`]), the packed Linears are **dequantized** to
+    /// dense f32, the delta is **folded** through [`crate::adapters::merge_adapters`] (shared, verbatim —
+    /// no LoRA/LoKr math reimplemented), and only the adapted layers are **kept dense** while every
+    /// unadapted layer stays packed ([`crate::packed_adapters`]). The resulting mixed (dense-adapted +
+    /// packed-unadapted) tensor map feeds the vendored UNet through a `VarBuilder::from_tensors`, whose
+    /// per-Linear `linear_detect_gs` packed-detects each layer by its `.scales` sibling — so an adapted
+    /// layer routes through the dense arm and an unadapted one keeps its packed footprint.
+    fn load_packed_unet_with_adapters(
+        &self,
+        unet_file: &Path,
+        group_size: usize,
+    ) -> Result<VendoredUNet> {
+        // The vendored UNet's top-level constructor threads only the default MLX group 64 through its
+        // blocks; a non-64 tier would dequantize/repartition at `group_size` while the UNet reads at 64.
+        // Refuse it loudly (mirrors `detect_packed_unet`) rather than silently mis-fold.
+        crate::packed_adapters::assert_group_size_supported(group_size)?;
+        let raw = candle_gen::candle_core::safetensors::load(unet_file, &Device::Cpu)?;
+        let merged =
+            crate::packed_adapters::fold_adapters_into_packed_map(raw, &self.adapters, group_size)?;
+        // `from_tensors` serves the u32 packed weights via the vendored seam's `get_unchecked_dtype`
+        // (exactly as the mmap path) and the dense merged weights via the vb dtype — so the packed vs
+        // dense fork is taken per Linear as loaded. `false` = no flash-attn on the packed path.
+        let vs = VarBuilder::from_tensors(merged, self.dtype, &self.device);
         Ok(VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?)
     }
 

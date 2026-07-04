@@ -59,6 +59,11 @@ mod adapters;
 // analog of `mlx-gen-sdxl::apply_sdxl_adapters`'s report), and the trainer-verify lane
 // (`tests/trainer_e2e.rs`) asserts a trained adapter merges into every target with nothing skipped.
 pub use adapters::{merge_adapters, MergeReport};
+// Adapters on a **packed** (pre-quantized MLX tier) UNet (sc-9528, the sc-9089j follow-up deferred from
+// sc-9416): dequantize the packed Linears, fold the LoRA/LoKr delta through `merge_adapters` verbatim,
+// and keep the handful of adapted layers dense while every unadapted layer stays packed. Replaces the
+// sc-9416 "adapters on a packed tier are unsupported" guard with a real fold.
+mod packed_adapters;
 
 // IP-Adapter (sc-5491, epic 5480): the perceiver `Resampler` (`image_proj.*` → image/identity tokens)
 // + the decoupled cross-attn K/V pairs (`ip_adapter.*`), the candle twin of `mlx-gen-sdxl::ip_adapter`.
