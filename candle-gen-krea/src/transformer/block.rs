@@ -10,10 +10,9 @@
 
 use candle_gen::candle_core::{Result, Tensor, D};
 use candle_gen::candle_nn::ops::{sigmoid, softmax_last_dim};
-use candle_gen::candle_nn::{Linear, Module};
 
 use super::rope::apply_interleaved_rope;
-use crate::loader::{linear, linear_detect, rms_scale, rms_scale_weight, Weights};
+use crate::loader::{linear_detect, rms_scale, rms_scale_weight, Weights};
 use crate::quant::QLinear;
 
 /// Join a module prefix with a leaf name.
@@ -276,7 +275,7 @@ impl SingleStreamBlock {
 /// → `refiner_blocks` attend across the token axis.
 pub struct TextFusionTransformer {
     layerwise: Vec<TextFusionBlock>,
-    projector: Linear, // Linear(num_layers → 1), no bias
+    projector: QLinear, // Linear(num_layers → 1), no bias — packed-detect for future-proofing (sc-9486)
     refiner: Vec<TextFusionBlock>,
 }
 
@@ -305,7 +304,7 @@ impl TextFusionTransformer {
             layerwise: (0..num_layerwise)
                 .map(|i| block(i, "layerwise_blocks"))
                 .collect::<Result<_>>()?,
-            projector: linear(w, "text_fusion.projector", false)?,
+            projector: linear_detect(w, "text_fusion.projector", false)?,
             refiner: (0..num_refiner)
                 .map(|i| block(i, "refiner_blocks"))
                 .collect::<Result<_>>()?,

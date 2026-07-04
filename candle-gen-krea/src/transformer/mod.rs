@@ -20,10 +20,10 @@ pub mod block;
 pub mod rope;
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
-use candle_gen::candle_nn::{Linear, Module};
 
 use crate::config::Krea2Config;
-use crate::loader::{linear, Weights};
+use crate::loader::{linear_detect, Weights};
+use crate::quant::QLinear;
 use block::{RmsScale, SingleStreamBlock, TextFusionTransformer};
 use rope::RopeTables;
 
@@ -32,17 +32,17 @@ pub struct Krea2Transformer {
     cfg: Krea2Config,
     device: Device,
     dtype: DType,
-    img_in: Linear,
-    time_embed_l1: Linear,
-    time_embed_l2: Linear,
-    time_mod_proj: Linear,
+    img_in: QLinear,
+    time_embed_l1: QLinear,
+    time_embed_l2: QLinear,
+    time_mod_proj: QLinear,
     txt_in_norm: RmsScale,
-    txt_in_l1: Linear,
-    txt_in_l2: Linear,
+    txt_in_l1: QLinear,
+    txt_in_l2: QLinear,
     text_fusion: TextFusionTransformer,
     blocks: Vec<SingleStreamBlock>,
     final_norm: RmsScale,
-    final_linear: Linear,
+    final_linear: QLinear,
     final_sstable: Tensor, // [1, 2, hidden]
     /// Per-render RoPE-table cache (sc-8992 / F-012). The joint `(cos, sin)` table depends only on the
     /// fixed geometry `(cap_len, ht, wt)` — not on the flow time / the current latent — so it is
@@ -79,13 +79,13 @@ impl Krea2Transformer {
             cfg: cfg.clone(),
             device: w.device().clone(),
             dtype: w.dtype(),
-            img_in: linear(w, "img_in", true)?,
-            time_embed_l1: linear(w, "time_embed.linear_1", true)?,
-            time_embed_l2: linear(w, "time_embed.linear_2", true)?,
-            time_mod_proj: linear(w, "time_mod_proj", true)?,
+            img_in: linear_detect(w, "img_in", true)?,
+            time_embed_l1: linear_detect(w, "time_embed.linear_1", true)?,
+            time_embed_l2: linear_detect(w, "time_embed.linear_2", true)?,
+            time_mod_proj: linear_detect(w, "time_mod_proj", true)?,
             txt_in_norm: RmsScale::load(w, "txt_in.norm.weight", eps)?,
-            txt_in_l1: linear(w, "txt_in.linear_1", true)?,
-            txt_in_l2: linear(w, "txt_in.linear_2", true)?,
+            txt_in_l1: linear_detect(w, "txt_in.linear_1", true)?,
+            txt_in_l2: linear_detect(w, "txt_in.linear_2", true)?,
             text_fusion: TextFusionTransformer::load(
                 w,
                 cfg.num_layerwise_text_blocks,
@@ -109,7 +109,7 @@ impl Krea2Transformer {
                 })
                 .collect::<Result<_>>()?,
             final_norm: RmsScale::load(w, "final_layer.norm.weight", eps)?,
-            final_linear: linear(w, "final_layer.linear", true)?,
+            final_linear: linear_detect(w, "final_layer.linear", true)?,
             final_sstable,
             rope_cache: std::sync::Mutex::new(None),
         })
