@@ -802,6 +802,7 @@ mod tests {
     /// Covers BOTH encoders the SDXL conditioner uses, on their real shapes:
     ///   * CLIP-L (`Config::sdxl()` vs `stock::Config::sdxl()`): 12 layers, 768/3072, QuickGelu;
     ///   * OpenCLIP bigG (`Config::sdxl2()` vs `stock::Config::sdxl2()`): 32 layers, 1280/5120, Gelu.
+    ///
     /// A per-encoder activation/eps/dim divergence on the bigG arm (different activation + dims than
     /// CLIP-L) would be caught here. And for BOTH encoders it compares BOTH forward paths the
     /// conditioner actually reads — the last-hidden `forward` AND the penultimate
