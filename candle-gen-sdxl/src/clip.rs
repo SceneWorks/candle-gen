@@ -488,12 +488,19 @@ mod tests {
         }
     }
 
-    fn stock_cfg_matches() -> stock::Config {
-        // The stock `Config` fields are private, so we can only build it via its named constructors.
-        // `sdxl()` (CLIP-L) is the one whose public shape (12 layers, 768/3072, QuickGelu) our
-        // `Config::sdxl()` mirrors exactly — used by the vendored-vs-stock parity test on real SDXL
-        // dims. The `tiny_cfg` parity below uses the vendored tower against itself (packed vs dense).
+    /// The stock CLIP config whose public shape our vendored `Config::sdxl()` (CLIP-L: 12 layers,
+    /// 768/3072, QuickGelu) mirrors exactly. The stock `Config` fields are private, so we can only
+    /// build it via its named constructors.
+    fn stock_cfg_l() -> stock::Config {
         stock::Config::sdxl()
+    }
+
+    /// The stock CLIP config whose public shape our vendored `Config::sdxl2()` (OpenCLIP bigG: 32
+    /// layers, 1280/5120, Gelu, 20 heads) mirrors exactly. Same private-fields constraint — the bigG
+    /// arm therefore exercises the FULL 32-layer tower (no reduced-depth stock ctor exists), which
+    /// still runs cheaply enough on CPU for a `--lib` test.
+    fn stock_cfg_g() -> stock::Config {
+        stock::Config::sdxl2()
     }
 
     /// Cosine similarity over all elements (f64) — the canonical `candle_gen::quant` packed-vs-dense
@@ -790,25 +797,70 @@ mod tests {
 
     /// The vendored tower on a DENSE checkpoint is bit-identical to the stock candle-transformers CLIP
     /// built from the SAME `VarMap` weights — the guard that swapping `candle_nn::Linear` →
-    /// `QLinear::linear_detect_gs` (dense fallback) changed nothing numerically. Uses the real
-    /// `Config::sdxl()` shape against `stock::Config::sdxl()`.
+    /// `QLinear::linear_detect_gs` (dense fallback) changed nothing numerically.
+    ///
+    /// Covers BOTH encoders the SDXL conditioner uses, on their real shapes:
+    ///   * CLIP-L (`Config::sdxl()` vs `stock::Config::sdxl()`): 12 layers, 768/3072, QuickGelu;
+    ///   * OpenCLIP bigG (`Config::sdxl2()` vs `stock::Config::sdxl2()`): 32 layers, 1280/5120, Gelu.
+    /// A per-encoder activation/eps/dim divergence on the bigG arm (different activation + dims than
+    /// CLIP-L) would be caught here. And for BOTH encoders it compares BOTH forward paths the
+    /// conditioner actually reads — the last-hidden `forward` AND the penultimate
+    /// `forward_until_encoder_layer(.., -2)` (InstantID/refiner conditioning path).
     #[test]
     fn vendored_dense_matches_stock() -> Result<()> {
-        let dev = Device::Cpu;
-        let vm = VarMap::new();
-        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
-        // The vendored tower is built first, populating the VarMap with random weights (no `.scales`,
-        // so the dense fallback fires); the stock tower reads the SAME parameters.
-        let c = Config::sdxl();
-        let vendored = ClipTextTransformer::new(vb.clone(), &c)?;
-        let stock_model = stock::ClipTextTransformer::new(vb, &stock_cfg_matches())?;
+        // One arm: build the vendored tower first (populating the VarMap with random dense weights —
+        // no `.scales`, so the dense fallback fires), then the stock tower reads the SAME parameters,
+        // and compare last-hidden + penultimate to the vendored tolerance bar (1e-4).
+        fn assert_arm(vendored_cfg: &Config, stock_cfg: &stock::Config) -> Result<(f32, f32)> {
+            let dev = Device::Cpu;
+            let vm = VarMap::new();
+            let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+            let vendored = ClipTextTransformer::new(vb.clone(), vendored_cfg)?;
+            let stock_model = stock::ClipTextTransformer::new(vb, stock_cfg)?;
 
-        let ids = Tensor::from_vec((0..77u32).collect::<Vec<_>>(), (1, 77), &dev)?;
-        let y_v = vendored.forward(&ids)?;
-        let y_s = stock_model.forward(&ids)?;
-        assert_eq!(y_v.dims(), y_s.dims());
-        let diff = (y_v - y_s)?.abs()?.max_all()?.to_scalar::<f32>()?;
-        assert!(diff < 1e-4, "vendored CLIP diverged from stock by {diff}");
+            let ids = Tensor::from_vec((0..77u32).collect::<Vec<_>>(), (1, 77), &dev)?;
+
+            // Last hidden state (`final_layer_norm` output).
+            let y_v = vendored.forward(&ids)?;
+            let y_s = stock_model.forward(&ids)?;
+            assert_eq!(y_v.dims(), y_s.dims());
+            let diff_last = (y_v - y_s)?.abs()?.max_all()?.to_scalar::<f32>()?;
+
+            // Penultimate hidden state (`until_layer = -2`) — the conditioning path.
+            let (_, penult_v) = vendored.forward_until_encoder_layer(&ids, usize::MAX, -2)?;
+            let (_, penult_s) = stock_model.forward_until_encoder_layer(&ids, usize::MAX, -2)?;
+            assert_eq!(penult_v.dims(), penult_s.dims());
+            let diff_penult = (penult_v - penult_s)?
+                .abs()?
+                .max_all()?
+                .to_scalar::<f32>()?;
+
+            Ok((diff_last, diff_penult))
+        }
+
+        // CLIP-L (`text_encoder/`): QuickGelu, 12 layers, 768/3072.
+        let (l_last, l_penult) = assert_arm(&Config::sdxl(), &stock_cfg_l())?;
+        assert!(
+            l_last < 1e-4,
+            "vendored CLIP-L last-hidden diverged from stock by {l_last}"
+        );
+        assert!(
+            l_penult < 1e-4,
+            "vendored CLIP-L penultimate diverged from stock by {l_penult}"
+        );
+
+        // OpenCLIP bigG (`text_encoder_2/`): Gelu, 32 layers, 1280/5120, 20 heads — the arm that would
+        // catch a per-encoder activation/eps/dim divergence CLIP-L cannot.
+        let (g_last, g_penult) = assert_arm(&Config::sdxl2(), &stock_cfg_g())?;
+        assert!(
+            g_last < 1e-4,
+            "vendored bigG last-hidden diverged from stock by {g_last}"
+        );
+        assert!(
+            g_penult < 1e-4,
+            "vendored bigG penultimate diverged from stock by {g_penult}"
+        );
+
         Ok(())
     }
 }
