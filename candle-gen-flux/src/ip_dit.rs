@@ -24,6 +24,7 @@ use candle_nn::{LayerNorm, Linear, RmsNorm, VarBuilder};
 pub use candle_transformers::models::flux::model::Config;
 
 use crate::ip_adapter::FluxIpInjector;
+use crate::quant::QLinear;
 
 /// A per-block **additive residual** injector for the FLUX DiT image stream — the generic *post-block*
 /// seam the PuLID-FLUX id cross-attn (sc-5492, `candle-gen-pulid`) plugs into, the candle twin of
@@ -299,18 +300,18 @@ impl Modulation2 {
 
 #[derive(Debug, Clone)]
 struct SelfAttention {
-    qkv: Linear,
+    qkv: QLinear,
     norm: QkNorm,
-    proj: Linear,
+    proj: QLinear,
     num_heads: usize,
 }
 
 impl SelfAttention {
     fn new(dim: usize, num_heads: usize, qkv_bias: bool, vb: VarBuilder) -> Result<Self> {
         let head_dim = dim / num_heads;
-        let qkv = candle_nn::linear_b(dim, dim * 3, qkv_bias, vb.pp("qkv"))?;
+        let qkv = QLinear::linear_detect(dim, dim * 3, &vb, "qkv", qkv_bias)?;
         let norm = QkNorm::new(head_dim, vb.pp("norm"))?;
-        let proj = candle_nn::linear(dim, dim, vb.pp("proj"))?;
+        let proj = QLinear::linear_detect(dim, dim, &vb, "proj", true)?;
         Ok(Self {
             qkv,
             norm,
@@ -320,7 +321,7 @@ impl SelfAttention {
     }
 
     fn qkv(&self, xs: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
-        let qkv = xs.apply(&self.qkv)?;
+        let qkv = self.qkv.forward(xs)?;
         let (b, l, _khd) = qkv.dims3()?;
         let qkv = qkv.reshape((b, l, 3, self.num_heads, ()))?;
         let q = qkv.i((.., .., 0))?.transpose(1, 2)?;
@@ -334,21 +335,21 @@ impl SelfAttention {
 
 #[derive(Debug, Clone)]
 struct Mlp {
-    lin1: Linear,
-    lin2: Linear,
+    lin1: QLinear,
+    lin2: QLinear,
 }
 
 impl Mlp {
     fn new(in_sz: usize, mlp_sz: usize, vb: VarBuilder) -> Result<Self> {
-        let lin1 = candle_nn::linear(in_sz, mlp_sz, vb.pp("0"))?;
-        let lin2 = candle_nn::linear(mlp_sz, in_sz, vb.pp("2"))?;
+        let lin1 = QLinear::linear_detect(in_sz, mlp_sz, &vb, "0", true)?;
+        let lin2 = QLinear::linear_detect(mlp_sz, in_sz, &vb, "2", true)?;
         Ok(Self { lin1, lin2 })
     }
 }
 
 impl candle_core::Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        xs.apply(&self.lin1)?.gelu()?.apply(&self.lin2)
+        self.lin2.forward(&self.lin1.forward(xs)?.gelu()?)
     }
 }
 
@@ -429,7 +430,7 @@ impl DoubleStreamBlock {
         let txt_attn = attn.narrow(1, 0, txt.dim(1)?)?;
         let img_attn = attn.narrow(1, txt.dim(1)?, attn.dim(1)? - txt.dim(1)?)?;
 
-        let img = (img + img_mod1.gate(&img_attn.apply(&self.img_attn.proj)?))?;
+        let img = (img + img_mod1.gate(&self.img_attn.proj.forward(&img_attn)?))?;
         let img = (&img
             + img_mod2.gate(
                 &img_mod2
@@ -448,7 +449,7 @@ impl DoubleStreamBlock {
             _ => img,
         };
 
-        let txt = (txt + txt_mod1.gate(&txt_attn.apply(&self.txt_attn.proj)?))?;
+        let txt = (txt + txt_mod1.gate(&self.txt_attn.proj.forward(&txt_attn)?))?;
         let txt = (&txt
             + txt_mod2.gate(
                 &txt_mod2
@@ -462,8 +463,8 @@ impl DoubleStreamBlock {
 
 #[derive(Debug, Clone)]
 struct SingleStreamBlock {
-    linear1: Linear,
-    linear2: Linear,
+    linear1: QLinear,
+    linear2: QLinear,
     norm: QkNorm,
     pre_norm: LayerNorm,
     modulation: Modulation1,
@@ -477,8 +478,8 @@ impl SingleStreamBlock {
         let h_sz = cfg.hidden_size;
         let mlp_sz = (h_sz as f64 * cfg.mlp_ratio) as usize;
         let head_dim = h_sz / cfg.num_heads;
-        let linear1 = candle_nn::linear(h_sz, h_sz * 3 + mlp_sz, vb.pp("linear1"))?;
-        let linear2 = candle_nn::linear(h_sz + mlp_sz, h_sz, vb.pp("linear2"))?;
+        let linear1 = QLinear::linear_detect(h_sz, h_sz * 3 + mlp_sz, &vb, "linear1", true)?;
+        let linear2 = QLinear::linear_detect(h_sz + mlp_sz, h_sz, &vb, "linear2", true)?;
         let norm = QkNorm::new(head_dim, vb.pp("norm"))?;
         let pre_norm = layer_norm(h_sz, vb.pp("pre_norm"))?;
         let modulation = Modulation1::new(h_sz, vb.pp("modulation"))?;
@@ -497,7 +498,7 @@ impl SingleStreamBlock {
     fn forward(&self, xs: &Tensor, vec_: &Tensor, pe: &Tensor) -> Result<Tensor> {
         let mod_ = self.modulation.forward(vec_)?;
         let x_mod = mod_.scale_shift(&xs.apply(&self.pre_norm)?)?;
-        let x_mod = x_mod.apply(&self.linear1)?;
+        let x_mod = self.linear1.forward(&x_mod)?;
         let qkv = x_mod.narrow(D::Minus1, 0, 3 * self.h_sz)?;
         let (b, l, _khd) = qkv.dims3()?;
         let qkv = qkv.reshape((b, l, 3, self.num_heads, ()))?;
@@ -508,7 +509,9 @@ impl SingleStreamBlock {
         let q = q.apply(&self.norm.query_norm)?;
         let k = k.apply(&self.norm.key_norm)?;
         let attn = attention(&q, &k, &v, pe)?;
-        let output = Tensor::cat(&[attn, mlp.gelu()?], 2)?.apply(&self.linear2)?;
+        let output = self
+            .linear2
+            .forward(&Tensor::cat(&[attn, mlp.gelu()?], 2)?)?;
         xs + mod_.gate(&output)
     }
 }
@@ -516,14 +519,14 @@ impl SingleStreamBlock {
 #[derive(Debug, Clone)]
 struct LastLayer {
     norm_final: LayerNorm,
-    linear: Linear,
+    linear: QLinear,
     ada_ln_modulation: Linear,
 }
 
 impl LastLayer {
     fn new(h_sz: usize, p_sz: usize, out_c: usize, vb: VarBuilder) -> Result<Self> {
         let norm_final = layer_norm(h_sz, vb.pp("norm_final"))?;
-        let linear = candle_nn::linear(h_sz, p_sz * p_sz * out_c, vb.pp("linear"))?;
+        let linear = QLinear::linear_detect(h_sz, p_sz * p_sz * out_c, &vb, "linear", true)?;
         let ada_ln_modulation = candle_nn::linear(h_sz, 2 * h_sz, vb.pp("adaLN_modulation.1"))?;
         Ok(Self {
             norm_final,
@@ -539,7 +542,7 @@ impl LastLayer {
             .apply(&self.norm_final)?
             .broadcast_mul(&(scale.unsqueeze(1)? + 1.0)?)?
             .broadcast_add(&shift.unsqueeze(1)?)?;
-        xs.apply(&self.linear)
+        self.linear.forward(&xs)
     }
 }
 
@@ -548,8 +551,8 @@ impl LastLayer {
 /// optional [`FluxIpInjector`] threaded into the 19 double blocks.
 #[derive(Debug, Clone)]
 pub struct IpFlux {
-    img_in: Linear,
-    txt_in: Linear,
+    img_in: QLinear,
+    txt_in: QLinear,
     time_in: MlpEmbedder,
     vector_in: MlpEmbedder,
     guidance_in: Option<MlpEmbedder>,
@@ -566,8 +569,9 @@ impl IpFlux {
     }
 
     pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let img_in = candle_nn::linear(cfg.in_channels, cfg.hidden_size, vb.pp("img_in"))?;
-        let txt_in = candle_nn::linear(cfg.context_in_dim, cfg.hidden_size, vb.pp("txt_in"))?;
+        let img_in = QLinear::linear_detect(cfg.in_channels, cfg.hidden_size, &vb, "img_in", true)?;
+        let txt_in =
+            QLinear::linear_detect(cfg.context_in_dim, cfg.hidden_size, &vb, "txt_in", true)?;
         let mut double_blocks = Vec::with_capacity(cfg.depth);
         let vb_d = vb.pp("double_blocks");
         for idx in 0..cfg.depth {
@@ -736,8 +740,8 @@ impl IpFlux {
             let ids = Tensor::cat(&[txt_ids, img_ids], 1)?;
             ids.apply(&self.pe_embedder)?
         };
-        let mut txt = txt.apply(&self.txt_in)?;
-        let mut img = img.apply(&self.img_in)?;
+        let mut txt = self.txt_in.forward(txt)?;
+        let mut img = self.img_in.forward(img)?;
         let vec_ = timestep_embedding(timesteps, 256, dtype)?.apply(&self.time_in)?;
         let vec_ = match (self.guidance_in.as_ref(), guidance) {
             (Some(g_in), Some(guidance)) => {
