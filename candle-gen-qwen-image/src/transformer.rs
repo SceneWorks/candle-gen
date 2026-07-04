@@ -656,10 +656,13 @@ impl QwenFunControlBranch {
         vb: VarBuilder,
     ) -> Result<Self> {
         let inner = cfg.inner_dim();
-        // The alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` checkpoint is a **separate dense**
-        // artifact — not part of the MLX packed tiers, so every projection here packed-detects to the
-        // dense path unchanged (a packed Fun-control tier is deferred to sc-9517). Group size is inert
-        // on the dense path; threaded only so the seam composes if a packed tier ever ships.
+        // Every projection here loads through `QLinear::linear_detect_gs`, which packed-detects
+        // per-key: the caller-provided `controlnet` path may be the dense alibaba-pai
+        // `Qwen-Image-2512-Fun-Controlnet-Union` checkpoint **or** the shared packed control tier
+        // `SceneWorks/qwen-image-2512-fun-controlnet-union` (bf16/q8/q4 — each q4/q8 subdir a single
+        // `model.safetensors` of packed `{base}.weight` u32 + `.scales` + `.biases` triples). A dense
+        // checkpoint takes the dense path (group size inert); a packed tier packed-detects with **no
+        // code change** (sc-9869). The Qwen-Image tiers pack at the MLX default group size 64.
         let gs = candle_gen::quant::MLX_GROUP_SIZE;
         let n = control_layers.len();
         let mut blocks = Vec::with_capacity(n);

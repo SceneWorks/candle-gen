@@ -350,6 +350,163 @@ mod tests {
         assert!(e.starts_with("qwen fun-control:"), "got: {e}");
     }
 
+    /// **Packed-detect fires on the shared 2512-Fun control tier key layout (sc-9869).** The candle
+    /// `QwenFunControl` load path builds every control-branch projection through
+    /// [`crate::quant::QLinear::linear_detect_gs`], which packed-detects per key. So when the
+    /// caller-provided `controlnet` path points at the shared packed tier
+    /// `SceneWorks/qwen-image-2512-fun-controlnet-union` (a single `model.safetensors` of packed
+    /// `{base}.weight` u32 + `.scales` + `.biases` triples) instead of the dense alibaba-pai
+    /// checkpoint, the projections load straight from the packed parts — **no dense weight is
+    /// materialized, no engine change** (the group-size seam was already threaded).
+    ///
+    /// This test writes a synthetic packed checkpoint mirroring the tier's exact 2512-Fun control key
+    /// layout (`control_img_in`, `control_blocks.0.before_proj`, `control_blocks.0.after_proj` — the
+    /// keys `QwenFunControlBranch::new` reads) and loads each through the same `linear_detect_gs` call
+    /// the loader uses, asserting the packed path fires (`is_packed()`), that a dense sibling (no
+    /// `.scales`) stays dense, and that the packed forward reproduces the affine grid bit-exactly.
+    #[test]
+    fn packed_detect_fires_on_2512fun_control_layout() -> Result<()> {
+        use crate::quant::QLinear;
+        use candle_gen::candle_core::safetensors::MmapedSafetensors;
+        use candle_gen::candle_nn::VarBuilder;
+        use std::collections::HashMap;
+
+        let dev = Device::Cpu;
+        let gs = candle_gen::quant::MLX_GROUP_SIZE; // the hosted Qwen-Image tiers pack at group 64
+        let dev_ref = &dev;
+
+        // Test-side MLX Q4 packer: 4-bit codes → MLX u32 words (LSB-first nibbles), group `gs`. Returns
+        // `(wq [out,in/8] u32, scales [out,in/gs], biases [out,in/gs], affine grid [out,in])` — the
+        // exact packed-parts fixture the detect loader consumes plus the affine grid it reproduces.
+        let q4_packed = |out_dim: usize, in_dim: usize| -> (Tensor, Tensor, Tensor, Vec<f32>) {
+            let codes: Vec<u8> = (0..out_dim * in_dim)
+                .map(|i| ((i * 7 + i / 13) % 16) as u8)
+                .collect();
+            let groups = out_dim * in_dim / gs;
+            let scales: Vec<f32> = (0..groups).map(|g| 0.0625 * (g as f32 + 1.0)).collect();
+            let biases: Vec<f32> = (0..groups).map(|g| -0.5 - 0.25 * g as f32).collect();
+            let gpr = in_dim / gs;
+            let grid: Vec<f32> = (0..out_dim * in_dim)
+                .map(|i| {
+                    let (row, col) = (i / in_dim, i % in_dim);
+                    let g = row * gpr + col / gs;
+                    scales[g] * codes[i] as f32 + biases[g]
+                })
+                .collect();
+            let words: Vec<u32> = codes
+                .chunks_exact(8)
+                .map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .fold(0u32, |acc, (i, &q)| acc | ((q as u32 & 0xF) << (4 * i)))
+                })
+                .collect();
+            let wq = Tensor::from_vec(words, (out_dim, in_dim / 8), dev_ref).unwrap();
+            let s = Tensor::from_vec(scales, (out_dim, gpr), dev_ref).unwrap();
+            let b = Tensor::from_vec(biases, (out_dim, gpr), dev_ref).unwrap();
+            (wq, s, b, grid)
+        };
+
+        // Dims chosen gs-divisible (MLX packing requires `in_dim % group_size == 0`). The real
+        // `control_img_in` in-features is `CONTROL_IN_DIM` (132) — not a synthetic width here; a
+        // gs-divisible `cin` keeps the fixture a valid packed triple while still exercising the exact
+        // `control_img_in.{weight,scales,biases}` key the loader detects. `before/after_proj`:
+        // inner → inner.
+        let inner = 128usize;
+        let cin = 256usize;
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        let mut grids: HashMap<String, Vec<f32>> = HashMap::new();
+
+        // The three 2512-Fun control keys the loader packed-detects, each a packed triple. A bias is
+        // present (the loader loads these biased) — the dense `.bias` sibling must survive the base
+        // string alongside the `.scales`/`.biases` (the key-remap trap `linear_detect_gs` guards).
+        for (base, out_dim, in_dim) in [
+            ("control_img_in", inner, cin),
+            ("control_blocks.0.before_proj", inner, inner),
+            ("control_blocks.0.after_proj", inner, inner),
+        ] {
+            let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
+            map.insert(format!("{base}.weight"), wq);
+            map.insert(format!("{base}.scales"), s);
+            map.insert(format!("{base}.biases"), b);
+            let bias_vec: Vec<f32> = (0..out_dim).map(|i| 0.01 * i as f32).collect();
+            map.insert(
+                format!("{base}.bias"),
+                Tensor::from_vec(bias_vec, (out_dim,), &dev)?,
+            );
+            grids.insert(base.to_string(), grid);
+        }
+        // A dense sibling (no `.scales`) — the dense path must stay unchanged when a tier ships some
+        // weight dense.
+        map.insert(
+            "control_blocks.0.dense_proj.weight".into(),
+            Tensor::randn(0f32, 1f32, (inner, inner), &dev)?,
+        );
+        map.insert(
+            "control_blocks.0.dense_proj.bias".into(),
+            Tensor::zeros((inner,), DType::F32, &dev)?,
+        );
+
+        let tmp = std::env::temp_dir().join(format!(
+            "sc9869_2512fun_packed_{}.safetensors",
+            std::process::id()
+        ));
+        candle_gen::candle_core::safetensors::save(&map, &tmp)?;
+        // SAFETY: freshly written by this test, single reader.
+        let st = unsafe { MmapedSafetensors::new(&tmp)? };
+        let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev.clone());
+
+        // Load exactly as `QwenFunControlBranch::new` does: `control_img_in` off the root, the two
+        // block projections off `control_blocks.0`.
+        let img_in = QLinear::linear_detect_gs(cin, inner, &vb, "control_img_in", true, gs)?;
+        assert!(
+            img_in.is_packed(),
+            "control_img_in must packed-detect on the packed tier (no dense staging)"
+        );
+        let blk0 = vb.pp("control_blocks").pp(0);
+        let before = QLinear::linear_detect_gs(inner, inner, &blk0, "before_proj", true, gs)?;
+        let after = QLinear::linear_detect_gs(inner, inner, &blk0, "after_proj", true, gs)?;
+        assert!(before.is_packed(), "before_proj must packed-detect");
+        assert!(after.is_packed(), "after_proj must packed-detect");
+
+        // A dense sibling stays dense (packed-detect is per-key, not all-or-nothing).
+        let dense = QLinear::linear_detect_gs(inner, inner, &blk0, "dense_proj", true, gs)?;
+        assert!(!dense.is_packed(), "no `.scales` ⇒ dense path unchanged");
+
+        // The packed forward reproduces the affine grid bit-exactly (packed-detect wired correctly, not
+        // reinterpreting the u32 code stream as garbage).
+        let cosine = |a: &Tensor, b: &Tensor| -> f32 {
+            let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+            for (x, y) in a.iter().zip(&b) {
+                dot += (*x as f64) * (*y as f64);
+                na += (*x as f64) * (*x as f64);
+                nb += (*y as f64) * (*y as f64);
+            }
+            (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
+        };
+        let grid = grids.remove("control_img_in").unwrap();
+        // Same bias the packed `control_img_in` loaded (`0.01·i`) so the affine comparison includes it.
+        let img_in_bias: Vec<f32> = (0..inner).map(|i| 0.01 * i as f32).collect();
+        let grid_lin = candle_gen::candle_nn::Linear::new(
+            Tensor::from_vec(grid, (inner, cin), &dev)?,
+            Some(Tensor::from_vec(img_in_bias, (inner,), &dev)?),
+        );
+        let x = Tensor::randn(0f32, 1f32, (4, cin), &dev)?;
+        let cos = cosine(
+            &img_in.forward(&x)?,
+            &candle_gen::candle_nn::Module::forward(&grid_lin, &x)?,
+        );
+        assert!(
+            cos > 0.99999,
+            "packed control_img_in vs affine grid cosine {cos:.6}"
+        );
+
+        std::fs::remove_file(&tmp).ok();
+        Ok(())
+    }
+
     /// The 132-ch control context packs to `[1, seq, 132]` and reduces to `[control_latent | 0 | 0]`:
     /// the mask (channel 16) and the inpaint latents (channels 17..33) of every packed token are zero
     /// in the pose/canny/depth-only layout, while the control latent (channels 0..16) carries through.
