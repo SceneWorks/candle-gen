@@ -81,6 +81,12 @@ pub struct KreaGenerator {
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
     pid_spec: Option<PidWeights>,
+    /// The community **INT8-ConvRot** DiT single-file checkpoint (sc-9300), captured at load when the
+    /// spec selected the ConvRot consume path (a `WeightsSource::File` on `LoadSpec::text_encoder` — see
+    /// [`build`]). `Some` ⇒ the lazy component build takes the DiT from this int8 checkpoint
+    /// ([`pipeline::load_components_convrot`]) and the tokenizer / Qwen3-VL TE / Qwen-Image VAE from the
+    /// canonical `root` snapshot; `None` ⇒ the dense/packed `transformer/` snapshot path (unchanged).
+    convrot_dit: Option<PathBuf>,
     components: Mutex<Option<Arc<Components>>>,
 }
 
@@ -93,12 +99,23 @@ impl KreaGenerator {
         if let Some(c) = guard.as_ref() {
             return Ok(c.clone());
         }
-        let c = Arc::new(pipeline::load_components(
-            &self.root,
-            &self.device,
-            &self.adapters,
-            self.pid_spec.as_ref(),
-        )?);
+        // ConvRot consume path (sc-9300): when a ConvRot DiT was selected, the DiT is taken from the
+        // int8 single-file checkpoint while everything else loads from the canonical snapshot. The
+        // sm_89 compute-capability floor is enforced inside `load_components_convrot` (locked decision
+        // 7). LoRA/LoKr and PiD overlays are not wired through the ConvRot variant (rejected at `build`).
+        let c = match self.convrot_dit.as_ref() {
+            Some(convrot_dit) => Arc::new(pipeline::load_components_convrot(
+                &self.root,
+                convrot_dit,
+                &self.device,
+            )?),
+            None => Arc::new(pipeline::load_components(
+                &self.root,
+                &self.device,
+                &self.adapters,
+                self.pid_spec.as_ref(),
+            )?),
+        };
         *guard = Some(c.clone());
         Ok(c)
     }
@@ -181,6 +198,23 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
+/// sc-9300 ConvRot selection: decode whether a [`LoadSpec`] selects the community INT8-ConvRot DiT
+/// consume path, returning the DiT single-file checkpoint when it does. ConvRot rides the shared,
+/// already-optional [`LoadSpec::text_encoder`] field as a [`WeightsSource::File`]; a [`WeightsSource::Dir`]
+/// there is a mis-shaped spec (ConvRot is a single file) and errors. `None` on `text_encoder` ⇒ the
+/// dense/packed snapshot path. Extracted from [`build`] so the routing decision is unit-testable on CPU
+/// without loading weights.
+fn convrot_selector(spec: &LoadSpec, id: &str) -> gen_core::Result<Option<PathBuf>> {
+    match spec.text_encoder.as_ref() {
+        Some(WeightsSource::File(p)) => Ok(Some(p.clone())),
+        Some(WeightsSource::Dir(_)) => Err(gen_core::Error::Msg(format!(
+            "candle {id}: LoadSpec::text_encoder selects the INT8-ConvRot DiT and must be a single \
+             .safetensors file (WeightsSource::File), not a directory"
+        ))),
+        None => Ok(None),
+    }
+}
+
 fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -192,6 +226,17 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
             )));
         }
     };
+    // sc-9300 seam: select the community **INT8-ConvRot** DiT consume path when the spec carries a
+    // ConvRot DiT single-file checkpoint. It rides the shared, already-optional `LoadSpec::text_encoder`
+    // field as a `WeightsSource::File` — the canonical Krea 2 snapshot (`spec.weights`, a `Dir`) still
+    // supplies the tokenizer / Qwen3-VL TE / Qwen-Image VAE / config + all non-quantized surface, and
+    // only the DiT weights are taken from the int8 checkpoint (`pipeline::load_components_convrot`,
+    // which enforces the sm_89 compute-cap floor). This reuses an existing extensibility point (the same
+    // pattern LTX uses to ride an aux path on `text_encoder`) rather than growing the shared
+    // `WeightsSource` enum with a ConvRot variant — which would force a new match arm across every
+    // provider in candle-gen AND the worker plus a gen-core pin bump. Only Krea reads this; every other
+    // engine ignores `text_encoder` unchanged. `None`/`Dir` here ⇒ the dense/packed snapshot path below.
+    let convrot_dit = convrot_selector(spec, descriptor.id)?;
     // LoRA/LoKr adapters are accepted and merged into the DiT at first `generate` (sc-7836); the merge
     // (`adapters::merge_into_weights`) is lazy, so a nonexistent adapter path still loads here.
     //
@@ -205,6 +250,16 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
             descriptor.id
         )));
     }
+    // The ConvRot consume path (sc-9300) is DiT-only and does not thread LoRA/LoKr or PiD overlays — the
+    // int8 checkpoint replaces the dense transformer wholesale. Reject the combination up front so the
+    // worker gets a clear error instead of silently dropping the overlay.
+    if convrot_dit.is_some() && (!spec.adapters.is_empty() || spec.pid.is_some()) {
+        return Err(gen_core::Error::Unsupported(format!(
+            "candle {}: the INT8-ConvRot DiT path does not support LoRA/LoKr adapters or a PiD decoder \
+             overlay",
+            descriptor.id
+        )));
+    }
     let device = candle_gen::default_device()?;
     Ok(Box::new(KreaGenerator {
         descriptor,
@@ -214,12 +269,20 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         // PiD is an optional aux decoder (epic 7840 / sc-7853): capture the load-spec component (if any)
         // so the lazy component build loads the engine once. `None` keeps the byte-exact native path.
         pid_spec: spec.pid.clone(),
+        convrot_dit,
         components: Mutex::new(None),
     }))
 }
 
 /// Construct a lazy candle Krea 2 **Turbo** generator. `spec.weights` must be a [`WeightsSource::Dir`]
 /// pointing at a candle-readable (bf16) Krea 2 snapshot (`transformer/ text_encoder/ vae/ tokenizer/`).
+///
+/// **INT8-ConvRot (sc-9300).** To load the community int8-quantized DiT instead of the snapshot's dense
+/// `transformer/`, pass the ConvRot DiT single-file checkpoint as
+/// `spec.text_encoder = Some(WeightsSource::File(convrot_dit.safetensors))` while keeping
+/// `spec.weights = WeightsSource::Dir(canonical_snapshot)` (which supplies the tokenizer / TE / VAE /
+/// config). The ConvRot path enforces the sm_89 compute-cap floor and does not combine with LoRA/LoKr
+/// or PiD overlays.
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     build(spec, descriptor())
 }
@@ -334,5 +397,83 @@ mod tests {
             load(&quant).is_ok(),
             "Q4/Q8 quant is accepted + lazy (sc-9607)"
         );
+    }
+
+    // sc-9300: the ConvRot consume path is reachable through the LoadSpec API. The selector routes a
+    // `WeightsSource::File` on `text_encoder` to the INT8-ConvRot DiT (`load_components_convrot`), a
+    // plain `Dir` weights spec to the dense/packed snapshot path (`load_components`), and rejects the
+    // mis-shaped / incompatible combinations. These assert the routing decision on CPU (no weights).
+    #[test]
+    fn convrot_selector_routes_file_to_convrot_dir_to_dense() {
+        // A `Dir`-only spec (canonical snapshot, no ConvRot DiT) ⇒ the dense/packed path.
+        let dense = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        assert_eq!(
+            convrot_selector(&dense, KREA_2_TURBO_ID).unwrap(),
+            None,
+            "a Dir-only spec dispatches to the dense/packed snapshot path"
+        );
+        // A ConvRot DiT single-file on `text_encoder` ⇒ the ConvRot path, carrying the DiT checkpoint.
+        let convrot = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_convrot_text_encoder();
+        assert_eq!(
+            convrot_selector(&convrot, KREA_2_TURBO_ID).unwrap(),
+            Some(PathBuf::from("/krea2_int8_convrot.safetensors")),
+            "a File on text_encoder selects the ConvRot DiT consume path"
+        );
+        // A `Dir` on `text_encoder` is not a valid ConvRot selector (ConvRot is a single file).
+        let bad = LoadSpec {
+            text_encoder: Some(WeightsSource::Dir("/te_dir".into())),
+            ..LoadSpec::new(WeightsSource::Dir("/snap".into()))
+        };
+        assert!(
+            convrot_selector(&bad, KREA_2_TURBO_ID).is_err(),
+            "a Dir on text_encoder is a mis-shaped ConvRot selector and errors"
+        );
+    }
+
+    #[test]
+    fn load_accepts_convrot_and_rejects_convrot_with_overlays() {
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+        // A ConvRot-selecting spec loads (lazily — the int8 DiT + snapshot load at first `generate`).
+        let convrot = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_convrot_text_encoder();
+        assert!(
+            load(&convrot).is_ok(),
+            "a ConvRot LoadSpec is accepted + lazy (sc-9300)"
+        );
+        // ConvRot does not thread LoRA/LoKr — the int8 checkpoint replaces the dense DiT wholesale.
+        let convrot_lora = LoadSpec::new(WeightsSource::Dir("/snap".into()))
+            .with_convrot_text_encoder()
+            .with_adapters(vec![AdapterSpec::new(
+                "/lora.safetensors".into(),
+                1.0,
+                AdapterKind::Lora,
+            )]);
+        assert!(
+            load(&convrot_lora).is_err(),
+            "ConvRot + LoRA is rejected (the int8 DiT path is not adapter-wired)"
+        );
+        // ConvRot does not thread a PiD decoder overlay either.
+        let convrot_pid = LoadSpec::new(WeightsSource::Dir("/snap".into()))
+            .with_convrot_text_encoder()
+            .with_pid(
+                WeightsSource::File("/pid.safetensors".into()),
+                WeightsSource::Dir("/gemma".into()),
+            );
+        assert!(
+            load(&convrot_pid).is_err(),
+            "ConvRot + PiD is rejected (the int8 DiT path is not PiD-wired)"
+        );
+    }
+
+    /// Test helper: attach a ConvRot DiT single-file selector on `text_encoder` (sc-9300).
+    trait WithConvRot {
+        fn with_convrot_text_encoder(self) -> Self;
+    }
+    impl WithConvRot for LoadSpec {
+        fn with_convrot_text_encoder(mut self) -> Self {
+            self.text_encoder = Some(WeightsSource::File(
+                "/krea2_int8_convrot.safetensors".into(),
+            ));
+            self
+        }
     }
 }
