@@ -3,8 +3,8 @@
 //! Structural control (pose / canny / depth) on the **Qwen-Image-2512** base via the alibaba-pai
 //! `Qwen-Image-2512-Fun-Controlnet-Union` checkpoint (Apache-2.0, ungated).
 //!
-//! Unlike the InstantX [`crate::control::QwenControl`] (an independent mini-transformer
-//! emitting residuals the base ADDs at a fixed interval), this is **VACE-style**: a `control_img_in`
+//! Unlike the retired InstantX Qwen ControlNet lane (an independent mini-transformer
+//! emitting residuals the base ADDs at a fixed interval; removed in sc-9868), this is **VACE-style**: a `control_img_in`
 //! patch embedder feeds a control state threaded through 5 control blocks that reuse the base block
 //! math (seeded at block 0 by `before_proj(c) + img_embed`); each emits a zero-init `after_proj` hint
 //! the base 60-layer MMDiT adds into its image stream at `control_layers = [0, 12, 24, 36, 48]` scaled
@@ -14,10 +14,11 @@
 //! control image fed to [`QwenFunControl::generate`] — there is no mode index and no per-kind branch.
 //! v1 is pose/canny/depth-from-prompt (no img2img-with-control compose yet).
 //!
-//! Like the InstantX lane, this is a plain struct driven **directly** by the worker (a bespoke stream,
-//! like `candle_gen_sdxl::IpAdapterSdxl`), not a gen-core-registered generator — the registered
-//! `qwen_image` descriptor stays txt2img-only. The InstantX lane ([`crate::control`]) is kept intact;
-//! the worker retirement of InstantX is **Phase B** (sc-8246, a different repo).
+//! Like the (now-retired) InstantX lane, this is a plain struct driven **directly** by the worker (a
+//! bespoke stream, like `candle_gen_sdxl::IpAdapterSdxl`), not a gen-core-registered generator — the
+//! registered `qwen_image` descriptor stays txt2img-only. This is the sole Qwen control engine: the
+//! bespoke InstantX ControlNet lane was removed in sc-9868 (MLX twin retired in sc-8267, worker
+//! repointed InstantX→2512-Fun in sc-8350).
 
 use std::path::{Path, PathBuf};
 

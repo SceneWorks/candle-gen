@@ -9,8 +9,8 @@ pub const DEFAULT_HEIGHT: u32 = 1024;
 /// Default sampling steps for the **non-distilled** Qwen-Image base T2I model (sc-9046 / F-076).
 /// Qwen-Image base is a 20B undistilled flow-match model — 4 steps is a distilled/Lightning count and
 /// yields a visibly broken render, so the engine default must be a production step count. 30 matches
-/// the sibling non-distilled paths in this crate ([`edit::QwenEditRequest`], [`control::QwenControlRequest`],
-/// [`control_fun::QwenControlFunRequest`]) and sits inside the diffusers `QwenImagePipeline` range
+/// the sibling non-distilled paths in this crate ([`crate::edit::QwenEditRequest`],
+/// [`crate::control_fun::QwenFunControlRequest`]) and sits inside the diffusers `QwenImagePipeline` range
 /// (20–50). An explicit caller-supplied `steps` is always honored — only this default changed. (The
 /// few-step distilled Lightning path lives on the Edit surface, gated by `QwenEditRequest::lightning`,
 /// and keeps its own low step count.)

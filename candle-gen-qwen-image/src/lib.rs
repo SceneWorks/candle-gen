@@ -23,22 +23,17 @@
 // general Qwen-family LoRA/LoKr. Consumed by `edit::QwenEdit::load`.
 pub mod adapters;
 pub mod config;
-// Qwen-Image ControlNet (strict pose) — the candle reference-pose lane (sc-5489, epic 5480). The pose
-// skeleton is VAE-encoded + packed and fed to the InstantX control branch, whose per-block residuals
-// inject into the frozen base MMDiT. A bespoke provider the worker drives directly (the registered
-// `qwen_image` descriptor stays txt2img-only).
-pub mod control;
-// Shared scaffolding for the two control lanes (`control` + `control_fun`): the identical component
-// loader, prompt encoder, control-image preprocessor, and VAE-output converter, parameterized by an
-// error `label` (sc-9011, F-074). De-duplicates what used to be verbatim copies; both lanes' outputs are
-// preserved exactly.
+// Shared scaffolding for the control lane (`control_fun`): the component loader, prompt encoder,
+// control-image preprocessor, and VAE-output converter, parameterized by an error `label` (sc-9011,
+// F-074). De-duplicates what used to be verbatim copies; the lane's outputs are preserved exactly.
 mod control_common;
 // Qwen-Image **2512-Fun-Controlnet-Union** (VACE) control — the candle structural-control lane
 // (sc-8350, mirrors mlx sc-8267). A `control_img_in` patch embedder feeds a control state threaded
 // through 5 VACE control blocks (seeded by `before_proj`), each emitting a zero-init `after_proj` hint
 // the base 2512 MMDiT adds at `control_layers = [0, 12, 24, 36, 48]`. Input-agnostic (pose/canny/depth
-// share one path, no mode index). A bespoke provider the worker drives directly. The InstantX lane
-// (`control`) is kept intact; its retirement is Phase B (sc-8246, the worker repo).
+// share one path, no mode index). A bespoke provider the worker drives directly. This is the sole Qwen
+// control engine — the retired InstantX ControlNet lane (`control`) was removed in sc-9868 (its MLX
+// twin was retired in sc-8267 and the worker repointed InstantX→2512-Fun in sc-8350).
 pub mod control_fun;
 // Qwen-Image-Edit (img2img / reference) — the candle edit lane (sc-5487, epic 5480). The Qwen2.5-VL
 // vision tower + image processor + VL splice turn a reference image + edit prompt into vision-
@@ -60,16 +55,12 @@ pub mod vision;
 pub mod vision_language;
 pub mod vl_tokenizer;
 
-pub use control::{QwenControl, QwenControlPaths, QwenControlRequest, DEFAULT_CONTROL_SCALE};
 pub use control_fun::{
     QwenFunControl, QwenFunControlPaths, QwenFunControlRequest, CONTROL_IN_DIM, CONTROL_LAYERS,
+    DEFAULT_CONTROL_SCALE,
 };
 pub use edit::{QwenEdit, QwenEditPaths, QwenEditRequest};
 pub use vision_language::{load_vision_language_encoder, QwenVisionLanguageEncoder};
-
-/// Qwen-Image ControlNet (strict-pose) real-weight GPU validation (sc-5489) — env-driven, `#[ignore]`d.
-#[cfg(test)]
-mod control_validate;
 
 /// Qwen-Image 2512-Fun-Controlnet-Union (VACE) real-weight GPU validation (sc-8350) — env-driven,
 /// `#[ignore]`d.

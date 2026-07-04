@@ -11,8 +11,8 @@
 //!    transformer config).
 //! 3. flow-match Euler denoise (true CFG with norm-rescale) → slice the noise prefix → VAE decode.
 //!
-//! A bespoke provider driven **directly** by the worker (like [`crate::control::QwenControl`] and
-//! `candle_gen_sdxl::SdxlEdit`) — the registered `qwen_image` descriptor stays txt2img-only.
+//! A bespoke provider driven **directly** by the worker (like [`crate::control_fun::QwenFunControl`]
+//! and `candle_gen_sdxl::SdxlEdit`) — the registered `qwen_image` descriptor stays txt2img-only.
 //!
 //! NB: candle's CUDA attention indexes scores with i32, so a joint sequence whose scores tensor
 //! exceeds `i32::MAX` elements (~2.1B) would silently corrupt — the shared `JointAttention` guards

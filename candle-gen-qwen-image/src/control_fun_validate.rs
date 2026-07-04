@@ -2,7 +2,7 @@
 //! `#[ignore]`d integration test that drives the REAL [`QwenFunControl`] stack on the deployed hardware
 //! (a `Qwen/Qwen-Image-2512` snapshot + the alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union`
 //! checkpoint + a preprocessed pose/canny/depth control image). The candle sibling of the mlx
-//! `tests/control_real_weights.rs`, and the analog of the InstantX [`crate::control_validate`].
+//! `tests/control_real_weights.rs` (the retired InstantX `control_validate` was removed in sc-9868).
 //!
 //! **Gate.** A VACE control should make the generation *follow* the control image, so the metric is a
 //! with-control vs no-control ablation at one seed: generate **with** control (`control_scale > 0`) and

@@ -612,136 +612,14 @@ fn build_modulate_index(
     Tensor::from_vec(row, (1, img_seq), device)
 }
 
-/// The Qwen-Image **ControlNet-Union** control transformer (sc-5489) — the candle port of the InstantX
-/// `Qwen-Image-ControlNet-Union` `QwenImageControlNetModel`. A small (5-block) partial copy of the base
-/// MMDiT with its own input projections + a zero-init `controlnet_x_embedder` that adds the packed
-/// VAE-encoded control image to `img_in(x)`; each block's output is projected by a zero-init
-/// `controlnet_blocks[i]` into a residual. The residuals are injected into the frozen base transformer
-/// at `interval = ceil(60/5) = 12` (see [`QwenTransformer::forward_control`]). The block math is the
-/// **same** [`Block`] as the base (identical on-disk keys), so the loader reuses it.
-pub struct QwenControlNet {
-    img_in: QLinear,
-    txt_norm: RmsNorm,
-    txt_in: QLinear,
-    time_embed: TimeEmbed,
-    /// Zero-init projection of the packed control latent (`64 → inner`), added to `img_in(x)`.
-    x_embedder: QLinear,
-    blocks: Vec<Block>,
-    /// Zero-init per-block residual projections (`inner → inner`).
-    controlnet_blocks: Vec<QLinear>,
-    rope: QwenRope,
-    rope_cache: RopeCache,
-    device: Device,
-    dtype: DType,
-}
-
-impl QwenControlNet {
-    /// Load the control branch (`num_layers` blocks — 5 for the InstantX Union) from its single-file
-    /// checkpoint (the base block keys + `controlnet_x_embedder` + `controlnet_blocks.{i}`).
-    ///
-    /// The InstantX `Qwen-Image-ControlNet-Union` checkpoint is a **separate dense** artifact — it is
-    /// not part of the `SceneWorks/qwen-image-mlx` packed tiers, so it carries no `.scales` and every
-    /// projection here packed-**detects** to the dense path unchanged (a packed control tier is deferred
-    /// to sc-9517). The default group size is inert on the dense path; it is threaded only so the seam
-    /// composes with the base DiT if a packed control tier ever ships.
-    pub fn new(cfg: &TransformerConfig, num_layers: usize, vb: VarBuilder) -> Result<Self> {
-        let inner = cfg.inner_dim();
-        let gs = candle_gen::quant::MLX_GROUP_SIZE;
-        let mut blocks = Vec::with_capacity(num_layers);
-        let mut controlnet_blocks = Vec::with_capacity(num_layers);
-        for i in 0..num_layers {
-            blocks.push(Block::new(cfg, vb.pp("transformer_blocks").pp(i), gs)?);
-            let cb = vb.pp("controlnet_blocks");
-            controlnet_blocks.push(QLinear::linear_detect_gs(
-                inner,
-                inner,
-                &cb,
-                &i.to_string(),
-                true,
-                gs,
-            )?);
-        }
-        Ok(Self {
-            img_in: QLinear::linear_detect_gs(cfg.in_channels, inner, &vb, "img_in", true, gs)?,
-            txt_norm: rms_norm(cfg.joint_attention_dim, cfg.eps, vb.pp("txt_norm"))?,
-            txt_in: QLinear::linear_detect_gs(
-                cfg.joint_attention_dim,
-                inner,
-                &vb,
-                "txt_in",
-                true,
-                gs,
-            )?,
-            time_embed: TimeEmbed::new(cfg, vb.pp("time_text_embed"), gs)?,
-            x_embedder: QLinear::linear_detect_gs(
-                cfg.in_channels,
-                inner,
-                &vb,
-                "controlnet_x_embedder",
-                true,
-                gs,
-            )?,
-            blocks,
-            controlnet_blocks,
-            rope: QwenRope::new(cfg),
-            rope_cache: RopeCache::new(),
-            device: vb.device().clone(),
-            dtype: vb.dtype(),
-        })
-    }
-
-    /// The number of control residuals (= control layers); drives the base injection interval.
-    pub fn num_residuals(&self) -> usize {
-        self.controlnet_blocks.len()
-    }
-
-    /// Run the control branch → the per-block residuals (pre-scale), one per control layer.
-    /// `hidden_states`: the current packed noise latents `[1, seq, 64]`; `control_cond`: the packed
-    /// VAE-encoded control image `[1, seq, 64]` (constant across steps); `encoder_hidden_states`: text
-    /// `[1, txt_seq, 3584]`; `timestep`: the same raw sigma the base forward uses.
-    pub fn forward(
-        &self,
-        hidden_states: &Tensor,
-        control_cond: &Tensor,
-        encoder_hidden_states: &Tensor,
-        timestep: f32,
-        lat_h: usize,
-        lat_w: usize,
-    ) -> Result<Vec<Tensor>> {
-        let temb = self
-            .time_embed
-            .forward(timestep, &self.device, self.dtype)?;
-        // diffusers `hidden_states = self.img_in(x) + self.controlnet_x_embedder(controlnet_cond)`.
-        let mut hidden =
-            (self.img_in.forward(hidden_states)? + self.x_embedder.forward(control_cond)?)?;
-        let encoder = self.txt_norm.forward(encoder_hidden_states)?;
-        let mut encoder = self.txt_in.forward(&encoder)?;
-
-        let txt_seq = encoder.dim(1)?;
-        // Step-invariant (fixed grid), so cache the RoPE tables per render (sc-8992).
-        let (img_cos, img_sin, txt_cos, txt_sin) =
-            self.rope_cache
-                .tables(&self.rope, &[(lat_h, lat_w)], txt_seq, &self.device)?;
-
-        let mut residuals = Vec::with_capacity(self.blocks.len());
-        for (block, cn) in self.blocks.iter().zip(&self.controlnet_blocks) {
-            let (e, h) = block.forward(
-                &hidden, &encoder, &temb, &img_cos, &img_sin, &txt_cos, &txt_sin, None,
-            )?;
-            encoder = e;
-            hidden = h;
-            residuals.push(cn.forward(&hidden)?);
-        }
-        Ok(residuals)
-    }
-}
-
 /// The Qwen-Image **2512-Fun-Controlnet-Union** VACE control branch (sc-8350) — the candle port of the
 /// alibaba-pai `Qwen-Image-2512-Fun-Controlnet-Union` `QwenImageControlTransformer2DModel` (the
-/// `VideoX-Fun` VACE family, the same shape as the FLUX.2 / Z-Image Fun-Controlnet-Union branches),
-/// which **replaces** the InstantX [`QwenControlNet`] shape on the Qwen control path.
+/// `VideoX-Fun` VACE family, the same shape as the FLUX.2 / Z-Image Fun-Controlnet-Union branches).
+/// This is the sole Qwen control branch; it **replaced** the retired InstantX `QwenImageControlNetModel`
+/// shape on the Qwen control path (that dead lane was removed in sc-9868 — MLX twin retired in sc-8267,
+/// worker repointed InstantX→2512-Fun in sc-8350).
 ///
-/// Unlike the InstantX ControlNet (an independent mini-transformer with a zero-init
+/// Unlike that retired InstantX ControlNet (an independent mini-transformer with a zero-init
 /// `controlnet_x_embedder` ADDed onto `img_in(x)`, emitting per-block residuals the base ADDs at a
 /// fixed interval), the 2512-Fun branch is **VACE-style**: a `control_img_in` patch embedder
 /// (`132 → inner`) feeds a control state `c` threaded through `N` control blocks that reuse the base

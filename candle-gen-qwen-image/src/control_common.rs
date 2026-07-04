@@ -1,11 +1,12 @@
-//! Shared scaffolding for the two Qwen-Image control lanes (sc-9011, F-074): the InstantX strict-pose
-//! lane ([`crate::control`]) and the 2512-Fun-Controlnet-Union VACE lane ([`crate::control_fun`]).
+//! Shared scaffolding for the Qwen-Image control lane (sc-9011, F-074): the 2512-Fun-Controlnet-Union
+//! VACE lane ([`crate::control_fun`]). (Originally shared with the InstantX strict-pose lane, retired
+//! in sc-9868.)
 //!
-//! Both bespoke providers reuse an identical component loader, prompt encoder, control-image
-//! preprocessor, and VAE-output converter — historically copied verbatim between the two files, differing
-//! only by an error-message `label`. This module holds that common code parameterized by the `label`, so a
-//! preprocessing fix lands once. The genuinely different pieces (checkpoint resolution, the control-branch
-//! type and its forward wiring, the packed control context) stay in each lane's file.
+//! The bespoke provider reuses a common component loader, prompt encoder, control-image
+//! preprocessor, and VAE-output converter — historically copied verbatim between the two control files,
+//! differing only by an error-message `label`. This module holds that common code parameterized by the
+//! `label`, so a preprocessing fix lands once. The genuinely different pieces (checkpoint resolution, the
+//! control-branch type and its forward wiring, the packed control context) stay in the lane's file.
 //!
 //! These are byte-for-byte the previous per-lane private helpers; the only change is threading the
 //! `label` through the error messages, so both lanes' outputs are preserved exactly.

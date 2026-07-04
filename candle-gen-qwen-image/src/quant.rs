@@ -26,8 +26,8 @@
 //! path, not fall through.
 //!
 //! Absent `.scales` (a dense bf16 tier — the stock diffusers `Qwen/Qwen-Image` snapshot, *and* the
-//! separate InstantX `QwenControlNet` / alibaba-pai `QwenFunControlBranch` control checkpoints, which
-//! are **not** part of the MLX tiers and are genuinely-deferred to sc-9517 for their own packed tiers)
+//! separate alibaba-pai `QwenFunControlBranch` control checkpoint, which is
+//! **not** part of the MLX tiers and is genuinely-deferred to sc-9517 for its own packed tier)
 //! the loader falls back to the **stock** `candle_nn::linear` path unchanged, so the same
 //! [`crate::transformer`] serves both a dense snapshot and a packed one, and the mixed dense/packed DiT
 //! loads with one call site per projection.
