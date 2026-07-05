@@ -79,6 +79,16 @@ impl CaptionEncoder {
     /// + length policy can be parity-checked against the reference without the Gemma weights.
     pub fn token_ids(&self, caption: &str) -> Result<(Vec<i32>, Vec<i32>)> {
         let max_len = self.num_chi_tokens + MODEL_MAX_LENGTH - 2;
+        // The caption is fed RAW (no lowercasing) because PiD was TRAINED on raw-case captions, so raw
+        // is what the checkpoint expects (sc-9935). Evidence, not just parity: PiD's training-time
+        // caption conditioner (`modules/conditioner.py`) passes captions through unmodified; its
+        // reference inference (`_encode_text_raw`) appends `chi_prompt_str + cap` unmodified; the
+        // authors' own demo manifest uses mixed-case prompts; and there is no `.lower()` on captions
+        // anywhere in the PiD repo. This deliberately differs from SANA, whose reference is the
+        // diffusers `SanaPipeline` (`_text_preprocessing` lowercases) — so `mlx-gen-sana` applies its
+        // own `preprocess()` before this shared encoder (sc-9927). Lowercasing here would feed PiD
+        // OOD-cased captions. (The effect is also small — an A/B moved a PiD SR decode 0.034%, weak
+        // LQ-dominated conditioning — but the reason to keep raw is correctness, not impact.)
         let mut ids = self
             .tok
             .encode_ids(&format!("{}{caption}", self.chi_prompt), true)?;
