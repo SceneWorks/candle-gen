@@ -212,7 +212,7 @@ pub(crate) fn preprocess_image(
             image.pixels.iter().map(|&p| p as f32).collect()
         }
         ResizePolicy::ResizeIfNeeded | ResizePolicy::ResizeAlways => {
-            resize_lanczos_u8(&image.pixels, ih, iw, rh, rw) // HWC f32 [0,255]
+            resize_lanczos_u8(&image.pixels, ih, iw, rh, rw)? // HWC f32 [0,255]
         }
     };
     // [0,255] → [-1,1], HWC → CHW.

@@ -167,7 +167,7 @@ fn cuda_video_chunk_overlap_smoke() {
     // structural faithfulness: each output frame correlates with the bicubic upscale of its LR frame.
     let mut min_corr = 1.0f64;
     for (i, f) in out.iter().enumerate() {
-        let base = imageops::resize_bicubic_u8(&clip[i].pixels, src, src, tgt, tgt);
+        let base = imageops::resize_bicubic_u8(&clip[i].pixels, src, src, tgt, tgt).unwrap();
         let of: Vec<f32> = f.pixels.iter().map(|&v| v as f32).collect();
         min_corr = min_corr.min(pearson(&of, &base));
     }

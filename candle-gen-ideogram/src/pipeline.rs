@@ -627,7 +627,7 @@ fn preprocess_source_image(
     let resized: Vec<f32> = if (ih, iw) == (th, tw) {
         image.pixels.iter().map(|&p| p as f32).collect()
     } else {
-        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)
+        resize_lanczos_u8(&image.pixels, ih, iw, th, tw)?
     };
     let norm: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();
     let hwc = Tensor::from_vec(norm, (th, tw, 3), device)?; // [H, W, 3]
@@ -659,7 +659,7 @@ fn preprocess_mask_packed(
             mask.width as usize,
             h,
             w,
-        );
+        )?;
         let u8s: Vec<u8> = resized
             .iter()
             .map(|&v| v.round().clamp(0.0, 255.0) as u8)

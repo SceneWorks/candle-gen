@@ -311,8 +311,16 @@ resolver = "2"
 # lone `///` doc-comment tag rename (`F-114` -> `sc-8827`) in gen-core/src/runtime.rs — NO API, field,
 # type, or behavior change; the squash's struct-literal fix lives in mlx-gen provider crates candle does
 # NOT link, so candle compiles UNCHANGED. Both lines move together.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "b520a0e753e1a75e6c7d791212c5d2660a1a733a" }
-sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "b520a0e753e1a75e6c7d791212c5d2660a1a733a" }
+# Bumped `b520a0e` -> `fd4f801` (sc-9940): catch up 15 gen-core commits so the worker's SANA quant-matrix
+# mlx-gen re-pin (ccd852c -> fd4f801, epic 8506 / sc-8513) keeps candle-gen on the SAME gen-core rev its
+# `--features backend-candle` skew gate demands. UNLIKE the prior bumps, `git diff b520a0e..fd4f801 --
+# gen-core/` is NON-empty (724 insertions, the #639 whole-workspace review remediation) and DRIFTED two
+# public APIs candle links: `imageops::resize_lanczos_u8`/`resize_bicubic_u8` became fallible
+# (`-> Result<Vec<f32>, gen_core::Error>`) and `AlphaSchedule::scaled_linear` became infallible (returns
+# `AlphaSchedule` directly). All candle-gen call sites were adapted in this same change. Both lines move
+# together. candle-core (huggingface c1e6756/65ecb58) is UNTOUCHED — only these two gen-core lines move.
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "fd4f801d0323b2c8de0a02207c587b3b5ddf6580" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "fd4f801d0323b2c8de0a02207c587b3b5ddf6580" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels

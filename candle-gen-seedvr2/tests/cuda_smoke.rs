@@ -132,7 +132,7 @@ fn cuda_upscale_smoke() {
     );
 
     // structural faithfulness vs a bicubic baseline of the same LR
-    let base = imageops::resize_bicubic_u8(&lr.pixels, src, src, tgt, tgt); // f32 [0,255] HWC
+    let base = imageops::resize_bicubic_u8(&lr.pixels, src, src, tgt, tgt).unwrap(); // f32 [0,255] HWC
     let out_f: Vec<f32> = out.pixels.iter().map(|&v| v as f32).collect();
     let corr = pearson(&out_f, &base);
     let ge_out = grad_energy(&out_f, tgt, tgt);

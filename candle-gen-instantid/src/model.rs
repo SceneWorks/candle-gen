@@ -258,8 +258,7 @@ impl InstantId {
                 SDXL_TRAIN_STEPS,
                 SDXL_BETA_START,
                 SDXL_BETA_END,
-            )
-            .map_err(|e| CandleError::Msg(format!("instantid: build SDXL alpha schedule: {e}")))?,
+            ),
             face: None,
             pid: None,
             device,

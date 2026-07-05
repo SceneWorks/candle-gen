@@ -120,8 +120,11 @@ const SDXL_TRAIN_STEPS: usize = 1000;
 /// txt2img [`Pipeline::denoise_curated`] (sc-7124), the Lightning policy, and the conditioned
 /// [`crate::ip_provider`] curated denoise (sc-7297), so they speak one SDXL noise schedule.
 pub(crate) fn sdxl_alpha_schedule() -> Result<AlphaSchedule> {
-    AlphaSchedule::scaled_linear(SDXL_TRAIN_STEPS, SDXL_BETA_START, SDXL_BETA_END)
-        .map_err(|e| CandleError::Msg(format!("sdxl curated schedule: {e}")))
+    Ok(AlphaSchedule::scaled_linear(
+        SDXL_TRAIN_STEPS,
+        SDXL_BETA_START,
+        SDXL_BETA_END,
+    ))
 }
 
 /// Build the SDXL-**Lightning** sampler *policy* (sc-6128) for `num_steps`: diffusers

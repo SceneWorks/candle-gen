@@ -600,7 +600,7 @@ mod tests {
     /// equivalence the DDPM cohort's (sc-7124) curated path relies on.
     #[test]
     fn run_curated_sampler_eps_euler_matches_legacy_discrete_step() {
-        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012).unwrap();
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012);
         let ms = DiscreteModelSampling::sdxl(&sched);
         let sigmas = vec![8.0_f32, 4.0, 2.0, 1.0, 0.5, 0.0];
         let x_init = t(&[0.3, -1.1, 2.0]);

@@ -803,7 +803,7 @@ mod tests {
         let cond_embed = cn.embed_cond(&control).unwrap();
 
         // A short discrete σ schedule (trailing 0) over the SDXL ε contract.
-        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012).unwrap();
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012);
         let ms = DiscreteModelSampling::sdxl(&sched);
         let sigmas = vec![8.0_f32, 4.0, 2.0, 1.0, 0.5, 0.0];
         // VE σ-space prior: unit noise · σ_max.
@@ -867,7 +867,7 @@ mod tests {
         let c = cond(&dev);
         unet.set_ip_context(Some(&c.ip_tokens), 0.8).unwrap();
 
-        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012).unwrap();
+        let sched = AlphaSchedule::scaled_linear(1000, 0.00085, 0.012);
         let ms = DiscreteModelSampling::sdxl(&sched);
         let sigmas = vec![8.0_f32, 4.0, 0.0];
         let prior = Tensor::randn(0f32, 1f32, (1, 4, 8, 8), &dev).unwrap();

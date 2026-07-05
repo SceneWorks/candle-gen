@@ -372,7 +372,7 @@ mod tests {
                 conditioning: vec![Conditioning::Control {
                     image: img(512, 512),
                     kind: candle_gen::gen_core::ControlKind::Pose,
-                    scale: 1.0,
+                    scale: Some(1.0),
                 }],
                 ..base
             })

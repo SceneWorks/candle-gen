@@ -61,8 +61,11 @@ const KOLORS_TRAIN_STEPS: usize = crate::sampler::NUM_TRAIN_TIMESTEPS;
 /// txt2img [`Pipeline::denoise_curated`] (sc-7124) and the conditioned [`crate::control`] /
 /// [`crate::ip_provider`] curated denoises (sc-7297), so all three speak one Kolors noise schedule.
 pub(crate) fn kolors_alpha_schedule() -> Result<AlphaSchedule> {
-    AlphaSchedule::scaled_linear(KOLORS_TRAIN_STEPS, KOLORS_BETA_START, KOLORS_BETA_END)
-        .map_err(|e| CandleError::Msg(format!("kolors curated schedule: {e}")))
+    Ok(AlphaSchedule::scaled_linear(
+        KOLORS_TRAIN_STEPS,
+        KOLORS_BETA_START,
+        KOLORS_BETA_END,
+    ))
 }
 
 /// Curated-vs-native routing shared by the three Kolors entry points — txt2img

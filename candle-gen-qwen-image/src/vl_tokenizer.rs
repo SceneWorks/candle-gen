@@ -77,7 +77,7 @@ pub fn preprocess_edit_image(
         // `resize_bicubic_u8` already returns integer-valued, [0,255]-clamped f32; the `round().clamp()`
         // is an explicit/defensive u8 quantization matching the sibling `image_processor` path
         // (byte-identical here — not a bug fix).
-        resize_bicubic_u8(image.data, image.height, image.width, ch, cw)
+        resize_bicubic_u8(image.data, image.height, image.width, ch, cw)?
             .iter()
             .map(|&v| v.round().clamp(0.0, 255.0) as u8)
             .collect()
@@ -132,7 +132,7 @@ pub fn encode_reference_latents(
     let resized: Vec<f32> = if (image.height, image.width) == (ch, cw) {
         image.data.iter().map(|&p| p as f32).collect()
     } else {
-        resize_lanczos_u8(image.data, image.height, image.width, ch, cw)
+        resize_lanczos_u8(image.data, image.height, image.width, ch, cw)?
     };
     // [0,255] → [-1,1], laid out NCHW [1, 3, calc_h, calc_w].
     let plane = ch * cw;

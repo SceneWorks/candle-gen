@@ -84,7 +84,7 @@ pub fn preprocess_image(
     let resized: Vec<f32> = if (height, width) == (rh, rw) {
         pixels_hwc.iter().map(|&p| p as f32).collect()
     } else {
-        resize_bicubic_u8(pixels_hwc, height, width, rh, rw)
+        resize_bicubic_u8(pixels_hwc, height, width, rh, rw)?
     };
 
     // /255, normalize (x - 0.5)/0.5, laid out as the single frame repeated across the temporal axis.

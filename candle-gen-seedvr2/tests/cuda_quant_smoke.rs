@@ -126,7 +126,7 @@ fn cuda_quant_near_lossless() {
     eprintln!("[seedvr2-quant] dense {src}->{tgt} in {:?}", t.elapsed());
     drop(pipe);
 
-    let base = imageops::resize_bicubic_u8(&lr.pixels, src, src, tgt, tgt);
+    let base = imageops::resize_bicubic_u8(&lr.pixels, src, src, tgt, tgt).unwrap();
     let ge_ref = grad_energy(&reference, tgt, tgt);
     let ge_base = grad_energy(&base, tgt, tgt);
 
@@ -197,7 +197,7 @@ fn cuda_7b_upscale_smoke() {
         "7B output is constant (degenerate): min={mn} max={mx}"
     );
 
-    let base = imageops::resize_bicubic_u8(&lr.pixels, src, src, tgt, tgt);
+    let base = imageops::resize_bicubic_u8(&lr.pixels, src, src, tgt, tgt).unwrap();
     let corr = pearson(&out_f, &base);
     let ge_out = grad_energy(&out_f, tgt, tgt);
     let ge_base = grad_energy(&base, tgt, tgt);

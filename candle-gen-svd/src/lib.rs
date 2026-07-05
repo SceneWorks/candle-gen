@@ -319,7 +319,7 @@ impl SvdGenerator {
             img.width as usize,
             oh,
             ow,
-        ); // HWC [0,255] f32
+        )?; // HWC [0,255] f32
         let plane = oh * ow;
         let mut chw = vec![0f32; 3 * plane];
         for y in 0..oh {

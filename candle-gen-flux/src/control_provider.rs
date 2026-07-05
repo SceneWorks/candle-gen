@@ -148,7 +148,7 @@ fn preprocess_control(
     let resized: Vec<f32> = if (ih, iw) == (rh, rw) {
         image.pixels.iter().map(|&v| v as f32).collect()
     } else {
-        resize_lanczos_u8(&image.pixels, ih, iw, rh, rw) // HWC f32 [0,255]
+        resize_lanczos_u8(&image.pixels, ih, iw, rh, rw)? // HWC f32 [0,255]
     };
     let data: Vec<f32> = resized.iter().map(|&v| 2.0 * (v / 255.0) - 1.0).collect();
     let hwc = Tensor::from_vec(data, (rh, rw, 3), device)?;

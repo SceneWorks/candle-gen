@@ -98,7 +98,7 @@ impl QwenImageProcessor {
         let resized: Vec<f32> = if (image.height, image.width) == (rh, rw) {
             image.data.iter().map(|&p| p as f32).collect()
         } else {
-            resize_bicubic_u8(image.data, image.height, image.width, rh, rw)
+            resize_bicubic_u8(image.data, image.height, image.width, rh, rw)?
         };
 
         // /255, CLIP-normalize, laid out as [t, c, rh, rw] (the single frame repeated across the

@@ -276,8 +276,8 @@ impl SdxlEdit {
             )));
         }
         let (rw, rh) = (width as usize, height as usize);
-        let resized = resize_lanczos_u8(&source.pixels, ih, iw, rh, rw); // HWC f32 [0,255]
-                                                                         // [0,255] → [-1,1], then HWC → NCHW.
+        let resized = resize_lanczos_u8(&source.pixels, ih, iw, rh, rw)?; // HWC f32 [0,255]
+                                                                          // [0,255] → [-1,1], then HWC → NCHW.
         let data: Vec<f32> = resized.iter().map(|&v| v / 127.5 - 1.0).collect();
         let hwc = Tensor::from_vec(data, (rh, rw, 3), &self.device)?;
         let nchw = hwc
@@ -387,7 +387,7 @@ fn encode_mask(mask: &Image, width: u32, height: u32, device: &Device) -> Result
         )));
     }
     let (rw, rh) = (width as usize, height as usize);
-    let resized = resize_nearest_u8(&mask.pixels, ih, iw, rh, rw); // HWC f32 [0,255]
+    let resized = resize_nearest_u8(&mask.pixels, ih, iw, rh, rw)?; // HWC f32 [0,255]
     let scale = SPATIAL_SCALE as usize;
     let (lh, lw) = (rh / scale, rw / scale);
     let mut latent = Vec::with_capacity(lh * lw);

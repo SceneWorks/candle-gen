@@ -299,14 +299,14 @@ impl Seedvr2Pipeline {
             let factor = 1.0 + softness.clamp(0.0, 1.0) * 7.0;
             let dw = ((width as f32 / factor) as usize).max(2);
             let dh = ((height as f32 / factor) as usize).max(2);
-            let down = imageops::resize_bicubic_u8(&image.pixels, ih, iw, dh, dw);
+            let down = imageops::resize_bicubic_u8(&image.pixels, ih, iw, dh, dw)?;
             let down_u8: Vec<u8> = down
                 .iter()
                 .map(|&v| v.round().clamp(0.0, 255.0) as u8)
                 .collect();
-            imageops::resize_bicubic_u8(&down_u8, dh, dw, height, width)
+            imageops::resize_bicubic_u8(&down_u8, dh, dw, height, width)?
         } else {
-            imageops::resize_bicubic_u8(&image.pixels, ih, iw, height, width)
+            imageops::resize_bicubic_u8(&image.pixels, ih, iw, height, width)?
         };
         // HWC [0,255] → [-1,1] → (1,3,H,W)
         let arr = Tensor::from_vec(resized, (height, width, 3), &self.device)?;
