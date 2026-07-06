@@ -20,15 +20,10 @@
 //! Like the candle InstantID / IP-Adapter providers, [`PulidFlux`] is a plain struct the worker drives
 //! **directly** (a bespoke reference stream), NOT a gen-core-registered generator.
 
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::path::PathBuf;
 
 use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::clip::text_model::ClipTextTransformer;
-use candle_transformers::models::flux::autoencoder::AutoEncoder;
 use candle_transformers::models::flux::sampling::{get_schedule, State};
-use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
 use rand::{rngs::StdRng, SeedableRng};
 
 use candle_gen::gen_core::runtime::CancelFlag;
@@ -36,10 +31,7 @@ use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{Image, PidWeights, Progress};
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
-use candle_gen_flux::{
-    ae_config, clip_config, decode_latents, encode_text, flux_config, DitImageInjector,
-    FluxTokenizers, IpFlux, Variant,
-};
+use candle_gen_flux::{DitImageInjector, FluxRefBackbone, Variant};
 use candle_gen_pid::{PidDecoder, PidEngine};
 
 use crate::ca::PulidCa;
@@ -65,8 +57,11 @@ pub const DEFAULT_GUIDANCE: f32 = 4.0;
 
 /// Paths to the PuLID-FLUX checkpoints.
 pub struct PulidFluxPaths {
-    /// The black-forest-labs `FLUX.1-dev` snapshot dir (`flux1-dev.safetensors`, `ae.safetensors`,
-    /// `text_encoder/`, `text_encoder_2/`, `tokenizer_2/`).
+    /// The FLUX.1-dev backbone snapshot dir — auto-detected (sc-10103): either a dense black-forest-labs
+    /// `FLUX.1-dev` snapshot (`flux1-dev.safetensors`, `ae.safetensors`, `text_encoder{,_2}/`,
+    /// `tokenizer_2/`) OR a packed/dense `SceneWorks/flux1-dev-mlx` turnkey **tier subdir**
+    /// (`…/q4`, `…/q8`, `…/bf16`: `transformer/` + `text_encoder{,_2}/` + `vae/` + `tokenizer_2/`). The
+    /// [`FluxRefBackbone`] loader picks the right layout — the worker resolves the tier subdir.
     pub flux_base: PathBuf,
     /// `guozinan/PuLID` `pulid_flux_v0.9.1.safetensors` (holds both `pulid_encoder.*` = the IDFormer and
     /// `pulid_ca.*` = the 20 cross-attn modules).
@@ -125,25 +120,6 @@ impl Default for PulidFluxRequest {
     }
 }
 
-/// mmap a [`VarBuilder`] over `files` at `dtype`/`device`, erroring if any is missing.
-fn mmap_vb(files: &[PathBuf], dtype: DType, device: &Device) -> Result<VarBuilder<'static>> {
-    for f in files {
-        if !f.is_file() {
-            return Err(CandleError::Msg(format!(
-                "pulid_flux snapshot is missing {}",
-                f.display()
-            )));
-        }
-    }
-    candle_gen::mmap_var_builder(files, dtype, device)
-}
-
-/// Sorted list of every `.safetensors` in `dir` (the sharded T5 checkpoint). Errors if none are found.
-fn safetensors_in(dir: &Path) -> Result<Vec<PathBuf>> {
-    // Shared sorted-`.safetensors` resolver (sc-8999 / F-019).
-    candle_gen::sorted_safetensors(dir, "pulid_flux")
-}
-
 /// The FLUX.1-dev flow-match time-shift `mu` for the curated scheduler axis (epic 7114, sc-7297) — the
 /// same linear map candle's `get_schedule(.., Some((seq_len, BASE_SHIFT, MAX_SHIFT)))` applies, so
 /// gen-core's exponential time-shift lands on the native schedule's shift (the candle-gen-flux
@@ -167,20 +143,18 @@ fn l2_normalize_rows(x: &Tensor) -> candle_core::Result<Tensor> {
     x.broadcast_div(&norm)
 }
 
-/// The loaded PuLID-FLUX model: the FLUX backbone (text encoders + forked DiT + VAE) + the EVA tower +
-/// the IDFormer + the kept PuLID checkpoint (for the per-generate [`PulidCa`]) + the native face stack.
+/// The loaded PuLID-FLUX model: the tier-detected FLUX backbone (text encoders, DiT, VAE, tokenizers),
+/// the EVA tower, the IDFormer, the kept PuLID checkpoint (for the per-generate [`PulidCa`]), and the
+/// native face stack.
 pub struct PulidFlux {
-    /// T5 + CLIP tokenizers, loaded+parsed **once** at load and reused across encodes (sc-8991 / F-011)
-    /// instead of re-parsing per prompt in `encode_text`.
-    toks: FluxTokenizers,
     device: Device,
     dtype: DType,
-    clip: ClipTextTransformer,
-    /// `Mutex` because `T5EncoderModel::forward` takes `&mut self` while `generate` is `&self`; locked
-    /// only for the once-per-request text encode.
-    t5: Mutex<T5EncoderModel>,
-    transformer: IpFlux,
-    vae: AutoEncoder,
+    /// The FLUX.1-dev backbone — CLIP + T5 + DiT + VAE + both tokenizers, tier-detected at load
+    /// (sc-10103): a dense BFL snapshot or a packed/dense `SceneWorks/flux1-dev-mlx` turnkey tier. The
+    /// PuLID CA identity injection drives its post-block [`DitImageInjector`]
+    /// [`forward_injected`](FluxRefBackbone::forward_injected) seam. Reuses the base FLUX txt2img pipeline
+    /// load path, so PuLID and `flux_dev` never drift on tokenization / tier detection / VAE decode.
+    backbone: FluxRefBackbone,
     eva: EvaVisionTransformer,
     idformer: IdFormer,
     /// The PuLID checkpoint (f32) — kept to build a per-generate [`PulidCa`] from `pulid_ca.*`
@@ -198,36 +172,13 @@ impl PulidFlux {
     pub fn load(paths: &PulidFluxPaths) -> Result<Self> {
         let device = candle_gen::default_device()?;
         let dtype = DTYPE;
-        let variant = Variant::Dev;
-        let root = paths.flux_base.clone();
 
-        // CLIP-L (text) under `text_encoder/`.
-        let clip_vb = mmap_vb(
-            &[root.join("text_encoder/model.safetensors")],
-            dtype,
-            &device,
-        )?;
-        let clip = ClipTextTransformer::new(clip_vb.pp("text_model"), &clip_config())?;
-
-        // T5-XXL under `text_encoder_2/` (sharded; config.json alongside).
-        let t5_dir = root.join("text_encoder_2");
-        let t5_cfg: T5Config = {
-            let cfg = std::fs::read_to_string(t5_dir.join("config.json")).map_err(|e| {
-                CandleError::Msg(format!("pulid_flux: read text_encoder_2/config.json: {e}"))
-            })?;
-            serde_json::from_str(&cfg)
-                .map_err(|e| CandleError::Msg(format!("pulid_flux: parse T5 config.json: {e}")))?
-        };
-        let t5_vb = mmap_vb(&safetensors_in(&t5_dir)?, dtype, &device)?;
-        let t5 = T5EncoderModel::load(t5_vb, &t5_cfg)?;
-
-        // The forked FLUX DiT (the post-block injector seam) from the root BFL checkpoint.
-        let dit_vb = mmap_vb(&[root.join(variant.transformer_file())], dtype, &device)?;
-        let transformer = IpFlux::new(&flux_config(variant), dit_vb)?;
-
-        // FLUX AutoEncoder (`ae.safetensors`).
-        let vae_vb = mmap_vb(&[root.join("ae.safetensors")], dtype, &device)?;
-        let vae = AutoEncoder::new(&ae_config(variant), vae_vb)?;
+        // FLUX.1-dev backbone — tier-detected (sc-10103): a dense BFL snapshot or a packed/dense
+        // `SceneWorks/flux1-dev-mlx` turnkey tier subdir. Reuses the base FLUX txt2img pipeline's
+        // detect-and-load, so PuLID consumes the SAME q4/q8/bf16 tiers `flux_dev` does. The PuLID CA
+        // injection runs through the backbone's post-block `forward_injected` seam (on the BFL `IpFlux`
+        // or the diffusers `PackedFluxDit`, whichever tier loaded).
+        let backbone = FluxRefBackbone::load(&paths.flux_base, Variant::Dev, &device, dtype)?;
 
         // EVA-CLIP tower (f32 conditioning path).
         let eva_w = Weights::from_file(&paths.eva_weights, &device, COND_DTYPE).map_err(|e| {
@@ -250,15 +201,10 @@ impl PulidFlux {
         // Native face stack + BiSeNet parser (the `face_features_image` path).
         let face = candle_gen_face::load_with_parser_on(&paths.face_dir, &device)?;
 
-        let toks = FluxTokenizers::load(&root)?;
         Ok(Self {
-            toks,
             device,
             dtype,
-            clip,
-            t5: Mutex::new(t5),
-            transformer,
-            vae,
+            backbone,
             eva,
             idformer,
             pulid,
@@ -341,16 +287,9 @@ impl PulidFlux {
             NUM_SINGLE_BLOCKS,
         )?;
 
-        // Text conditioning (T5 seq + CLIP pooled).
-        let (t5_emb, clip_emb) = encode_text(
-            Variant::Dev,
-            &self.toks,
-            &self.device,
-            self.dtype,
-            &self.clip,
-            &self.t5,
-            &req.prompt,
-        )?;
+        // Text conditioning (T5 seq + CLIP pooled) — tier-agnostic via the backbone (dense or packed
+        // encoders, same token ids either way).
+        let (t5_emb, clip_emb) = self.backbone.encode_text(&req.prompt)?;
 
         // candle's get_noise geometry: latent is /8 of a multiple-of-16 request.
         let lat_h = (req.height as usize).div_ceil(16) * 2;
@@ -384,12 +323,11 @@ impl PulidFlux {
         // this generation opted in (`req.use_pid`) and `with_pid` loaded one (epic 7840, sc-8044). PiD is a
         // generative decoder, so face likeness may shift — the user's per-gen call.
         let pid_decoder = self.pid_decoder_for(req)?;
-        decode_latents(
-            &self.vae,
-            pid_decoder.as_ref(),
+        self.backbone.decode(
             &latents,
             req.height as usize,
             req.width as usize,
+            pid_decoder.as_ref(),
         )
     }
 
@@ -433,10 +371,11 @@ impl PulidFlux {
             cancel,
             on_progress,
             |img, t| -> Result<Tensor> {
-                // The forked DiT forward returns a `candle_core::Result`; `?` bridges it into the
-                // driver's `CandleError`. The PuLID CA identity injection lives inside this closure.
+                // The backbone dispatches to the loaded tier's DiT (BFL `IpFlux` or packed
+                // `PackedFluxDit`) `forward_injected`; the PuLID CA identity injection lives inside this
+                // closure so a multi-eval solver re-runs the whole step.
                 let t_vec = Tensor::full(t, b_sz, &self.device)?;
-                Ok(self.transformer.forward_injected(
+                self.backbone.forward_injected(
                     img,
                     &state.img_ids,
                     &state.txt,
@@ -445,7 +384,7 @@ impl PulidFlux {
                     &state.vec,
                     Some(&guidance_t),
                     Some(injector as &dyn DitImageInjector),
-                )?)
+                )
             },
         )
     }

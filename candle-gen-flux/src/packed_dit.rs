@@ -32,7 +32,7 @@ use candle_gen::candle_core::{DType, Result, Tensor, D};
 use candle_gen::candle_nn::{LayerNorm, Module, RmsNorm, VarBuilder};
 
 use crate::ip_dit::{
-    apply_rope, scaled_dot_product_attention, timestep_embedding, Config, EmbedNd,
+    apply_rope, scaled_dot_product_attention, timestep_embedding, Config, DitImageInjector, EmbedNd,
 };
 use crate::quant::QLinear;
 
@@ -552,6 +552,9 @@ impl PackedFluxDit {
     /// `[B, txt_seq, 4096]`. `pooled`: CLIP pooled `[B, 768]`. `timesteps`: `[B]` raw σ (the sinusoid
     /// embedder scales ×1000). `guidance`: `[B]` embedded guidance (dev only). `img_ids`/`txt_ids`:
     /// `[B, seq, 3]` FLUX position ids. Returns `[B, img_seq, 64]`.
+    ///
+    /// A thin wrapper over [`forward_injected`](Self::forward_injected) with `injector = None`, so it is
+    /// byte-identical to the pre-seam body (the txt2img packed path, [`crate::pipeline`]).
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -563,24 +566,74 @@ impl PackedFluxDit {
         pooled: &Tensor,
         guidance: Option<&Tensor>,
     ) -> Result<Tensor> {
+        self.forward_injected(
+            img, img_ids, txt, txt_ids, timesteps, pooled, guidance, None,
+        )
+    }
+
+    /// FLUX velocity forward plus the generic **post-block** image-stream residual injector — the
+    /// diffusers-layout twin of [`crate::ip_dit::IpFlux::forward_injected`], so the PuLID-FLUX id
+    /// cross-attn (`candle-gen-pulid`, sc-5492) drives the SAME [`DitImageInjector`] seam on a packed
+    /// (or dense diffusers) tier that it drives on the BFL-layout `IpFlux`. The injector is consulted
+    /// after every double block (on the image stream `hidden`) and after the single blocks it opts into
+    /// (on the image-token tail of the joint `cat(encoder, hidden)` stream), matching the reference
+    /// PuLID injection points. `injector = None` is byte-identical to [`forward`](Self::forward) — the
+    /// no-id ablation (`id_weight = 0` ⇒ every residual `None`) carries zero overhead.
+    ///
+    /// The injector block indices are layout-agnostic (the diffusers `transformer_blocks` /
+    /// `single_transformer_blocks` are the SAME 19 double / 38 single blocks as the BFL
+    /// `double_blocks` / `single_blocks`), so a [`crate::ip_dit::DitImageInjector`] built for the BFL
+    /// model injects at the identical points here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_injected(
+        &self,
+        img: &Tensor,
+        img_ids: &Tensor,
+        txt: &Tensor,
+        txt_ids: &Tensor,
+        timesteps: &Tensor,
+        pooled: &Tensor,
+        guidance: Option<&Tensor>,
+        injector: Option<&dyn DitImageInjector>,
+    ) -> Result<Tensor> {
         let mut hidden = self.x_embedder.forward(img)?;
         let mut encoder = self.context_embedder.forward(txt)?;
         let emb = self.time_text_embed.forward(timesteps, guidance, pooled)?;
         let pe = Tensor::cat(&[txt_ids, img_ids], 1)?.apply(&self.pe_embedder)?;
 
-        for block in &self.double_blocks {
+        for (i, block) in self.double_blocks.iter().enumerate() {
             let (h, e) = block.forward(&hidden, &encoder, &emb, &pe)?;
             hidden = h;
             encoder = e;
+            // Post-block identity injector (PuLID): add its residual to the image stream. Inert when
+            // `injector = None` or the block index yields no residual.
+            if let Some(inj) = injector {
+                if let Some(r) = inj.after_double(i, &hidden)? {
+                    hidden = (&hidden + r.to_dtype(hidden.dtype())?)?;
+                }
+            }
         }
 
-        // The single blocks run on the concatenated `cat(txt, img)` stream.
+        // The single blocks run on the concatenated `cat(txt, img)` stream (`txt_seq` unchanged by them,
+        // so the image tail always starts at `txt_seq`). The injector's `after_single` residual is added
+        // to the image-token tail (and written back) after the single blocks it opts into.
         let txt_seq = encoder.dim(1)?;
-        let mut joint = Tensor::cat(&[&encoder, &hidden], 1)?;
-        for block in &self.single_blocks {
-            joint = block.forward(&joint, &emb, &pe)?;
-        }
         let img_seq = hidden.dim(1)?;
+        let mut joint = Tensor::cat(&[&encoder, &hidden], 1)?;
+        for (i, block) in self.single_blocks.iter().enumerate() {
+            joint = block.forward(&joint, &emb, &pe)?;
+            if let Some(inj) = injector {
+                if inj.injects_after_single(i) {
+                    let seq = joint.dim(1)?;
+                    let img_part = joint.narrow(1, txt_seq, seq - txt_seq)?;
+                    if let Some(r) = inj.after_single(i, &img_part)? {
+                        let added = (img_part + r.to_dtype(joint.dtype())?)?;
+                        let txt_part = joint.narrow(1, 0, txt_seq)?;
+                        joint = Tensor::cat(&[&txt_part, &added], 1)?;
+                    }
+                }
+            }
+        }
         let hidden = joint.narrow(1, txt_seq, img_seq)?;
 
         self.output.forward(&hidden, &emb)
@@ -637,6 +690,146 @@ mod tests {
         assert_eq!(out.dims(), &[b, img_seq, 64]);
         let max = out.abs()?.max_all()?.to_scalar::<f32>()?;
         assert!(max.is_finite(), "DiT output must be finite, got max {max}");
+        Ok(())
+    }
+
+    /// A test [`DitImageInjector`] that adds a constant residual to the image stream after one double
+    /// block and one single block, so the effect of the seam is observable (the candle twin of the
+    /// PuLID CA modules, without the identity math).
+    struct StubInjector {
+        after_double_idx: usize,
+        after_single_idx: usize,
+        value: f64,
+    }
+
+    impl StubInjector {
+        /// A **channel-varying** residual (a per-channel ramp, broadcast over batch/tokens). A constant
+        /// or pure-scalar-multiple residual would be normalized away by the output-head LayerNorm
+        /// (shift/scale-invariant per token) after passing near-unchanged through the residual single
+        /// blocks — so it could not be observed. The real PuLID CA residual likewise varies per channel.
+        fn residual(&self, like: &Tensor) -> Result<Tensor> {
+            let (b, s, c) = like.dims3()?;
+            let ramp = Tensor::arange(0u32, c as u32, like.device())?
+                .to_dtype(like.dtype())?
+                .affine(self.value / c as f64, self.value)?;
+            ramp.reshape((1, 1, c))?
+                .broadcast_as((b, s, c))?
+                .contiguous()
+        }
+    }
+
+    impl DitImageInjector for StubInjector {
+        fn after_double(&self, block_idx: usize, img_hidden: &Tensor) -> Result<Option<Tensor>> {
+            if block_idx == self.after_double_idx {
+                Ok(Some(self.residual(img_hidden)?))
+            } else {
+                Ok(None)
+            }
+        }
+        fn injects_after_single(&self, block_idx: usize) -> bool {
+            block_idx == self.after_single_idx
+        }
+        fn after_single(&self, block_idx: usize, img_tokens: &Tensor) -> Result<Option<Tensor>> {
+            if block_idx == self.after_single_idx {
+                Ok(Some(self.residual(img_tokens)?))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    /// Build a tiny dense diffusers DiT with deterministically-randomized weights. A zero-init VarMap
+    /// (as in the finite-shape smoke above) makes the forward degenerate — the output-head LayerNorm
+    /// normalizes away a constant residual and the zero `proj_out` maps everything to 0 — so an injected
+    /// residual could not be observed. Randomizing every parameter (mirrors `ip_dit::tests::tiny_ipflux`)
+    /// makes the forward a non-degenerate function of the injector.
+    fn randomized_tiny_dit(dev: &Device) -> Result<PackedFluxDit> {
+        let cfg = tiny_cfg(true);
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, dev);
+        let dit = PackedFluxDit::new(&cfg, 2, 2, vb)?;
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        for var in vm.data().lock().unwrap().values() {
+            let n = var.shape().elem_count();
+            let data: Vec<f32> = (0..n)
+                .map(|_| {
+                    // xorshift64* — deterministic, self-contained (no rand dep in this crate's tests).
+                    seed ^= seed >> 12;
+                    seed ^= seed << 25;
+                    seed ^= seed >> 27;
+                    let u =
+                        (seed.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64;
+                    ((u as f32) - 0.5) * 0.1
+                })
+                .collect();
+            var.set(&Tensor::from_vec(data, var.shape(), dev)?)?;
+        }
+        Ok(dit)
+    }
+
+    /// `forward_injected(.., None)` is byte-identical to `forward(..)` — the seam is inert with no
+    /// injector, so the txt2img packed path is unperturbed (mirrors the BFL `IpFlux` invariant).
+    #[test]
+    fn forward_injected_none_matches_forward() -> Result<()> {
+        let dev = Device::Cpu;
+        let dit = randomized_tiny_dit(&dev)?;
+        let (b, img_seq, txt_seq) = (1usize, 4usize, 3usize);
+        let img = Tensor::randn(0f32, 1f32, (b, img_seq, 64), &dev)?;
+        let txt = Tensor::randn(0f32, 1f32, (b, txt_seq, 4096), &dev)?;
+        let pooled = Tensor::randn(0f32, 1f32, (b, 768), &dev)?;
+        let img_ids = Tensor::zeros((b, img_seq, 3), DType::F32, &dev)?;
+        let txt_ids = Tensor::zeros((b, txt_seq, 3), DType::F32, &dev)?;
+        let ts = Tensor::full(0.5f32, b, &dev)?;
+        let g = Tensor::full(3.5f32, b, &dev)?;
+
+        let base = dit.forward(&img, &img_ids, &txt, &txt_ids, &ts, &pooled, Some(&g))?;
+        let injected =
+            dit.forward_injected(&img, &img_ids, &txt, &txt_ids, &ts, &pooled, Some(&g), None)?;
+        assert_eq!(
+            max_abs_diff(&base, &injected),
+            0.0,
+            "None injector must be a no-op"
+        );
+        Ok(())
+    }
+
+    /// A nonzero injected residual (after a double block AND a single block) changes the output — the
+    /// seam is actually wired into both block loops, not silently dropped.
+    #[test]
+    fn forward_injected_residual_changes_output() -> Result<()> {
+        let dev = Device::Cpu;
+        let dit = randomized_tiny_dit(&dev)?;
+        let (b, img_seq, txt_seq) = (1usize, 4usize, 3usize);
+        let img = Tensor::randn(0f32, 1f32, (b, img_seq, 64), &dev)?;
+        let txt = Tensor::randn(0f32, 1f32, (b, txt_seq, 4096), &dev)?;
+        let pooled = Tensor::randn(0f32, 1f32, (b, 768), &dev)?;
+        let img_ids = Tensor::zeros((b, img_seq, 3), DType::F32, &dev)?;
+        let txt_ids = Tensor::zeros((b, txt_seq, 3), DType::F32, &dev)?;
+        let ts = Tensor::full(0.5f32, b, &dev)?;
+        let g = Tensor::full(3.5f32, b, &dev)?;
+
+        let base = dit.forward(&img, &img_ids, &txt, &txt_ids, &ts, &pooled, Some(&g))?;
+        // Inject after double block 1 and single block 0 (both must be in-range for the tiny 2/2 DiT).
+        let inj = StubInjector {
+            after_double_idx: 1,
+            after_single_idx: 0,
+            value: 0.5,
+        };
+        let out = dit.forward_injected(
+            &img,
+            &img_ids,
+            &txt,
+            &txt_ids,
+            &ts,
+            &pooled,
+            Some(&g),
+            Some(&inj),
+        )?;
+        let d = max_abs_diff(&base, &out);
+        assert!(
+            d > 1e-4,
+            "a nonzero injected residual must change the output: max|Δ| = {d}"
+        );
         Ok(())
     }
 

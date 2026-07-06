@@ -678,6 +678,25 @@ impl Pipeline {
         };
         to_image(&decoded)
     }
+
+    /// Tier-dispatching decode for a caller that owns its OWN [`PidDecoder`] (the reference lanes via
+    /// [`crate::ref_backbone::FluxRefBackbone`]) rather than the components-embedded PiD engine: routes
+    /// the denoised latents through the stock [`AutoEncoder`] or the packed [`AutoEncoderKL`] exactly as
+    /// [`render`](Self::render), but takes the decoder explicitly (PuLID / the IP-adapter build their PiD
+    /// decoder separately from the backbone). `pid = None` ⇒ the native VAE decode.
+    pub(crate) fn decode_ref(
+        &self,
+        components: &Components,
+        latents: &Tensor,
+        height: usize,
+        width: usize,
+        pid: Option<&PidDecoder>,
+    ) -> Result<Image> {
+        match components {
+            Components::Stock { vae, .. } => self.decode(vae, pid, latents, height, width),
+            Components::Packed { vae, .. } => self.decode_packed(vae, pid, latents, height, width),
+        }
+    }
 }
 
 /// Convert a decoded pixel tensor `(1, 3, H, W)` in `[-1, 1]` (f32) → RGB8 [`Image`] (`(x+1)·127.5`).

@@ -81,6 +81,14 @@ pub use pipeline::{
     ae_config, clip_config, decode_latents, encode_text, flux_config, FluxTokenizers,
 };
 
+// The tier-detecting reference backbone (sc-10103, epic 9083) — the candle twin of
+// `mlx_gen_flux::load_flux1`. Reuses the txt2img `Pipeline`'s tier detect-and-load so the reference
+// lanes (`candle-gen-pulid`, the FLUX IP-adapter) consume the SAME `SceneWorks/flux1-dev-mlx`
+// q4/q8/bf16 turnkey tiers the base generator does, driving the post-block `DitImageInjector` seam on
+// either the BFL `IpFlux` or the diffusers `PackedFluxDit`.
+mod ref_backbone;
+pub use ref_backbone::FluxRefBackbone;
+
 /// FLUX XLabs IP-Adapter real-weight GPU validation (sc-5872) — env-driven, `#[ignore]`d integration
 /// test (the analog of the SDXL/Kolors IP-Adapter Phase-5 harnesses).
 #[cfg(test)]
