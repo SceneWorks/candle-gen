@@ -62,6 +62,28 @@ fn is_coherent(img: &Image) -> bool {
     std > 10.0 && distinct > 24 && adj < 60.0
 }
 
+/// Longest run of consecutive near-constant rows (per-row std < 4). The sc-10023 VAE i32 im2col
+/// overflow left the bottom ~55% of a ≥1792² render as a flat gray band (per-row std ≈ 3), which the
+/// whole-image `is_coherent` gate did NOT catch (the flat band *lowers* the global adjΔ). A coherent
+/// natural render has no long constant run, so this pins the tiled-decode fix.
+fn longest_flat_row_run(px: &[u8], w: u32, h: u32) -> usize {
+    let stride = (w * 3) as usize;
+    let (mut run, mut best) = (0usize, 0usize);
+    for y in 0..h as usize {
+        let row = &px[y * stride..(y + 1) * stride];
+        let m = row.iter().map(|&v| v as f64).sum::<f64>() / row.len() as f64;
+        let sd =
+            (row.iter().map(|&v| (v as f64 - m).powi(2)).sum::<f64>() / row.len() as f64).sqrt();
+        if sd < 4.0 {
+            run += 1;
+            best = best.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    best
+}
+
 fn save(img: &Image, name: &str) {
     let dir = std::env::temp_dir().join("krea_turbo_smoke");
     std::fs::create_dir_all(&dir).unwrap();
@@ -122,6 +144,14 @@ fn render(width: u32, height: u32) {
     assert!(
         is_coherent(img),
         "Turbo render must be a coherent image, not noise (std={std:.1} distinct={distinct} adjΔ={adj:.1})"
+    );
+    // sc-10023: no flat horizontal band (the VAE i32 im2col-overflow signature at ≥1792²). A coherent
+    // render has no long constant-row run; the bug left >1000 flat rows.
+    let flat_run = longest_flat_row_run(&img.pixels, img.width, img.height);
+    assert!(
+        flat_run < 128,
+        "flat horizontal band detected ({flat_run} consecutive near-constant rows) — VAE decode \
+         overflow regression (sc-10023)"
     );
 }
 

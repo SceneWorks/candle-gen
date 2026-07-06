@@ -11,8 +11,9 @@
 //! feature-axis RMSNorm) — `x / max(‖x‖₂ over C, 1e-12) · √C · gamma` — and the latent is
 //! de-normalized as `z·std + mean` with per-channel constants before `post_quant_conv`.
 
-use candle_gen::candle_core::{DType, IndexOp, Result, Tensor};
+use candle_gen::candle_core::{DType, Error as CandleError, IndexOp, Result, Tensor};
 use candle_gen::candle_nn::{Conv2d, Conv2dConfig, Module, VarBuilder};
+use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 
 const NORM_EPS: f64 = 1e-12;
 
@@ -206,6 +207,23 @@ impl UpBlock {
     }
 }
 
+/// Output side (px) above which a **monolithic** decode overflows candle's im2col launch (sc-10023) and
+/// must be tiled. The `up_block2` upsampler conv runs at the FULL output resolution with 192 input
+/// channels, so its im2col column tensor is `out² · (192·9) = out² · 1728` elements. candle-core builds
+/// that buffer with `LaunchConfig::for_num_elems(dst_el as u32)` — the `as u32` silently truncates once
+/// `dst_el` crosses `u32::MAX` (4.29e9), leaving the tail rows uninitialized (a hard flat band). That
+/// crossing is at `out ≈ 1576`; gate a touch below it so every `≤ 1536²` render stays a **bit-exact**
+/// monolithic decode and only larger targets pay the (seam-free) tiled path.
+const DECODE_TILE_ABOVE_PX: usize = 1536;
+
+/// Tail-decode tiling geometry (sc-10023): the decoder tail upsamples ×8 spatially, an image VAE has no
+/// temporal axis (`f = 1`, non-causal). Matches SDXL's `SDXL_VAE_TILING`.
+const TAIL_TILING: VaeTiling = VaeTiling {
+    spatial_scale: 8,
+    temporal_scale: 1,
+    causal_temporal: false,
+};
+
 /// The Qwen-Image VAE (decode-only).
 pub struct QwenVae {
     mean: Tensor, // [1,16,1,1]
@@ -274,7 +292,27 @@ impl QwenVae {
     }
 
     /// Decode VAE latents `[1, 16, H/8, W/8]` (NCHW) → RGB `[1, 3, H, W]` in `[-1, 1]`.
+    ///
+    /// At or below [`DECODE_TILE_ABOVE_PX`] this is the plain monolithic decode (bit-exact:
+    /// [`Self::decode_mid`] ∘ [`Self::decode_tail`] is the identical op sequence). Above it — where a
+    /// single decoder conv would overflow candle's im2col launch (sc-10023) — the global-context head runs
+    /// **once on the full latent** (so the mid-block self-attention still sees the whole field) and only
+    /// the resolution-growing tail is tiled with a trapezoidal seam blend.
     pub fn decode(&self, latents: &Tensor) -> Result<Tensor> {
+        let (_, _, lh, lw) = latents.dims4()?;
+        let mid = self.decode_mid(latents)?;
+        if (lh * 8).max(lw * 8) <= DECODE_TILE_ABOVE_PX {
+            self.decode_tail(&mid)
+        } else {
+            self.tile_blend_tail(&mid)
+        }
+    }
+
+    /// The **global-context head**: de-normalize → post_quant_conv → conv_in → mid block (resnet, GLOBAL
+    /// self-attention, resnet). Runs at latent resolution (`H/8`), so the whole spatial field is present
+    /// for the mid-block attention. Output `[1, 384, H/8, W/8]`. Kept whole even in the tiled path so the
+    /// attention never sees a truncated field (the source of the naive-tiling seam).
+    pub fn decode_mid(&self, latents: &Tensor) -> Result<Tensor> {
         let l = latents.to_dtype(DType::F32)?;
         // De-normalize: z·std + mean.
         let l = l.broadcast_mul(&self.std)?.broadcast_add(&self.mean)?;
@@ -282,12 +320,81 @@ impl QwenVae {
         let mut h = self.conv_in.forward(&l)?;
         h = self.mid_resnet0.forward(&h)?;
         h = self.mid_attn.forward(&h)?;
-        h = self.mid_resnet1.forward(&h)?;
+        self.mid_resnet1.forward(&h)
+    }
+
+    /// The **upsampling tail**: up_blocks (×8 spatial) → norm_out → conv_out. Purely spatially-local
+    /// (convs + nearest upsample, no attention), so it tiles cleanly with an overlap. Input the mid
+    /// feature map `[1, 384, h, w]`; output `[1, 3, 8h, 8w]` in `[-1, 1]`.
+    pub fn decode_tail(&self, mid: &Tensor) -> Result<Tensor> {
+        let mut h = mid.clone();
         for ub in &self.up_blocks {
             h = ub.forward(&h)?;
         }
         let h = self.norm_out.forward(&h)?.silu()?;
         self.conv_out.forward(&h)
+    }
+
+    /// Tiled [`Self::decode_tail`] with trapezoidal seam blending (sc-10023) — the SDXL sc-4987
+    /// `tile_blend_decode` policy specialized to the Qwen tail. Splits the mid feature map `[1,384,h,w]`
+    /// into overlapping 64²-mid tiles (512² output, 128 px overlap), decodes each tail tile, and
+    /// accumulates `Σ(maskᵢ·decodeᵢ) / Σ maskᵢ`. Because the tail is attention-free and the per-axis
+    /// trapezoidal masks are a partition of unity over the overlap, the blend is seam-free.
+    fn tile_blend_tail(&self, mid: &Tensor) -> Result<Tensor> {
+        let device = mid.device();
+        let (_b, _c, h, w) = mid.dims4()?;
+        let cfg = TilingConfig::spatial_only(512, 128);
+        let plan = cfg.plan(TAIL_TILING, 1, h as i32, w as i32);
+        let (out_h, out_w) = (plan.out_h as usize, plan.out_w as usize);
+
+        let mut output: Option<Tensor> = None; // [1, 3, out_h, out_w] f32
+        let mut weights: Option<Tensor> = None; // [1, 1, out_h, out_w] f32
+        for hh in &plan.h {
+            for ww in &plan.w {
+                let tile = mid
+                    .narrow(2, hh.start as usize, (hh.end - hh.start) as usize)?
+                    .narrow(3, ww.start as usize, (ww.end - ww.start) as usize)?;
+                let dec = self.decode_tail(&tile)?;
+
+                // Clip the decoded tile + masks to the planned output span (the Qwen tail's exact ×8 makes
+                // this a no-op, but it guards a decoder returning a pixel or two over/under).
+                let (_, _, dh, dw) = dec.dims4()?;
+                let ah = dh.min((hh.out_stop - hh.out_start) as usize);
+                let aw = dw.min((ww.out_stop - ww.out_start) as usize);
+                let dec = dec.narrow(2, 0, ah)?.narrow(3, 0, aw)?;
+
+                let hm = Tensor::from_slice(&hh.mask[..ah], (1, 1, ah, 1), device)?;
+                let wm = Tensor::from_slice(&ww.mask[..aw], (1, 1, 1, aw), device)?;
+                let blend = hm.broadcast_mul(&wm)?; // [1, 1, ah, aw]
+                let weighted = dec.broadcast_mul(&blend)?; // [1, 3, ah, aw]
+
+                let (pad_top, pad_bottom) =
+                    (hh.out_start as usize, out_h - (hh.out_start as usize + ah));
+                let (pad_left, pad_right) =
+                    (ww.out_start as usize, out_w - (ww.out_start as usize + aw));
+                let weighted_full = weighted
+                    .pad_with_zeros(2, pad_top, pad_bottom)?
+                    .pad_with_zeros(3, pad_left, pad_right)?;
+                let blend_full = blend
+                    .pad_with_zeros(2, pad_top, pad_bottom)?
+                    .pad_with_zeros(3, pad_left, pad_right)?;
+
+                output = Some(match output {
+                    None => weighted_full,
+                    Some(acc) => (acc + weighted_full)?,
+                });
+                weights = Some(match weights {
+                    None => blend_full,
+                    Some(acc) => (acc + blend_full)?,
+                });
+            }
+        }
+        let output =
+            output.ok_or_else(|| CandleError::Msg("vae tail tiling produced no tiles".into()))?;
+        let weights =
+            weights.ok_or_else(|| CandleError::Msg("vae tail tiling produced no tiles".into()))?;
+        // Floor the divisor to avoid a divide-by-zero at any coverage gap (the plan guarantees > 0).
+        output.broadcast_div(&weights.clamp(1e-8f32, f32::MAX)?)
     }
 }
 
