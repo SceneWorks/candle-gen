@@ -1,9 +1,14 @@
-//! Krea 2 **Turbo** text-to-image pipeline (sc-7580/sc-7582) — tokenize → Qwen3-VL-4B condition-encode
-//! (the 12-layer select stack) → DiT (text_fusion aggregator + single-stream denoise) → Qwen-Image VAE
-//! decode. Port of `mlx-gen-krea`'s `pipeline.rs` (the reference `sampling.py::sample` Turbo path).
+//! Krea 2 text-to-image pipeline (sc-7580/sc-7582) — tokenize → Qwen3-VL-4B condition-encode (the
+//! 12-layer select stack) → DiT (text_fusion aggregator + single-stream denoise) → Qwen-Image VAE
+//! decode. Port of `mlx-gen-krea`'s `pipeline.rs` (the reference `sampling.py::sample`). Two render
+//! surfaces share this one pipeline:
+//! - **Turbo** ([`render`]) — the distilled few-step **CFG-free** path (one DiT forward/step).
+//! - **Raw** ([`render_base`], sc-9994 / epic 9992) — the undistilled 12B DiT with **true
+//!   classifier-free guidance** (two DiT forwards/step: cond vs uncond) + optional user negative
+//!   prompt at 52 steps, resolution-dynamic mu ([`base_schedule`]). The Boogu base/turbo precedent.
 //!
-//! **CFG-free.** The TDM distillation baked the guided velocity into the weights, so there is no
-//! unconditional branch (`guidance == 0` in the reference) — one DiT forward per step. Per-sample
+//! **CFG-free (Turbo).** The TDM distillation baked the guided velocity into the weights, so there is
+//! no unconditional branch (`guidance == 0` in the reference) — one DiT forward per step. Per-sample
 //! `B = 1`: one prompt → no padding → the DiT runs the full valid context.
 //!
 //! **Rectified-flow v-param Euler.** The DiT consumes the raw sigma as its timestep
@@ -30,7 +35,7 @@ const PID_BACKBONE: &str = "qwenimage";
 
 use crate::config::Krea2Config;
 use crate::loader::Weights;
-use crate::schedule::{turbo_sigmas, TURBO_MU, TURBO_STEPS};
+use crate::schedule::{dynamic_mu, krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
 use crate::text_encoder::{KreaTeConfig, KreaTextEncoder};
 use crate::transformer::Krea2Transformer;
 use crate::vae::load_vae;
@@ -44,6 +49,13 @@ const DIT_DTYPE: DType = DType::BF16;
 /// VAE spatial downscale (the latent is image/8 per side) and latent channel count.
 const SPATIAL_SCALE: u32 = 8;
 const LATENT_CHANNELS: usize = 16;
+
+/// Raw (undistilled, full-CFG) generation defaults — the reference `sampling.py` Raw preset (sc-7566
+/// spike), mirroring mlx-gen-krea `DEFAULT_RAW_STEPS` / `DEFAULT_RAW_GUIDANCE` (sc-9994). 52 steps,
+/// guidance 3.5, resolution-dynamic mu ([`base_schedule`]); the SceneWorks manifest `default_steps` /
+/// `defaults.guidanceScale` mirror these.
+pub const RAW_STEPS: usize = 52;
+pub const RAW_GUIDANCE: f32 = 3.5;
 
 /// Max prompt tokens the Qwen3-VL RoPE table is sized for (generous; Krea prompts + the 34-token
 /// template prefix are short). Enforced up front by [`crate::tokenizer::KreaTokenizer::encode_prompt`]
@@ -250,6 +262,124 @@ pub fn render(
     Ok(images)
 }
 
+/// Render the **Raw** (undistilled, full classifier-free-guidance) rectified-flow text-to-image path
+/// for `req` (`krea_2_raw`, epic 9992 / sc-9994) — the CFG sibling of [`render`]. Two DiT forwards per
+/// step, the conditional (positive prompt) and the unconditional (the user negative prompt, or `""`
+/// when none), combined by the **reference** `sampling.py:129` formula via [`krea_cfg_combine`]
+/// (`v = cond + guidance·(cond − uncond)`, NOT the textbook `uncond + g·Δ`: Krea's guidance is offset by
+/// one). `guidance ≤ 0` short-circuits to a single conditional forward (the uncond context is never
+/// encoded), matching the reference `cfg = guidance > 0`. Unlike Turbo's fixed `mu = 1.15`, the schedule
+/// is resolution-**dynamic** ([`base_schedule`]). Everything else — the Qwen3-VL condition encode, the
+/// PiD/native decode seam, and the per-seed batch loop — is identical to [`render`].
+pub fn render_base(
+    comps: &Components,
+    req: &GenerationRequest,
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    let steps = req.steps.map(|s| s as usize).unwrap_or(RAW_STEPS);
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
+
+    // Positive (conditional) condition encoding (seed-independent): the 12 selected Qwen3-VL hidden
+    // layers → the DiT's text_fusion context [1, n_tok, 12, 2560].
+    let context = comps
+        .te
+        .forward(&comps.tok.encode_prompt(&req.prompt, MAX_TEXT_TOKENS)?)?;
+
+    // Unconditional context, encoded ONLY when CFG is active (reference `cfg = guidance > 0`). An
+    // absent / empty negative prompt defaults to `""` (reference `negative_prompts = [""] * n`).
+    let neg_context = if guidance > 0.0 {
+        let negative = req.negative_prompt.as_deref().unwrap_or_default();
+        Some(
+            comps
+                .te
+                .forward(&comps.tok.encode_prompt(negative, MAX_TEXT_TOKENS)?)?,
+        )
+    } else {
+        None
+    };
+
+    // Resolution-dynamic Raw sigma schedule (mu from the image-token count); a curated scheduler
+    // reshapes over the same dynamic mu. Raw sigma → DiT timestep, raw velocity → Euler
+    // `x + v·(σ_{i+1} − σ_i)`.
+    let sigmas = base_schedule(steps, req.width, req.height, req.scheduler.as_deref());
+
+    // Resolve the decode seam once for the whole batch (epic 7840 / sc-7853): a per-generation PiD
+    // decoder bound to this prompt when `req.use_pid` is set (errors if requested but not loaded), else
+    // `None` → the native QwenVae decode.
+    let pid_decoder = candle_gen_pid::resolve_pid_decoder(
+        comps.pid.as_deref(),
+        req,
+        base_seed,
+        crate::KREA_2_RAW_ID,
+    )?;
+
+    let mut images = Vec::with_capacity(req.count as usize);
+    for index in 0..req.count {
+        let seed = base_seed.wrapping_add(index as u64);
+        let noise = init_noise(req.height, req.width, seed, device)?;
+        let lat = candle_gen::run_flow_sampler(
+            req.sampler.as_deref(),
+            TimestepConvention::Sigma,
+            &sigmas,
+            noise,
+            seed,
+            &req.cancel,
+            on_progress,
+            |x, timestep| -> Result<Tensor> {
+                let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                let cond = comps.dit.forward(x, &t, &context)?;
+                // Two-forward CFG when a negative context was prepared (guidance > 0); else the bare
+                // conditional velocity. Combined by the shared reference formula (`krea_cfg_combine`).
+                let v = match &neg_context {
+                    Some(nc) => {
+                        let uncond = comps.dit.forward(x, &t, nc)?;
+                        krea_cfg_combine(&cond, &uncond, guidance)?
+                    }
+                    None => cond,
+                };
+                Ok(v.to_dtype(DType::F32)?)
+            },
+        )?;
+        on_progress(Progress::Decoding);
+        let decoded = match &pid_decoder {
+            Some(pid) => pid.decode(&lat)?,
+            None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
+        };
+        images.push(to_image(&decoded)?);
+    }
+    Ok(images)
+}
+
+/// The **Raw** flow-match sigma schedule for `steps` at a given resolution: the exponential-mu shift
+/// with a resolution-**dynamic** `mu` interpolated in image-token count ([`dynamic_mu`]), unlike the
+/// Turbo fixed `mu = 1.15`. Length `steps + 1`, descending with a trailing `0.0`; a curated scheduler
+/// (epic 7114) reshapes over the same dynamic mu. Mirrors mlx-gen-krea `base_schedule`.
+pub fn base_schedule(steps: usize, width: u32, height: u32, scheduler: Option<&str>) -> Vec<f32> {
+    // Image token count = (W/16)·(H/16) (latent /8 then patch /2) — the reference `x.shape[1]`.
+    let seq_len = (width as f64 / 16.0) * (height as f64 / 16.0);
+    let mu = dynamic_mu(seq_len);
+    let native = krea_sigmas(steps, mu);
+    candle_gen::resolve_flow_schedule(scheduler, mu as f32, steps, &native)
+}
+
+/// Krea's classifier-free-guidance velocity combine — the reference `sampling.py:129`
+/// `v = v_cond + guidance·(v_cond − v_uncond)`, **NOT** the standard `v_uncond + g·Δ`. Krea's guidance
+/// is offset by one: the standard form applies one full step LESS guidance, and at `guidance = 1.0`
+/// collapses to exactly `v_cond` (zero effective CFG — the washed-out-render trap). Single source of
+/// truth so the Raw inference path (sc-9994) and the trainer preview (`training::render_sample`) can
+/// never drift again (mirrors the mlx-gen sc-10009 dedupe). The caller runs this only for
+/// `guidance > 0` (a single conditional forward otherwise, matching `cfg = guidance > 0`).
+pub(crate) fn krea_cfg_combine(
+    v_cond: &Tensor,
+    v_uncond: &Tensor,
+    guidance: f32,
+) -> Result<Tensor> {
+    let guided = ((v_cond - v_uncond)? * guidance as f64)?;
+    Ok((v_cond + guided)?)
+}
+
 /// Seeded initial Gaussian latent noise `[1, 16, H/8, W/8]` (f32; the VAE's 8× spatial compression).
 /// Deterministic, launch-portable CPU RNG (sc-3673 parity), exactly as the z-image/ideogram/boogu
 /// providers. The model layer offsets `seed` per image in a batch (reference `seed + i`).
@@ -287,4 +417,47 @@ fn to_image(decoded: &Tensor) -> Result<Image> {
         height: h as u32,
         pixels,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Krea CFG combine is the reference `cond + g·(cond − uncond)`, not the standard
+    /// `uncond + g·Δ`. With cond = 2, uncond = 1 (Δ = 1): g = 1 → 3 (the standard form would give 2 —
+    /// exactly `cond` — which is why the shared default `sample_guidance_scale = 1.0` washed previews
+    /// out, sc-10009); a larger g pushes further from cond, away from uncond; g = 0 → cond.
+    #[test]
+    fn cfg_combine_is_reference_offset_by_one() {
+        let cond = Tensor::from_vec(vec![2.0f32], (1,), &Device::Cpu).unwrap();
+        let uncond = Tensor::from_vec(vec![1.0f32], (1,), &Device::Cpu).unwrap();
+        for (g, want) in [(1.0f32, 3.0f32), (3.5, 5.5), (0.0, 2.0)] {
+            let v = krea_cfg_combine(&cond, &uncond, g).unwrap();
+            let got = v.to_vec1::<f32>().unwrap()[0];
+            assert!((got - want).abs() < 1e-5, "g={g}: got {got}, want {want}");
+        }
+    }
+
+    /// The Raw schedule uses the resolution-dynamic mu (vs Turbo's fixed 1.15): at 1024² the image-token
+    /// count is `(1024/16)² = 4096`, so `mu = dynamic_mu(4096) = 0.90625`, and the native (unscheduled)
+    /// sigmas match the reference `timesteps(seq_len=4096)` — a descending `[1.0 … 0.0]` of length
+    /// `steps + 1`. Distinct from `turbo_sigmas`, confirming Raw is not on the distilled fixed-mu curve.
+    #[test]
+    fn base_schedule_is_resolution_dynamic() {
+        let sig = base_schedule(4, 1024, 1024, None);
+        assert_eq!(sig.len(), 5);
+        assert_eq!(sig.first().copied(), Some(1.0));
+        assert_eq!(sig.last().copied(), Some(0.0));
+        // Reference `timesteps(seq_len=4096, steps=4)` at f64 precision (narrowed to the f32 the sampler
+        // stores) — the same values schedule.rs asserts for the dynamic-mu path.
+        let want = [1.0f64, 0.88130659, 0.71223223, 0.45205718, 0.0];
+        for (i, (&g, w)) in sig.iter().zip(want).enumerate() {
+            assert!((g as f64 - w).abs() < 1e-5, "sigma[{i}] = {g}, want {w}");
+        }
+        assert_ne!(
+            sig,
+            turbo_sigmas(4),
+            "Raw dynamic-mu differs from Turbo fixed-mu"
+        );
+    }
 }

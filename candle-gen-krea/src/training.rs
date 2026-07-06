@@ -72,6 +72,7 @@ use rand::{rngs::StdRng, SeedableRng};
 
 use crate::config::Krea2Config;
 use crate::loader::Weights;
+use crate::pipeline::krea_cfg_combine;
 use crate::schedule::{dynamic_mu, krea_sigmas};
 use crate::text_encoder::{KreaTeConfig, KreaTextEncoder};
 use crate::tokenizer::KreaTokenizer;
@@ -426,9 +427,10 @@ impl FlowMatchTrainer for KreaTrainer {
     /// classifier-free guidance — NOT the deployed few-step CFG-free `krea_2_turbo` render
     /// ([`crate::pipeline`]). A CFG-free Turbo-schedule render of the Raw checkpoint collapses to
     /// washed-out, unrepresentative output. Krea consumes the **raw** velocity at timestep `σ`
-    /// ([`TimestepConvention::Sigma`], no negation); the CFG mix is
-    /// `v = v_uncond + guidance·(v_cond − v_uncond)` (`guidance ≤ 1` ⇒ conditional-only, a single
-    /// forward). Best-effort: any error here is logged + skipped by the driver, never aborting the run.
+    /// ([`TimestepConvention::Sigma`], no negation); the CFG mix is the shared reference
+    /// [`krea_cfg_combine`] `v = v_cond + guidance·(v_cond − v_uncond)` (`guidance ≤ 0` ⇒
+    /// conditional-only, a single forward). Best-effort: any error here is logged + skipped by the
+    /// driver, never aborting the run.
     fn render_sample(
         &self,
         dit: &KreaTrainDit,
@@ -467,12 +469,15 @@ impl FlowMatchTrainer for KreaTrainer {
             |x, timestep| -> Result<Tensor> {
                 let t = Tensor::from_vec(vec![timestep], (1,), device)?;
                 let v_cond = dit.forward(x, &t, &ctx_pos)?;
-                // CFG: `v = v_uncond + guidance·(v_cond − v_uncond)`. `guidance ≤ 1` collapses to the
-                // conditional velocity, so skip the extra unconditional forward.
-                let v = if guidance > 1.0 {
+                // CFG via the shared [`krea_cfg_combine`] (reference `sampling.py:129`
+                // `v_cond + g·(v_cond − v_uncond)`, one source of truth with the Raw inference path).
+                // Prior to sc-9994 this used the standard `v_uncond + g·Δ` gated on `guidance > 1.0`,
+                // which at the shared default `sample_guidance_scale = 1.0` collapsed to exactly `v_cond`
+                // — zero effective CFG, the washed-out previews (the candle twin of mlx-gen sc-10009).
+                // `guidance ≤ 0` still collapses to the bare conditional velocity (one forward).
+                let v = if guidance > 0.0 {
                     let v_uncond = dit.forward(x, &t, &ctx_neg)?;
-                    let guided = ((&v_cond - &v_uncond)? * guidance as f64)?;
-                    (&v_uncond + guided)?
+                    krea_cfg_combine(&v_cond, &v_uncond, guidance)?
                 } else {
                     v_cond
                 };
