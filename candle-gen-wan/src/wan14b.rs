@@ -151,35 +151,55 @@ impl Pipeline {
         crate::text_encode::component_vb(&self.root, sub, dtype, &self.device, "wan-14b", desc)
     }
 
-    /// Build one expert from its `sub` dir, folding in any adapter whose [`AdapterSpec::moe_expert`]
-    /// targets it (`Some(expert)` or `None` = shared). With no adapter for this expert, the fast
-    /// mmap path is used; otherwise the weights are loaded to CPU, the delta is merged
-    /// ([`crate::adapters::merge_adapters`], f32 math), and the expert is built from the merged map
-    /// (`VarBuilder::from_tensors` casts/moves per-tensor on `get`, so peak GPU is unchanged) — the
-    /// merge-not-residual pattern the SDXL/Z-Image ports established. The [`crate::adapters::MergeReport`]
-    /// is discarded (only the `?` error path is kept, so a zero-match adapter still hard-errors inside
-    /// `merge_adapters`), matching the silent library-side merge of the SDXL/Z-Image/sd3/qwen-image-edit
-    /// twins (F-051 / sc-9035: per-merge stderr is unstructured, uncapturable noise).
-    fn build_expert(&self, sub: &str, expert: MoeExpert) -> CResult<WanTransformer> {
+    /// Build one expert from its `sub` dir, applying any adapter whose [`AdapterSpec::moe_expert`]
+    /// targets it (`Some(expert)` or `None` = shared). The adapter application differs by tier:
+    ///
+    /// - **Dense** tier: the delta is FOLDED into the dense weights before build
+    ///   ([`crate::adapters::merge_adapters`], f32 math, `VarBuilder::from_tensors`) — the
+    ///   merge-not-residual pattern the SDXL/Z-Image ports established, byte-identical to before.
+    ///   `merge_adapters` hard-errors on its own zero-match (the report is otherwise discarded, F-051).
+    /// - **Packed** q4/q8 tier (sc-10095): a packed tier has **no dense `W`** to fold into, so the
+    ///   adapters attach as forward-time **additive** residuals on the packed `QLinear`
+    ///   ([`crate::adapters::install_additive`], sc-10094) — the base weight stays q4/q8. LoKr/LoHa on a
+    ///   packed tier is rejected there (deferred to sc-10050/10051).
+    ///
+    /// Returns the expert plus `Some(applied)` on the packed path (the count of attached residuals, for
+    /// the caller's cross-expert zero-match guard) or `None` on the dense/no-adapter paths (which
+    /// self-guard). With no adapter for this expert the fast mmap build is used unchanged.
+    fn build_expert(
+        &self,
+        sub: &str,
+        expert: MoeExpert,
+    ) -> CResult<(WanTransformer, Option<usize>)> {
         let specs: Vec<AdapterSpec> = self
             .adapters
             .iter()
             .filter(|s| s.moe_expert.is_none_or(|e| e == expert))
             .cloned()
             .collect();
-        if specs.is_empty() {
-            return Ok(WanTransformer::new(
-                &self.dit_cfg,
-                self.component_vb(sub, DIT_DTYPE)?,
-            )?);
+        let vb = self.component_vb(sub, DIT_DTYPE)?;
+        // Packed-tier marker: the sc-10025 seam packs every DiT Linear (incl. `proj_out`), so a
+        // `proj_out.scales` sibling is present iff this is a pre-quantized q4/q8 tier.
+        let packed = vb.contains_tensor("proj_out.scales");
+        if packed {
+            let mut dit = WanTransformer::new(&self.dit_cfg, vb)?;
+            if specs.is_empty() {
+                return Ok((dit, Some(0)));
+            }
+            // Additive install on the packed base — no dense weight materialized (sc-10094/10095).
+            let report = crate::adapters::install_additive(&mut dit, &specs, expert)?;
+            return Ok((dit, Some(report.applied)));
         }
+        if specs.is_empty() {
+            return Ok((WanTransformer::new(&self.dit_cfg, vb)?, None));
+        }
+        // Dense tier + adapters: fold the delta into the dense weights before building (the legacy
+        // merge-not-residual fast path). `merge_adapters` hard-errors on its own zero-match.
+        drop(vb);
         let mut map = self.load_component_map(sub)?;
-        // Merge the adapter delta, discarding the report (sc-9027 / F-043). The `?` keeps the zero-match
-        // hard-error; the per-expert merge count is *not* printed to stderr — F-051 (sc-9035) ratified
-        // silent library-side merges, matching the Z-Image/sd3/qwen-image-edit twins.
         crate::adapters::merge_adapters(&mut map, &specs)?;
         let vb = VarBuilder::from_tensors(map, DIT_DTYPE, &self.device);
-        Ok(WanTransformer::new(&self.dit_cfg, vb)?)
+        Ok((WanTransformer::new(&self.dit_cfg, vb)?, None))
     }
 
     /// Load every `.safetensors` in the component subdir `sub` into one CPU tensor map (native dtype) —
@@ -199,8 +219,25 @@ impl Pipeline {
     fn load_components(&self) -> CResult<Components> {
         let te = Umt5Encoder::new(&self.te_cfg, self.component_vb("text_encoder", ENC_DTYPE)?)?;
         // transformer/ = high-noise expert, transformer_2/ = low-noise expert (diffusers WanPipeline).
-        let high = self.build_expert("transformer", MoeExpert::High)?;
-        let low = self.build_expert("transformer_2", MoeExpert::Low)?;
+        let (high, high_applied) = self.build_expert("transformer", MoeExpert::High)?;
+        let (low, low_applied) = self.build_expert("transformer_2", MoeExpert::Low)?;
+        // Packed-tier zero-match guard (sc-10095): on the additive path a non-empty adapter set that
+        // attached NO residual across either expert is a format/prefix misconfiguration (the dense fold
+        // path self-guards inside `merge_adapters`, so it returns `None` here and is exempt). Both experts
+        // share a tier, so this is `Some` iff packed.
+        if !self.adapters.is_empty() {
+            if let (Some(h), Some(l)) = (high_applied, low_applied) {
+                if h + l == 0 {
+                    return Err(CandleError::Msg(format!(
+                        "{}: {} LoRA adapter file(s) matched no projection on either packed expert — \
+                         check the key format (expected PEFT `<path>.lora_A/B.weight` or kohya \
+                         `lora_unet_<flat>` targeting the DiT attention/FFN Linears)",
+                        self.variant.id(),
+                        self.adapters.len()
+                    )));
+                }
+            }
+        }
         let vae_vb = self.component_vb("vae", VAE_DTYPE)?;
         let vae = match self.variant {
             // I2V needs the VAE encoder (the conditioning image's first-frame latent).
