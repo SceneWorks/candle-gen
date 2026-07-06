@@ -32,6 +32,7 @@ pub mod lq;
 pub(crate) mod nn;
 pub mod registry;
 pub mod sampler;
+pub mod tiling;
 
 pub use backbone::PixDiT;
 pub use caption::CaptionEncoder;

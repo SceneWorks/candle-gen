@@ -23,6 +23,7 @@ use rand::SeedableRng;
 
 use crate::config::{SampleType, SamplerConfig};
 use crate::lq::PidNet;
+use crate::tiling::forward_tiled;
 
 /// The distilled few-step sampler.
 pub struct Sampler {
@@ -76,6 +77,43 @@ impl Sampler {
         sigma: &Tensor,
         cancel: Option<&CancelFlag>,
     ) -> Result<Tensor> {
+        self.run_inner(noise, eps, cancel, |x, t_scaled| {
+            net.forward(x, t_scaled, caption, lq_latent, sigma)
+        })
+    }
+
+    /// Like [`Self::run`] but the per-step **velocity** forward is spatially tiled (sc-10087):
+    /// [`crate::tiling::forward_tiled`] runs the net on overlapping `tile`-px pixel windows and
+    /// feather-blends them, so the whole-image `PidNet::forward` VRAM peak (the CUDA sysmem-fallback
+    /// silent-hang trigger) never materializes. The 4-step SDE loop stays whole-image — `noise`/`eps` are
+    /// the same full-res seeded draws, so the sampler math + RNG sequence are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_tiled(
+        &self,
+        net: &PidNet,
+        noise: &Tensor,
+        eps: &[Tensor],
+        caption: &Tensor,
+        lq_latent: &Tensor,
+        sigma: &Tensor,
+        tile: i32,
+        overlap: i32,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Tensor> {
+        self.run_inner(noise, eps, cancel, |x, t_scaled| {
+            forward_tiled(net, x, t_scaled, caption, lq_latent, sigma, tile, overlap)
+        })
+    }
+
+    /// Shared SDE step loop. `forward(x, t_scaled) -> v` is the per-step velocity predictor — either the
+    /// whole-image `PidNet::forward` ([`Self::run`]) or the tiled forward ([`Self::run_tiled`]).
+    fn run_inner(
+        &self,
+        noise: &Tensor,
+        eps: &[Tensor],
+        cancel: Option<&CancelFlag>,
+        forward: impl Fn(&Tensor, &Tensor) -> Result<Tensor>,
+    ) -> Result<Tensor> {
         let b = noise.dim(0)?;
         let device = noise.device();
         let mut x = noise.clone();
@@ -87,7 +125,7 @@ impl Sampler {
             let t_cur = self.t_list[i];
             let t_next = self.t_list[i + 1];
             let t_scaled = Tensor::from_vec(vec![t_cur * self.timescale; b], (b,), device)?;
-            let v = net.forward(&x, &t_scaled, caption, lq_latent, sigma)?;
+            let v = forward(&x, &t_scaled)?;
             if t_next > 0.0 {
                 if self.sde {
                     let x0 = Self::velocity_to_x0(&x, &v, t_cur)?;
@@ -132,5 +170,40 @@ impl Sampler {
             eps.push(draw()?);
         }
         self.run(net, &noise, &eps, caption, lq_latent, sigma, cancel)
+    }
+
+    /// Tiled production entry (sc-10087): identical seeded noise/ε draw as [`Self::sample`] (full-res, so
+    /// the RNG sequence is byte-for-byte the same), then [`Self::run_tiled`] with the spatial `tile` /
+    /// `overlap`. Use for large outputs where the whole-image forward exhausts VRAM. `tile`/`overlap` are
+    /// output-pixel units (rounded to the pixel→latent factor internally).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_tiled(
+        &self,
+        net: &PidNet,
+        caption: &Tensor,
+        lq_latent: &Tensor,
+        sigma: &Tensor,
+        b: usize,
+        h: usize,
+        w: usize,
+        seed: u64,
+        tile: i32,
+        overlap: i32,
+        cancel: Option<&CancelFlag>,
+    ) -> Result<Tensor> {
+        let device = lq_latent.device();
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut draw = || -> Result<Tensor> {
+            let v = seeded_normal_vec(&mut rng, b * 3 * h * w);
+            Ok(Tensor::from_vec(v, (b, 3, h, w), device)?)
+        };
+        let noise = draw()?;
+        let mut eps = Vec::with_capacity(self.num_eps());
+        for _ in 0..self.num_eps() {
+            eps.push(draw()?);
+        }
+        self.run_tiled(
+            net, &noise, &eps, caption, lq_latent, sigma, tile, overlap, cancel,
+        )
     }
 }

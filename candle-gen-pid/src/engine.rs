@@ -187,11 +187,12 @@ pub fn resolve_pid_decoder_at_sigma(
             "{model_id}: use_pid was requested but no PiD decoder is loaded (load with LoadSpec::pid)"
         ))
     })?;
-    // Memory budget guard (F-013). PiD super-resolves in pixel space by `engine.scale()`, so a
-    // `max_size`-legal `req.width × req.height` decodes at `(width·scale) × (height·scale)` — tens of
-    // GB of concurrent pixel-space + patch-stream tensors. Estimate that peak against the machine's
-    // safe budget (`nvidia-smi` total × 0.85, or the `PID_DECODE_BUDGET_GIB` override) and refuse
-    // *here*, before the caption encode + `PidNet` build, rather than OOM mid-decode.
+    // Memory budget + tiling (F-013 sc-9095, tiling sc-10087). PiD super-resolves in pixel space by
+    // `engine.scale()`, so a `max_size`-legal `req.width × req.height` decodes at `(width·scale) ×
+    // (height·scale)` — a 1536² request → 6144², whose whole-image forward exhausts VRAM (→ the CUDA
+    // sysmem-fallback silent hang). We now **tile** rather than refuse: size the tile against the
+    // machine's safe budget (`nvidia-smi` total × 0.85, or the `PID_DECODE_BUDGET_GIB` override) and only
+    // refuse when even a minimum tile plus the resident output-resolution buffers won't fit.
     let safe_gib = candle_gen::vae_tiling::safe_budget_gib(PID_BUDGET_ENV, 0.85, 16.0);
     crate::budget::guard(
         model_id,
@@ -202,13 +203,29 @@ pub fn resolve_pid_decoder_at_sigma(
         engine.config(),
         safe_gib,
     )?;
+    let scale = engine.scale();
+    let (th, tw) = (
+        (req.height * scale as u32) as i32,
+        (req.width * scale as u32) as i32,
+    );
+    let cfg = engine.config();
+    let plan = crate::budget::plan_tile_edge(
+        req.count.max(1) as i32,
+        th,
+        tw,
+        cfg.patch_size,
+        cfg.hidden_size,
+        safe_gib,
+    );
     // Thread the request's cancel flag into the minted decoder so the 4-step decode honors a cancel
     // per sampler step (F-006) — the `LatentDecoder::decode` trait signature carries no flag.
-    Ok(Some(
-        engine
-            .decoder(&req.prompt, capture_sigma, base_seed)?
-            .with_cancel(req.cancel.clone()),
-    ))
+    let mut decoder = engine
+        .decoder(&req.prompt, capture_sigma, base_seed)?
+        .with_cancel(req.cancel.clone());
+    if !plan.whole_fits {
+        decoder = decoder.with_tiling(plan.edge, plan.overlap);
+    }
+    Ok(Some(decoder))
 }
 
 /// Resolve the `from_ldm` early-stop for one **flow-match** generation: fold `req.use_pid` +
