@@ -77,6 +77,20 @@ impl Attention {
         })
     }
 
+    /// Visit this attention's four adaptable projections (`{prefix}.{to_q,to_k,to_v,to_out.0}`) for the
+    /// additive-adapter walk (sc-10094).
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        f(&format!("{prefix}.to_q"), &mut self.to_q)?;
+        f(&format!("{prefix}.to_k"), &mut self.to_k)?;
+        f(&format!("{prefix}.to_v"), &mut self.to_v)?;
+        f(&format!("{prefix}.to_out.0"), &mut self.to_out)?;
+        Ok(())
+    }
+
     /// `hidden`: `[B, S, dim]`; `context`: cross-attn K/V source (= hidden for self-attn). RoPE is
     /// applied only when `cos`/`sin` are given (self-attn).
     fn forward(
@@ -125,6 +139,18 @@ impl Ffn {
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.out.forward(&self.proj.forward(x)?.gelu()?)
+    }
+
+    /// Visit the FFN's two adaptable projections (`{prefix}.net.0.proj`, `{prefix}.net.2`) for the
+    /// additive-adapter walk (sc-10094).
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        f(&format!("{prefix}.net.0.proj"), &mut self.proj)?;
+        f(&format!("{prefix}.net.2"), &mut self.out)?;
+        Ok(())
     }
 }
 
@@ -197,6 +223,21 @@ impl Block {
         let f = self.ffn.forward(&n)?;
         let hf = (hf + f.to_dtype(DType::F32)?.broadcast_mul(&c_gate)?)?;
         hf.to_dtype(dt)
+    }
+
+    /// Visit this block's adaptable projections (`{prefix}.attn1/attn2.*`, `{prefix}.ffn.*`) for the
+    /// additive-adapter walk (sc-10094).
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        self.attn1
+            .visit_adaptable_mut(&format!("{prefix}.attn1"), f)?;
+        self.attn2
+            .visit_adaptable_mut(&format!("{prefix}.attn2"), f)?;
+        self.ffn.visit_adaptable_mut(&format!("{prefix}.ffn"), f)?;
+        Ok(())
     }
 }
 
@@ -368,5 +409,68 @@ impl WanTransformer {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Whether this DiT loaded from a **packed** MLX tier (its projections are quantized) — the additive
+    /// router uses this to reject LoKr/LoHa on a packed base (sc-10094). Probed on `proj_out` (every
+    /// projection in a tier packs together; a dense checkpoint packs none).
+    pub fn is_packed(&self) -> bool {
+        self.proj_out.is_packed()
+    }
+
+    /// The canonical dotted paths of every adaptable projection (attention q/k/v/out, FFN, the
+    /// condition-embedder projections, `time_proj`, `proj_out`) — the LoRA merge surface, in the diffusers
+    /// key namespace. Drives the additive-adapter kohya `flat→dotted` table (sc-10094).
+    pub fn adaptable_paths(&self) -> Vec<String> {
+        let mut paths = vec![
+            "condition_embedder.text_embedder.linear_1".to_string(),
+            "condition_embedder.text_embedder.linear_2".to_string(),
+            "condition_embedder.time_embedder.linear_1".to_string(),
+            "condition_embedder.time_embedder.linear_2".to_string(),
+            "condition_embedder.time_proj".to_string(),
+        ];
+        for i in 0..self.blocks.len() {
+            for attn in ["attn1", "attn2"] {
+                for leaf in ["to_q", "to_k", "to_v", "to_out.0"] {
+                    paths.push(format!("blocks.{i}.{attn}.{leaf}"));
+                }
+            }
+            paths.push(format!("blocks.{i}.ffn.net.0.proj"));
+            paths.push(format!("blocks.{i}.ffn.net.2"));
+        }
+        paths.push("proj_out".to_string());
+        paths
+    }
+
+    /// Walk every adaptable projection, invoking `f(path, &mut QLinear)` once each with the projection's
+    /// canonical dotted path — the host visitor the additive-adapter installer routes residuals through
+    /// (sc-10094; the candle analog of mlx-gen's `AdaptableHost`). The order matches
+    /// [`Self::adaptable_paths`].
+    pub fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        f(
+            "condition_embedder.text_embedder.linear_1",
+            &mut self.text_l1,
+        )?;
+        f(
+            "condition_embedder.text_embedder.linear_2",
+            &mut self.text_l2,
+        )?;
+        f(
+            "condition_embedder.time_embedder.linear_1",
+            &mut self.time_l1,
+        )?;
+        f(
+            "condition_embedder.time_embedder.linear_2",
+            &mut self.time_l2,
+        )?;
+        f("condition_embedder.time_proj", &mut self.time_proj)?;
+        for (i, blk) in self.blocks.iter_mut().enumerate() {
+            blk.visit_adaptable_mut(&format!("blocks.{i}"), f)?;
+        }
+        f("proj_out", &mut self.proj_out)?;
+        Ok(())
     }
 }

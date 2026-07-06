@@ -27,10 +27,10 @@
 //! populated report is *discarded* at the call site — F-051 (sc-9035) ratified silent library-side
 //! merges (no per-merge stderr), matching the Z-Image/sd3/qwen-image-edit twins.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-use candle_gen::candle_core::Tensor;
-use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::gen_core::{AdapterKind, AdapterSpec, MoeExpert};
 use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta};
 // The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report primitives
 // this crate previously hand-copied. Only the Wan-specific key→module resolution stays local below.
@@ -41,6 +41,8 @@ use candle_gen::train::merge::{
 // Re-exported so `candle_gen_wan::MergeReport` (the crate's public surface) keeps resolving.
 pub use candle_gen::train::merge::MergeReport;
 use candle_gen::{CandleError, Result};
+
+use crate::transformer::WanTransformer;
 
 /// LoRA-key namespace prefixes a Wan adapter may carry, longest-first so the more specific peft form
 /// wins. The candle trainer writes bare keys (matched by the trailing `""`).
@@ -272,6 +274,187 @@ pub fn merge_adapters(
     Ok(report)
 }
 
+// ---- Unmerged additive-LoRA path (sc-10094, epic 10043) -----------------------------------------
+//
+// A packed q4/q8 tier has no dense `W` to fold `δ` into (`merge_adapters` above folds `W += δ` before
+// the DiT is built), so on a packed tier the mandatory Lightning distill (and user LoRAs) apply as a
+// **forward-time residual** on the packed [`QLinear`] instead: `y = base(x) + scale·((x·A)·B)`
+// ([`QLinear::push_lora`](crate::quant::QLinear::push_lora)), the base weight used AS-IS — no dense
+// weight is materialized, so a q4 base keeps its q4 footprint. The candle twin of mlx-gen's
+// `apply_wan_adapters_additive` (sc-10044). **LoKr/LoHa on a packed tier is rejected** (its residual
+// needs the base's dense grid — deferred to sc-10050/10051); on a dense tier those still fold through
+// [`merge_adapters`]. `install_additive` inverts the mlx flow (walk the host once, look each projection
+// up in the resolved map) — the same result, but no path→field string routing.
+
+/// Report of an additive-adapter install (sc-10094): how many projections received a residual, plus the
+/// resolved target paths that matched **no** projection on the host and the off-surface adapter keys —
+/// both surfaced, never silently dropped. The caller aggregates `applied` across the A14B's two experts
+/// and raises the zero-match error (a non-empty adapter set that adapts nothing is a misconfiguration).
+#[derive(Debug, Default)]
+pub struct AdditiveReport {
+    /// Projections that received a residual (one per `(path, file)` hit; multiple stack).
+    pub applied: usize,
+    /// Resolved target paths present in the adapter file(s) but absent from the host DiT surface.
+    pub skipped_targets: Vec<String>,
+    /// Adapter-file keys outside the LoRA surface (text-encoder keys, half-pairs, non-2-D factors).
+    pub skipped_keys: usize,
+}
+
+/// A LoRA residual resolved from a file, pending attachment to a host projection: `a = downᵀ`
+/// `[in, rank]`, `b = upᵀ·(alpha/rank)` `[rank, out]` (the `alpha/rank` ratio folded into `b`, matching
+/// the fold path's split), `scale` = the spec's user strength. Held f32 (the trainer/merge dtype).
+struct PendingLora {
+    a: Tensor,
+    b: Tensor,
+    scale: f64,
+}
+
+/// True when a file carries LoKr/LoHa factors (or is stamped/declared LoKr) — such an adapter cannot
+/// apply additively on a **packed** tier (its residual needs the base's dense grid; deferred to
+/// sc-10050/10051), and on a dense tier it belongs on the [`merge_adapters`] fold path.
+fn is_lokr_or_loha(af: &AdapterFile, kind: AdapterKind) -> bool {
+    kind == AdapterKind::Lokr
+        || af.declares_lokr()
+        || af.tensors.keys().any(|k| {
+            k.contains(".lokr_")
+                || k.contains(".hada_")
+                || k.starts_with("lokr_")
+                || k.starts_with("hada_")
+        })
+}
+
+/// Resolve one LoRA file's complete `(down, up[, alpha])` groups into per-path [`PendingLora`]s at
+/// `scale`, mirroring [`merge_lora_file`]'s classification + `alpha/rank` split — but producing the
+/// **unmerged** `a`/`b` factors instead of folding a delta. `table` is the host-derived kohya
+/// `flat→dotted` map (built from [`WanTransformer::adaptable_paths`], since a packed tier has no dense
+/// base map to build it from).
+fn resolve_lora_file(
+    af: &AdapterFile,
+    scale: f32,
+    table: &BTreeMap<String, String>,
+    pending: &mut BTreeMap<String, Vec<PendingLora>>,
+    skipped_keys: &mut usize,
+) -> Result<()> {
+    let mut triples: BTreeMap<String, LoraTriple> = BTreeMap::new();
+    for (key, t) in &af.tensors {
+        match classify_lora_key(key, table) {
+            Some((path, Role::Down)) => triples.entry(path).or_default().down = Some(t.clone()),
+            Some((path, Role::Up)) => triples.entry(path).or_default().up = Some(t.clone()),
+            Some((path, Role::Alpha)) => {
+                triples.entry(path).or_default().alpha = Some(read_scalar(key, t)?)
+            }
+            None => *skipped_keys += 1,
+        }
+    }
+    for (path, t) in triples {
+        let (Some(down), Some(up)) = (t.down, t.up) else {
+            *skipped_keys += 1; // half-pair
+            continue;
+        };
+        if down.dims().len() != 2 || up.dims().len() != 2 {
+            *skipped_keys += 1; // Wan adapts Linears only (no conv surface)
+            continue;
+        }
+        let rank = down.dims()[0] as f64;
+        if rank == 0.0 {
+            *skipped_keys += 1;
+            continue;
+        }
+        let alpha = t.alpha.map(|a| a as f64).unwrap_or(rank);
+        let ratio = alpha / rank;
+        // a = downᵀ [in, rank]; b = upᵀ·(alpha/rank) [rank, out]. f32, contiguous for the matmul.
+        let a = down.to_dtype(DType::F32)?.t()?.contiguous()?;
+        let b = (up.to_dtype(DType::F32)?.t()?.contiguous()? * ratio)?;
+        pending.entry(path).or_default().push(PendingLora {
+            a,
+            b,
+            scale: scale as f64,
+        });
+    }
+    Ok(())
+}
+
+/// Install `specs` as forward-time additive residuals on an already-built [`WanTransformer`] (sc-10094)
+/// — the packed-tier path where [`merge_adapters`] can't fold. Shared (`moe_expert == None`) specs apply
+/// to any `expert`; expert-tagged specs apply only to their expert (the A14B MoE routing), shared ones
+/// stacked first. **LoKr/LoHa on a packed tier is a hard, actionable error** (deferred to
+/// sc-10050/10051); on a dense base such an adapter belongs on [`merge_adapters`]. Returns the per-call
+/// [`AdditiveReport`] **without** raising the zero-match error — the caller aggregates `applied` across
+/// the two experts and decides (a High-only spec legitimately adapts nothing on the Low expert).
+pub fn install_additive(
+    dit: &mut WanTransformer,
+    specs: &[AdapterSpec],
+    expert: MoeExpert,
+) -> Result<AdditiveReport> {
+    let packed = dit.is_packed();
+    let table: BTreeMap<String, String> = dit
+        .adaptable_paths()
+        .into_iter()
+        .map(|p| (p.replace('.', "_"), p))
+        .collect();
+
+    // Resolve shared specs first, then this expert's — so shared residuals stack before expert ones
+    // (mlx pass-1/pass-2 order).
+    let ordered = specs
+        .iter()
+        .filter(|s| s.moe_expert.is_none())
+        .chain(specs.iter().filter(|s| s.moe_expert == Some(expert)));
+
+    let mut pending: BTreeMap<String, Vec<PendingLora>> = BTreeMap::new();
+    let mut report = AdditiveReport::default();
+    for spec in ordered {
+        let af = read_adapter(&spec.path)?;
+        if is_lokr_or_loha(&af, spec.kind) {
+            let why = if packed {
+                "on a quantized (packed q4/q8) Wan tier are not supported yet — use the bf16 tier \
+                 (where they fold into the dense weight), or a plain LoRA (which applies additively \
+                 on any tier); tracked in sc-10050 (LoKr) / sc-10051 (LoHa)"
+            } else {
+                "reached the additive path on a dense base — fold them via merge_adapters instead"
+            };
+            return Err(CandleError::Msg(format!(
+                "wan: LoKr/LoHa adapters {why}. Offending file: {}",
+                spec.path.display()
+            )));
+        }
+        resolve_lora_file(
+            &af,
+            spec.scale,
+            &table,
+            &mut pending,
+            &mut report.skipped_keys,
+        )?;
+    }
+
+    // Attach: walk the host once, pushing any resolved residual for each projection's path. A factor
+    // whose dims don't match the target projection (`a` `[in, r]`, `b` `[r, out]`) is surfaced as a
+    // skipped key, never a crashing forward — the additive analog of the fold path's `merge_into`
+    // shape guard (a mismatched community LoRA target is skipped, not fatal).
+    let mut matched: HashSet<String> = HashSet::new();
+    dit.visit_adaptable_mut(&mut |path, lin| {
+        if let Some(list) = pending.get(path) {
+            matched.insert(path.to_string());
+            let (out_f, in_f) = lin.base_shape();
+            for p in list {
+                if p.a.dims()[0] != in_f || p.b.dims()[1] != out_f {
+                    report.skipped_keys += 1; // shape-mismatched factor for this projection
+                    continue;
+                }
+                lin.push_lora(p.a.clone(), p.b.clone(), p.scale);
+                report.applied += 1;
+            }
+        }
+        Ok(())
+    })?;
+    // Pending targets absent from the host surface are surfaced, never silently dropped.
+    for path in pending.keys() {
+        if !matched.contains(path) {
+            report.skipped_targets.push(path.clone());
+        }
+    }
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,5 +639,237 @@ mod tests {
         merge_lora_file(&mut map, &af, 1.0, &table, &mut report).unwrap();
         assert_eq!(report.merged, 0);
         assert!(report.skipped_keys >= 1);
+    }
+
+    // ---- additive-adapter install (sc-10094) ----------------------------------------------------
+
+    use crate::config::TransformerConfig;
+    use crate::rope::WanRope;
+    use candle_gen::candle_core::safetensors as cst;
+    use candle_gen::candle_nn::{VarBuilder, VarMap};
+
+    /// A tiny Wan-shaped config (z16, 2 layers, 1 head, head_dim 128) — the dit_train test shape,
+    /// exercising every vendored DiT path cheaply on CPU.
+    fn tiny_cfg() -> TransformerConfig {
+        TransformerConfig {
+            in_channels: 16,
+            out_channels: 16,
+            num_layers: 2,
+            num_heads: 1,
+            head_dim: 128,
+            dim: 128,
+            ffn_dim: 256,
+            freq_dim: 256,
+            text_dim: 64,
+            patch: (1, 2, 2),
+            eps: 1e-6,
+            rope_theta: 10000.0,
+            rope_max_seq_len: 1024,
+        }
+    }
+
+    /// A fresh, **randomized** dense base tensor map for `cfg` — build a `WanTransformer` once to
+    /// populate every key, randomize all vars (a zero patch kernel makes the forward vacuous), then
+    /// snapshot the varmap to a CPU f32 map both the additive and the fold path can build from.
+    fn random_base_map(cfg: &TransformerConfig, dev: &Device) -> HashMap<String, Tensor> {
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, dev);
+        let _ = WanTransformer::new(cfg, vb).unwrap(); // populate keys/shapes
+        for v in vm.all_vars() {
+            v.set(&Tensor::randn(0f32, 0.1f32, v.dims(), dev).unwrap())
+                .unwrap();
+        }
+        let data = vm.data().lock().unwrap();
+        data.iter()
+            .map(|(k, v)| (k.clone(), v.as_tensor().clone()))
+            .collect()
+    }
+
+    fn dit_from_map(
+        cfg: &TransformerConfig,
+        map: HashMap<String, Tensor>,
+        dev: &Device,
+    ) -> WanTransformer {
+        WanTransformer::new(cfg, VarBuilder::from_tensors(map, DType::F32, dev)).unwrap()
+    }
+
+    /// Fixed DiT inputs `(latent, umt5, cos, sin)` so two DiTs can be compared on the *same* forward.
+    fn fixed_inputs(cfg: &TransformerConfig, dev: &Device) -> (Tensor, Tensor, Tensor, Tensor) {
+        let latent = Tensor::randn(0f32, 1f32, (1, cfg.in_channels, 1, 4, 4), dev).unwrap();
+        let umt5 = Tensor::randn(0f32, 1f32, (1, 3, cfg.text_dim), dev).unwrap();
+        let (cos, sin) = WanRope::new(cfg).cos_sin(1, 2, 2, dev).unwrap();
+        (latent, umt5, cos, sin)
+    }
+
+    fn dit_forward(dit: &WanTransformer, inp: &(Tensor, Tensor, Tensor, Tensor)) -> Tensor {
+        let (latent, umt5, cos, sin) = inp;
+        let ctx = dit.embed_text(umt5).unwrap();
+        dit.forward(latent, &ctx, 500.0, cos, sin).unwrap()
+    }
+
+    fn max_abs_dev(a: &Tensor, b: &Tensor) -> f32 {
+        a.sub(b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    /// Write a PEFT LoRA `.safetensors` targeting `paths` (each `[out,in]` = `[dim,dim]`), rank `r`,
+    /// per-target `.alpha`.
+    fn write_lora(
+        paths: &[&str],
+        dim: usize,
+        r: usize,
+        alpha: f32,
+        tag: &str,
+    ) -> std::path::PathBuf {
+        let dev = Device::Cpu;
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        for p in paths {
+            m.insert(
+                format!("{p}.lora_A.weight"),
+                Tensor::randn(0f32, 1f32, (r, dim), &dev).unwrap(),
+            );
+            m.insert(
+                format!("{p}.lora_B.weight"),
+                Tensor::randn(0f32, 1f32, (dim, r), &dev).unwrap(),
+            );
+            m.insert(
+                format!("{p}.alpha"),
+                Tensor::from_vec(vec![alpha], (1,), &dev).unwrap(),
+            );
+        }
+        let path = std::env::temp_dir().join(format!(
+            "sc10094_lora_{tag}_{}.safetensors",
+            std::process::id()
+        ));
+        cst::save(&m, &path).unwrap();
+        path
+    }
+
+    /// The additive install on a dense base reproduces the `merge_adapters` fold: same base weights +
+    /// same LoRA → the two DiT forwards match tightly (f32), on the *same* inputs. The sc-10094
+    /// additive==folded acceptance, end-to-end through the vendored DiT (not just the bare `QLinear`).
+    #[test]
+    fn install_additive_matches_merge_fold() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let base = random_base_map(&cfg, &dev);
+        // Square (dim×dim) attention projections — the uniform-shape write_lora fixture; the FFN
+        // net.2 (in=ffn_dim≠out=dim) needs a shape-matched factor, covered by the shape guard.
+        let targets = [
+            "blocks.0.attn1.to_q",
+            "blocks.1.attn2.to_v",
+            "blocks.1.attn1.to_k",
+        ];
+        let lora = write_lora(&targets, cfg.dim, 4, 8.0, "parity");
+        let specs = vec![AdapterSpec::new(lora.clone(), 0.8, AdapterKind::Lora)];
+
+        // Additive: build from the base, install forward-time residuals.
+        let mut dit_add = dit_from_map(&cfg, base.clone(), &dev);
+        let report = install_additive(&mut dit_add, &specs, MoeExpert::High).unwrap();
+        assert_eq!(report.applied, targets.len(), "every target adapts");
+        assert!(
+            report.skipped_targets.is_empty(),
+            "no target missed the host"
+        );
+
+        // Fold: merge the same delta into the base map, build from the merged map.
+        let mut merged = base.clone();
+        merge_adapters(&mut merged, &specs).unwrap();
+        let dit_fold = dit_from_map(&cfg, merged, &dev);
+
+        let inp = fixed_inputs(&cfg, &dev);
+        let dev_max = max_abs_dev(&dit_forward(&dit_add, &inp), &dit_forward(&dit_fold, &inp));
+        assert!(
+            dev_max < 1e-3,
+            "additive DiT forward vs folded deviates by {dev_max}"
+        );
+        std::fs::remove_file(&lora).ok();
+    }
+
+    /// A LoRA installs additively onto the tiny DiT and **shifts** the forward vs the un-adapted base
+    /// (same inputs); the report accounts for every target with no host miss.
+    #[test]
+    fn install_additive_applies_and_shifts() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let base = random_base_map(&cfg, &dev);
+        let targets = ["blocks.0.attn1.to_q", "blocks.1.attn2.to_v"];
+        let lora = write_lora(&targets, cfg.dim, 4, 8.0, "shift");
+        let specs = vec![AdapterSpec::new(lora.clone(), 1.0, AdapterKind::Lora)];
+
+        let dit_base = dit_from_map(&cfg, base.clone(), &dev);
+        let mut dit_add = dit_from_map(&cfg, base, &dev);
+        let report = install_additive(&mut dit_add, &specs, MoeExpert::High).unwrap();
+        assert_eq!(report.applied, 2);
+        assert!(report.skipped_targets.is_empty());
+
+        let inp = fixed_inputs(&cfg, &dev);
+        let shift = max_abs_dev(&dit_forward(&dit_base, &inp), &dit_forward(&dit_add, &inp));
+        assert!(
+            shift > 1e-4,
+            "additive LoRA did not shift the DiT forward ({shift})"
+        );
+        std::fs::remove_file(&lora).ok();
+    }
+
+    /// MoE routing: a High-tagged spec adapts nothing when installed for the Low expert, and adapts its
+    /// targets when installed for the High expert.
+    #[test]
+    fn install_additive_moe_routing() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let base = random_base_map(&cfg, &dev);
+        let lora = write_lora(&["blocks.0.attn1.to_q"], cfg.dim, 4, 4.0, "moe");
+        let specs =
+            vec![AdapterSpec::new(lora.clone(), 1.0, AdapterKind::Lora)
+                .with_moe_expert(MoeExpert::High)];
+
+        let mut low = dit_from_map(&cfg, base.clone(), &dev);
+        let low_report = install_additive(&mut low, &specs, MoeExpert::Low).unwrap();
+        assert_eq!(
+            low_report.applied, 0,
+            "a High spec must not touch the Low expert"
+        );
+
+        let mut high = dit_from_map(&cfg, base, &dev);
+        let high_report = install_additive(&mut high, &specs, MoeExpert::High).unwrap();
+        assert_eq!(high_report.applied, 1, "a High spec adapts the High expert");
+        std::fs::remove_file(&lora).ok();
+    }
+
+    /// A LoKr adapter is rejected by the additive path with an actionable error (LoKr/LoHa fold on the
+    /// dense path; a packed tier rejects them entirely — sc-10050/10051).
+    #[test]
+    fn install_additive_rejects_lokr() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let base = random_base_map(&cfg, &dev);
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        m.insert(
+            "blocks.0.attn1.to_q.lokr_w1".into(),
+            Tensor::randn(0f32, 1f32, (cfg.dim, cfg.dim), &dev).unwrap(),
+        );
+        m.insert(
+            "blocks.0.attn1.to_q.lokr_w2".into(),
+            Tensor::from_vec(vec![1.0f32], (1, 1), &dev).unwrap(),
+        );
+        let path =
+            std::env::temp_dir().join(format!("sc10094_lokr_{}.safetensors", std::process::id()));
+        cst::save(&m, &path).unwrap();
+        let specs = vec![AdapterSpec::new(path.clone(), 1.0, AdapterKind::Lokr)];
+
+        let mut dit = dit_from_map(&cfg, base, &dev);
+        let err = install_additive(&mut dit, &specs, MoeExpert::High).unwrap_err();
+        assert!(
+            err.to_string().contains("LoKr/LoHa"),
+            "expected a LoKr/LoHa rejection, got: {err}"
+        );
+        std::fs::remove_file(&path).ok();
     }
 }

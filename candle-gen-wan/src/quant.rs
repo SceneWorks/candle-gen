@@ -51,34 +51,109 @@ use candle_gen::quant as shared;
 /// the per-component config `group_size` at real tier ingestion.
 pub const GROUP_SIZE: usize = shared::MLX_GROUP_SIZE; // 64
 
-/// A Linear projection that is **dense** (the loaded weight, the legacy per-crate path) or **packed**
-/// (loaded straight from an MLX-packed tier via the shared [`candle_gen::quant::QLinear`]). Built dense
-/// ([`Self::linear`] / [`Self::linear_no_bias`]) or packed-detected ([`Self::linear_detect`]); both
-/// forwards compute `x·Wᵀ + b`.
-pub enum QLinear {
+/// A Linear projection — a **base** weight (dense, the legacy per-crate path, or **packed** straight from
+/// an MLX-packed tier via the shared [`candle_gen::quant::QLinear`]) plus zero or more forward-time
+/// **additive LoRA/LoKr adapters** (sc-10094). Built dense ([`Self::linear`] / [`Self::linear_no_bias`]) or
+/// packed-detected ([`Self::linear_detect`]); the base forward computes `x·Wᵀ + b`, and each attached
+/// adapter adds a residual `scale·((x·A)·B)` (LoRA) / `scale·x·ΔWᵀ` (LoKr) computed AS-IS against the base
+/// weight — **no dense weight is materialized**, so a packed q4/q8 base keeps its footprint while the
+/// mandatory Lightning distill (or a user LoRA) applies *unmerged* (the ComfyUI-style branch epic 10043
+/// delivers; the candle twin of mlx-gen's `AdaptableLinear`). With no adapter the forward is byte-identical
+/// to the pre-sc-10094 dense/packed path.
+pub struct QLinear {
+    base: Base,
+    in_features: usize,
+    out_features: usize,
+    /// Forward-time additive residuals applied in push order (adapters stack). Empty on the pure
+    /// inference/dense path.
+    adapters: Vec<Adapter>,
+}
+
+/// The frozen base weight behind a [`QLinear`] — **dense** or **MLX-packed**. Both compute `x·Wᵀ + b`; the
+/// packed arm dequantizes-on-forward into a dense matmul (sc-7702, *not* the int8 `QMatMul` fast path).
+enum Base {
     Dense(Linear),
-    /// Loaded directly from an MLX-packed tier through the shared module — the resident `Q4_1`/`Q8_0`
-    /// weight **dequantizes-on-forward** into a dense matmul (sc-7702, *not* the int8 `QMatMul` fast
-    /// path).
     Packed(shared::QLinear),
 }
 
+/// A forward-time additive adapter residual (sc-10094) — the base weight is **never mutated** (the
+/// ComfyUI-style unmerged branch, candle twin of mlx-gen's `Adapter`). Factors are held **f32** and cast to
+/// the activation dtype per forward (they are tiny — `[in,r]`/`[r,out]` — so the cast is cheap).
+enum Adapter {
+    /// LoRA residual `scale·(x·a)·b`: `a` `[in, rank]` (= `downᵀ`), `b` `[rank, out]` (= `upᵀ` with the
+    /// `alpha/rank` ratio folded in at resolution). The **deferred two-small-matmul** form — never the
+    /// `[out,in]` product — so it stays memory-free on any quant (a q4 base keeps its q4 footprint).
+    Lora { a: Tensor, b: Tensor, scale: f64 },
+    /// LoKr / full-delta residual `scale·x·δᵀ`: `delta` `[out, in]` f32 reconstructed from the Kronecker
+    /// factors at the base's shape. It materializes a dense `[out,in]` delta, so it is **dense-base only**
+    /// (a packed tier rejects LoKr/LoHa — deferred to sc-10050/10051); kept for dense additive==folded
+    /// parity.
+    Lokr { delta: Tensor, scale: f64 },
+}
+
+impl Base {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Base::Dense(l) => l.forward(x),
+            Base::Packed(l) => l.forward(x),
+        }
+    }
+
+    fn is_packed(&self) -> bool {
+        matches!(self, Base::Packed(_))
+    }
+}
+
+impl Adapter {
+    /// The residual this adapter adds to the base forward, in the activation dtype of `x`.
+    fn residual(&self, x: &Tensor) -> Result<Tensor> {
+        let xd = x.dtype();
+        match self {
+            // Two small matmuls: `(x·a)·b`, never the `[out,in]` product (memory-free on any quant).
+            Adapter::Lora { a, b, scale } => {
+                let r = x
+                    .broadcast_matmul(&a.to_dtype(xd)?)?
+                    .broadcast_matmul(&b.to_dtype(xd)?)?;
+                r * *scale
+            }
+            // Reconstructed dense delta: `x·δᵀ` (dense base only).
+            Adapter::Lokr { delta, scale } => {
+                let r = x.broadcast_matmul(&delta.to_dtype(xd)?.t()?)?;
+                r * *scale
+            }
+        }
+    }
+}
+
 impl QLinear {
+    fn wrap_dense(l: Linear, in_dim: usize, out_dim: usize) -> Self {
+        Self {
+            base: Base::Dense(l),
+            in_features: in_dim,
+            out_features: out_dim,
+            adapters: Vec::new(),
+        }
+    }
+
     /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`), shape-checked
     /// exactly like the legacy `transformer::linear` — so it loads unchanged on the crate's `VarMap`-backed
     /// test fixtures.
     pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        Ok(Self::Dense(candle_gen::candle_nn::linear(
-            in_dim, out_dim, vb,
-        )?))
+        Ok(Self::wrap_dense(
+            candle_gen::candle_nn::linear(in_dim, out_dim, vb)?,
+            in_dim,
+            out_dim,
+        ))
     }
 
     /// A bias-less dense `[out, in]` projection from `vb` (`{prefix}.weight`) — the UMT5 q/k/v/o + FFN
     /// projections load bias-less (the legacy `text_encoder::linear_no_bias`).
     pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        Ok(Self::Dense(candle_gen::candle_nn::linear_no_bias(
-            in_dim, out_dim, vb,
-        )?))
+        Ok(Self::wrap_dense(
+            candle_gen::candle_nn::linear_no_bias(in_dim, out_dim, vb)?,
+            in_dim,
+            out_dim,
+        ))
     }
 
     /// **Packed-detecting** `[out, in]` loader at an explicit MLX `group_size` (sc-10025): if
@@ -100,9 +175,12 @@ impl QLinear {
         group_size: usize,
     ) -> Result<Self> {
         if vb.contains_tensor(&format!("{base}.scales")) {
-            return Ok(Self::Packed(shared::lin_gs(
-                vb, base, in_dim, out_dim, bias, group_size,
-            )?));
+            return Ok(Self {
+                base: Base::Packed(shared::lin_gs(vb, base, in_dim, out_dim, bias, group_size)?),
+                in_features: in_dim,
+                out_features: out_dim,
+                adapters: Vec::new(),
+            });
         }
         let sub = vb.pp(base);
         if bias {
@@ -125,20 +203,62 @@ impl QLinear {
         Self::linear_detect_gs(in_dim, out_dim, vb, base, bias, GROUP_SIZE)
     }
 
-    /// `x·Wᵀ + b`. Dense delegates to `candle_nn::Linear`; packed delegates to the shared
-    /// dequant-on-forward `QLinear` (sc-7702).
+    /// `x·Wᵀ + b` plus every attached additive adapter residual, in push order (sc-10094). The base
+    /// (dense `candle_nn::Linear` or the shared dequant-on-forward packed `QLinear`, sc-7702) is used
+    /// AS-IS; each adapter adds `scale·((x·A)·B)` (LoRA) / `scale·x·ΔWᵀ` (LoKr). With no adapter the
+    /// output is byte-identical to the pre-sc-10094 base forward.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Dense(l) => l.forward(x),
-            Self::Packed(l) => l.forward(x),
+        let mut y = self.base.forward(x)?;
+        for a in &self.adapters {
+            y = (y + a.residual(x)?)?;
         }
+        Ok(y)
     }
 
     /// Whether this projection loaded directly from an MLX-packed tier (the packed path) — used by the
-    /// tests to assert a packed tier fired the packed path (not a silent dense fallback).
+    /// tests to assert a packed tier fired the packed path (not a silent dense fallback), and by the
+    /// additive-adapter router to reject LoKr/LoHa on a packed base (sc-10094; deferred to sc-10050/10051).
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_packed(&self) -> bool {
-        matches!(self, Self::Packed(_))
+        self.base.is_packed()
+    }
+
+    /// The base projection's `(out_features, in_features)` — the shape a LoKr delta is reconstructed at,
+    /// recoverable even from a packed base (the logical dims are captured at construction, not read back
+    /// from the quantized weight).
+    pub fn base_shape(&self) -> (usize, usize) {
+        (self.out_features, self.in_features)
+    }
+
+    /// The projection's contraction (`in_features`) — the last-dim an `[in, rank]` LoRA `a` factor
+    /// contracts against.
+    pub fn in_features(&self) -> usize {
+        self.in_features
+    }
+
+    /// The projection's output width (`out_features`).
+    pub fn out_features(&self) -> usize {
+        self.out_features
+    }
+
+    /// Attach a **LoRA** residual `scale·(x·a)·b` (sc-10094): `a` `[in, rank]` (= `downᵀ`), `b`
+    /// `[rank, out]` (= `upᵀ` with the `alpha/rank` ratio already folded in), `scale` the caller's
+    /// per-adapter strength. Multiple pushes stack. Valid on **any** base (dense or packed) — the base
+    /// weight is untouched, so a packed q4/q8 tier keeps its footprint.
+    pub fn push_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
+        self.adapters.push(Adapter::Lora { a, b, scale });
+    }
+
+    /// Attach a **full-delta** residual `scale·x·δᵀ` (sc-10094) from a reconstructed `[out, in]` LoKr/LoHa
+    /// delta. Dense-base only — a packed tier rejects LoKr/LoHa upstream (the delta would need the base's
+    /// dense grid); kept for dense additive==folded parity.
+    pub fn push_delta(&mut self, delta: Tensor, scale: f64) {
+        self.adapters.push(Adapter::Lokr { delta, scale });
+    }
+
+    /// Whether any additive adapter is attached.
+    pub fn is_adapted(&self) -> bool {
+        !self.adapters.is_empty()
     }
 }
 
@@ -278,10 +398,14 @@ mod tests {
         );
 
         // The packed forward reproduces the affine grid (+ the dense bias) bit-exactly.
-        let grid_lin = QLinear::Dense(Linear::new(
-            Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
-            Some(out_bias),
-        ));
+        let grid_lin = QLinear::wrap_dense(
+            Linear::new(
+                Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
+                Some(out_bias),
+            ),
+            in_dim,
+            out_dim,
+        );
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
@@ -419,6 +543,120 @@ mod tests {
         guard_dense(&vb, "conv_out")?; // clean dense leaf passes
 
         std::fs::remove_file(&tmp).ok();
+        Ok(())
+    }
+
+    /// Build a packed wan [`QLinear`] on the `p` key via the round-trip the DiT loader takes
+    /// (`linear_detect` on a written `.scales`/`.biases`/`.weight` triple) — the packed base the additive
+    /// tests attach a LoRA onto.
+    fn packed_qlinear(out_dim: usize, in_dim: usize) -> (QLinear, Vec<f32>) {
+        let dev = Device::Cpu;
+        let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        map.insert("p.weight".into(), wq);
+        map.insert("p.scales".into(), s);
+        map.insert("p.biases".into(), b);
+        let tmp =
+            std::env::temp_dir().join(format!("sc10094_packed_{}.safetensors", std::process::id()));
+        candle_gen::candle_core::safetensors::save(&map, &tmp).unwrap();
+        // SAFETY: freshly written, single-reader for the test.
+        let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
+        let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev);
+        let q = QLinear::linear_detect(in_dim, out_dim, &vb, "p", false).unwrap();
+        std::fs::remove_file(&tmp).ok();
+        (q, grid)
+    }
+
+    /// The additive LoRA branch (`base(x) + scale·(x·a)·b`, `a = downᵀ`, `b = upᵀ` with `alpha/rank`
+    /// folded in) reproduces the **folded** merge `x·(W + δ)ᵀ` with `δ = (alpha/rank)·scale·(up·down)`,
+    /// on a dense f32 base — the sc-10094 additive==folded parity (tight in f32).
+    #[test]
+    fn additive_lora_matches_folded_dense() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, rank) = (48usize, 64usize, 4usize);
+        let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?;
+        let down = Tensor::randn(0f32, 1f32, (rank, in_dim), &dev)?; // A [rank, in]
+        let up = Tensor::randn(0f32, 1f32, (out_dim, rank), &dev)?; // B [out, rank]
+        let (alpha, user_scale) = (8.0f64, 0.7f64);
+        let ratio = alpha / rank as f64; // 2.0
+
+        // Additive: a = downᵀ [in, rank], b = (upᵀ)·ratio [rank, out], scale = user strength.
+        let a = down.t()?.contiguous()?;
+        let b = (up.t()?.contiguous()? * ratio)?;
+        let mut q = QLinear::wrap_dense(Linear::new(w.clone(), None), in_dim, out_dim);
+        q.push_lora(a, b, user_scale);
+        assert!(q.is_adapted());
+
+        // Folded: δ = ratio·user_scale·(up·down); W_merged = W + δ.
+        let delta = ((up.matmul(&down)?) * (ratio * user_scale))?;
+        let folded = QLinear::wrap_dense(Linear::new((w + delta)?, None), in_dim, out_dim);
+
+        let x = Tensor::randn(0f32, 1f32, (3, in_dim), &dev)?;
+        let dev_max = (q.forward(&x)?.sub(&folded.forward(&x)?)?)
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(dev_max < 1e-4, "additive vs folded deviates by {dev_max}");
+        Ok(())
+    }
+
+    /// A scale-0 additive LoRA is a byte-exact no-op — the adapter is attached but contributes nothing,
+    /// so the forward equals the un-adapted base exactly.
+    #[test]
+    fn additive_scale_zero_is_noop() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, rank) = (32usize, 40usize, 4usize);
+        let w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?;
+        let base = QLinear::wrap_dense(Linear::new(w.clone(), None), in_dim, out_dim);
+        let mut adapted = QLinear::wrap_dense(Linear::new(w, None), in_dim, out_dim);
+        adapted.push_lora(
+            Tensor::randn(0f32, 1f32, (in_dim, rank), &dev)?,
+            Tensor::randn(0f32, 1f32, (rank, out_dim), &dev)?,
+            0.0,
+        );
+        let x = Tensor::randn(0f32, 1f32, (3, in_dim), &dev)?;
+        let dev_max = (adapted.forward(&x)?.sub(&base.forward(&x)?)?)
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert_eq!(dev_max, 0.0, "scale-0 additive LoRA must be an exact no-op");
+        Ok(())
+    }
+
+    /// A LoRA applied additively onto a **packed** base runs with no error, keeps the base packed (no
+    /// dense weight materialized), and **shifts** the output away from the un-adapted packed forward —
+    /// the core sc-10094 acceptance on a quantized tier. The output stays finite.
+    #[test]
+    fn additive_lora_on_packed_shifts_and_finite() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, rank) = (64usize, 128usize, 8usize);
+        let (packed_base, _grid) = packed_qlinear(out_dim, in_dim);
+        assert!(packed_base.is_packed());
+
+        let mut adapted = {
+            let (q, _) = packed_qlinear(out_dim, in_dim);
+            q
+        };
+        // Non-degenerate factors so the residual is a real shift.
+        let a = (Tensor::randn(0f32, 1f32, (in_dim, rank), &dev)? * 0.1)?;
+        let b = (Tensor::randn(0f32, 1f32, (rank, out_dim), &dev)? * 0.1)?;
+        adapted.push_lora(a, b, 1.0);
+        assert!(adapted.is_packed(), "adapter must not un-pack the base");
+        assert!(adapted.is_adapted());
+
+        let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+        let base_y = packed_base.forward(&x)?;
+        let adapted_y = adapted.forward(&x)?;
+        let shift = (adapted_y.sub(&base_y)?)
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(
+            shift > 1e-4,
+            "additive LoRA on packed did not shift ({shift})"
+        );
+        let maxabs = adapted_y.abs()?.max_all()?.to_scalar::<f32>()?;
+        assert!(maxabs.is_finite(), "packed additive output non-finite");
         Ok(())
     }
 }
