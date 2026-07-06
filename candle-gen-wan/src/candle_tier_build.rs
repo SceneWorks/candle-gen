@@ -240,9 +240,13 @@ mod tests {
             "written tier must load through the packed seam path"
         );
 
-        // Dequantized forward ≈ the original dense Linear (Q4 cosine parity, > 0.999).
+        // Dequantized forward ≈ the original dense Linear (Q4 cosine parity). Q4 is genuinely lossy, so
+        // this is a cosine tolerance (> 0.997), not bit-equality; the input is **deterministic** (not an
+        // unseeded `randn`) so the parity is portable — an unseeded input made the cosine flap around the
+        // Q4 loss floor and fail on CI's FP under a too-tight threshold ([[fp-byte-equality tests are
+        // non-portable]]).
         let dense_lin = Linear::new(w, None);
-        let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+        let x = dense(4, in_dim, 11.0);
         let a = loaded.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
         let b = dense_lin.forward(&x)?.flatten_all()?.to_vec1::<f32>()?;
         let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
@@ -253,7 +257,7 @@ mod tests {
         }
         let cos = dot / (na.sqrt() * nb.sqrt() + 1e-12);
         assert!(
-            cos > 0.999,
+            cos > 0.997,
             "packed-load forward cosine {cos:.6} vs dense too low"
         );
 
