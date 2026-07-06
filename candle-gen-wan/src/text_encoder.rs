@@ -8,9 +8,11 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
-use candle_gen::candle_nn::{Embedding, Linear, Module, VarBuilder};
+use candle_gen::candle_nn::VarBuilder;
+use candle_gen::quant::{embedding_gs, QEmbedding, MLX_GROUP_SIZE};
 
 use crate::config::TextEncoderConfig;
+use crate::quant::QLinear;
 
 /// T5 RMS LayerNorm (no centering, no bias), computed in f32.
 fn t5_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
@@ -21,15 +23,11 @@ fn t5_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
     normed.to_dtype(dt)?.broadcast_mul(weight)
 }
 
-fn linear_no_bias(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Linear> {
-    Ok(Linear::new(vb.get((out_c, in_c), "weight")?, None))
-}
-
 struct Attention {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    o: Linear,
+    q: QLinear,
+    k: QLinear,
+    v: QLinear,
+    o: QLinear,
     rel_bias: Tensor, // [num_buckets, num_heads]
     num_heads: usize,
     d_kv: usize,
@@ -39,10 +37,11 @@ impl Attention {
     fn new(cfg: &TextEncoderConfig, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.num_heads * cfg.d_kv;
         Ok(Self {
-            q: linear_no_bias(cfg.d_model, inner, vb.pp("q"))?,
-            k: linear_no_bias(cfg.d_model, inner, vb.pp("k"))?,
-            v: linear_no_bias(cfg.d_model, inner, vb.pp("v"))?,
-            o: linear_no_bias(inner, cfg.d_model, vb.pp("o"))?,
+            // Bias-less UMT5 projections, packed-detect (sc-10025) — dense in the hosted Wan tier.
+            q: QLinear::linear_detect(cfg.d_model, inner, &vb, "q", false)?,
+            k: QLinear::linear_detect(cfg.d_model, inner, &vb, "k", false)?,
+            v: QLinear::linear_detect(cfg.d_model, inner, &vb, "v", false)?,
+            o: QLinear::linear_detect(inner, cfg.d_model, &vb, "o", false)?,
             rel_bias: vb
                 .pp("relative_attention_bias")
                 .get((cfg.num_buckets, cfg.num_heads), "weight")?,
@@ -82,17 +81,17 @@ impl Attention {
 }
 
 struct Ffn {
-    wi_0: Linear,
-    wi_1: Linear,
-    wo: Linear,
+    wi_0: QLinear,
+    wi_1: QLinear,
+    wo: QLinear,
 }
 
 impl Ffn {
     fn new(cfg: &TextEncoderConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            wi_0: linear_no_bias(cfg.d_model, cfg.d_ff, vb.pp("wi_0"))?,
-            wi_1: linear_no_bias(cfg.d_model, cfg.d_ff, vb.pp("wi_1"))?,
-            wo: linear_no_bias(cfg.d_ff, cfg.d_model, vb.pp("wo"))?,
+            wi_0: QLinear::linear_detect(cfg.d_model, cfg.d_ff, &vb, "wi_0", false)?,
+            wi_1: QLinear::linear_detect(cfg.d_model, cfg.d_ff, &vb, "wi_1", false)?,
+            wo: QLinear::linear_detect(cfg.d_ff, cfg.d_model, &vb, "wo", false)?,
         })
     }
 
@@ -133,7 +132,7 @@ impl Block {
 }
 
 pub struct Umt5Encoder {
-    shared: Embedding,
+    shared: QEmbedding,
     blocks: Vec<Block>,
     final_norm: Tensor,
     cfg: TextEncoderConfig,
@@ -142,10 +141,10 @@ pub struct Umt5Encoder {
 
 impl Umt5Encoder {
     pub fn new(cfg: &TextEncoderConfig, vb: VarBuilder) -> Result<Self> {
-        let shared = Embedding::new(
-            vb.get((cfg.vocab_size, cfg.d_model), "shared.weight")?,
-            cfg.d_model,
-        );
+        // Packed-detect the `shared` embedding (sc-10025) via the shared loader — dense in the hosted Wan
+        // tier (the MLX build keeps the T5 dense); the packed arm future-proofs + closes the guard. Its
+        // dense fallback is the shape-checked `candle_nn::embedding`, so the forward path is unchanged.
+        let shared = embedding_gs(&vb, "shared", cfg.vocab_size, cfg.d_model, MLX_GROUP_SIZE)?;
         let enc = vb.pp("encoder");
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {

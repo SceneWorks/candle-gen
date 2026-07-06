@@ -164,7 +164,14 @@ mod tests {
     /// Returns the config + encoder + tokenizer.
     fn tiny_encoder(dir: &Path) -> (TextEncoderConfig, Umt5Encoder, TextTokenizer) {
         let cfg = tiny_cfg();
-        let vb = VarBuilder::zeros(DType::F32, &Device::Cpu);
+        // A VarMap backend (not `VarBuilder::zeros`): the packed-detect loaders (sc-10025) probe
+        // `{key}.scales` via `contains_tensor`, and the `Zeros` backend reports EVERY key present (so it
+        // would spuriously fire the packed arm). A fresh VarMap reports only the keys the encoder
+        // actually `get`s — no `.scales` → every leaf takes the dense arm, exactly as before. Weights are
+        // init'd (finite) and reused within the built encoder, which is all these determinism/shape tests
+        // need.
+        let varmap = candle_gen::candle_nn::VarMap::new();
+        let vb = VarBuilder::from_varmap(&varmap, DType::F32, &Device::Cpu);
         let te = Umt5Encoder::new(&cfg, vb).expect("tiny encoder");
         std::fs::create_dir_all(dir.join("tokenizer")).unwrap();
         std::fs::write(dir.join("tokenizer/tokenizer.json"), TINY_TOKENIZER_JSON).unwrap();

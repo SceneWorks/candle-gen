@@ -8,11 +8,14 @@
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::ops::softmax_last_dim;
-use candle_gen::candle_nn::{Linear, Module, VarBuilder};
+use candle_gen::candle_nn::{Linear, VarBuilder};
 
 use crate::config::TransformerConfig;
+use crate::quant::QLinear;
 use crate::rope::apply_rope;
 
+/// Dense Linear loader — retained for the VACE model (`vace.rs`) and the training DiT (`dit_train.rs`),
+/// whose tiers are not packed. The inference DiT Linears route through [`qlinear`] (packed-detect).
 pub(crate) fn linear(in_c: usize, out_c: usize, vb: VarBuilder) -> Result<Linear> {
     Ok(Linear::new(
         vb.get((out_c, in_c), "weight")?,
@@ -47,10 +50,10 @@ fn sdpa(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Result<Tensor> {
 }
 
 struct Attention {
-    to_q: Linear,
-    to_k: Linear,
-    to_v: Linear,
-    to_out: Linear,
+    to_q: QLinear,
+    to_k: QLinear,
+    to_v: QLinear,
+    to_out: QLinear,
     norm_q: Tensor,
     norm_k: Tensor,
     num_heads: usize,
@@ -62,10 +65,10 @@ impl Attention {
     fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
         let inner = cfg.dim;
         Ok(Self {
-            to_q: linear(cfg.dim, inner, vb.pp("to_q"))?,
-            to_k: linear(cfg.dim, inner, vb.pp("to_k"))?,
-            to_v: linear(cfg.dim, inner, vb.pp("to_v"))?,
-            to_out: linear(inner, cfg.dim, vb.pp("to_out").pp("0"))?,
+            to_q: QLinear::linear_detect(cfg.dim, inner, &vb, "to_q", true)?,
+            to_k: QLinear::linear_detect(cfg.dim, inner, &vb, "to_k", true)?,
+            to_v: QLinear::linear_detect(cfg.dim, inner, &vb, "to_v", true)?,
+            to_out: QLinear::linear_detect(inner, cfg.dim, &vb, "to_out.0", true)?,
             norm_q: vb.pp("norm_q").get(inner, "weight")?,
             norm_k: vb.pp("norm_k").get(inner, "weight")?,
             num_heads: cfg.num_heads,
@@ -109,15 +112,15 @@ impl Attention {
 }
 
 struct Ffn {
-    proj: Linear, // net.0.proj
-    out: Linear,  // net.2
+    proj: QLinear, // net.0.proj
+    out: QLinear,  // net.2
 }
 
 impl Ffn {
     fn new(cfg: &TransformerConfig, vb: VarBuilder) -> Result<Self> {
         Ok(Self {
-            proj: linear(cfg.dim, cfg.ffn_dim, vb.pp("net").pp("0").pp("proj"))?,
-            out: linear(cfg.ffn_dim, cfg.dim, vb.pp("net").pp("2"))?,
+            proj: QLinear::linear_detect(cfg.dim, cfg.ffn_dim, &vb, "net.0.proj", true)?,
+            out: QLinear::linear_detect(cfg.ffn_dim, cfg.dim, &vb, "net.2", true)?,
         })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -219,14 +222,14 @@ pub(crate) fn timestep_sinusoid(t: f64, freq_dim: usize, b: usize, dev: &Device)
 pub struct WanTransformer {
     patch_w: Tensor, // [dim,48,p_h,p_w]
     patch_b: Tensor, // [1,dim,1,1]
-    text_l1: Linear,
-    text_l2: Linear,
-    time_l1: Linear,
-    time_l2: Linear,
-    time_proj: Linear,
+    text_l1: QLinear,
+    text_l2: QLinear,
+    time_l1: QLinear,
+    time_l2: QLinear,
+    time_proj: QLinear,
     blocks: Vec<Block>,
     norm_out_eps: f64,
-    proj_out: Linear,
+    proj_out: QLinear,
     scale_shift_table: Tensor, // [1,2,dim] f32
     cfg: TransformerConfig,
     device: Device,
@@ -247,18 +250,28 @@ impl WanTransformer {
             .reshape((1, cfg.dim, 1, 1))?;
 
         let ce = vb.pp("condition_embedder");
-        let text_l1 = linear(cfg.text_dim, cfg.dim, ce.pp("text_embedder").pp("linear_1"))?;
-        let text_l2 = linear(cfg.dim, cfg.dim, ce.pp("text_embedder").pp("linear_2"))?;
-        let time_l1 = linear(cfg.freq_dim, cfg.dim, ce.pp("time_embedder").pp("linear_1"))?;
-        let time_l2 = linear(cfg.dim, cfg.dim, ce.pp("time_embedder").pp("linear_2"))?;
-        let time_proj = linear(cfg.dim, 6 * cfg.dim, ce.pp("time_proj"))?;
+        let text_l1 =
+            QLinear::linear_detect(cfg.text_dim, cfg.dim, &ce, "text_embedder.linear_1", true)?;
+        let text_l2 =
+            QLinear::linear_detect(cfg.dim, cfg.dim, &ce, "text_embedder.linear_2", true)?;
+        let time_l1 =
+            QLinear::linear_detect(cfg.freq_dim, cfg.dim, &ce, "time_embedder.linear_1", true)?;
+        let time_l2 =
+            QLinear::linear_detect(cfg.dim, cfg.dim, &ce, "time_embedder.linear_2", true)?;
+        let time_proj = QLinear::linear_detect(cfg.dim, 6 * cfg.dim, &ce, "time_proj", true)?;
 
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for i in 0..cfg.num_layers {
             blocks.push(Block::new(cfg, vb.pp("blocks").pp(i))?);
         }
 
-        let proj_out = linear(cfg.dim, cfg.out_channels * pt * ph * pw, vb.pp("proj_out"))?;
+        let proj_out = QLinear::linear_detect(
+            cfg.dim,
+            cfg.out_channels * pt * ph * pw,
+            &vb,
+            "proj_out",
+            true,
+        )?;
         let scale_shift_table = vb
             .get((1, 2, cfg.dim), "scale_shift_table")?
             .to_dtype(DType::F32)?;

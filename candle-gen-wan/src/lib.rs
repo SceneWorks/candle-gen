@@ -25,6 +25,7 @@ pub mod conv3d;
 pub mod dit_train;
 pub mod model_vace;
 pub mod pipeline;
+pub mod quant;
 pub mod rope;
 pub mod scheduler;
 mod text_encode;
@@ -307,7 +308,9 @@ impl Generator for WanGenerator {
 }
 
 /// Wan2.2 TI2V-5B txt2video descriptor — the surface sc-3697 wires: CFG txt2video with a negative
-/// prompt, UniPC / Euler samplers; no conditioning (image / VACE deferred), no LoRA/quant.
+/// prompt, UniPC / Euler samplers; no conditioning (image / VACE deferred), no LoRA. Advertises the
+/// Q4/Q8 packed tiers (sc-10025) — the tiers are pre-quantized MLX snapshots the packed-detect loaders
+/// read directly (no on-the-fly quantization); tier ingestion is sc-10026.
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -342,7 +345,7 @@ pub fn descriptor() -> ModelDescriptor {
             max_size: 1280,
             max_count: 1,
             mac_only: false,
-            supported_quants: &[] as &[Quant],
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
         },
@@ -350,8 +353,10 @@ pub fn descriptor() -> ModelDescriptor {
 }
 
 /// Construct a lazy candle Wan generator. `spec.weights` must be a [`WeightsSource::Dir`] pointing at
-/// a `Wan-AI/Wan2.2-TI2V-5B-Diffusers` snapshot (`text_encoder/`, `transformer/`, `vae/`,
-/// `tokenizer/`). Adapters / quantization / control overlays are rejected (not wired).
+/// a `Wan-AI/Wan2.2-TI2V-5B-Diffusers` dense snapshot OR a pre-quantized MLX tier
+/// (`SceneWorks/wan2.2-ti2v-5b-mlx` q4/q8) — the packed-detect loaders (sc-10025) read whichever the
+/// dir holds. `spec.quantize` is a no-op: the tier is already packed (or dense), never requantized at
+/// load. Adapters / control overlays are rejected (not wired).
 pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let root = match &spec.weights {
         WeightsSource::Dir(p) => p.clone(),
@@ -368,11 +373,9 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             "candle wan does not support LoRA/LoKr yet".into(),
         ));
     }
-    if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(
-            "candle wan does not support on-the-fly Q4/Q8 quantization yet".into(),
-        ));
-    }
+    // No `spec.quantize` reject (sc-10025): the quant matrix is packed-tier, not on-the-fly — a q4/q8
+    // tier is pre-quantized (the packed-detect loaders read its `.scales`), a dense tier loads dense, so
+    // `spec.quantize` is a no-op tier-select marker resolved worker-side (mirrors ltx sc-9417).
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(
             "candle wan does not support image / VACE conditioning yet (txt2video only)".into(),
@@ -478,8 +481,9 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_unwired_surfaces() {
+    fn load_rejects_lora_accepts_quant() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+        // LoRA/LoKr is still unwired → rejected.
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
@@ -487,11 +491,13 @@ mod tests {
             load(&lora).err().expect("err"),
             gen_core::Error::Unsupported(_)
         ));
+        // Quant is now a no-op tier-select marker (packed-detect load, sc-10025), not a reject — a q4/q8
+        // tier is pre-quantized, so `spec.quantize` no longer errors (lazy load, no fs touch here).
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load(&quant).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(
+            load(&quant).is_ok(),
+            "quant is accepted (packed-tier select, no on-the-fly quant)"
+        );
     }
 
     #[test]

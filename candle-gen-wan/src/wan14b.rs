@@ -586,7 +586,10 @@ fn descriptor_for(variant: Variant) -> ModelDescriptor {
             max_size: 1280,
             max_count: 1,
             mac_only: false,
-            supported_quants: &[] as &[Quant],
+            // Q4/Q8 packed MLX tiers (sc-10025): both dual-expert `WanTransformer` backbones load packed
+            // via the shared packed-detect loaders; the tiers are pre-quantized (no on-the-fly quant).
+            // Tier ingestion (MLX layout + key remap) is sc-10026.
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             requires_sigma_shift: false,
         },
@@ -614,11 +617,9 @@ fn load_variant(spec: &LoadSpec, variant: Variant) -> gen_core::Result<Box<dyn G
             )));
         }
     };
-    if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "{id} does not support on-the-fly Q4/Q8 quantization yet"
-        )));
-    }
+    // No `spec.quantize` reject (sc-10025): the A14B quant matrix is packed-tier, not on-the-fly — a
+    // q4/q8 tier is pre-quantized (the packed-detect loaders read its `.scales`), a dense tier loads
+    // dense, so `spec.quantize` is a no-op tier-select marker resolved worker-side (mirrors ltx sc-9417).
     // I2V's conditioning image arrives per-request (`Conditioning::Reference`), not via `spec.control`;
     // the diffusers control/VACE overlays are not wired here.
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
@@ -835,19 +836,17 @@ mod tests {
     }
 
     #[test]
-    fn load_accepts_adapters_rejects_quant() {
+    fn load_accepts_adapters_and_quant() {
         use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-        // LoRA/LoKr are now supported (sc-5167) — load is lazy, so attaching adapters resolves OK
+        // LoRA/LoKr are supported (sc-5167) — load is lazy, so attaching adapters resolves OK
         // (the merge happens at the first `generate`).
         let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
             AdapterSpec::new("/lora.safetensors".into(), 1.0, AdapterKind::Lora),
         ]);
         assert!(load_t2v_14b(&lora).is_ok());
-        // Quant is still deferred.
+        // Quant is now a no-op tier-select marker (packed-detect load, sc-10025) — a q4/q8 A14B tier is
+        // pre-quantized, so `spec.quantize` no longer rejects; both experts load packed at ingestion.
         let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load_i2v_14b(&quant).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
+        assert!(load_i2v_14b(&quant).is_ok());
     }
 }
