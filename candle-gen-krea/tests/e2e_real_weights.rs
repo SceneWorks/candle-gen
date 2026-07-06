@@ -145,6 +145,118 @@ fn turbo_engine_renders_coherent_2048() {
     render(2048, 2048);
 }
 
+// ── sc-9994 Krea 2 Raw (undistilled, full-CFG) end-to-end ─────────────────────────────────────────
+
+/// The rehosted `SceneWorks/krea-2-raw-mlx` turnkey tier directory (e.g. the `q8/` subdir), pointed at
+/// by `KREA_RAW_DIR`. Same snapshot layout candle's `krea_2_raw` loader consumes (the Raw + Turbo
+/// turnkeys are byte-layout-identical; only the DiT weights differ, distilled vs base).
+fn raw_snapshot() -> Option<PathBuf> {
+    std::env::var("KREA_RAW_DIR").ok().map(PathBuf::from)
+}
+
+/// Render one image through the registered `krea_2_raw` **full-CFG** engine (sc-9994). `guidance > 0`
+/// with `negative` exercises the two-forward CFG path (`render_base`); `guidance = 0` runs the single
+/// conditional forward. Steps default to the Raw preset (52) unless `KREA_RAW_STEPS` overrides (a lower
+/// count keeps the smoke fast while still exercising the CFG + dynamic-mu path).
+fn render_raw(width: u32, height: u32, guidance: f32, negative: &str) -> Option<Image> {
+    candle_gen_krea::force_link();
+    let root = raw_snapshot()?;
+    let steps = std::env::var("KREA_RAW_STEPS")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok());
+
+    // The same `load_raw` the `krea_2_raw` registry entry dispatches to (registration is unit-tested in
+    // `tests::registers_krea_2_raw_as_candle`).
+    let spec = LoadSpec::new(WeightsSource::Dir(root));
+    let t_load = Instant::now();
+    let gen = registry::load("krea_2_raw", &spec).expect("load krea_2_raw engine");
+    let load_s = t_load.elapsed().as_secs_f32();
+
+    let req = GenerationRequest {
+        prompt: PROMPT.into(),
+        width,
+        height,
+        count: 1,
+        seed: Some(0),
+        steps,
+        guidance: Some(guidance),
+        negative_prompt: (!negative.is_empty()).then(|| negative.to_string()),
+        ..Default::default()
+    };
+
+    let t_gen = Instant::now();
+    let out = gen.generate(&req, &mut |_| {}).expect("generate");
+    let gen_s = t_gen.elapsed().as_secs_f32();
+
+    let GenerationOutput::Images(mut imgs) = out else {
+        panic!("expected GenerationOutput::Images");
+    };
+    assert_eq!(imgs.len(), 1, "count=1 → one image");
+    let img = imgs.remove(0);
+    assert_eq!((img.width, img.height), (width, height), "output dims");
+    let (std, distinct, adj) = image_stats(&img.pixels, img.width);
+    eprintln!(
+        "[krea_2_raw {width}x{height} g={guidance}] load {load_s:.1}s · render {gen_s:.1}s · \
+         std={std:.1} distinct={distinct} adjΔ={adj:.1} coherent={}",
+        is_coherent(&img)
+    );
+    Some(img)
+}
+
+/// Mean absolute per-pixel difference between two equal-size RGB8 buffers (0..255).
+fn mean_abs_diff(a: &Image, b: &Image) -> f32 {
+    assert_eq!(a.pixels.len(), b.pixels.len(), "same-size images");
+    let sum: u64 = a
+        .pixels
+        .iter()
+        .zip(&b.pixels)
+        .map(|(&x, &y)| (x as i32 - y as i32).unsigned_abs() as u64)
+        .sum();
+    sum as f32 / a.pixels.len() as f32
+}
+
+/// The Raw engine renders a coherent 1024² image through the full-CFG path (guidance 3.5 + a user
+/// negative prompt) — the primary sc-9994 AC. A velocity-sign / schedule-direction / CFG-combine bug
+/// yields noise → fails the coherence gate.
+#[test]
+#[ignore = "needs the real Krea 2 Raw snapshot (set KREA_RAW_DIR); --features cuda"]
+fn raw_engine_renders_coherent_1024_cfg() {
+    let Some(img) = render_raw(1024, 1024, 3.5, "blurry, deformed, low quality, watermark") else {
+        eprintln!("skipping: set KREA_RAW_DIR");
+        return;
+    };
+    save(&img, "raw_fox_1024_g3p5");
+    let (std, distinct, adj) = image_stats(&img.pixels, img.width);
+    assert!(
+        is_coherent(&img),
+        "Raw CFG render must be a coherent image, not noise (std={std:.1} distinct={distinct} adjΔ={adj:.1})"
+    );
+}
+
+/// Guidance is actually wired: a CFG render (g=3.5 + negative) must differ measurably from a CFG-free
+/// render (g=0, single conditional forward) of the same prompt/seed. If the reference `krea_cfg_combine`
+/// were mis-wired (e.g. the standard `uncond + g·Δ`, which at g=1 collapses to `cond`) or the uncond
+/// branch never ran, the two renders would be identical/near-identical — this catches that.
+#[test]
+#[ignore = "needs the real Krea 2 Raw snapshot (set KREA_RAW_DIR); --features cuda; two renders"]
+fn raw_cfg_visibly_affects_render() {
+    let (Some(cfg_on), Some(cfg_off)) = (
+        render_raw(1024, 1024, 3.5, "blurry, deformed, low quality, watermark"),
+        render_raw(1024, 1024, 0.0, ""),
+    ) else {
+        eprintln!("skipping: set KREA_RAW_DIR");
+        return;
+    };
+    save(&cfg_on, "raw_fox_1024_cfg_on");
+    save(&cfg_off, "raw_fox_1024_cfg_off");
+    let diff = mean_abs_diff(&cfg_on, &cfg_off);
+    eprintln!("[krea_2_raw CFG on vs off] mean|Δ|={diff:.2} / 255");
+    assert!(
+        diff > 2.0,
+        "guidance must visibly change the render; mean|Δ|={diff:.2} is too small — CFG path may be inert"
+    );
+}
+
 // ── sc-7836 inference-side LoRA/LoKr adapter merge ────────────────────────────────────────────────
 
 /// Write a synthetic bare-dotted `krea_2_raw`-format LoRA covering **every** attention projection
