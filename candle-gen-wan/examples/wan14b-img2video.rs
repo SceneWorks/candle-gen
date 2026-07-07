@@ -89,8 +89,7 @@ fn main() -> Result<()> {
     );
 
     candle_gen_wan::force_link();
-    let spec =
-        LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot))).with_adapters(adapters);
+    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot))).with_adapters(adapters);
     let gen = gen_core::registry::load("wan2_2_i2v_14b", &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={} modality={:?}",
