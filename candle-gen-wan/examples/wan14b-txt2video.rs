@@ -13,7 +13,8 @@
 use std::path::PathBuf;
 
 use candle_gen::gen_core::{
-    self, GenerationOutput, GenerationRequest, LoadSpec, Progress, WeightsSource,
+    self, AdapterKind, AdapterSpec, GenerationOutput, GenerationRequest, LoadSpec, MoeExpert,
+    Progress, WeightsSource,
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -49,14 +50,36 @@ fn main() -> Result<()> {
     let fps: Option<u32> = arg(&args, "--fps").and_then(|s| s.parse().ok());
     let sampler = arg(&args, "--sampler");
     let out = arg(&args, "--out").unwrap_or_else(|| "wan14b_smoke".into());
+    // Optional A14B MoE LoRA pair (e.g. the lightx2v Lightning distill, sc-10026): the high-noise file
+    // tags the high expert, the low-noise file the low. Applied additively on a packed q4/q8 tier
+    // (sc-10094/10095) or folded on a dense snapshot. `--lora-scale` scales both (default 1.0).
+    let lora_high = arg(&args, "--lora-high");
+    let lora_low = arg(&args, "--lora-low");
+    let lora_scale: f32 = arg(&args, "--lora-scale")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1.0);
+    let mut adapters: Vec<AdapterSpec> = Vec::new();
+    if let Some(high) = &lora_high {
+        adapters.push(
+            AdapterSpec::new(PathBuf::from(high), lora_scale, AdapterKind::Lora)
+                .with_moe_expert(MoeExpert::High),
+        );
+    }
+    if let Some(low) = &lora_low {
+        adapters.push(
+            AdapterSpec::new(PathBuf::from(low), lora_scale, AdapterKind::Lora)
+                .with_moe_expert(MoeExpert::Low),
+        );
+    }
 
     println!(
         "[smoke] snapshot={snapshot}\n[smoke] {width}x{height} frames={frames:?} steps={steps:?} \
-         guidance={guidance:?} sampler={sampler:?} seed={seed}\n[smoke] prompt={prompt:?}"
+         guidance={guidance:?} sampler={sampler:?} seed={seed}\n[smoke] prompt={prompt:?}\n\
+         [smoke] adapters: high={lora_high:?} low={lora_low:?} scale={lora_scale}"
     );
 
     candle_gen_wan::force_link();
-    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
+    let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot))).with_adapters(adapters);
     let gen = gen_core::registry::load("wan2_2_t2v_14b", &spec)?;
     println!(
         "[smoke] resolved engine id={} backend={} modality={:?}",

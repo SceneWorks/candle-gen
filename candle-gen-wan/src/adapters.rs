@@ -77,9 +77,48 @@ fn strip_lora_prefix(key: &str) -> &str {
     key
 }
 
+/// Translate a **native-Wan** LoRA module path into the crate's **diffusers** key namespace (sc-10026).
+/// Community / distill Wan LoRAs — notably the mandatory lightx2v **Lightning** distill — are keyed on
+/// the native `WanModel` submodule names (`self_attn`/`cross_attn`, bare `q`/`k`/`v`/`o`, the FFN
+/// `Sequential` indices `ffn.0`/`ffn.2`), but the candle [`WanTransformer`](crate::transformer) is a port
+/// of the diffusers `WanTransformer3DModel` (`attn1`/`attn2`, `to_q`/`to_k`/`to_v`/`to_out.0`,
+/// `ffn.net.0.proj`/`ffn.net.2`). Without this rename a native-keyed LoRA resolves to a path no
+/// projection carries → the additive install matches nothing (the mlx Wan path needs no translation — it
+/// *is* native-keyed). A path already in the diffusers namespace passes through unchanged: none of the
+/// native tokens (`self_attn`/`cross_attn`/trailing bare `q/k/v/o`/`ffn.0`/`ffn.2`) appear in a diffusers
+/// key (its attention leaf is `to_q`…`to_out.0`, never a bare `q`).
+fn translate_wan_native_key(path: &str) -> String {
+    let mut p = path
+        .replace(".self_attn.", ".attn1.")
+        .replace(".cross_attn.", ".attn2.");
+    // Native FFN `Sequential` indices → the diffusers `FeedForward` submodule names.
+    if let Some(base) = p.strip_suffix(".ffn.0") {
+        p = format!("{base}.ffn.net.0.proj");
+    } else if let Some(base) = p.strip_suffix(".ffn.2") {
+        p = format!("{base}.ffn.net.2");
+    }
+    // Native bare attention projection names → diffusers `to_*`, matching only the trailing segment. A
+    // diffusers key's attention leaf is `to_q`/`to_k`/`to_v` or `to_out`.`0` — none ends in a bare
+    // `.q`/`.k`/`.v`/`.o`, so this can never double-map an already-diffusers key.
+    for (native, diff) in [
+        (".q", ".to_q"),
+        (".k", ".to_k"),
+        (".v", ".to_v"),
+        (".o", ".to_out.0"),
+    ] {
+        if let Some(base) = p.strip_suffix(native) {
+            p = format!("{base}{diff}");
+            break;
+        }
+    }
+    p
+}
+
 /// Map one LoRA key to `(diffusers_dotted_path, role)`, or `None` if outside the DiT merge surface.
 /// kohya (`lora_unet_<flat>…`) resolves the flattened stem via `table`; the dotted forms (bare or
-/// namespaced) resolve directly.
+/// namespaced) resolve directly, with a native-Wan → diffusers submodule rename
+/// ([`translate_wan_native_key`]) so the lightx2v Lightning distill (native-keyed) lands on the
+/// diffusers projections.
 fn classify_lora_key(key: &str, table: &BTreeMap<String, String>) -> Option<(String, Role)> {
     // A bundled text-encoder adapter (`lora_te*` / `…text_encoder.…`) is never a DiT target — reject it
     // up front so the permissive dotted branch below (which accepts a bare path) can't mis-route it.
@@ -109,7 +148,7 @@ fn classify_lora_key(key: &str, table: &BTreeMap<String, String>) -> Option<(Str
         (".alpha", Role::Alpha),
     ] {
         if let Some(path) = rem.strip_suffix(suf) {
-            return Some((path.to_string(), role));
+            return Some((translate_wan_native_key(path), role));
         }
     }
     None
@@ -126,7 +165,7 @@ fn classify_lokr_key(
             return if let Some(flat) = stem.strip_prefix(KOHYA_PREFIX) {
                 table.get(flat).map(|d| (d.clone(), factor))
             } else {
-                Some((strip_lora_prefix(stem).to_string(), factor))
+                Some((translate_wan_native_key(strip_lora_prefix(stem)), factor))
             };
         }
     }
@@ -429,7 +468,10 @@ pub fn install_additive(
     // Attach: walk the host once, pushing any resolved residual for each projection's path. A factor
     // whose dims don't match the target projection (`a` `[in, r]`, `b` `[r, out]`) is surfaced as a
     // skipped key, never a crashing forward — the additive analog of the fold path's `merge_into`
-    // shape guard (a mismatched community LoRA target is skipped, not fatal).
+    // shape guard (a mismatched community LoRA target is skipped, not fatal). The factors are read on the
+    // CPU (`read_adapter`) but the base weight lives on the DiT's device (e.g. CUDA on a packed tier), so
+    // they are moved onto it once here — else the forward-time residual matmul is a device mismatch.
+    let device = dit.device().clone();
     let mut matched: HashSet<String> = HashSet::new();
     dit.visit_adaptable_mut(&mut |path, lin| {
         if let Some(list) = pending.get(path) {
@@ -440,7 +482,7 @@ pub fn install_additive(
                     report.skipped_keys += 1; // shape-mismatched factor for this projection
                     continue;
                 }
-                lin.push_lora(p.a.clone(), p.b.clone(), p.scale);
+                lin.push_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale);
                 report.applied += 1;
             }
         }
@@ -497,6 +539,47 @@ mod tests {
         assert!(
             classify_lora_key("lora_te_text_model_layers_0_q.lora_down.weight", &table).is_none()
         );
+    }
+
+    /// A **native-Wan**-keyed LoRA (the lightx2v Lightning distill: `self_attn`/`cross_attn`, bare
+    /// `q/k/v/o`, `ffn.0`/`ffn.2`, under a `diffusion_model.` namespace) is translated onto the crate's
+    /// diffusers projections (sc-10026) — without this the mandatory 4-step distill matches no projection
+    /// and the additive install zero-matches.
+    #[test]
+    fn classify_lora_translates_native_wan_keys() {
+        let table = build_kohya_table(&base_map(), &[2]);
+        for (key, want) in [
+            (
+                "diffusion_model.blocks.0.self_attn.q.lora_down.weight",
+                "blocks.0.attn1.to_q",
+            ),
+            (
+                "diffusion_model.blocks.3.cross_attn.k.lora_up.weight",
+                "blocks.3.attn2.to_k",
+            ),
+            (
+                "diffusion_model.blocks.1.cross_attn.o.lora_down.weight",
+                "blocks.1.attn2.to_out.0",
+            ),
+            (
+                "diffusion_model.blocks.2.self_attn.v.lora_up.weight",
+                "blocks.2.attn1.to_v",
+            ),
+            (
+                "diffusion_model.blocks.0.ffn.0.lora_down.weight",
+                "blocks.0.ffn.net.0.proj",
+            ),
+            (
+                "diffusion_model.blocks.0.ffn.2.lora_up.weight",
+                "blocks.0.ffn.net.2",
+            ),
+        ] {
+            let (p, _) = classify_lora_key(key, &table).expect(key);
+            assert_eq!(p, want, "native key {key}");
+        }
+        // An already-diffusers key is untouched by the translator (no native tokens to rename).
+        let (p, _) = classify_lora_key("blocks.5.attn2.to_out.0.lora_A.weight", &table).unwrap();
+        assert_eq!(p, "blocks.5.attn2.to_out.0");
     }
 
     /// PEFT LoRA merges into `W += (alpha/rank)·scale·B·A`; base is zero so the merged weight IS ΔW.
