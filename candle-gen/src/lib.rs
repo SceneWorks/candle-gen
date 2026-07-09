@@ -123,12 +123,14 @@ pub mod vae_tiling;
 pub mod weights;
 pub use weights::Weights;
 
-// Poison-tolerant locking for the shared generator/component caches (sc-9015 / F-031): a panic while
-// holding a cache `Mutex` (e.g. a CUDA OOM lifted to a panic mid-decode) poisons it, after which a
-// plain `.lock().unwrap()` panics forever — one transient failure wedges a long-lived worker lane
-// into a permanent panic loop. `lock_recover` treats a poisoned overwrite-on-miss cache as usable.
+// Poison-tolerant locking + read-through helper for the shared generator/component caches (sc-9015 /
+// F-031; `cached` sc-7792): a panic while holding a cache `Mutex` (e.g. a CUDA OOM lifted to a panic
+// mid-decode) poisons it, after which a plain `.lock().unwrap()` panics forever — one transient
+// failure wedges a long-lived worker lane into a permanent panic loop. `lock_recover` treats a
+// poisoned overwrite-on-miss cache as usable; `cached` is the lazy `components()` read-through built
+// on it, collapsing the byte-identical lock-check-load-store scaffold across the provider crates.
 pub mod sync;
-pub use sync::lock_recover;
+pub use sync::{cached, lock_recover};
 
 // Shared test-support helpers (sc-9055 / F-069): the PPM read/write, cosine, env-path, GPU peak-VRAM,
 // and HF-Hub-cache resolution helpers that had been hand-copied — and had drifted — across ~16

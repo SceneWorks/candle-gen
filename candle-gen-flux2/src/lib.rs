@@ -476,16 +476,10 @@ pub struct Flux2Generator {
 
 impl Flux2Generator {
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        let mut guard = self
-            .components
-            .lock()
-            .expect("flux2 components cache mutex poisoned");
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
-        }
-        let c = pipe.load_components()?;
-        *guard = Some(c.clone());
-        Ok(c)
+        // `?` bridges the candle-side `load_components` error into `gen_core::Error`.
+        Ok(candle_gen::cached(&self.components, || {
+            pipe.load_components()
+        })?)
     }
 }
 

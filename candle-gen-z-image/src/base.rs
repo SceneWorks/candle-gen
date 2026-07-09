@@ -92,16 +92,8 @@ impl ZImageBaseGenerator {
     /// miss. Only ever called when a request carries a `Reference` at a strength that yields a non-empty
     /// denoise (`start_step > 0`), so a txt2img-only workload never builds it.
     fn vae_encoder(&self, pipe: &Pipeline) -> gen_core::Result<Arc<VaeEncoder>> {
-        let mut guard = self
-            .vae_encoder
-            .lock()
-            .expect("z-image base vae-encoder cache mutex poisoned");
-        if let Some(enc) = guard.as_ref() {
-            return Ok(enc.clone());
-        }
-        let enc = Arc::new(pipe.load_vae_encoder()?);
-        *guard = Some(enc.clone());
-        Ok(enc)
+        // The inner `?` bridges the candle-side `load_vae_encoder` error into `gen_core::Error`.
+        candle_gen::cached(&self.vae_encoder, || Ok(Arc::new(pipe.load_vae_encoder()?)))
     }
 }
 

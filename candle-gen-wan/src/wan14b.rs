@@ -513,15 +513,11 @@ pub struct Wan14bGenerator {
 
 impl Wan14bGenerator {
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        // sc-9015 / F-031: recover from a poisoned lock (overwrite-on-miss cache; a prior panic
-        // while locked must not turn every later `generate` into a panic).
-        let mut guard = candle_gen::lock_recover(&self.components);
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
-        }
-        let c = pipe.load_components()?;
-        *guard = Some(c.clone());
-        Ok(c)
+        // `cached` recovers a poisoned lock (sc-9015) internally; `?` bridges the candle-side
+        // `load_components` error into `gen_core::Error`.
+        Ok(candle_gen::cached(&self.components, || {
+            pipe.load_components()
+        })?)
     }
 }
 

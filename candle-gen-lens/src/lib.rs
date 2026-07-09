@@ -593,16 +593,10 @@ impl LensGenerator {
     }
 
     fn components(&self) -> gen_core::Result<Components> {
-        let mut guard = self
-            .components
-            .lock()
-            .expect("lens components cache mutex poisoned");
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
-        }
-        let c = self.pipeline.load_components()?;
-        *guard = Some(c.clone());
-        Ok(c)
+        // `?` bridges the candle-side `load_components` error into `gen_core::Error`.
+        Ok(candle_gen::cached(&self.components, || {
+            self.pipeline.load_components()
+        })?)
     }
 
     /// e2e-parity hook (sc-5115): encode → denoise from **injected** latents → decode, factoring out

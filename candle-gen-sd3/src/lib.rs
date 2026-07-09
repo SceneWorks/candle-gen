@@ -100,16 +100,10 @@ impl Sd3Generator {
 
     /// Get the cached components, loading (and caching) them on a miss.
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        let mut guard = self
-            .components
-            .lock()
-            .expect("sd3 components cache mutex poisoned");
-        if let Some(comps) = guard.as_ref() {
-            return Ok(comps.clone());
-        }
-        let comps = pipe.load_components()?;
-        *guard = Some(comps.clone());
-        Ok(comps)
+        // `?` bridges the candle-side `load_components` error into `gen_core::Error`.
+        Ok(candle_gen::cached(&self.components, || {
+            pipe.load_components()
+        })?)
     }
 }
 

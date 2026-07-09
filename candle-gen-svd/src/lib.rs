@@ -260,17 +260,11 @@ impl SvdGenerator {
             })
     }
 
-    /// Lazily load + cache the SVD components.
+    /// Lazily load + cache the SVD components. `cached` recovers a poisoned lock (sc-9015) internally.
     fn components(&self) -> CResult<Components> {
-        // sc-9015 / F-031: recover from a poisoned lock (overwrite-on-miss cache; a prior panic
-        // while locked must not turn every later `generate` into a panic).
-        let mut guard = candle_gen::lock_recover(&self.components);
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
-        }
-        let c = Components::load(&self.root, &self.device)?;
-        *guard = Some(c.clone());
-        Ok(c)
+        candle_gen::cached(&self.components, || {
+            Components::load(&self.root, &self.device)
+        })
     }
 
     /// CLIP `image_embeds` `[1, 1, 1024]` from the reference: diffusers `_resize_with_antialiasing` to

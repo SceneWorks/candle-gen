@@ -60,16 +60,10 @@ pub struct ChromaGenerator {
 
 impl ChromaGenerator {
     fn components(&self, pipe: &Pipeline) -> gen_core::Result<Components> {
-        let mut guard = self
-            .components
-            .lock()
-            .expect("chroma components cache mutex poisoned");
-        if let Some(comps) = guard.as_ref() {
-            return Ok(comps.clone());
-        }
-        let comps = pipe.load_components()?;
-        *guard = Some(comps.clone());
-        Ok(comps)
+        // `?` bridges the candle-side `load_components` error into `gen_core::Error`.
+        Ok(candle_gen::cached(&self.components, || {
+            pipe.load_components()
+        })?)
     }
 }
 

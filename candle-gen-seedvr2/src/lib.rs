@@ -127,26 +127,22 @@ fn reference_image(req: &GenerationRequest) -> Option<&Image> {
 
 impl Seedvr2Generator {
     fn pipeline(&self) -> gen_core::Result<std::sync::Arc<Seedvr2Pipeline>> {
-        // sc-9015 / F-031: recover from a poisoned lock (overwrite-on-miss cache; a prior panic
-        // while locked must not turn every later `generate` into a panic).
-        let mut guard = candle_gen::lock_recover(&self.pipe);
-        if let Some(p) = guard.as_ref() {
-            return Ok(p.clone());
-        }
-        let mut p = Seedvr2Pipeline::load(
-            &self.root,
-            self.dit_file,
-            &self.cfg,
-            self.dtype,
-            &self.device,
-        )?;
-        // sc-5927: int8/int4 quantize the DiT Linears at load (the VAE stays dense).
-        if let Some(q) = self.quant {
-            p.quantize(q)?;
-        }
-        let p = std::sync::Arc::new(p);
-        *guard = Some(p.clone());
-        Ok(p)
+        // `cached` recovers a poisoned lock (sc-9015) internally; the inner `?` bridges the
+        // candle-side load/quantize errors into `gen_core::Error`.
+        candle_gen::cached(&self.pipe, || {
+            let mut p = Seedvr2Pipeline::load(
+                &self.root,
+                self.dit_file,
+                &self.cfg,
+                self.dtype,
+                &self.device,
+            )?;
+            // sc-5927: int8/int4 quantize the DiT Linears at load (the VAE stays dense).
+            if let Some(q) = self.quant {
+                p.quantize(q)?;
+            }
+            Ok(std::sync::Arc::new(p))
+        })
     }
 }
 

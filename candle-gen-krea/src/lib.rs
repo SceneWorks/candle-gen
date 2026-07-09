@@ -103,32 +103,26 @@ pub struct KreaGenerator {
 
 impl KreaGenerator {
     fn components(&self) -> gen_core::Result<Arc<Components>> {
-        let mut guard = self
-            .components
-            .lock()
-            .expect("krea components cache mutex poisoned");
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
-        }
-        // ConvRot consume path (sc-9300): when a ConvRot DiT was selected, the DiT is taken from the
-        // int8 single-file checkpoint while everything else loads from the canonical snapshot. The
-        // sm_89 compute-capability floor is enforced inside `load_components_convrot` (locked decision
-        // 7). LoRA/LoKr and PiD overlays are not wired through the ConvRot variant (rejected at `build`).
-        let c = match self.convrot_dit.as_ref() {
-            Some(convrot_dit) => Arc::new(pipeline::load_components_convrot(
-                &self.root,
-                convrot_dit,
-                &self.device,
-            )?),
-            None => Arc::new(pipeline::load_components(
-                &self.root,
-                &self.device,
-                &self.adapters,
-                self.pid_spec.as_ref(),
-            )?),
-        };
-        *guard = Some(c.clone());
-        Ok(c)
+        candle_gen::cached(&self.components, || {
+            // ConvRot consume path (sc-9300): when a ConvRot DiT was selected, the DiT is taken from
+            // the int8 single-file checkpoint while everything else loads from the canonical snapshot.
+            // The sm_89 compute-capability floor is enforced inside `load_components_convrot` (locked
+            // decision 7). LoRA/LoKr and PiD overlays are not wired through the ConvRot variant
+            // (rejected at `build`).
+            Ok(match self.convrot_dit.as_ref() {
+                Some(convrot_dit) => Arc::new(pipeline::load_components_convrot(
+                    &self.root,
+                    convrot_dit,
+                    &self.device,
+                )?),
+                None => Arc::new(pipeline::load_components(
+                    &self.root,
+                    &self.device,
+                    &self.adapters,
+                    self.pid_spec.as_ref(),
+                )?),
+            })
+        })
     }
 }
 

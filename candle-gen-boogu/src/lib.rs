@@ -94,33 +94,22 @@ pub struct BooguGenerator {
 
 impl BooguGenerator {
     fn components(&self) -> gen_core::Result<Arc<Components>> {
-        let mut guard = self
-            .components
-            .lock()
-            .expect("boogu components cache mutex poisoned");
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
-        }
-        let c = Arc::new(pipeline::load_components(
-            &self.root,
-            &self.device,
-            self.pid_spec.as_ref(),
-        )?);
-        *guard = Some(c.clone());
-        Ok(c)
+        candle_gen::cached(&self.components, || {
+            Ok(Arc::new(pipeline::load_components(
+                &self.root,
+                &self.device,
+                self.pid_spec.as_ref(),
+            )?))
+        })
     }
 
     fn edit_components(&self) -> gen_core::Result<Arc<EditComponents>> {
-        let mut guard = self
-            .edit_components
-            .lock()
-            .expect("boogu edit-components cache mutex poisoned");
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
-        }
-        let c = Arc::new(pipeline::load_edit_components(&self.root, &self.device)?);
-        *guard = Some(c.clone());
-        Ok(c)
+        candle_gen::cached(&self.edit_components, || {
+            Ok(Arc::new(pipeline::load_edit_components(
+                &self.root,
+                &self.device,
+            )?))
+        })
     }
 }
 

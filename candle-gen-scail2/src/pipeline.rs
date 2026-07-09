@@ -176,16 +176,7 @@ impl Scail2 {
     }
 
     fn components(&self) -> CResult<Arc<Components>> {
-        let mut guard = self
-            .components
-            .lock()
-            .expect("scail2 components cache mutex poisoned");
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
-        }
-        let c = Arc::new(self.load_components()?);
-        *guard = Some(c.clone());
-        Ok(c)
+        candle_gen::cached(&self.components, || Ok(Arc::new(self.load_components()?)))
     }
 }
 

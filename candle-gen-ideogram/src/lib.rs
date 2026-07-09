@@ -57,21 +57,14 @@ pub struct Ideogram4Generator {
 
 impl Ideogram4Generator {
     fn components(&self) -> gen_core::Result<Arc<Components>> {
-        let mut guard = self
-            .components
-            .lock()
-            .expect("ideogram components cache mutex poisoned");
-        if let Some(c) = guard.as_ref() {
-            return Ok(c.clone());
-        }
-        let components = if self.turbo {
-            pipeline::load_components_turbo(&self.root, &self.device, self.pid_spec.as_ref())?
-        } else {
-            pipeline::load_components(&self.root, &self.device, self.pid_spec.as_ref())?
-        };
-        let c = Arc::new(components);
-        *guard = Some(c.clone());
-        Ok(c)
+        candle_gen::cached(&self.components, || {
+            let components = if self.turbo {
+                pipeline::load_components_turbo(&self.root, &self.device, self.pid_spec.as_ref())?
+            } else {
+                pipeline::load_components(&self.root, &self.device, self.pid_spec.as_ref())?
+            };
+            Ok(Arc::new(components))
+        })
     }
 }
 

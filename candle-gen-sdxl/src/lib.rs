@@ -283,16 +283,12 @@ impl SdxlGenerator {
 
     /// Get the cached dual CLIP tokenizers, loading (and caching) them on a miss (sc-8991 / F-011). The
     /// tokenizers are model-agnostic (fixed hf-hub repos) so a single pair serves every request; parsing
-    /// them once here removes the tens-of-ms `tokenizer.json` re-parse the per-encode load did. Uses the
-    /// F-031 `lock_recover` idiom (a prior panic while locked must not poison every later `generate`).
+    /// them once here removes the tens-of-ms `tokenizer.json` re-parse the per-encode load did. The
+    /// shared [`candle_gen::cached`] read-through recovers a poisoned lock internally (the F-031 idiom).
     fn tokenizers(&self) -> gen_core::Result<Arc<pipeline::SdxlTokenizers>> {
-        let mut guard = candle_gen::lock_recover(&self.tokenizers);
-        if let Some(toks) = guard.as_ref() {
-            return Ok(toks.clone());
-        }
-        let toks = Arc::new(pipeline::SdxlTokenizers::load()?);
-        *guard = Some(toks.clone());
-        Ok(toks)
+        candle_gen::cached(&self.tokenizers, || {
+            Ok(Arc::new(pipeline::SdxlTokenizers::load()?))
+        })
     }
 }
 
