@@ -311,9 +311,7 @@ pub fn render(
     let pid_decoder =
         candle_gen_pid::resolve_pid_decoder(comps.pid.as_ref(), req, base_seed, model_id)?;
 
-    let mut images = Vec::with_capacity(req.count as usize);
-    for index in 0..req.count {
-        let seed = base_seed.wrapping_add(index as u64);
+    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let z = denoise(
             comps,
             &ids,
@@ -326,15 +324,8 @@ pub fn render(
             on_progress,
         )?;
         on_progress(Progress::Decoding);
-        images.push(decode(
-            comps,
-            &z,
-            req.width,
-            req.height,
-            pid_decoder.as_ref(),
-        )?);
-    }
-    Ok(images)
+        decode(comps, &z, req.width, req.height, pid_decoder.as_ref())
+    })
 }
 
 /// Resolve the optional edit conditioning: a single img2img/inpaint source [`Conditioning::Reference`]

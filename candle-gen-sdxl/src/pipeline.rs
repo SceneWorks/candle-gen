@@ -65,7 +65,6 @@ use candle_gen::gen_core::sampling::{
 use candle_gen::gen_core::tiling::{TilingConfig, VaeTiling};
 use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, PidWeights, Progress};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
-use candle_gen::image_seed;
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
 
@@ -740,10 +739,7 @@ impl Pipeline {
             None
         };
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
-            let seed = image_seed(base_seed, index);
-
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             // sc-3673 — deterministic, launch-portable initial noise: draw N(0,1) from a
             // fixed-algorithm CPU RNG (`StdRng`, ChaCha-based) seeded by `seed`, build the latent on
             // CPU, then move it to the compute device. This replaces candle's CUDA `device.set_seed`
@@ -811,9 +807,8 @@ impl Pipeline {
             };
 
             on_progress(Progress::Decoding);
-            images.push(self.decode(vae, pid_decoder.as_ref(), &latents)?);
-        }
-        Ok(images)
+            self.decode(vae, pid_decoder.as_ref(), &latents)
+        })
     }
 
     /// The SDXL-**Lightning** few-step denoise (sc-6128) — diffusers Euler-trailing, ε-prediction,

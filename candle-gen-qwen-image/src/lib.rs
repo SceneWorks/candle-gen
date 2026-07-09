@@ -246,9 +246,7 @@ impl Pipeline {
         let pid_decoder =
             candle_gen_pid::resolve_pid_decoder(comps.pid.as_deref(), req, base_seed, MODEL_ID)?;
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
-            let seed = base_seed.wrapping_add(index as u64);
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let latents = pipeline::create_noise(seed, req.width, req.height, &self.device)?
                 .to_dtype(DIT_DTYPE)?;
 
@@ -287,9 +285,8 @@ impl Pipeline {
                 Some(pid) => pid.decode(&lat)?,
                 None => comps.vae.decode(&lat)?,
             };
-            images.push(to_image(&decoded)?);
-        }
-        Ok(images)
+            to_image(&decoded)
+        })
     }
 }
 

@@ -436,9 +436,7 @@ impl Pipeline {
         let pid_decoder =
             candle_gen_pid::resolve_pid_decoder(comps.pid.as_deref(), req, base_seed, defaults.id)?;
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
-            let seed = base_seed.wrapping_add(index as u64);
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let init = create_noise(seed, latent_h, latent_w, &self.device)?;
             let latents = self.denoise(
                 comps,
@@ -472,9 +470,8 @@ impl Pipeline {
                 }
                 None => vae::decode(&comps.vae, &latents, latent_h, latent_w)?,
             };
-            images.push(to_image(&decoded)?);
-        }
-        Ok(images)
+            to_image(&decoded)
+        })
     }
 }
 

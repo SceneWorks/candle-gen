@@ -162,9 +162,7 @@ pub(crate) fn render_base(
         crate::BOOGU_IMAGE_ID,
     )?;
 
-    let mut images = Vec::with_capacity(req.count as usize);
-    for index in 0..req.count {
-        let seed = base_seed.wrapping_add(index as u64);
+    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, 0, device)?;
         let lat = candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
@@ -189,9 +187,8 @@ pub(crate) fn render_base(
             },
         )?;
         on_progress(Progress::Decoding);
-        images.push(decode(&comps.vae, pid_decoder.as_ref(), &lat)?);
-    }
-    Ok(images)
+        decode(&comps.vae, pid_decoder.as_ref(), &lat)
+    })
 }
 
 /// Render the **Turbo** (DMD student few-step, CFG-free) text-to-image path for `req`.
@@ -227,9 +224,7 @@ pub(crate) fn render_turbo(
         // scheduler re-shape over the same σ span.
         let sigmas =
             candle_gen::resolve_flow_schedule(req.scheduler.as_deref(), 0.0, steps, &native);
-        let mut images = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
-            let seed = base_seed.wrapping_add(index as u64);
+        return candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let noise = init_noise(req.height, req.width, seed, 0, device)?;
             let lat = candle_gen::run_flow_sampler(
                 req.sampler.as_deref(),
@@ -246,16 +241,13 @@ pub(crate) fn render_turbo(
                 },
             )?;
             on_progress(Progress::Decoding);
-            images.push(decode(&comps.vae, pid_decoder.as_ref(), &lat)?);
-        }
-        return Ok(images);
+            decode(&comps.vae, pid_decoder.as_ref(), &lat)
+        });
     }
 
     let sigmas = dmd_sigmas(DEFAULT_TURBO_SIGMA, steps);
 
-    let mut images = Vec::with_capacity(req.count as usize);
-    for index in 0..req.count {
-        let seed = base_seed.wrapping_add(index as u64);
+    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let mut lat = init_noise(req.height, req.width, seed, 0, device)?;
         for i in 0..steps {
             if req.cancel.is_cancelled() {
@@ -279,9 +271,8 @@ pub(crate) fn render_turbo(
             });
         }
         on_progress(Progress::Decoding);
-        images.push(decode(&comps.vae, pid_decoder.as_ref(), &lat)?);
-    }
-    Ok(images)
+        decode(&comps.vae, pid_decoder.as_ref(), &lat)
+    })
 }
 
 // ── Edit (single-reference TI2I) path (sc-7523) ──────────────────────────────────────────────────
@@ -374,9 +365,7 @@ pub(crate) fn render_edit(
         crate::BOOGU_IMAGE_EDIT_ID,
     )?;
 
-    let mut images = Vec::with_capacity(req.count as usize);
-    for index in 0..req.count {
-        let seed = base_seed.wrapping_add(index as u64);
+    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, 0, device)?;
         let lat = candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
@@ -401,9 +390,8 @@ pub(crate) fn render_edit(
             },
         )?;
         on_progress(Progress::Decoding);
-        images.push(decode(&comps.vae, pid_decoder.as_ref(), &lat)?);
-    }
-    Ok(images)
+        decode(&comps.vae, pid_decoder.as_ref(), &lat)
+    })
 }
 
 /// Image-conditioned instruction features for the edit path: preprocess each reference, run the

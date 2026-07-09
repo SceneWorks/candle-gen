@@ -231,9 +231,7 @@ pub fn render(
         crate::KREA_2_TURBO_ID,
     )?;
 
-    let mut images = Vec::with_capacity(req.count as usize);
-    for index in 0..req.count {
-        let seed = base_seed.wrapping_add(index as u64);
+    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
         let lat = candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
@@ -257,9 +255,8 @@ pub fn render(
             Some(pid) => pid.decode(&lat)?,
             None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
         };
-        images.push(to_image(&decoded)?);
-    }
-    Ok(images)
+        to_image(&decoded)
+    })
 }
 
 /// Render the **Raw** (undistilled, full classifier-free-guidance) rectified-flow text-to-image path
@@ -315,9 +312,7 @@ pub fn render_base(
         crate::KREA_2_RAW_ID,
     )?;
 
-    let mut images = Vec::with_capacity(req.count as usize);
-    for index in 0..req.count {
-        let seed = base_seed.wrapping_add(index as u64);
+    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
         let lat = candle_gen::run_flow_sampler(
             req.sampler.as_deref(),
@@ -347,9 +342,8 @@ pub fn render_base(
             Some(pid) => pid.decode(&lat)?,
             None => comps.vae.decode(&lat)?.to_dtype(DType::F32)?,
         };
-        images.push(to_image(&decoded)?);
-    }
-    Ok(images)
+        to_image(&decoded)
+    })
 }
 
 /// The **Raw** flow-match sigma schedule for `steps` at a given resolution: the exponential-mu shift

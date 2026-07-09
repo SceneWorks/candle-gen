@@ -59,7 +59,6 @@ use candle_gen::gen_core::{
     self, AdapterSpec, Conditioning, GenerationRequest, Image, PidWeights, Progress,
 };
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
-use candle_gen::image_seed;
 use candle_gen::{CandleError, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
 
@@ -564,10 +563,7 @@ impl Pipeline {
             crate::MODEL_ID,
         )?;
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
-            let seed = image_seed(base_seed, index);
-
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             // sc-3673 parity — deterministic, launch-portable initial noise (shared [`common::seed_noise`]).
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
 
@@ -633,9 +629,8 @@ impl Pipeline {
             )?;
 
             on_progress(Progress::Decoding);
-            images.push(self.decode(&components.vae, pid_decoder.as_ref(), &latents)?);
-        }
-        Ok(images)
+            self.decode(&components.vae, pid_decoder.as_ref(), &latents)
+        })
     }
 
     /// Render `req` against pre-loaded `components` on the **base** (non-Turbo) path: real
@@ -704,10 +699,7 @@ impl Pipeline {
             crate::MODEL_ID,
         )?;
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
-            let seed = image_seed(base_seed, index);
-
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             // sc-3673 parity — deterministic, launch-portable initial noise (shared [`common::seed_noise`]).
             let noise = common::seed_noise(seed, lat_h, lat_w, &self.device, self.dtype)?;
 
@@ -794,9 +786,8 @@ impl Pipeline {
             )?;
 
             on_progress(Progress::Decoding);
-            images.push(self.decode(&components.vae, pid_decoder.as_ref(), &latents)?);
-        }
-        Ok(images)
+            self.decode(&components.vae, pid_decoder.as_ref(), &latents)
+        })
     }
 
     /// Decode the final latents `(1, 16, 1, h, w)` to an RGB8 [`Image`] via the shared [`common::decode`].

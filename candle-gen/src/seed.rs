@@ -80,6 +80,36 @@ pub fn seeded_noise_nchw(
     Tensor::from_vec(noise, (1, c, h, w), &Device::Cpu)?.to_device(device)
 }
 
+/// Run `body` once per image in a `count`-image batch, deriving each per-image seed from `base_seed`
+/// via [`image_seed`], and collect the results (sc-7792).
+///
+/// This owns the outer frame every batch image render repeats — the `0..count` loop, the
+/// [`image_seed`] derivation, and the `Vec` collect — while the model body (noise / schedule /
+/// predict / decode, plus its own progress emits) stays hand-written in the closure, which captures
+/// `on_progress` and the loaded components from the enclosing scope. Generic over the produced item
+/// `I` and the error type `E`, so both the `gen_core::Result` and candle-side [`crate::Result`]
+/// providers share it.
+///
+/// **Why `base_seed` is a parameter, not re-derived from the request.** [`gen_core::default_seed`] is
+/// *non-deterministic* (it draws from the wall clock), so it must be resolved exactly **once** per
+/// generation — `req.seed.unwrap_or_else(gen_core::default_seed)` — at the call site. Most renders
+/// also feed that same `base_seed` to a per-generation PiD decoder (epic 7840) resolved before the
+/// loop; re-drawing it here would seed the decoder and the image loop from two different clocks. So
+/// the caller owns the one draw and passes it in. The single-output video providers (wan / ltx / svd)
+/// don't loop over a count and don't use this.
+#[inline]
+pub fn for_each_image_seed<I, E>(
+    base_seed: u64,
+    count: u32,
+    mut body: impl FnMut(u64) -> Result<I, E>,
+) -> Result<Vec<I>, E> {
+    let mut out = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        out.push(body(image_seed(base_seed, index))?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,5 +192,32 @@ mod tests {
         let av = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         let bv = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
         assert_eq!(av, bv);
+    }
+
+    /// `for_each_image_seed` runs the body once per `count`, feeding `image_seed(base, index)` each
+    /// time, and collects the results in order. GPU-free.
+    #[test]
+    fn for_each_image_seed_derives_per_image_seed_and_collects() {
+        let seeds: Vec<u64> = for_each_image_seed(100, 3, Ok::<u64, ()>).unwrap();
+        assert_eq!(seeds, vec![100, 101, 102]);
+    }
+
+    /// `count == 0` yields an empty batch, and a body error short-circuits the loop (no further calls).
+    #[test]
+    fn for_each_image_seed_empty_batch_and_error_short_circuit() {
+        let empty: Vec<u64> = for_each_image_seed(1, 0, Ok::<u64, ()>).unwrap();
+        assert!(empty.is_empty());
+
+        let mut calls = 0;
+        let r: Result<Vec<u64>, &str> = for_each_image_seed(1, 5, |s| {
+            calls += 1;
+            if calls == 2 {
+                Err("boom")
+            } else {
+                Ok(s)
+            }
+        });
+        assert_eq!(r, Err("boom"));
+        assert_eq!(calls, 2, "stops at the first error");
     }
 }

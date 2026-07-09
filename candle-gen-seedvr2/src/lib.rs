@@ -218,8 +218,7 @@ impl Generator for Seedvr2Generator {
                 self.descriptor.id
             ))
         })?;
-        let mut out = Vec::with_capacity(req.count as usize);
-        for i in 0..req.count {
+        let out = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             if req.cancel.is_cancelled() {
                 return Err(gen_core::Error::Canceled);
             }
@@ -227,7 +226,6 @@ impl Generator for Seedvr2Generator {
                 current: 1,
                 total: 1,
             });
-            let seed = base_seed.wrapping_add(i as u64);
             let img = pipe.generate(
                 image,
                 req.width as usize,
@@ -236,8 +234,8 @@ impl Generator for Seedvr2Generator {
                 softness,
             )?;
             on_progress(Progress::Decoding);
-            out.push(img);
-        }
+            Ok(img)
+        })?;
         Ok(GenerationOutput::Images(out))
     }
 }

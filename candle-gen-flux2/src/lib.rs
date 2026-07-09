@@ -376,9 +376,7 @@ impl Pipeline {
             self.variant.id(),
         )?;
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
-            let seed = base_seed.wrapping_add(index as u64);
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let latents =
                 pipeline::create_noise(&self.cfg, seed, req.width, req.height, &self.device)?;
 
@@ -437,9 +435,8 @@ impl Pipeline {
                 Some(pid) => pid.decode(&packed)?,
                 None => comps.vae.decode_packed(&packed)?, // [1,3,H,W] in [-1,1]
             };
-            images.push(to_image(&decoded)?);
-        }
-        Ok(images)
+            to_image(&decoded)
+        })
     }
 }
 

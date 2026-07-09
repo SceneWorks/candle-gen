@@ -25,7 +25,6 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::{AlphaSchedule, Scheduler, Solver};
 use candle_gen::gen_core::{self, GenerationRequest, Image, PidWeights, Progress};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
-use candle_gen::image_seed;
 use candle_gen::{CandleError, Result};
 use candle_gen_pid::PidEngine;
 use candle_transformers::models::stable_diffusion::vae::{AutoEncoderKL, AutoEncoderKLConfig};
@@ -217,9 +216,7 @@ impl Pipeline {
 
         let (lat_h, lat_w) = ((h / 8) as usize, (w / 8) as usize);
         let total = sampler.num_steps() as u32;
-        let mut images = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
-            let seed = image_seed(base_seed, index);
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             let noise = common::initial_noise(&self.device, seed, lat_h, lat_w)?;
 
             let latents = if let Some(name) = curated {
@@ -273,13 +270,8 @@ impl Pipeline {
             };
 
             on_progress(Progress::Decoding);
-            images.push(common::decode(
-                &components.vae,
-                pid_decoder.as_ref(),
-                &latents,
-            )?);
-        }
-        Ok(images)
+            common::decode(&components.vae, pid_decoder.as_ref(), &latents)
+        })
     }
 
     /// The **curated** ε/DDPM denoise (epic 7114 P4, sc-7124) — an ADDITIVE option alongside the native

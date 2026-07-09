@@ -64,7 +64,6 @@ use candle_gen::candle_nn::{Module, VarBuilder};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{self, GenerationRequest, Image, PidWeights, Progress};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
-use candle_gen::image_seed;
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
 
@@ -507,10 +506,7 @@ impl Pipeline {
             self.variant.model_id(),
         )?;
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
-            let seed = image_seed(base_seed, index);
-
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             // sc-3673 parity — deterministic, launch-portable initial noise in candle's get_noise
             // shape (1, 16, h/8, w/8): N(0,1) from a fixed-algorithm CPU RNG seeded by `seed` (shared
             // FLUX.1 helper, sc-9003).
@@ -544,25 +540,23 @@ impl Pipeline {
             )?;
 
             on_progress(Progress::Decoding);
-            let image = match components {
+            match components {
                 Components::Stock { vae, .. } => self.decode(
                     vae,
                     pid_decoder.as_ref(),
                     &latents,
                     req.height as usize,
                     req.width as usize,
-                )?,
+                ),
                 Components::Packed { vae, .. } => self.decode_packed(
                     vae,
                     pid_decoder.as_ref(),
                     &latents,
                     req.height as usize,
                     req.width as usize,
-                )?,
-            };
-            images.push(image);
-        }
-        Ok(images)
+                ),
+            }
+        })
     }
 
     /// The flow-match denoise, routed through the unified curated sampler/scheduler driver (epic 7114

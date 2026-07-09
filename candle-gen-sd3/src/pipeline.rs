@@ -33,7 +33,6 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, Progress, Quant};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
-use candle_gen::image_seed;
 use candle_gen::{CandleError, Result};
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -387,10 +386,8 @@ impl Pipeline {
         // gates the uncond encode — at 1.0 the CFG blend collapses to cond, so it's skipped (sc-8993).
         let (cond, uncond) = self.conditioning(&components.encoders, req, cfg_scale)?;
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
-            let seed = image_seed(base_seed, index);
-            let image = render_core(
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+            render_core(
                 &components.transformer,
                 &components.vae,
                 &cond,
@@ -406,10 +403,8 @@ impl Pipeline {
                 req.scheduler.as_deref(),
                 &req.cancel,
                 on_progress,
-            )?;
-            images.push(image);
-        }
-        Ok(images)
+            )
+        })
     }
 }
 

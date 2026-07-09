@@ -28,7 +28,6 @@ use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{self, GenerationRequest, Image, PidWeights, Progress};
 // Shared per-image batch seed (`base + index`) — one home in `candle-gen` (sc-9043 / F-059).
-use candle_gen::image_seed;
 use candle_gen::{CandleError, LatentDecoder, Result};
 use candle_gen_pid::{PidDecoder, PidEngine};
 use candle_transformers::models::flux::sampling::unpack;
@@ -200,12 +199,10 @@ impl Pipeline {
             self.variant.id(),
         )?;
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for index in 0..req.count {
+        candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
-            let seed = image_seed(base_seed, index);
             let latents = self.initial_packed_noise(seed, req.height, req.width)?;
             let latents = self.denoise(
                 &components.transformer,
@@ -224,15 +221,14 @@ impl Pipeline {
                 on_progress,
             )?;
             on_progress(Progress::Decoding);
-            images.push(self.decode(
+            self.decode(
                 &components.vae,
                 pid_decoder.as_ref(),
                 &latents,
                 req.height,
                 req.width,
-            )?);
-        }
-        Ok(images)
+            )
+        })
     }
 
     /// Encode a prompt to its T5 sequence embedding `[1, L, 4096]` (natural length).

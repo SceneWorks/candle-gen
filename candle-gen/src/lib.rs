@@ -106,7 +106,9 @@ pub use sampler::{
 // noise draw. Previously hand-copied into every provider crate — a single divergent copy silently
 // breaks cross-provider / cross-backend reproducibility, so they get one home here.
 pub mod seed;
-pub use seed::{image_seed, seeded_noise_nchw, seeded_normal_vec, STEP_RNG_SALT};
+pub use seed::{
+    for_each_image_seed, image_seed, seeded_noise_nchw, seeded_normal_vec, STEP_RNG_SALT,
+};
 
 // Shared budgeted video-VAE tiling machinery (sc-9006 / F-026): the tile/narrow/blend/pad-accumulate/
 // normalize DRIVER + the `<PREFIX>_VAE_BUDGET_GIB` budget resolver + the budgeted-plan selector that

@@ -220,14 +220,13 @@ impl SenseNovaGenerator {
         let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
         let (w, h) = (req.width as usize, req.height as usize);
 
-        let mut images = Vec::with_capacity(req.count as usize);
-        for i in 0..req.count {
+        let images = candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
             // A 50-step 8B run is multi-minute; check cancellation between images too (the per-step
             // check lives in the denoise loop).
             if req.cancel.is_cancelled() {
                 return Err(CandleError::Canceled);
             }
-            let opts = self.options(req, &comps.cfg, base_seed.wrapping_add(i as u64));
+            let opts = self.options(req, &comps.cfg, seed);
             let img = comps.model.generate(
                 &comps.tokenizer,
                 &req.prompt,
@@ -237,8 +236,9 @@ impl SenseNovaGenerator {
                 &req.cancel,
                 on_progress,
             )?;
-            images.push(tensor_to_image(&img)?);
-        }
+            // `?` bridges the candle-side `tensor_to_image` error into `CandleError`.
+            Ok(tensor_to_image(&img)?)
+        })?;
         Ok(GenerationOutput::Images(images))
     }
 }
