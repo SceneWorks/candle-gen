@@ -53,7 +53,7 @@ use candle_gen::{CandleError, Result as CResult};
 use candle_gen::gen_core::sampling::TimestepConvention;
 use config::{
     TextEncoderConfig, TransformerConfig, VaeConfig, DEFAULT_FPS, DEFAULT_FRAMES, DEFAULT_GUIDANCE,
-    DEFAULT_STEPS, MODEL_ID, NEGATIVE_FALLBACK, SIZE_MULTIPLE,
+    DEFAULT_STEPS, MIN_SIZE, MODEL_ID, NEGATIVE_FALLBACK, SIZE_MULTIPLE,
 };
 use rope::WanRope;
 use scheduler::{flow_shift, FlowScheduler, Sampler};
@@ -404,7 +404,10 @@ pub fn descriptor() -> ModelDescriptor {
             ],
             schedulers: vec![],
             supported_guidance_methods: vec![],
-            min_size: 32,
+            // Per-side floor 480 (= a 15×15 latent-token grid): below it the z48 vae22's coarse
+            // effective 32× stride starves the DiT, which renders rainbow garbage at ANY flow-shift
+            // (dense + packed alike, sc-10306). Enforced by `Capabilities::validate_request`.
+            min_size: MIN_SIZE,
             max_size: 1280,
             max_count: 1,
             mac_only: false,
@@ -493,8 +496,9 @@ mod tests {
         let g = registry::load(MODEL_ID, &spec).unwrap();
         let ok = GenerationRequest {
             prompt: "a cat walking across a sunny garden".into(),
-            width: 256,
-            height: 256,
+            width: 512,
+            height: 512,
+            count: 1,
             guidance: Some(5.0),
             negative_prompt: Some("blurry".into()),
             frames: Some(17),
@@ -509,32 +513,40 @@ mod tests {
                 ..ok.clone()
             })
             .is_ok());
+        // Each bad case spreads from the valid `ok` so it is rejected for its OWN reason, not an
+        // unrelated default.
         for bad in [
             // empty prompt
-            GenerationRequest::default(),
+            GenerationRequest {
+                prompt: String::new(),
+                ..ok.clone()
+            },
             // frames not ≡ 1 (mod 4)
             GenerationRequest {
-                prompt: "x".into(),
                 frames: Some(16),
-                ..Default::default()
+                ..ok.clone()
             },
-            // size not a multiple of 32
+            // size not a multiple of 32 (500 is in-range but 500 % 32 != 0)
             GenerationRequest {
-                prompt: "x".into(),
-                width: 300,
-                ..Default::default()
+                width: 500,
+                ..ok.clone()
+            },
+            // below the per-side min-size floor (sc-10306): 320² is 32-aligned but under 480 → the z48
+            // token grid is too coarse to converge, so the descriptor rejects it up front.
+            GenerationRequest {
+                width: 320,
+                height: 320,
+                ..ok.clone()
             },
             // zero steps
             GenerationRequest {
-                prompt: "x".into(),
                 steps: Some(0),
-                ..Default::default()
+                ..ok.clone()
             },
             // unadvertised sampler
             GenerationRequest {
-                prompt: "x".into(),
                 sampler: Some("dpmpp2m".into()),
-                ..Default::default()
+                ..ok.clone()
             },
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");

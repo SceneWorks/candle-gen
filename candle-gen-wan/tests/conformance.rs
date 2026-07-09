@@ -48,10 +48,13 @@ fn wan_conformance() {
         .expect("set WAN_SNAPSHOT to a Wan2.2-TI2V-5B-Diffusers snapshot dir");
     let spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(snap)));
 
-    // 256² / 4 steps / 5 frames keeps the suite affordable. Verifies contract behavior, not quality.
+    // 512² / 4 steps / 5 frames keeps the suite affordable. Verifies contract behavior, not quality.
+    // 512² (not 256²) is the smallest size the descriptor now accepts: the 5B's z48 vae22 renders
+    // garbage below a ~15×15 latent grid (min_size 480, sc-10306), and the validate-honesty check
+    // exercises `generate` at the profile size.
     let profile = Profile {
-        width: 256,
-        height: 256,
+        width: 512,
+        height: 512,
         steps: 4,
         ..Profile::cheap()
     };

@@ -7,7 +7,10 @@
 //! cargo run --release --example wan-txt2video --features cuda -- \
 //!   --snapshot "C:\Users\…\models--Wan-AI--Wan2.2-TI2V-5B-Diffusers\snapshots\<hash>" \
 //!   --prompt "a fluffy cat walking across a sunny garden, cinematic" \
-//!   --width 320 --height 320 --frames 17 --steps 30 --guidance 5 --seed 42 --out wan_smoke
+//!   --width 512 --height 512 --frames 17 --steps 30 --guidance 5 --seed 42 --out wan_smoke
+//!
+//! Sizes must be >= 480 per side (the descriptor `min_size`): the 5B's z48 vae22 renders rainbow
+//! garbage below a ~15x15 latent-token grid at any flow-shift (sc-10306).
 //! ```
 
 use std::path::PathBuf;
@@ -41,13 +44,14 @@ fn main() -> Result<()> {
         .unwrap_or(42);
     let width: u32 = arg(&args, "--width")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(320);
+        .unwrap_or(512);
     let height: u32 = arg(&args, "--height")
         .and_then(|s| s.parse().ok())
-        .unwrap_or(320);
+        .unwrap_or(512);
     let frames: Option<u32> = arg(&args, "--frames").and_then(|s| s.parse().ok());
     let fps: Option<u32> = arg(&args, "--fps").and_then(|s| s.parse().ok());
     let sampler = arg(&args, "--sampler");
+    let shift: Option<f32> = arg(&args, "--shift").and_then(|s| s.parse().ok());
     let out = arg(&args, "--out").unwrap_or_else(|| "wan_smoke".into());
 
     println!(
@@ -77,6 +81,7 @@ fn main() -> Result<()> {
         frames,
         fps,
         sampler,
+        scheduler_shift: shift,
         ..Default::default()
     };
 

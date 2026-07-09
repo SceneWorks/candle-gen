@@ -36,6 +36,15 @@ pub const NEGATIVE_FALLBACK: &str =
 /// Spatial size must be a multiple of `vae_stride_spatial (16) × patch (2) = 32` so the latent
 /// (`H/16`) is even for the DiT 2×2 spatial patch.
 pub const SIZE_MULTIPLE: u32 = 32;
+/// Minimum spatial size **per side** (px) for a coherent 5B render — the descriptor `min_size`,
+/// enforced by `gen_core::Capabilities::validate_request`. The z48 vae22 gives an effective
+/// pixel→DiT-token stride of `VAE_STRIDE_SPATIAL (16) × patch (2) = 32`, so the DiT denoises over a
+/// `width/32 × height/32` latent-token grid. Below a 15×15 grid the 720P-class 5B can't converge and
+/// the VAE decodes the residual noise as rainbow garbage. Measured on-device (dense + packed alike,
+/// RTX PRO 6000): ≤448² (≤14×14) glitches, ≥480² (≥15×15) is clean — and it is **shift-independent**
+/// (flow-shift 1.0–5.0 all glitch at 320²/384²), so this is a latent-geometry floor, not a sampler
+/// knob. `480 = 15·32` keeps the floor itself `SIZE_MULTIPLE`-aligned. (sc-10306)
+pub const MIN_SIZE: u32 = 480;
 /// VAE spatial downsample factor (latent `H = height / 16`).
 pub const VAE_STRIDE_SPATIAL: u32 = 16;
 /// VAE temporal downsample factor (latent `T = (frames - 1) / 4 + 1`).
