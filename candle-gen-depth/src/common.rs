@@ -46,6 +46,7 @@ impl Weights {
             .map_err(|e| CandleError::Msg(format!("read_dir {}: {e}", dir.display())))?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().map(|x| x == "safetensors").unwrap_or(false))
+            .filter(|p| !candle_gen::gen_core::weightsmeta::is_hidden_file(p))
             .collect();
         shards.sort();
         if shards.is_empty() {

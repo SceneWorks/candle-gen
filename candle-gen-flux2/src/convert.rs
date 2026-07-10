@@ -248,6 +248,7 @@ fn safetensors_shards(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut shards: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
+        .filter(|p| !candle_gen::gen_core::weightsmeta::is_hidden_file(p))
         .collect();
     shards.sort();
     Ok(shards)

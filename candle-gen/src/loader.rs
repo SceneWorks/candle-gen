@@ -39,11 +39,16 @@ use crate::{CandleError, Result};
 ///
 /// The sort is a plain lexical [`slice::sort`] — see the module docs for why this ordering is
 /// load-bearing and must not change.
+///
+/// Hidden entries are skipped ([`gen_core::weightsmeta::is_hidden_file`]): a macOS AppleDouble
+/// sidecar (`._model.safetensors`) carries the `.safetensors` extension and sorts *ahead* of the
+/// real shard, so an extension-only filter would hand it to the mmap first (SceneWorks#1333).
 pub fn sorted_safetensors(dir: &Path, label: &str) -> Result<Vec<PathBuf>> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .map_err(|e| CandleError::Msg(format!("{label}: read {}: {e}", dir.display())))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+        .filter(|p| !gen_core::weightsmeta::is_hidden_file(p))
         .collect();
     files.sort();
     if files.is_empty() {
@@ -456,6 +461,45 @@ mod tests {
                 assert!(m.contains("prov") && m.contains("transformer/"), "got: {m}")
             }
             _ => panic!("expected a crafted missing-subdir error"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// SceneWorks#1333: a macOS AppleDouble sidecar (`._model.safetensors`) has extension
+    /// `safetensors` and sorts *before* the real shard, so an extension-only filter would mmap it
+    /// first. It must not appear in the shard list. Sidecars ride into Linux/Windows checkouts via
+    /// Mac-authored zips and copied HF caches, so this is not a macOS-only concern.
+    #[test]
+    fn sorted_safetensors_skips_appledouble_sidecar() {
+        let dir = tmp_dir("appledouble");
+        write_st(&dir.join("model.safetensors"), "blk.weight", 1.0);
+        // Real AppleDouble header: magic 0x00051607, version 0x00020000.
+        std::fs::write(
+            dir.join("._model.safetensors"),
+            [0x00, 0x05, 0x16, 0x07, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00],
+        )
+        .unwrap();
+
+        let files = sorted_safetensors(&dir, "prov").unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "sidecar leaked into the shard list: {files:?}"
+        );
+        assert_eq!(files[0].file_name().unwrap(), "model.safetensors");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dir holding *only* a sidecar has no shards — the crafted "no .safetensors" error must fire
+    /// rather than a raw mmap failure on the sidecar's bogus header.
+    #[test]
+    fn sorted_safetensors_with_only_a_sidecar_errors() {
+        let dir = tmp_dir("only_sidecar");
+        std::fs::write(dir.join("._model.safetensors"), [0x00, 0x05, 0x16, 0x07]).unwrap();
+
+        match sorted_safetensors(&dir, "prov") {
+            Err(CandleError::Msg(m)) => assert!(m.contains("no .safetensors"), "got: {m}"),
+            _ => panic!("expected the crafted no-shards error"),
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

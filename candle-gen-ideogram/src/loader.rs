@@ -59,6 +59,7 @@ impl Weights {
             .map_err(|e| Error::Msg(format!("ideogram: read {}: {e}", dir.display())))?
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().is_some_and(|x| x == "safetensors"))
+            .filter(|p| !candle_gen::gen_core::weightsmeta::is_hidden_file(p))
             .collect();
         files.sort();
         if files.is_empty() {
