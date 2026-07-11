@@ -259,16 +259,13 @@ impl BerniniRenderer {
             let t = sched.timestep(i);
             // MoE: high-noise expert at/above the boundary timestep, low-noise below — switching the
             // transformer AND its per-expert text contexts together. On the first low-noise step, scale
-            // all omegas once by `OMEGA_SCALE` (the reference's `omega_scale`).
-            let (expert, ctx_pos, ctx_neg) = if t >= boundary_ts {
-                (&comps.high, &high_pos, &high_neg)
-            } else {
-                if !switched {
-                    switched = true;
-                    omega *= Defaults::OMEGA_SCALE;
-                }
-                (&comps.low, &low_pos, &low_neg)
-            };
+            // all omegas once by `OMEGA_SCALE` (the reference's `omega_scale`). The switch + omega latch
+            // live in the pure `select_expert` helper so they stay unit-testable without GPU weights.
+            let (expert, ctx_pos, ctx_neg) =
+                match select_expert(t, boundary_ts, &mut switched, &mut omega) {
+                    Expert::High => (&comps.high, &high_pos, &high_neg),
+                    Expert::Low => (&comps.low, &low_pos, &low_neg),
+                };
             let et = expert.forward(&latents, ctx_pos, t, &cos, &sin)?; // cond velocity
             let e0 = expert.forward(&latents, ctx_neg, t, &cos, &sin)?; // uncond velocity
             let v = match mode {
@@ -317,6 +314,35 @@ impl BerniniRenderer {
                 audio: None,
             })
         }
+    }
+}
+
+/// Which dual-expert transformer a denoise step routes through: **high-noise** at/above the boundary
+/// timestep (`transformer/`), **low-noise** below (`transformer_2/`) — the diffusers WanPipeline
+/// convention mirrored by [`Components`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Expert {
+    High,
+    Low,
+}
+
+/// Pure dual-expert selection for one denoise step (sc-10994) — Bernini's most model-specific renderer
+/// delta, factored out of [`BerniniRenderer::render`] so it is unit-testable without GPU weights.
+///
+/// High-noise expert while the integer timestep `t ≥ boundary_ts`, low-noise below. On the FIRST
+/// low-noise step (the high→low transition) all omegas are scaled once by [`Defaults::OMEGA_SCALE`] (the
+/// reference's `omega_scale`) via the `switched` latch, and never again on subsequent low steps.
+/// `render` maps the returned [`Expert`] onto the resident experts + per-expert text contexts, so this
+/// stays behaviorally identical to the previous inline switch.
+fn select_expert(t: f64, boundary_ts: f64, switched: &mut bool, omega: &mut f32) -> Expert {
+    if t >= boundary_ts {
+        Expert::High
+    } else {
+        if !*switched {
+            *switched = true;
+            *omega *= Defaults::OMEGA_SCALE;
+        }
+        Expert::Low
     }
 }
 
@@ -542,5 +568,82 @@ mod tests {
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
+    }
+
+    /// The dual-expert switch + omega-scale-once latch (the story AC's "expert selection" test). Asserts
+    /// (a) high→low transition happens exactly at the boundary, (b) omega scales exactly once on the
+    /// first sub-boundary step and not again, (c) high expert above the boundary.
+    #[test]
+    fn select_expert_switches_at_boundary_and_scales_omega_once() {
+        let boundary =
+            BerniniKnobs::default().switch_dit_boundary as f64 * NUM_TRAIN_TIMESTEPS as f64; // 0.875 * 1000 = 875.0
+        let base = Defaults::OMEGA_TXT;
+
+        let mut switched = false;
+        let mut omega = base;
+
+        // (c) Above the boundary → high expert; no switch, omega untouched.
+        assert_eq!(
+            select_expert(900.0, boundary, &mut switched, &mut omega),
+            Expert::High
+        );
+        assert!(!switched);
+        assert_eq!(omega, base);
+
+        // (a) Exactly AT the boundary is still high-noise (the switch is `t >= boundary_ts`).
+        assert_eq!(
+            select_expert(boundary, boundary, &mut switched, &mut omega),
+            Expert::High
+        );
+        assert!(!switched);
+        assert_eq!(omega, base);
+
+        // (a) First step below the boundary → low expert, latch flips.
+        assert_eq!(
+            select_expert(boundary - 1.0, boundary, &mut switched, &mut omega),
+            Expert::Low
+        );
+        assert!(switched);
+        // (b) omega scaled exactly once.
+        assert_eq!(omega, base * Defaults::OMEGA_SCALE);
+
+        // (b) Subsequent low-noise steps do NOT scale omega again.
+        let after_first = omega;
+        assert_eq!(
+            select_expert(100.0, boundary, &mut switched, &mut omega),
+            Expert::Low
+        );
+        assert_eq!(omega, after_first);
+        assert_eq!(
+            select_expert(0.0, boundary, &mut switched, &mut omega),
+            Expert::Low
+        );
+        assert_eq!(omega, after_first);
+    }
+
+    /// Scheduler wiring: the `boundary_ts` axis and the `flow_sigmas(steps, shift)` the APG x-space
+    /// conversion indexes both share the `FlowScheduler`'s internal sigma indexing — `timestep(i) ==
+    /// σ_i · NUM_TRAIN_TIMESTEPS`. Guards the sigma-vs-index alignment the APG conversion depends on.
+    #[test]
+    fn flow_sigmas_align_with_scheduler_timesteps() {
+        let steps = 8;
+        let shift = 3.0_f64;
+        let sched = FlowScheduler::new(Sampler::UniPC, steps, shift);
+        let sigmas = flow_sigmas(steps, shift);
+        assert_eq!(sigmas.len(), steps + 1); // terminal 0.0
+        for (i, &sigma) in sigmas.iter().enumerate().take(steps) {
+            // sched.timestep uses the f64 sigmas; flow_sigmas is the f32-cast schedule the APG loop
+            // indexes at the same `i`. They align within f32 rounding on the 0..1000 timestep axis.
+            let expected = sigma as f64 * NUM_TRAIN_TIMESTEPS as f64;
+            assert!(
+                (sched.timestep(i) - expected).abs() < 1e-3,
+                "step {i}: timestep {} vs σ_i·N {expected}",
+                sched.timestep(i)
+            );
+        }
+        // boundary_ts (render's expert switch) lives on that same 0..1000 timestep axis.
+        let boundary_ts =
+            BerniniKnobs::default().switch_dit_boundary as f64 * NUM_TRAIN_TIMESTEPS as f64;
+        assert!((boundary_ts - 875.0).abs() < 1e-9);
     }
 }
