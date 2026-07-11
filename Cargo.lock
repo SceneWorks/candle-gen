@@ -223,6 +223,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-bernini"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "candle-gen-wan",
+ "image",
+ "inventory",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core-testkit",
+ "serde_json",
+]
+
+[[package]]
 name = "candle-gen-boogu"
 version = "0.0.0"
 dependencies = [

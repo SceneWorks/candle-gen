@@ -1,0 +1,33 @@
+[package]
+name = "candle-gen-bernini"
+version = "0.0.0"
+edition = "2021"
+description = "ByteDance Bernini Wan2.2-T2V-A14B dual-expert renderer provider crate for candle-gen — the Windows/CUDA sibling of mlx-gen-bernini's renderer (sc-4706). Registers `bernini_renderer`."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "video", "bernini", "inference"]
+categories = ["science"]
+
+[dependencies]
+candle-gen = { path = "../candle-gen" }
+# The Bernini renderer IS Wan2.2-T2V-A14B (finetuned): the z16 VAE (`WanVae16`), the UMT5 text encoder
+# (`Umt5Encoder`), the dual-expert `WanTransformer` DiT + packed-detect Q4/Q8 load, the flow/UniPC
+# scheduler (`FlowScheduler`/`Sampler`/`flow_sigmas`), the RoPE table (`WanRope`), and the noise/frames
+# glue all come from candle-gen-wan (mirrors mlx-gen-bernini → mlx-gen-wan). The Bernini deltas
+# (dual-expert switch boundary + APG guidance + the Bernini knobs) layer on top.
+candle-gen-wan = { path = "../candle-gen-wan" }
+# Link-time self-registration into candle-gen's model registry.
+inventory = { workspace = true }
+# bernini_renderer.json knob sidecar reading + the converter's config emit.
+serde_json = { workspace = true }
+# The candle turnkey tier converter reads the ByteDance/Bernini-Diffusers combined `bernini/` index.
+safetensors = "0.7"
+
+[features]
+default = []
+metal = ["candle-gen/metal", "candle-gen-wan/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-wan/cuda"]
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+sceneworks-gen-core-testkit = { workspace = true }
