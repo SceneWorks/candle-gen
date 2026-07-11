@@ -22,20 +22,46 @@
 //!      (`t2v`) selectable via `video_mode="t2v"`. On the first low-noise step all omegas are scaled once
 //!      by `OMEGA_SCALE`.
 //!
-//! ## Status / scope (sc-10994, part 1)
-//! The **caption→pixel renderer** (t2v / t2v_apg), Q4/Q8 packed streaming load of the two experts, and
-//! the candle turnkey tier [`convert`]er are implemented; `bernini_renderer` self-registers. The packed
-//! **source-id conditioning** modes (i2i/v2v/r2v — token-axis packed forward + per-source RoPE) and the
-//! Qwen2.5-VL **planner** / MAR / ViT-guidance are follow-ups (the planner is sc-10995).
+//! ## Status / scope
+//! **sc-10994 (renderer):** the **caption→pixel renderer** (t2v / t2v_apg), Q4/Q8 packed streaming load
+//! of the two experts, and the candle turnkey tier [`convert`]er are implemented; `bernini_renderer`
+//! self-registers.
+//!
+//! **sc-10995 (planner slice):** the framework-independent planner seams are ported + CPU-golden
+//! parity-tested against the same fixtures the MLX lane asserts (`tests/*_parity.rs`): the Qwen2.5-VL
+//! text backbone ([`qwen2_5_vl::Qwen25VlText`] — MRoPE table + penultimate hidden state), the MRoPE
+//! host-side input shaping ([`process`] — `generate_unified_inputs` / position ids / flex mask), the
+//! [`connector::MlpConnector`] (`for_gen`/`for_vit`), the planner→renderer [`mar`] handoff
+//! (`four_streams` / `post_process_input_embeds` / `mar_schedule`), and the ViT-conditioned
+//! [`vit_guidance`] combine modes. These are **library modules** — the full `bernini` end-to-end
+//! generator (the MAR sampling loop `mar::sample_vit_embed`, the vision tower, the clip-diff
+//! flow-matching head, the packed-conditioning renderer forward, and the `bernini` registration) is the
+//! precise follow-up beyond this slice; nothing here fakes an end-to-end pipeline.
 //!
 //! `backend = "candle"`, `mac_only = false`.
 
 pub mod config;
+pub mod connector;
 pub mod convert;
 pub mod guidance;
+pub mod mar;
+mod nn;
 pub mod pipeline;
+pub mod process;
+pub mod qwen2_5_vl;
+pub mod vit_guidance;
 
 pub use config::{resolve_mode, BerniniKnobs, Defaults, Mode};
+pub use connector::MlpConnector;
 pub use convert::{build_bernini_candle_tier, route_bernini_expert_key};
-pub use guidance::{normalized_guidance, normalized_guidance_chain, MomentumBuffer};
+pub use guidance::{apg_delta, normalized_guidance, normalized_guidance_chain, MomentumBuffer};
+pub use mar::{
+    feat_to_renderer, four_streams, mar_schedule, post_process_input_embeds, FourStreams,
+    RendererFeat,
+};
 pub use pipeline::{descriptor, force_link, load, MODEL_ID};
+pub use process::{
+    build_attention_mask_4d, generate_unified_inputs, mrope_position_ids, MRopeConfig,
+};
+pub use qwen2_5_vl::{Qwen25VlText, QwenVlTextConfig};
+pub use vit_guidance::{rv2v_chain, vae_txt_vit};

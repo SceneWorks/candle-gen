@@ -48,6 +48,30 @@ pub fn normalized_guidance(
     )?)
 }
 
+/// v-space APG projection of a `delta` against a `reference`, both `[1, n_target, C]` (the
+/// target-sliced packed-token predictions, batch 1) — the ViT-conditioned guidance-combine primitive
+/// (`apg_delta`, the candle sibling of the mlx seam). The reduction is over every axis except the batch
+/// axis 0 (`n_target · C`):
+///
+///   `proj = (delta·ref)/max(‖ref‖², eps)·ref`; `out = parallel_scale·proj + orthogonal_scale·(delta − proj)`.
+pub fn apg_delta(
+    delta: &Tensor,
+    reference: &Tensor,
+    parallel_scale: f32,
+    orthogonal_scale: f32,
+) -> CResult<Tensor> {
+    let axes: Vec<i32> = (1..delta.rank() as i32).collect();
+    Ok(core::apg_delta(
+        &CandleLatentOps,
+        delta,
+        reference,
+        parallel_scale,
+        orthogonal_scale,
+        &[], // shape unused on candle (the Tensor carries its own).
+        &axes,
+    )?)
+}
+
 /// Chained APG over an ordered list of predictions (`normalized_guidance_chain`). With
 /// `bases = [uncond, preds[0], preds[1], …]`, accumulates
 /// `result = uncond + Σ_i scales[i] · normalize_diff(preds[i] − bases[i], base = preds[i])`, each term
