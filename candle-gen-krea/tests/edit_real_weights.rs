@@ -124,8 +124,22 @@ fn edit_renders_coherent_with_dual_conditioning() {
     if let Ok(b) = std::env::var("KREA_EDIT_SOURCE_B") {
         references.push(read_ppm(&PathBuf::from(b)));
     }
-    // Target resolution: default to the (last) reference's size (the render is at the target grid).
-    let (w, h) = (references[0].width, references[0].height);
+    // Target resolution: `KREA_EDIT_SIZE=WxH` (both multiples of 16) overrides; else the reference's
+    // size. A smaller target keeps the DiT joint sequence (and its memory/time) light — the vision
+    // grounding still runs at the reference's native resolution regardless.
+    let (w, h) = std::env::var("KREA_EDIT_SIZE")
+        .ok()
+        .and_then(|s| {
+            let (a, b) = s.split_once('x')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        })
+        .unwrap_or((references[0].width, references[0].height));
+    let steps = std::env::var("KREA_EDIT_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20u32);
+    let prompt = std::env::var("KREA_EDIT_PROMPT")
+        .unwrap_or_else(|_| "make the person smile warmly, keep their identity".into());
 
     let t_load = Instant::now();
     let comps = load_components(
@@ -139,12 +153,12 @@ fn edit_renders_coherent_with_dual_conditioning() {
     let load_s = t_load.elapsed().as_secs_f32();
 
     let req = GenerationRequest {
-        prompt: "make the person smile warmly, keep their identity".into(),
+        prompt,
         width: w,
         height: h,
         count: 1,
         seed: Some(0),
-        steps: Some(20),
+        steps: Some(steps),
         guidance: Some(3.5),
         ..Default::default()
     };
@@ -169,12 +183,15 @@ fn edit_renders_coherent_with_dual_conditioning() {
         is_coherent(img),
         "edit render must be a coherent image, not noise (std={std:.1} distinct={distinct} adjΔ={adj:.1})"
     );
-    // The edit must differ from the (resized) source — an inert conditioning path would echo the input.
-    let diff = references[0]
-        .pixels
-        .iter()
-        .zip(&img.pixels)
-        .filter(|(a, b)| a != b)
-        .count();
-    assert!(diff > 0, "the edit must change the source, not echo it");
+    // When the target matches the source size, the edit must differ from the source — an inert
+    // conditioning path would echo the input. (Skipped when KREA_EDIT_SIZE rescaled the target.)
+    if (w, h) == (references[0].width, references[0].height) {
+        let diff = references[0]
+            .pixels
+            .iter()
+            .zip(&img.pixels)
+            .filter(|(a, b)| a != b)
+            .count();
+        assert!(diff > 0, "the edit must change the source, not echo it");
+    }
 }

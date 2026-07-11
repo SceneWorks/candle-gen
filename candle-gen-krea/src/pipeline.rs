@@ -70,6 +70,14 @@ pub const MAX_EDIT_REFERENCES: usize = 2;
 /// in the condition encoder (sc-9047).
 pub(crate) const MAX_TEXT_TOKENS: usize = 1024;
 
+/// Max tokens for the **image-grounded edit** conditioning (epic 10871 / sc-10880). Far larger than
+/// [`MAX_TEXT_TOKENS`] because the edit template embeds one `<|image_pad|>` per merged vision token —
+/// a single ~1 MP reference is ~1000 tokens, and two references push past 2000. Unlike the t2i path,
+/// this is NOT bounded by the encoder's RoPE-table size: the grounded [`KreaTextEncoder::forward_with_images`]
+/// builds a fresh interleaved-MRoPE table sized to the actual sequence, so the only cap is this guard
+/// against a pathologically large reference set. (The t2i cap stays 1024 — short prompts only.)
+pub(crate) const MAX_EDIT_TOKENS: usize = 8192;
+
 /// The loaded Krea 2 Turbo components, `Arc`-shared so the generator caches them across `generate`.
 pub struct Components {
     tok: crate::tokenizer::KreaTokenizer,
@@ -501,7 +509,7 @@ impl Grounding {
         te: &KreaTextEncoder,
         prompt: &str,
     ) -> Result<Tensor> {
-        let ids = tok.encode_with_images(prompt, &self.n_per_ref, MAX_TEXT_TOKENS)?;
+        let ids = tok.encode_with_images(prompt, &self.n_per_ref, MAX_EDIT_TOKENS)?;
         Ok(te.forward_with_images(&ids, &self.embeds, &self.deepstack, &self.grids)?)
     }
 }
