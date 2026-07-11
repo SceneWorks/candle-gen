@@ -6,16 +6,18 @@
 //!
 //! Mirrors [`candle_gen_wan::wan14b`]'s dual-expert staging (UMT5 → high/low experts → z16 VAE) with the
 //! plain-CFG combine replaced by the Bernini renderer's guided velocity: for the caption-only render the
-//! default mode is [`Mode::T2vApg`] (APG in x-space; the reference's `resolve_mode(None,false,false)`),
-//! with plain CFG ([`Mode::T2v`]) selectable via `video_mode="t2v"`. Dual-expert switch:
-//! **high-noise** expert while the integer timestep `≥ switch_dit_boundary·1000`, **low-noise** below —
-//! and on the first low-noise step all omegas are scaled once by `OMEGA_SCALE` (the reference's
-//! `omega_scale`).
+//! default mode is `t2v_apg` (APG in x-space; the reference's `resolve_mode(None,false,false)`), with
+//! plain CFG (`t2v`) selectable via `video_mode="t2v"`. Dual-expert switch: **high-noise** expert while
+//! the integer timestep `≥ switch_dit_boundary·1000`, **low-noise** below — and on the first low-noise
+//! step all omegas are scaled once by `OMEGA_SCALE` (the reference's `omega_scale`).
 //!
-//! **Part-1 scope (sc-10994):** the caption→pixel renderer (t2v / t2v_apg). The packed source-id
-//! conditioning modes (`v2v`/`r2v`/`rv2v` — token-axis packed forward + per-source RoPE) and the
-//! Qwen2.5-VL planner / MAR / ViT-guidance are follow-ups (the planner is sc-10995); requests that
-//! resolve to a conditioning mode are rejected loudly rather than silently rendered text-only.
+//! **Scope (sc-11004):** every renderer guidance mode runs through [`crate::forward`]'s token-axis packed
+//! conditioning — the text-only `t2v`/`t2v_apg` **and** the packed source-id conditioning modes
+//! (`v2v`/`v2v_chain`/`v2v_apg`/`r2v_apg`/`rv2v`). A `Reference` (i2i), `MultiReference` (r2v refs), or
+//! `VideoClip` (v2v/rv2v) is VAE-encoded to a z16 source latent, patch-embedded with its own source-id
+//! RoPE, and packed on the DiT token axis with the noisy target; the target tokens are sliced back out to
+//! the velocity. The Qwen2.5-VL planner / MAR / ViT-guidance path (the `*_wapg` modes) remains a follow-up
+//! (the planner seams are sc-10995).
 //!
 //! **Dtypes:** UMT5 + z16 VAE run **f32**; the two experts run **bf16** (norms/modulation upcast to
 //! f32); APG runs f32. `backend = "candle"`, `mac_only = false`. Q4/Q8 is a **packed tier** (the two
@@ -28,8 +30,8 @@ use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
 use candle_gen::gen_core::{
-    self, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec, Modality,
-    ModelDescriptor, Progress, Quant, WeightsSource,
+    self, Capabilities, Conditioning, ConditioningKind, GenerationOutput, GenerationRequest,
+    Generator, LoadSpec, Modality, ModelDescriptor, Progress, Quant, WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
 
@@ -38,15 +40,16 @@ use candle_gen_wan::config::{
     NEGATIVE_FALLBACK, NUM_TRAIN_TIMESTEPS, SIZE_MULTIPLE_14B, VAE16_STRIDE_SPATIAL,
     VAE16_STRIDE_TEMPORAL,
 };
-use candle_gen_wan::pipeline::{cfg as plain_cfg, create_noise, frames_to_images};
-use candle_gen_wan::rope::WanRope;
+use candle_gen_wan::pipeline::{create_noise, frames_to_images};
 use candle_gen_wan::scheduler::{flow_sigmas, FlowScheduler, Sampler};
 use candle_gen_wan::text_encoder::Umt5Encoder;
 use candle_gen_wan::transformer::WanTransformer;
 use candle_gen_wan::vae16::WanVae16;
 
-use crate::config::{resolve_mode, BerniniKnobs, Defaults, Mode};
-use crate::guidance::{normalized_guidance, MomentumBuffer};
+use crate::config::{resolve_mode, BerniniKnobs, Defaults};
+use crate::forward::{guided_velocity, num_momentum_buffers, GuidanceParams, PackedForward};
+use crate::guidance::MomentumBuffer;
+use crate::preprocess::{encode_image, encode_videoclip};
 
 /// The experts run bf16 (the diffusers weights load as bf16, matching the 5B/14B regime); UMT5 + VAE f32.
 const DIT_DTYPE: DType = DType::BF16;
@@ -62,10 +65,11 @@ pub const MODEL_ID: &str = "bernini_renderer";
 /// Stable identity + advertised capabilities for the Bernini renderer (Wan2.2-A14B dual-expert with
 /// APG guidance; caption→video/image). `backend = "candle"`, `mac_only = false`.
 ///
-/// Part-1 advertises **no conditioning**: the packed source-id conditioning modes (i2i/v2v/r2v) need
-/// the candle-gen-wan packed forward (a follow-up). Advertising them would let a conditioned request
-/// validate, render for minutes, and silently drop the conditioning — the anti-pattern sc-8985 fixed
-/// for scail2. Q4/Q8 are **packed tiers** (pre-quantized; the loaders read the `.scales` siblings).
+/// Advertises the **packed source-id conditioning** surface (sc-11004): a single `Reference` (i2i), a
+/// `MultiReference` set (r2v reference images), or a `VideoClip` (v2v/rv2v) — each VAE-encoded to a z16
+/// source latent and packed on the DiT token axis with its own source-id RoPE. The text-only render
+/// (t2v/t2v_apg) stays the default when no conditioning is present. Q4/Q8 are **packed tiers**
+/// (pre-quantized; the loaders read the `.scales` siblings).
 pub fn descriptor() -> ModelDescriptor {
     ModelDescriptor {
         id: MODEL_ID,
@@ -76,7 +80,11 @@ pub fn descriptor() -> ModelDescriptor {
             supports_negative_prompt: true,
             supports_guidance: true,
             supports_true_cfg: false,
-            conditioning: vec![],
+            conditioning: vec![
+                ConditioningKind::Reference,
+                ConditioningKind::MultiReference,
+                ConditioningKind::VideoClip,
+            ],
             // LoRA/quant-adapter surface is a follow-on; the renderer ships dense bf16 / packed q4/q8.
             supports_lora: false,
             supports_lokr: false,
@@ -133,7 +141,14 @@ impl BerniniRenderer {
         // transformer/ = high-noise, transformer_2/ = low-noise (diffusers WanPipeline convention).
         let high = WanTransformer::new(&dit_cfg, self.component_vb("transformer", DIT_DTYPE)?)?;
         let low = WanTransformer::new(&dit_cfg, self.component_vb("transformer_2", DIT_DTYPE)?)?;
-        let vae = WanVae16::new(&Vae16Config::wan21(), self.component_vb("vae", VAE_DTYPE)?)?;
+        // Build the VAE **with its encoder**: the packed source-id conditioning modes (i2i/v2v/r2v,
+        // sc-11004) VAE-encode the Reference/MultiReference/VideoClip media into z16 source latents. The
+        // text-only render (t2v/t2v_apg) only uses the decoder, but the encoder is resident either way
+        // (one component build, cached; mirrors wan14b I2V).
+        let vae = WanVae16::new_with_encoder(
+            &Vae16Config::wan21(),
+            self.component_vb("vae", VAE_DTYPE)?,
+        )?;
         let tok = build_tokenizer(&self.root)?;
         Ok(Components {
             te,
@@ -201,19 +216,60 @@ impl BerniniRenderer {
             .map(|s| s as f64)
             .unwrap_or(self.knobs.shift as f64);
 
-        // Part-1 renderer: no conditioning is advertised, so `has_video`/`has_image` are always false
-        // and `resolve_mode` yields a text mode (`t2v` when explicitly requested, else `t2v_apg`). Guard
-        // the conditioning modes loudly in case a future request contract reaches here.
-        let mode = resolve_mode(req.video_mode.as_deref(), false, false);
-        if mode.needs_conditioning() {
-            return Err(CandleError::Msg(format!(
-                "bernini_renderer: guidance mode {mode:?} needs source-id packed conditioning \
-                 (video/image latents), which the Part-1 renderer does not implement — use \
-                 video_mode=\"t2v\" or \"t2v_apg\" (the packed-conditioning modes are a follow-up)"
-            )));
-        }
+        // Conditioning split (mirrors mlx): VideoClip → videos, Reference/MultiReference → images. The
+        // presence of each drives `resolve_mode`, which picks the guidance [`Mode`] (text-only ⇒
+        // `t2v_apg`, images ⇒ `v2v`, video ⇒ `v2v_apg`, both ⇒ `rv2v`, overridable via `video_mode`).
+        let has_video = req
+            .conditioning
+            .iter()
+            .any(|c| matches!(c, Conditioning::VideoClip { .. }));
+        let has_image = req.conditioning.iter().any(|c| {
+            matches!(
+                c,
+                Conditioning::Reference { .. } | Conditioning::MultiReference { .. }
+            )
+        });
+        let mode = resolve_mode(req.video_mode.as_deref(), has_video, has_image);
 
-        let omega_txt = req.guidance.unwrap_or(Defaults::OMEGA_TXT);
+        // VAE-encode the source media → z16 conditioning latents (each `[1, 16, T, H8, W8]`). VideoClips
+        // become `videos`; Reference / MultiReference images become `images`. The packed forward assigns
+        // each its source-id RoPE (videos first) and concatenates them on the DiT token axis.
+        let mut videos: Vec<Tensor> = Vec::new();
+        let mut images: Vec<Tensor> = Vec::new();
+        for c in &req.conditioning {
+            match c {
+                Conditioning::VideoClip { frames: fr, .. } => {
+                    videos.push(encode_videoclip(
+                        &comps.vae,
+                        fr,
+                        width,
+                        height,
+                        &self.device,
+                    )?);
+                }
+                Conditioning::Reference { image, .. } => {
+                    images.push(encode_image(
+                        &comps.vae,
+                        image,
+                        width,
+                        height,
+                        &self.device,
+                    )?);
+                }
+                Conditioning::MultiReference { images: imgs } => {
+                    for im in imgs {
+                        images.push(encode_image(&comps.vae, im, width, height, &self.device)?);
+                    }
+                }
+                other => {
+                    return Err(CandleError::Msg(format!(
+                        "bernini_renderer: unsupported conditioning kind {:?} (only Reference / \
+                         MultiReference / VideoClip are packed as source-id conditioning)",
+                        other.kind()
+                    )));
+                }
+            }
+        }
 
         // --- Text encode (pos + neg) once; project to each expert's context (per-expert embedder) ---
         let pos = self.encode(comps, &req.prompt)?;
@@ -224,14 +280,12 @@ impl BerniniRenderer {
         let high_neg = comps.high.embed_text(&neg)?;
         let low_neg = comps.low.embed_text(&neg)?;
 
-        // --- Latent geometry (z16 strides) + RoPE for the shared token grid ---
+        // --- Latent geometry (z16 strides). RoPE is now built per token-segment inside `PackedForward`
+        // (each source + the target gets its own source-id-shifted table), so no shared cos/sin here. ---
         let t_lat = ((frames - 1) / VAE16_STRIDE_TEMPORAL + 1) as usize;
         let h_lat = (height / VAE16_STRIDE_SPATIAL) as usize;
         let w_lat = (width / VAE16_STRIDE_SPATIAL) as usize;
         let dit_cfg = TransformerConfig::t2v_14b();
-        let (pt, ph, pw) = dit_cfg.patch;
-        let (ppf, pph, ppw) = (t_lat / pt, h_lat / ph, w_lat / pw);
-        let (cos, sin) = WanRope::new(&dit_cfg).cos_sin(ppf, pph, ppw, &self.device)?;
 
         let mut latents = create_noise(seed, Z_DIM, t_lat, h_lat, w_lat, &self.device)?;
         let mut sched = FlowScheduler::new(sampler, steps, shift);
@@ -240,17 +294,27 @@ impl BerniniRenderer {
         let boundary_ts = self.knobs.switch_dit_boundary as f64 * NUM_TRAIN_TIMESTEPS as f64;
         let total = steps as u32;
 
-        // APG momentum buffer persists across steps (allocated only for the `*_apg` modes).
-        let mut mbuf = if mode.is_apg() {
-            Some(MomentumBuffer::new(Defaults::MOMENTUM))
-        } else {
-            None
-        };
+        // The packed-forward engine drives **every** mode uniformly: the target (and each conditioning
+        // source) is patch-embedded with its source-id RoPE, packed on the token axis, run through one
+        // `forward_packed`, and the target tokens sliced back out. For the text-only modes the source set
+        // is empty and this reduces to the plain per-expert forward (byte-identical to sc-10994's path).
+        let pf = PackedForward::new(
+            dit_cfg,
+            self.knobs.max_trained_src_id,
+            self.knobs.interpolate_src_id,
+        );
+        // APG momentum buffers persist across steps (0 for the plain modes, 1 for the single-cond `*_apg`
+        // modes, 2 for the chained `r2v_apg`).
+        let mut mbufs: Vec<MomentumBuffer> = (0..num_momentum_buffers(mode))
+            .map(|_| MomentumBuffer::new(Defaults::MOMENTUM))
+            .collect();
         let mut switched = false;
-        let mut omega = omega_txt;
+        let mut omega_txt = req.guidance.unwrap_or(Defaults::OMEGA_TXT);
+        let mut omega_vid = Defaults::OMEGA_VID;
+        let mut omega_img = Defaults::OMEGA_IMG;
 
-        // `i` drives the scheduler timestep, the progress counter, AND the (conditional, T2vApg-only)
-        // flow-sigma lookup — not a plain element walk over one slice, so the range loop is correct.
+        // `i` drives the scheduler timestep, the progress counter, AND the flow-sigma lookup (the *_apg
+        // modes' x-space conversion) — not a plain element walk over one slice, so the range loop is correct.
         #[allow(clippy::needless_range_loop)]
         for i in 0..steps {
             if req.cancel.is_cancelled() {
@@ -258,37 +322,29 @@ impl BerniniRenderer {
             }
             let t = sched.timestep(i);
             // MoE: high-noise expert at/above the boundary timestep, low-noise below — switching the
-            // transformer AND its per-expert text contexts together. On the first low-noise step, scale
-            // all omegas once by `OMEGA_SCALE` (the reference's `omega_scale`). The switch + omega latch
-            // live in the pure `select_expert` helper so they stay unit-testable without GPU weights.
+            // transformer AND its per-expert text contexts together. `select_expert` scales omega_txt once
+            // on the first low-noise step (its own unit test); scale the video/image omegas the same way.
+            let prev = switched;
             let (expert, ctx_pos, ctx_neg) =
-                match select_expert(t, boundary_ts, &mut switched, &mut omega) {
+                match select_expert(t, boundary_ts, &mut switched, &mut omega_txt) {
                     Expert::High => (&comps.high, &high_pos, &high_neg),
                     Expert::Low => (&comps.low, &low_pos, &low_neg),
                 };
-            let et = expert.forward(&latents, ctx_pos, t, &cos, &sin)?; // cond velocity
-            let e0 = expert.forward(&latents, ctx_neg, t, &cos, &sin)?; // uncond velocity
-            let v = match mode {
-                // Plain CFG (the `t2v` guidance mode): uncond + ω·(cond − uncond).
-                Mode::T2v => plain_cfg(&et, &e0, omega as f64)?,
-                // APG in x-space (`t2v_apg`, the caption-only default): convert both velocities to
-                // x-space, apply normalized guidance (momentum carries across steps), convert back.
-                Mode::T2vApg => {
-                    let sigma = sigmas[i];
-                    let x0 = to_x(&latents, sigma, &e0)?;
-                    let xt = to_x(&latents, sigma, &et)?;
-                    let xg = normalized_guidance(
-                        &xt,
-                        &x0,
-                        omega,
-                        mbuf.as_mut(),
-                        Defaults::ETA,
-                        Defaults::NORM_THRESHOLD,
-                    )?;
-                    from_x(&latents, sigma, &xg)?
-                }
-                _ => unreachable!("conditioning modes are rejected before the denoise loop"),
+            if switched && !prev {
+                omega_vid *= Defaults::OMEGA_SCALE;
+                omega_img *= Defaults::OMEGA_SCALE;
+            }
+            let g = GuidanceParams {
+                omega_vid,
+                omega_img,
+                omega_txt,
+                eta: Defaults::ETA,
+                norm_threshold: [Defaults::NORM_THRESHOLD, Defaults::NORM_THRESHOLD],
             };
+            let v = guided_velocity(
+                &pf, mode, expert, &latents, &videos, &images, t, sigmas[i], ctx_pos, ctx_neg, &g,
+                &mut mbufs,
+            )?;
             latents = sched.step(&v, &latents)?; // 16-channel latent (out_dim 16)
             on_progress(Progress::Step {
                 current: i as u32 + 1,
@@ -298,18 +354,18 @@ impl BerniniRenderer {
 
         on_progress(Progress::Decoding);
         let decoded = comps.vae.decode(&latents)?;
-        let images = frames_to_images(&decoded)?;
+        let out_images = frames_to_images(&decoded)?;
 
         // num_frames == 1 ⇒ a still image (t2i). A single latent frame still decodes to one VAE
         // temporal chunk; the still image is the first frame, matching the reference's single-frame PNG.
         if frames == 1 {
-            let first = images.into_iter().next().ok_or_else(|| {
+            let first = out_images.into_iter().next().ok_or_else(|| {
                 CandleError::Msg("bernini_renderer: VAE decode produced no frames".into())
             })?;
             Ok(GenerationOutput::Images(vec![first]))
         } else {
             Ok(GenerationOutput::Video {
-                frames: images,
+                frames: out_images,
                 fps,
                 audio: None,
             })
@@ -344,15 +400,6 @@ fn select_expert(t: f64, boundary_ts: f64, switched: &mut bool, omega: &mut f32)
         }
         Expert::Low
     }
-}
-
-/// `x = noisy − σ·v` (velocity → x-space). APG operates in x-space.
-fn to_x(noisy: &Tensor, sigma: f32, v: &Tensor) -> CResult<Tensor> {
-    Ok((noisy - v.affine(sigma as f64, 0.0)?)?)
-}
-/// `v = (noisy − x)/σ` (x-space → velocity).
-fn from_x(noisy: &Tensor, sigma: f32, x: &Tensor) -> CResult<Tensor> {
-    Ok((noisy - x)?.affine(1.0 / sigma as f64, 0.0)?)
 }
 
 /// Build the Bernini renderer UMT5 tokenizer from `root/tokenizer/tokenizer.json` **once** (reused
@@ -497,8 +544,10 @@ mod tests {
         assert!(d.capabilities.supported_quants.contains(&Quant::Q8));
         assert!(d.capabilities.samplers.contains(&"uni_pc"));
         assert!(d.capabilities.samplers.contains(&"unipc")); // legacy alias
-                                                             // Part-1 renderer advertises no conditioning (packed source-id modes are a follow-up).
-        assert!(d.capabilities.conditioning.is_empty());
+                                                             // Packed source-id conditioning surface (sc-11004): reference image / multi-reference / video clip.
+        assert!(d.capabilities.accepts(ConditioningKind::Reference));
+        assert!(d.capabilities.accepts(ConditioningKind::MultiReference));
+        assert!(d.capabilities.accepts(ConditioningKind::VideoClip));
     }
 
     #[test]

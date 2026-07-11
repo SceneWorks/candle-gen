@@ -22,6 +22,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
+use candle_gen::gen_core::imageops::resize_bicubic_u8;
 use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{self, AdapterSpec, GenerationRequest, Image, PidWeights, Progress};
 use candle_gen::{CandleError, LatentDecoder, Result};
@@ -38,7 +39,7 @@ use crate::loader::Weights;
 use crate::schedule::{dynamic_mu, krea_sigmas, turbo_sigmas, TURBO_MU, TURBO_STEPS};
 use crate::text_encoder::{KreaTeConfig, KreaTextEncoder};
 use crate::transformer::Krea2Transformer;
-use crate::vae::load_vae;
+use crate::vae::{load_vae, load_vae_encoder, QwenVaeEncoder};
 
 /// Component compute dtypes. The Qwen3-VL TE runs in **f32** (parity-grade for this encoder, shared
 /// with the ideogram/boogu ports); the 12B DiT runs **bf16** (native on candle's CUDA backend); the
@@ -57,11 +58,25 @@ const LATENT_CHANNELS: usize = 16;
 pub const RAW_STEPS: usize = 52;
 pub const RAW_GUIDANCE: f32 = 3.5;
 
+/// The image-edit reference cap (epic 10871 / sc-10878). The edit LoRA was trained on **one or two**
+/// references in a **fixed order** — scene = image 1, person = image 2 — and the authors note swapping
+/// the order degrades results. The engine's `forward_edit` is generic over N references (each at its own
+/// RoPE frame), but the trained contract is 1..=2, so the pipeline caps here.
+pub const MAX_EDIT_REFERENCES: usize = 2;
+
 /// Max prompt tokens the Qwen3-VL RoPE table is sized for (generous; Krea prompts + the 34-token
 /// template prefix are short). Enforced up front by [`crate::tokenizer::KreaTokenizer::encode_prompt`]
 /// so an over-length prompt returns a clear length error instead of an opaque tensor-shape error deep
 /// in the condition encoder (sc-9047).
 pub(crate) const MAX_TEXT_TOKENS: usize = 1024;
+
+/// Max tokens for the **image-grounded edit** conditioning (epic 10871 / sc-10880). Far larger than
+/// [`MAX_TEXT_TOKENS`] because the edit template embeds one `<|image_pad|>` per merged vision token —
+/// a single ~1 MP reference is ~1000 tokens, and two references push past 2000. Unlike the t2i path,
+/// this is NOT bounded by the encoder's RoPE-table size: the grounded [`KreaTextEncoder::forward_with_images`]
+/// builds a fresh interleaved-MRoPE table sized to the actual sequence, so the only cap is this guard
+/// against a pathologically large reference set. (The t2i cap stays 1024 — short prompts only.)
+pub(crate) const MAX_EDIT_TOKENS: usize = 8192;
 
 /// The loaded Krea 2 Turbo components, `Arc`-shared so the generator caches them across `generate`.
 pub struct Components {
@@ -346,6 +361,220 @@ pub fn render_base(
     })
 }
 
+/// The image-edit-only components (epic 10871), loaded lazily on the first edit so the txt2img paths
+/// keep their footprint. Holds the two extra wires the edit LoRA's dual-conditioning contract needs:
+/// the Qwen-Image VAE **encoder** (source references → in-context VAE tokens, sc-10877) and the
+/// Qwen3-VL **vision tower** (source references → image-grounded conditioning, sc-10880).
+pub struct EditComponents {
+    vae_encoder: QwenVaeEncoder,
+    vision: crate::vision::VisionTower,
+}
+
+/// Load the image-edit-only components from a Krea 2 snapshot (epic 10871). Both read weights that
+/// already ship in the snapshot — the VAE encoder from `vae/`, the vision tower from the `visual.*`
+/// subtree of `text_encoder/`.
+pub fn load_edit_components(root: &Path, device: &Device) -> Result<EditComponents> {
+    Ok(EditComponents {
+        vae_encoder: load_vae_encoder(root, device)?,
+        vision: crate::vision::load_vision_tower(root, device)?,
+    })
+}
+
+/// Render the **image-edit** path (epic 10871 / sc-10877, sc-10878) — a source reference (or two:
+/// scene = image 1, person = image 2) plus an instruction produce an edited image with identity/subject
+/// preserved. Kontext-style: each reference is VAE-encoded at the **target** resolution and prepended to
+/// the DiT sequence at its own RoPE frame ([`Krea2Transformer::forward_edit`]); the denoise runs the Raw
+/// true-CFG loop **from pure noise** (the source is in-context conditioning, NOT a noised init — the key
+/// difference from an img2img latent-blend). `references` is the fixed-order source set (1 or 2).
+///
+/// **Dual conditioning (R2).** BOTH wires the edit LoRA was trained against are supplied: (a) the
+/// in-context VAE tokens (references VAE-encoded at target res, seq-concat in `forward_edit`), and (b)
+/// the image-grounded Qwen3-VL encoding (references run through the vision tower, spliced into the
+/// condition encoder — [`KreaTextEncoder::forward_with_images`]). The vision tower runs once per
+/// reference and is reused across the positive/negative instruction encodings.
+pub fn render_edit(
+    comps: &Components,
+    edit: &EditComponents,
+    req: &GenerationRequest,
+    references: &[Image],
+    device: &Device,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Vec<Image>> {
+    check_reference_count(references.len())?;
+    let steps = req.steps.map(|s| s as usize).unwrap_or(RAW_STEPS);
+    let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
+    let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
+
+    // Wire (b): run the vision tower ONCE per reference (shared across the pos/neg instruction encodings).
+    let grounding = encode_vision(&edit.vision, references, device)?;
+
+    // Positive (+ optional unconditional) image-grounded conditioning: the instruction is tokenized with
+    // the vision blocks, and the tower's merged embeds + deepstack features are spliced in.
+    let context = grounding.condition(&comps.tok, &comps.te, &req.prompt)?;
+    let neg_context = if guidance > 0.0 {
+        let negative = req.negative_prompt.as_deref().unwrap_or_default();
+        Some(grounding.condition(&comps.tok, &comps.te, negative)?)
+    } else {
+        None
+    };
+
+    // Wire (a): VAE-encode each reference at the TARGET resolution → the normalized 16-ch latent (static
+    // across steps). Fixed order preserved (scene, then person — sc-10878).
+    let ref_latents =
+        encode_references(&edit.vae_encoder, references, req.width, req.height, device)?;
+
+    // Resolution-dynamic Raw schedule (the edit path is undistilled, like `render_base`).
+    let sigmas = base_schedule(steps, req.width, req.height, req.scheduler.as_deref());
+
+    candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
+        let noise = init_noise(req.height, req.width, seed, device)?;
+        let lat = candle_gen::run_flow_sampler(
+            req.sampler.as_deref(),
+            TimestepConvention::Sigma,
+            &sigmas,
+            noise,
+            seed,
+            &req.cancel,
+            on_progress,
+            |x, timestep| -> Result<Tensor> {
+                let t = Tensor::from_vec(vec![timestep], (1,), device)?;
+                let cond = comps.dit.forward_edit(x, &t, &context, &ref_latents)?;
+                let v = match &neg_context {
+                    Some(nc) => {
+                        let uncond = comps.dit.forward_edit(x, &t, nc, &ref_latents)?;
+                        krea_cfg_combine(&cond, &uncond, guidance)?
+                    }
+                    None => cond,
+                };
+                Ok(v.to_dtype(DType::F32)?)
+            },
+        )?;
+        on_progress(Progress::Decoding);
+        let decoded = comps.vae.decode(&lat)?.to_dtype(DType::F32)?;
+        to_image(&decoded)
+    })
+}
+
+/// VAE-encode each source `references` image at the target `(width, height)` → the normalized 16-ch
+/// latent `[1, 16, H/8, W/8]` the DiT's `img_in` consumes (same space as the noise). Fixed order is
+/// preserved (the returned vec is in `references` order — scene, then person; sc-10878).
+fn encode_references(
+    vae_encoder: &QwenVaeEncoder,
+    references: &[Image],
+    width: u32,
+    height: u32,
+    device: &Device,
+) -> Result<Vec<Tensor>> {
+    let mut out = Vec::with_capacity(references.len());
+    for im in references {
+        let pixels = image_to_pixels(im, width, height, device)?;
+        out.push(vae_encoder.encode(&pixels)?);
+    }
+    Ok(out)
+}
+
+/// Validate the source-reference count against the fixed-order [`MAX_EDIT_REFERENCES`] cap (sc-10878):
+/// at least one (an edit needs a source) and at most two (scene, then person). Pure so it is unit-testable.
+fn check_reference_count(n: usize) -> Result<()> {
+    if n == 0 {
+        return Err(CandleError::Msg(
+            "krea edit: at least one source reference image is required".into(),
+        ));
+    }
+    if n > MAX_EDIT_REFERENCES {
+        return Err(CandleError::Msg(format!(
+            "krea edit: at most {MAX_EDIT_REFERENCES} references are supported (scene = image 1, \
+             person = image 2); got {n}"
+        )));
+    }
+    Ok(())
+}
+
+/// The vision-tower output for the source references (epic 10871 / sc-10880), shared across the
+/// positive/negative instruction encodings: each reference's merged image embeds + 3 deepstack features
+/// + patch grid, and the per-reference `<|image_pad|>` placeholder count for the tokenizer.
+struct Grounding {
+    embeds: Vec<Tensor>,
+    deepstack: Vec<Vec<Tensor>>,
+    grids: Vec<[i32; 3]>,
+    n_per_ref: Vec<usize>,
+}
+
+impl Grounding {
+    /// Image-grounded condition encoding for one instruction: tokenize `prompt` with the reference
+    /// vision blocks, then splice the tower's embeds/deepstack into the condition encoder.
+    fn condition(
+        &self,
+        tok: &crate::tokenizer::KreaTokenizer,
+        te: &KreaTextEncoder,
+        prompt: &str,
+    ) -> Result<Tensor> {
+        let ids = tok.encode_with_images(prompt, &self.n_per_ref, MAX_EDIT_TOKENS)?;
+        Ok(te.forward_with_images(&ids, &self.embeds, &self.deepstack, &self.grids)?)
+    }
+}
+
+/// Run the Qwen3-VL vision tower over each source reference (in fixed order — sc-10878) → the shared
+/// [`Grounding`]. Preprocess + tower `forward` per reference (epic 10871 / sc-10880).
+fn encode_vision(
+    vision: &crate::vision::VisionTower,
+    references: &[Image],
+    device: &Device,
+) -> Result<Grounding> {
+    let merge = vision.config().spatial_merge_size;
+    let mut g = Grounding {
+        embeds: Vec::with_capacity(references.len()),
+        deepstack: Vec::with_capacity(references.len()),
+        grids: Vec::with_capacity(references.len()),
+        n_per_ref: Vec::with_capacity(references.len()),
+    };
+    for im in references {
+        let (embeds, deepstack, grid) = crate::vision::encode_image(
+            vision,
+            &im.pixels,
+            im.height as usize,
+            im.width as usize,
+            device,
+        )?;
+        g.n_per_ref
+            .push(crate::vision::merged_token_count(grid, merge));
+        g.embeds.push(embeds);
+        g.deepstack.push(deepstack);
+        g.grids.push(grid);
+    }
+    Ok(g)
+}
+
+/// One RGB8 [`Image`] (HWC, `[0, 255]`) resized to `(target_w, target_h)` → the VAE input tensor
+/// `[1, 3, H, W]` in `[-1, 1]` (f32, on `device`). BICUBIC resample (gen-core's PIL-exact
+/// [`resize_bicubic_u8`], the same used by the vision preprocess), then `(x/255)·2 − 1`.
+fn image_to_pixels(im: &Image, target_w: u32, target_h: u32, device: &Device) -> Result<Tensor> {
+    let (w, h) = (target_w as usize, target_h as usize);
+    if im.pixels.len() != (im.width * im.height * 3) as usize {
+        return Err(CandleError::Msg(format!(
+            "krea edit: reference pixel buffer {} != {}x{}x3",
+            im.pixels.len(),
+            im.width,
+            im.height
+        )));
+    }
+    let resized: Vec<f32> = if (im.width, im.height) == (target_w, target_h) {
+        im.pixels.iter().map(|&p| p as f32).collect()
+    } else {
+        resize_bicubic_u8(&im.pixels, im.height as usize, im.width as usize, h, w)?
+    };
+    // HWC [0,255] → CHW [-1,1].
+    let mut chw = vec![0f32; 3 * h * w];
+    for c in 0..3 {
+        for y in 0..h {
+            for x in 0..w {
+                chw[c * h * w + y * w + x] = resized[(y * w + x) * 3 + c] / 127.5 - 1.0;
+            }
+        }
+    }
+    Ok(Tensor::from_vec(chw, (1, 3, h, w), device)?)
+}
+
 /// The **Raw** flow-match sigma schedule for `steps` at a given resolution: the exponential-mu shift
 /// with a resolution-**dynamic** `mu` interpolated in image-token count ([`dynamic_mu`]), unlike the
 /// Turbo fixed `mu = 1.15`. Length `steps + 1`, descending with a trailing `0.0`; a curated scheduler
@@ -416,6 +645,54 @@ pub(crate) fn to_image(decoded: &Tensor) -> Result<Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `image_to_pixels` normalizes an RGB8 image to `[1, 3, H, W]` in `[-1, 1]` and, when the source is
+    /// already at the target size, maps pixel `v` → `v/127.5 − 1` per channel with no resample (a mid-gray
+    /// 128 → ~0.0039, black 0 → −1, white 255 → +1).
+    #[test]
+    fn image_to_pixels_normalizes_and_shapes() {
+        // 2×2 image, channel-constant: R=0, G=128, B=255.
+        let mut px = Vec::new();
+        for _ in 0..4 {
+            px.extend_from_slice(&[0u8, 128, 255]);
+        }
+        let im = Image {
+            width: 2,
+            height: 2,
+            pixels: px,
+        };
+        let t = image_to_pixels(&im, 2, 2, &Device::Cpu).unwrap();
+        assert_eq!(t.dims(), &[1, 3, 2, 2]);
+        let v = t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        // CHW: first 4 = R (−1), next 4 = G (~0), last 4 = B (+1).
+        assert!(v[0..4].iter().all(|&x| (x - (-1.0)).abs() < 1e-6));
+        assert!(v[4..8].iter().all(|&x| x.abs() < 0.01));
+        assert!(v[8..12].iter().all(|&x| (x - 1.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn image_to_pixels_rejects_bad_buffer() {
+        let im = Image {
+            width: 4,
+            height: 4,
+            pixels: vec![0u8; 10],
+        };
+        assert!(image_to_pixels(&im, 4, 4, &Device::Cpu).is_err());
+    }
+
+    #[test]
+    fn reference_count_enforces_fixed_order_cap() {
+        // 0 → error (an edit needs a source); 1 and 2 ok; 3 → error (past the scene/person cap).
+        assert!(check_reference_count(0).is_err());
+        assert!(check_reference_count(1).is_ok());
+        assert!(check_reference_count(2).is_ok());
+        let err = check_reference_count(3).unwrap_err().to_string();
+        assert!(err.contains('2'), "names the cap: {err}");
+        assert!(
+            err.contains("scene") && err.contains("person"),
+            "documents order: {err}"
+        );
+    }
 
     /// The Krea CFG combine is the reference `cond + g·(cond − uncond)`, not the standard
     /// `uncond + g·Δ`. With cond = 2, uncond = 1 (Δ = 1): g = 1 → 3 (the standard form would give 2 —

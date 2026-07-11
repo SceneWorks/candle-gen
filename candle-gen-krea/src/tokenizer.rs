@@ -35,6 +35,26 @@ fn render(user: &str) -> String {
     format!("{PREFIX}{user}{SUFFIX}")
 }
 
+/// Render the **image-edit** template (epic 10871 / sc-10880): `{PREFIX}` then, for each reference, a
+/// vision block `<|vision_start|><|image_pad|>×n<|vision_end|>` (`n` = that reference's merged vision
+/// token count), then the user instruction, then `{SUFFIX}`. Mirrors Qwen3-VL's image-in-user-turn chat
+/// template; the encoder splices the vision embeds over the `<|image_pad|>` runs
+/// ([`crate::text_encoder::KreaTextEncoder::forward_with_images`]). The vision markers are added-tokens
+/// in `tokenizer.json`, so each `<|image_pad|>` encodes to exactly one id.
+fn render_edit(user: &str, n_per_ref: &[usize]) -> String {
+    let mut s = PREFIX.to_string();
+    for &n in n_per_ref {
+        s.push_str("<|vision_start|>");
+        for _ in 0..n {
+            s.push_str("<|image_pad|>");
+        }
+        s.push_str("<|vision_end|>");
+    }
+    s.push_str(user);
+    s.push_str(SUFFIX);
+    s
+}
+
 /// The Krea condition tokenizer: the snapshot's `tokenizer/tokenizer.json` wrapped to render the Krea
 /// template and encode it. Builds `input_ids` directly on the model device.
 pub struct KreaTokenizer {
@@ -73,6 +93,28 @@ impl KreaTokenizer {
     /// Raw id vector for the templated prompt (parity testing against the reference `input_ids`).
     pub fn ids(&self, prompt: &str) -> Result<Vec<i32>> {
         self.encode(&render(prompt))
+    }
+
+    /// Raw id vector for the image-edit templated prompt (parity testing).
+    pub fn edit_ids(&self, prompt: &str, n_per_ref: &[usize]) -> Result<Vec<i32>> {
+        self.encode(&render_edit(prompt, n_per_ref))
+    }
+
+    /// Encode the **image-edit** templated prompt → `input_ids` `[1, L]` u32 (epic 10871 / sc-10880).
+    /// `n_per_ref[k]` is reference `k`'s merged vision token count (from the vision tower's `grid_thw`);
+    /// the encoder splices the vision embeds over the emitted `<|image_pad|>` runs and drops the same
+    /// [`PREFIX_TOKENS`] system prefix. Over-length prompts are rejected up front (sc-9047).
+    pub fn encode_with_images(
+        &self,
+        prompt: &str,
+        n_per_ref: &[usize],
+        max_tokens: usize,
+    ) -> Result<Tensor> {
+        let ids = self.edit_ids(prompt, n_per_ref)?;
+        check_len(ids.len(), max_tokens)?;
+        let ids: Vec<u32> = ids.iter().map(|&i| i as u32).collect();
+        let len = ids.len();
+        Ok(Tensor::from_vec(ids, (1, len), &self.device)?)
     }
 
     /// Token count of the bare [`PREFIX`] (should equal [`PREFIX_TOKENS`]).
@@ -140,5 +182,26 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("empty"));
+    }
+
+    #[test]
+    fn render_edit_emits_one_vision_block_per_reference() {
+        // Two references (n = 3 and n = 2 merged tokens) → two vision blocks, 5 image_pad markers total,
+        // in order, with the user instruction after the last vision block.
+        let s = render_edit("make it autumn", &[3, 2]);
+        assert!(s.starts_with(PREFIX));
+        assert!(s.ends_with(SUFFIX));
+        assert_eq!(s.matches("<|vision_start|>").count(), 2);
+        assert_eq!(s.matches("<|vision_end|>").count(), 2);
+        assert_eq!(s.matches("<|image_pad|>").count(), 5);
+        // The instruction sits after the final vision_end and before the suffix.
+        let after_vision = s.rsplit_once("<|vision_end|>").unwrap().1;
+        assert!(after_vision.starts_with("make it autumn"));
+    }
+
+    #[test]
+    fn render_edit_zero_refs_is_plain_template() {
+        // No references → identical to the plain t2i template.
+        assert_eq!(render_edit("a cat", &[]), render("a cat"));
     }
 }

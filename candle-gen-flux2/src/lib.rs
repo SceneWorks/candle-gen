@@ -1260,39 +1260,45 @@ mod tests {
         assert!(!super::sequential_offload_enabled());
     }
 
-    /// Sequential-residency GPU validation (epic 10765 Phase 1c, sc-10868). ONE probed FLUX.2-dev
-    /// generation whose mode is chosen by the same two seams `generate` reads — `CANDLE_GEN_OFFLOAD`
-    /// (the env override, sc-10769) or `LoadSpec::offload_policy` (the worker-facing contract, sc-10821)
-    /// — and prints the device peak VRAM + writes the raw RGB pixels to `FLUX2_OUT`. Run it TWICE in
-    /// SEPARATE processes (resident vs sequential) and compare: the pixel files must be byte-identical
-    /// (parity) and the sequential peak materially lower (the decoder-LM Mistral TE dropped before the
-    /// DiT loads). Two processes are REQUIRED — candle's cudarc caching allocator never returns pages to
-    /// the driver, so a second in-process run reuses the first run's pool and reads the same peak.
-    /// Ignored by default; needs a real-file (hardlink-staged, not raw-HF-symlink) FLUX.2-dev snapshot in
-    /// `FLUX2_DEV_DIR`, a `FLUX2_QUANT` of `q4`/`q8` (the 32B needs it — omit only for a dense fixture),
-    /// and a CUDA device.
+    /// Shared body for the FLUX.2 offload A/B harnesses (epic 10765 Phase 1c, sc-10868 dev / sc-11008
+    /// klein). Loads `label`'s snapshot from the `dir_env` env var and runs ONE probed 1024²
+    /// generation whose residency mode is chosen by the same two seams `generate` reads —
+    /// `CANDLE_GEN_OFFLOAD=sequential` (the env override, sc-10769) or `FLUX2_OFFLOAD_MODE=spec-sequential`
+    /// → `LoadSpec::offload_policy` (the worker-facing contract, sc-10821, with `CANDLE_GEN_OFFLOAD`
+    /// UNSET) — then prints the device peak VRAM (`SEQ_AB` line) and writes the raw RGB pixels to
+    /// `FLUX2_OUT`. Run it TWICE in SEPARATE processes (resident vs sequential) and compare: the pixel
+    /// files must be byte-identical (parity) and the sequential peak materially lower (the dense text
+    /// encoder dropped before the DiT loads). Two processes are REQUIRED — candle's cudarc caching
+    /// allocator never returns pages to the driver, so a second in-process run reuses the first run's
+    /// pool and reads the same peak. `honor_quant` reads `FLUX2_QUANT` (q4/q8) for the dev 32B (which
+    /// fits only quantized); klein has no candle quant path, so it always loads dense. Needs a real-file
+    /// (hardlink-staged, not raw-HF-symlink) snapshot in `dir_env` and a CUDA device.
     #[cfg(feature = "cuda")]
-    #[test]
-    #[ignore]
-    fn flux2_dev_probed_generate_for_offload_ab() {
-        let dir = std::env::var("FLUX2_DEV_DIR")
-            .expect("set FLUX2_DEV_DIR to a real-file (hardlink-staged) FLUX.2-dev snapshot");
+    fn run_probed_offload_ab(
+        label: &str,
+        dir_env: &str,
+        load: fn(&LoadSpec) -> gen_core::Result<Box<dyn Generator>>,
+        honor_quant: bool,
+        steps: u32,
+    ) {
+        let dir = std::env::var(dir_env).unwrap_or_else(|_| {
+            panic!("set {dir_env} to a real-file (hardlink-staged) {label} snapshot")
+        });
         let out = std::env::var("FLUX2_OUT").expect("set FLUX2_OUT to the pixel-dump path");
-        // Two ways to select sequential residency, both exercised by the A/B runner:
-        //   - env `CANDLE_GEN_OFFLOAD=sequential` (the override, sc-10769), OR
-        //   - `FLUX2_OFFLOAD_MODE=spec-sequential` → drive it through `LoadSpec::offload_policy`
-        //     (the worker-facing contract, sc-10821), with CANDLE_GEN_OFFLOAD UNSET.
         let mut spec = LoadSpec::new(WeightsSource::Dir(dir.into()));
         // The 32B dev fits only quantized; honor FLUX2_QUANT (q4/q8), else load dense (fixture-only).
-        spec = match std::env::var("FLUX2_QUANT")
-            .unwrap_or_default()
-            .to_lowercase()
-            .as_str()
-        {
-            "q4" => spec.with_quant(Quant::Q4),
-            "q8" => spec.with_quant(Quant::Q8),
-            _ => spec,
-        };
+        // klein has no candle quant path (only bf16 dense is candle-loadable) → honor_quant is false.
+        if honor_quant {
+            spec = match std::env::var("FLUX2_QUANT")
+                .unwrap_or_default()
+                .to_lowercase()
+                .as_str()
+            {
+                "q4" => spec.with_quant(Quant::Q4),
+                "q8" => spec.with_quant(Quant::Q8),
+                _ => spec,
+            };
+        }
         let spec_mode = std::env::var("FLUX2_OFFLOAD_MODE").unwrap_or_default();
         if spec_mode == "spec-sequential" {
             spec = spec.with_offload_policy(OffloadPolicy::Sequential);
@@ -1301,13 +1307,13 @@ mod tests {
             prompt: "a rusty robot holding a lit candle, studio lighting".into(),
             width: 1024,
             height: 1024,
-            steps: Some(8),
+            steps: Some(steps),
             seed: Some(42),
             count: 1,
             ..Default::default()
         };
         let sampler = candle_gen::testkit::PeakSampler::start(0);
-        let g = load_dev(&spec).expect("load flux2_dev");
+        let g = load(&spec).unwrap_or_else(|e| panic!("load {label}: {e}"));
         let output = g.generate(&req, &mut |_| {}).expect("generate");
         let peak_mib = sampler.stop();
         let img = match output {
@@ -1324,10 +1330,37 @@ mod tests {
             "resident"
         };
         eprintln!(
-            "SEQ_AB mode={mode} peak_mib={peak_mib} bytes={} {}x{} out={out}",
+            "SEQ_AB model={label} mode={mode} peak_mib={peak_mib} bytes={} {}x{} out={out}",
             img.pixels.len(),
             img.width,
             img.height
         );
+    }
+
+    /// Sequential-residency GPU validation (epic 10765 Phase 1c, sc-10868) for FLUX.2-**dev** (Mistral
+    /// TE, guidance-distilled 32B). See [`run_probed_offload_ab`] for the A/B protocol. Ignored by
+    /// default; needs a hardlink-staged FLUX.2-dev snapshot in `FLUX2_DEV_DIR`, a `FLUX2_QUANT` of
+    /// `q4`/`q8` (the 32B needs it — omit only for a dense fixture), and a CUDA device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn flux2_dev_probed_generate_for_offload_ab() {
+        run_probed_offload_ab("flux2_dev", "FLUX2_DEV_DIR", load_dev, true, 8);
+    }
+
+    /// klein sibling of [`flux2_dev_probed_generate_for_offload_ab`] (epic 10765 Phase 1c follow-up,
+    /// sc-11008). Same A/B protocol, but loads FLUX.2-**klein**-9B (Qwen3 TE + 9B DiT) DENSE bf16 from
+    /// `FLUX2_KLEIN_DIR` at 4 steps CFG-free. klein has NO candle quant path — the `SceneWorks/
+    /// flux2-klein-9b-mlx` q4/q8 turnkey tiers are MLX-format, not candle-loadable — so only the bf16
+    /// tier is candle-measurable here (`honor_quant = false`). Directly captures the klein resident-vs-
+    /// sequential peak that sc-10920 could only arch-scale, validating that dropping the DENSE ~16 GB
+    /// Qwen3 TE before the 9B DiT loads is the sequential floor. Ignored by default; needs a hardlink-
+    /// staged klein bf16 diffusers snapshot (`text_encoder/` = Qwen3, `transformer/`, `vae/`,
+    /// `tokenizer/`) in `FLUX2_KLEIN_DIR` and a CUDA device.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn flux2_klein_probed_generate_for_offload_ab() {
+        run_probed_offload_ab("flux2_klein_9b", "FLUX2_KLEIN_DIR", load_klein, false, 4);
     }
 }

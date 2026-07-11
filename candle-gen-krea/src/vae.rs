@@ -17,7 +17,7 @@ use candle_gen::candle_core::{DType, Device};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::Result;
 
-pub use candle_gen_qwen_image::vae::QwenVae;
+pub use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
 
 /// VAE spatial compression factor (`ae.compression`) — 3 spatial-downsample stages = 8×. With
 /// `patch_size = 2` this gives the pipeline's W/H alignment `compression · patch = 16`.
@@ -36,6 +36,15 @@ fn vae_varbuilder(dir: &Path, device: &Device) -> Result<VarBuilder<'static>> {
 pub fn load_vae(root: impl AsRef<Path>, device: &Device) -> Result<QwenVae> {
     let vb = vae_varbuilder(&root.as_ref().join("vae"), device)?;
     Ok(QwenVae::new(vb)?)
+}
+
+/// Load the Qwen-Image VAE **encoder** from a Krea snapshot's `vae/` dir (epic 10871 / sc-10877) — the
+/// image-edit path VAE-encodes each source reference into the normalized 16-ch latent the DiT's `img_in`
+/// consumes ([`QwenVaeEncoder::encode`], the inverse of [`QwenVae::decode`]'s de-normalize). Weights are
+/// the same `vae/` dir as [`load_vae`]; the encoder reads the `encoder.*` / `quant_conv` subtrees.
+pub fn load_vae_encoder(root: impl AsRef<Path>, device: &Device) -> Result<QwenVaeEncoder> {
+    let vb = vae_varbuilder(&root.as_ref().join("vae"), device)?;
+    Ok(QwenVaeEncoder::new(vb)?)
 }
 
 #[cfg(test)]

@@ -16,6 +16,12 @@
 //! cargo run --release --example flux2-txt2img --features cuda -- \
 //!   --variant dev --quant q4 --snapshot "D:\models\FLUX.2-dev" \
 //!   --prompt "a photo of a rusty robot holding a lit candle" --seed 42 --out dev.png
+//!
+//! # dev, DiT read in place from a ComfyUI fp8-mixed single-file (sc-10680 / sc-11028 repro):
+//! # same command plus --comfyui-dit; --snapshot still supplies the TE / VAE / tokenizer.
+//! cargo run --release --example flux2-txt2img --features cuda -- \
+//!   --variant dev --quant q8 --snapshot "…\flux2-dev-mlx\snapshots\<hash>\q8" \
+//!   --comfyui-dit "…\diffusion_models\flux2_dev_fp8mixed.safetensors" --seed 42 --out dev.png
 //! ```
 
 use std::path::PathBuf;
@@ -77,6 +83,11 @@ fn main() -> Result<()> {
         "[smoke] id={id} quant={quant:?} snapshot={snapshot}\n[smoke] {width}x{height} steps={steps:?} guidance={guidance:?} seed={seed}\n[smoke] prompt={prompt:?}"
     );
 
+    // In-place ComfyUI fp8-mixed DiT single-file (sc-10680; the sc-11028 dense→quantize repro
+    // harness): bypass the registry and load through `load_from_comfyui_dit` — the DiT comes from
+    // the file, the TE / VAE / tokenizer from --snapshot. dev-only.
+    let comfyui_dit = arg(&args, "--comfyui-dit").map(PathBuf::from);
+
     candle_gen_flux2::force_link();
     let mut spec = LoadSpec::new(WeightsSource::Dir(PathBuf::from(&snapshot)));
     if let Some(q) = quant {
@@ -98,7 +109,16 @@ fn main() -> Result<()> {
     let mut probe = vram_gpu.map(candle_gen::testkit::VramProbe::start);
 
     let load_phase = probe.as_ref().map(|p| p.phase());
-    let gen = gen_core::registry::load(id, &spec)?;
+    let gen = match &comfyui_dit {
+        Some(dit_file) => {
+            if id != "flux2_dev" {
+                return Err("--comfyui-dit is dev-only (pass --variant dev)".into());
+            }
+            println!("[smoke] comfyui-dit={}", dit_file.display());
+            candle_gen_flux2::load_from_comfyui_dit(dit_file, PathBuf::from(&snapshot), quant)?
+        }
+        None => gen_core::registry::load(id, &spec)?,
+    };
     if let (Some(p), Some(ph)) = (probe.as_mut(), load_phase) {
         p.end_load(ph);
     }

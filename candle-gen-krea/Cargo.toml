@@ -15,6 +15,13 @@ candle-gen = { path = "../candle-gen" }
 # than re-port the causal-Conv3d VAE — exactly as `mlx-gen-krea` reuses `mlx-gen-qwen-image`'s `QwenVae`
 # (the boogu→z-image / kolors→sdxl provider-reuse precedent).
 candle-gen-qwen-image = { path = "../candle-gen-qwen-image" }
+# Krea 2's Qwen3-VL condition encoder shares the **Qwen3-VL vision tower** with boogu (image-grounded
+# edit conditioning, epic 10871 / sc-10880). Reuse the parity-tested `candle_gen_boogu::vision`
+# `VisionTower` + image preprocess from a Krea-4B `VisionConfig` rather than re-port ~640 lines of
+# parity-critical ViT code — exactly as `mlx-gen-krea` depends on `mlx-gen-boogu` (and as krea already
+# reuses `mlx-gen-qwen-image`'s VAE). Krea's tower is 4B (narrower/shallower than boogu's 8B) but the
+# block code is dim-generic off `VisionConfig`.
+candle-gen-boogu = { path = "../candle-gen-boogu" }
 # NVIDIA PiD optional super-resolving decoder (epic 7840 / sc-7853). Krea reuses the Qwen-Image VAE, so
 # it shares the `qwenimage` PiD latent-space student. Wired behind `req.use_pid` (default off → the
 # byte-exact native QwenVae decode).
@@ -35,8 +42,8 @@ safetensors = "0.7"
 
 [features]
 default = []
-metal = ["candle-gen/metal", "candle-gen-qwen-image/metal", "candle-gen-pid/metal"]
-cuda = ["candle-gen/cuda", "candle-gen-qwen-image/cuda", "candle-gen-pid/cuda"]
+metal = ["candle-gen/metal", "candle-gen-qwen-image/metal", "candle-gen-boogu/metal", "candle-gen-pid/metal"]
+cuda = ["candle-gen/cuda", "candle-gen-qwen-image/cuda", "candle-gen-boogu/cuda", "candle-gen-pid/cuda"]
 
 [dev-dependencies]
 # Encode the e2e real-weight smoke output to PNG for eyeballing (sc-7582); mirrors the other families.

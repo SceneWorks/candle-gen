@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use candle_gen::candle_core::{DType, Device, Result, Tensor};
+use candle_gen::candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::rotary_emb::rope;
 
@@ -41,6 +41,12 @@ pub struct KreaTeConfig {
     /// Leading template-prefix tokens dropped from the conditioning (`Qwen3VLConditioner`'s
     /// `prompt_template_encode_start_idx`); the system-instruction prefix tokenizes to this many.
     pub prefix_tokens: usize,
+    /// `<|image_pad|>` id (the vision-embed splice placeholder) — image-grounded edit path only
+    /// (epic 10871 / sc-10880). Standard Qwen3-VL `151655` (confirmed for Krea, sc-10875).
+    pub image_token_id: u32,
+    /// Qwen3-VL `text_config.rope_parameters.mrope_section` — the per-axis (T/H/W) frequency counts over
+    /// `head_dim/2 = 64` used by the 3-D interleaved MRoPE on the image-grounded path (`[24, 20, 20]`).
+    pub mrope_section: [usize; 3],
 }
 
 impl KreaTeConfig {
@@ -54,6 +60,8 @@ impl KreaTeConfig {
             rope_theta: 5_000_000.0,
             select_hidden: vec![2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35],
             prefix_tokens: 34,
+            image_token_id: 151655,
+            mrope_section: [24, 20, 20],
         }
     }
 
@@ -98,6 +106,20 @@ impl KreaTeConfig {
                 .unwrap_or(d.rope_theta),
             select_hidden: d.select_hidden.clone(),
             prefix_tokens: d.prefix_tokens,
+            // `image_token_id` is a top-level config field; `mrope_section` lives under
+            // `rope_parameters`/`rope_scaling`. Both fall back to the standard Qwen3-VL values (sc-10875).
+            image_token_id: v
+                .get("image_token_id")
+                .and_then(serde_json::Value::as_u64)
+                .map(|n| n as u32)
+                .unwrap_or(d.image_token_id),
+            mrope_section: tc
+                .get("rope_parameters")
+                .or_else(|| tc.get("rope_scaling"))
+                .and_then(|r| r.get("mrope_section"))
+                .and_then(serde_json::Value::as_array)
+                .and_then(|a| read_mrope_section(a))
+                .unwrap_or(d.mrope_section),
         };
 
         // `text_encoder_select_layers` lives in the pipeline manifest. A genuinely-absent
@@ -145,6 +167,19 @@ fn read_optional_model_index(path: &Path) -> Result<Option<serde_json::Value>> {
         ))
     })?;
     Ok(Some(v))
+}
+
+/// Parse a JSON `mrope_section` array into `[t, h, w]` (exactly three positive counts); any other shape
+/// falls back (`None`) to the [`KreaTeConfig::qwen3_vl_4b`] default.
+fn read_mrope_section(a: &[serde_json::Value]) -> Option<[usize; 3]> {
+    if a.len() != 3 {
+        return None;
+    }
+    let mut out = [0usize; 3];
+    for (i, x) in a.iter().enumerate() {
+        out[i] = x.as_u64()? as usize;
+    }
+    Some(out)
 }
 
 /// HF half-split RoPE table (θ over `head_dim`), built once for the max sequence length (f32).
@@ -304,6 +339,14 @@ pub struct KreaTextEncoder {
     /// 0-indexed decoder-layer OUTPUT indices to capture (= `select_hidden[i] - 1`), in stack order.
     out_layers: Vec<usize>,
     prefix_tokens: usize,
+    // ── image-grounded edit path (epic 10871 / sc-10880) ────────────────────────────────────────
+    head_dim: usize,
+    rms_norm_eps: f64,
+    rope_theta: f32,
+    /// Qwen3-VL MRoPE per-axis (T/H/W) frequency counts over `head_dim/2` for the 3-D interleaved rope.
+    mrope_section: [usize; 3],
+    /// `<|image_pad|>` id — the vision-embed splice placeholder.
+    image_token_id: u32,
     device: Device,
 }
 
@@ -342,6 +385,11 @@ impl KreaTextEncoder {
             rotary: Rotary::new(cfg.head_dim, cfg.rope_theta, max_seq.max(1), w.device())?,
             out_layers,
             prefix_tokens: cfg.prefix_tokens,
+            head_dim: cfg.head_dim,
+            rms_norm_eps: cfg.rms_norm_eps,
+            rope_theta: cfg.rope_theta,
+            mrope_section: cfg.mrope_section,
+            image_token_id: cfg.image_token_id,
             device: w.device().clone(),
         })
     }
@@ -362,9 +410,87 @@ impl KreaTextEncoder {
                 saved.push((i, hidden.clone()));
             }
         }
+        self.stack_and_trim(&saved)
+    }
 
-        // Stack the captured layers (in `out_layers` order) on a NEW axis 2 → [b, s, n, hidden],
-        // matching the reference `torch.stack([hidden_states[i] for i in select], dim=2)`.
+    /// Image-grounded condition encoding for the edit path (epic 10871 / sc-10880). The image-only
+    /// sibling of [`forward`](Self::forward): the vision tower's merged embeds are spliced over each
+    /// reference's `<|image_pad|>` block, the decoder runs under the 3-D **interleaved MRoPE** (each
+    /// reference's grid advancing the shared position counter), and each reference's `deepstack[k]`
+    /// features are injected at its block after LM layers 0/1/2 — mirroring `Qwen3VLTextModel` with one
+    /// `<|image_pad|>` block per reference. The same select-layer stack + template-prefix drop tail as
+    /// [`forward`](Self::forward) produces the DiT's `context` `[1, S − prefix, num_select, hidden]`.
+    ///
+    /// - `input_ids`: `[1, S]` u32 from [`crate::tokenizer::KreaTokenizer::encode_with_images`] (the edit
+    ///   template with `<|vision_start|><|image_pad|>×n<|vision_end|>` per reference).
+    /// - `image_embeds[k]`: the k-th reference's merged vision embeds `[n_k, hidden]`.
+    /// - `deepstack[k]`: its 3 deepstack features (each `[n_k, hidden]`).
+    /// - `grids[k]`: its patch grid `[t, h, w]`.
+    ///
+    /// The block order must match the reference order (the template emits the references' vision blocks
+    /// in order, before the instruction). `b = 1`.
+    pub fn forward_with_images(
+        &self,
+        input_ids: &Tensor,
+        image_embeds: &[Tensor],
+        deepstack: &[Vec<Tensor>],
+        grids: &[[i32; 3]],
+    ) -> Result<Tensor> {
+        let (b, s) = input_ids.dims2()?;
+        let ids: Vec<u32> = input_ids.i(0)?.to_dtype(DType::U32)?.to_vec1::<u32>()?;
+
+        // Contiguous `<|image_pad|>` blocks, in order; block k carries reference k.
+        let blocks = image_blocks(&ids, self.image_token_id);
+        if blocks.len() != image_embeds.len() {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "krea te: {} image-token blocks in input_ids but {} reference embeds",
+                blocks.len(),
+                image_embeds.len()
+            )));
+        }
+
+        // Token embeddings (f32), then splice each reference's vision embeds over its block. Each
+        // replacement is the same length as the block, so earlier splices don't shift later indices.
+        let mut hidden = self.embed_tokens.forward(input_ids)?.to_dtype(DType::F32)?;
+        for (k, &(start, len)) in blocks.iter().enumerate() {
+            if image_embeds[k].dim(0)? != len {
+                return Err(candle_gen::candle_core::Error::Msg(format!(
+                    "krea te: reference {k} has {} vision tokens but its image block is {len}",
+                    image_embeds[k].dim(0)?
+                )));
+            }
+            let img = image_embeds[k].unsqueeze(0)?.to_dtype(hidden.dtype())?; // [1, n_k, hidden]
+            hidden = replace_seq(&hidden, &img, start, start + len, s)?;
+        }
+
+        // 3-D interleaved MRoPE (per-image grids) + causal mask.
+        let (pt, ph, pw) = mrope_positions(&ids, self.image_token_id, grids);
+        let (cos, sin) = self.mrope_cos_sin(&pt, &ph, &pw)?;
+        let mask = causal_mask(b, s, &self.device)?;
+
+        let mut saved: Vec<(usize, Tensor)> = Vec::with_capacity(self.out_layers.len());
+        for (i, layer) in self.layers.iter().enumerate() {
+            hidden = layer.forward(&hidden, &cos, &sin, &mask)?;
+            // Deepstack: after LM layers 0/1/2, add each reference's layer-i feature at its block.
+            for (k, &(start, len)) in blocks.iter().enumerate() {
+                if i < deepstack[k].len() {
+                    let ds = deepstack[k][i].unsqueeze(0)?.to_dtype(hidden.dtype())?; // [1, n_k, hidden]
+                    let mid = (slice_seq(&hidden, start, start + len)? + ds)?;
+                    hidden = replace_seq(&hidden, &mid, start, start + len, s)?;
+                }
+            }
+            if self.out_layers.contains(&i) {
+                saved.push((i, hidden.clone()));
+            }
+        }
+        self.stack_and_trim(&saved)
+    }
+
+    /// Stack the captured select layers on a NEW axis 2 → `[b, s, n, hidden]` (reference
+    /// `torch.stack([hidden_states[i] for i in select], dim=2)`), then drop the leading template-prefix
+    /// tokens. Shared by [`forward`](Self::forward) and [`forward_with_images`](Self::forward_with_images)
+    /// so the text and image-grounded paths stack identically.
+    fn stack_and_trim(&self, saved: &[(usize, Tensor)]) -> Result<Tensor> {
         let pick = |idx: usize| -> Result<Tensor> {
             saved
                 .iter()
@@ -393,6 +519,114 @@ impl KreaTextEncoder {
         }
         stacked.narrow(1, self.prefix_tokens, n - self.prefix_tokens)
     }
+
+    /// Build the interleaved-MRoPE `cos`/`sin` `[s, head_dim/2]` (f32). Each of the `head_dim/2`
+    /// frequencies takes its position from the T/H/W axis per the Qwen3-VL interleave: within the first
+    /// `mrope_section[1]·3` indices, `j%3==1 → H`, `j%3==2 → W`, else `T` (the tail stays `T`). Ported
+    /// verbatim from `candle_gen_boogu`'s text encoder (Krea shares the section `[24,20,20]`, head_dim
+    /// 128, and θ = 5e6).
+    fn mrope_cos_sin(&self, pt: &[i64], ph: &[i64], pw: &[i64]) -> Result<(Tensor, Tensor)> {
+        let s = pt.len();
+        let hd = self.head_dim;
+        let half = hd / 2;
+        let sec_h = self.mrope_section[1] * 3;
+        let sec_w = self.mrope_section[2] * 3;
+        let inv: Vec<f32> = (0..half)
+            .map(|j| (self.rope_theta as f64).powf(-(2.0 * j as f64) / hd as f64) as f32)
+            .collect();
+
+        let mut freqs = vec![0f32; s * half];
+        for (i, ((&t, &h), &w)) in pt.iter().zip(ph).zip(pw).enumerate() {
+            for j in 0..half {
+                let pos = if j < sec_h && j % 3 == 1 {
+                    h
+                } else if j < sec_w && j % 3 == 2 {
+                    w
+                } else {
+                    t
+                };
+                freqs[i * half + j] = pos as f32 * inv[j];
+            }
+        }
+        let freqs = Tensor::from_vec(freqs, (s, half), &self.device)?;
+        Ok((freqs.cos()?, freqs.sin()?))
+    }
+
+    /// The RMS-norm eps (exposed for the parity harness); the config value threaded at load.
+    pub fn rms_norm_eps(&self) -> f64 {
+        self.rms_norm_eps
+    }
+}
+
+/// Slice `[1, s, d]` along the sequence axis (axis 1) to `[start, end)`.
+fn slice_seq(x: &Tensor, start: usize, end: usize) -> Result<Tensor> {
+    x.narrow(1, start, end - start)
+}
+
+/// Replace `x[:, start:end, :]` with `repl` (`[1, end-start, d]`) via concat of the surrounding slices.
+fn replace_seq(x: &Tensor, repl: &Tensor, start: usize, end: usize, s: usize) -> Result<Tensor> {
+    let before = x.narrow(1, 0, start)?;
+    let after = x.narrow(1, end, s - end)?;
+    Tensor::cat(&[&before, repl, &after], 1)
+}
+
+/// Contiguous runs of `image_token_id` in `ids`, returned as `(start, len)` in input-id order. Each run
+/// is one reference image's `<|image_pad|>` block.
+fn image_blocks(ids: &[u32], image_token_id: u32) -> Vec<(usize, usize)> {
+    let mut blocks = Vec::new();
+    let mut i = 0usize;
+    while i < ids.len() {
+        if ids[i] == image_token_id {
+            let start = i;
+            while i < ids.len() && ids[i] == image_token_id {
+                i += 1;
+            }
+            blocks.push((start, i - start));
+        } else {
+            i += 1;
+        }
+    }
+    blocks
+}
+
+/// Vision spatial merge — the LM sees one token per `merge²` patches (Qwen3-VL `spatial_merge_size`).
+const SPATIAL_MERGE: i64 = 2;
+
+/// 3-D MRoPE positions per token (mirrors `get_rope_index`): text tokens advance `(i, i, i)`; the k-th
+/// image block (at running offset `cur`) takes `grids[k] = [t, h, w]`, gets `t = cur`, `h = cur + row`,
+/// `w = cur + col` over its `(h/merge)×(w/merge)` merged grid, then advances `cur += max(h, w) / merge`.
+/// Multiple image blocks consume `grids` in order. Ported from `candle_gen_boogu`'s text encoder.
+fn mrope_positions(
+    ids: &[u32],
+    image_token_id: u32,
+    grids: &[[i32; 3]],
+) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
+    let (mut pt, mut ph, mut pw) = (Vec::new(), Vec::new(), Vec::new());
+    let mut cur = 0i64;
+    let mut i = 0usize;
+    let mut img_k = 0usize;
+    while i < ids.len() {
+        if ids[i] == image_token_id {
+            let g = grids[img_k];
+            let (llm_h, llm_w) = (g[1] as i64 / SPATIAL_MERGE, g[2] as i64 / SPATIAL_MERGE);
+            let step = (g[1].max(g[2]) as i64) / SPATIAL_MERGE;
+            for idx in 0..(llm_h * llm_w) {
+                pt.push(cur);
+                ph.push(cur + idx / llm_w);
+                pw.push(cur + idx % llm_w);
+            }
+            cur += step;
+            i += (llm_h * llm_w) as usize;
+            img_k += 1;
+        } else {
+            pt.push(cur);
+            ph.push(cur);
+            pw.push(cur);
+            cur += 1;
+            i += 1;
+        }
+    }
+    (pt, ph, pw)
 }
 
 /// Additive causal mask `[B, 1, S, S]` (f32): `0` where query `i` may attend key `j` (`j ≤ i`),
@@ -472,5 +706,41 @@ mod tests {
         std::fs::write(tmp.join("model_index.json"), b"{ not json").unwrap();
         assert!(KreaTeConfig::from_snapshot(&tmp).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn te_config_carries_grounding_defaults() {
+        let c = KreaTeConfig::qwen3_vl_4b();
+        assert_eq!(c.image_token_id, 151655);
+        assert_eq!(c.mrope_section, [24, 20, 20]);
+    }
+
+    const IMG: u32 = 151655;
+
+    #[test]
+    fn image_blocks_finds_runs_in_order() {
+        // text, text, [4 image], text, [2 image], text.
+        let ids = [9u32, 9, IMG, IMG, IMG, IMG, 9, IMG, IMG, 9];
+        assert_eq!(image_blocks(&ids, IMG), vec![(2, 4), (7, 2)]);
+    }
+
+    #[test]
+    fn mrope_positions_advance_across_two_images() {
+        // Block 0 ↔ grid [1,4,4] (merged 2×2 = 4 tokens, t-step max(4,4)/2 = 2);
+        // block 1 ↔ grid [1,4,2] (merged 2×1 = 2 tokens, t-step max(4,2)/2 = 2). The scene-then-person
+        // fixed order (sc-10878) is exactly the grid order fed here.
+        let ids = [9u32, 9, IMG, IMG, IMG, IMG, 9, IMG, IMG, 9];
+        let grids = [[1, 4, 4], [1, 4, 2]];
+        let (pt, ph, pw) = mrope_positions(&ids, IMG, &grids);
+        assert_eq!(pt.len(), ids.len());
+        assert_eq!((pt[0], pt[1]), (0, 1));
+        assert_eq!(&pt[2..6], &[2, 2, 2, 2]);
+        assert_eq!(&ph[2..6], &[2, 2, 3, 3]);
+        assert_eq!(&pw[2..6], &[2, 3, 2, 3]);
+        assert_eq!(pt[6], 4);
+        assert_eq!(&pt[7..9], &[5, 5]);
+        assert_eq!(&ph[7..9], &[5, 6]);
+        assert_eq!(&pw[7..9], &[5, 5]);
+        assert_eq!(pt[9], 7);
     }
 }

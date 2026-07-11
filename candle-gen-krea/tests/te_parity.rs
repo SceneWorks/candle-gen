@@ -55,6 +55,8 @@ fn tiny_te_config() -> KreaTeConfig {
         rope_theta: 5_000_000.0,
         select_hidden: vec![2, 4],
         prefix_tokens: 3,
+        image_token_id: 151655,
+        mrope_section: [24, 20, 20],
     }
 }
 
@@ -81,6 +83,69 @@ fn te_matches_reference() -> Result<()> {
     assert!(
         max_abs_diff(&hiddens, &want) < 2e-2,
         "TE stacked context diverged beyond 2e-2 (cosine {c:.7})"
+    );
+    Ok(())
+}
+
+/// **Image-grounded smoke** (epic 10871 / sc-10880) on the committed tiny TE — no vision-tower weights
+/// needed. Drives the real `forward_with_images` plumbing (the `<|image_pad|>` splice, the 3-D
+/// interleaved MRoPE, deepstack injection at layers 0/1/2, and the select-layer stack + prefix-drop) on
+/// real (tiny) LM weights with synthetic vision features. `image_token_id` is overridden to a small
+/// in-vocab id so the tiny embedding table is valid. Asserts the grounded context is correctly shaped +
+/// finite, and — the key check — that changing the spliced vision embeds *changes* the output (the
+/// splice actually feeds through the decoder), which the weight-free helper tests can't show.
+#[test]
+fn grounded_forward_splices_vision_through() -> Result<()> {
+    let w = Weights::from_file(Path::new(FIXTURE), &Device::Cpu, DType::F32)
+        .unwrap_or_else(|e| panic!("load te fixture: {e}"));
+    // image_token_id = 0 (always in-vocab); filler/text tokens use 1 so they're never mistaken for the
+    // image placeholder. mrope_section is inert-safe at head_dim 32 (all freqs < the section bounds).
+    let mut cfg = tiny_te_config();
+    cfg.image_token_id = 0;
+    let te = KreaTextEncoder::load(&w, "language_model", &cfg, 64)?;
+    let hidden = w.get("out.hiddens")?.dim(3)?; // the LM hidden width the vision embeds must match
+
+    // input_ids: 4 text, then a 4-token `<|image_pad|>` block (a 2×2 merged grid → grid [1,4,4]), then
+    // 2 text. S = 10 > prefix 3, so the image block survives the prefix-drop.
+    let ids: Vec<u32> = vec![1, 1, 1, 1, 0, 0, 0, 0, 1, 1];
+    let input_ids = Tensor::from_vec(ids, (1, 10), &Device::Cpu)?;
+    let grid = [1i32, 4, 4]; // merged (4/2)·(4/2) = 4 = the block length
+    let n = 4usize;
+
+    let mk = |seed: f32| -> Result<(Vec<Tensor>, Vec<Vec<Tensor>>)> {
+        let embeds = (Tensor::ones((n, hidden), DType::F32, &Device::Cpu)? * seed as f64)?;
+        let ds: Vec<Tensor> = (0..3)
+            .map(|k| {
+                Tensor::ones((n, hidden), DType::F32, &Device::Cpu)
+                    .map(|t| (t * (0.01 * (k + 1) as f64)).unwrap())
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        Ok((vec![embeds], vec![ds]))
+    };
+
+    let (e_a, ds_a) = mk(0.5)?;
+    let out_a = te.forward_with_images(&input_ids, &e_a, &ds_a, &[grid])?;
+    assert_eq!(out_a.dim(0)?, 1, "batch");
+    assert_eq!(
+        out_a.dim(1)?,
+        10 - cfg.prefix_tokens,
+        "prefix-dropped length"
+    );
+    assert_eq!(out_a.dim(2)?, cfg.select_hidden.len(), "select-layer stack");
+    assert_eq!(out_a.dim(3)?, hidden, "hidden width");
+    assert!(
+        vec_f32(&out_a).iter().all(|v| v.is_finite()),
+        "grounded context finite"
+    );
+
+    // Different vision embeds → different grounded context (the splice feeds through the decoder).
+    let (e_b, ds_b) = mk(-0.7)?;
+    let out_b = te.forward_with_images(&input_ids, &e_b, &ds_b, &[grid])?;
+    let d = max_abs_diff(&out_a, &out_b);
+    println!("grounded smoke: vision-embed-change Δ={d:e}");
+    assert!(
+        d > 1e-4,
+        "changing the vision embeds must change the grounded context (Δ={d:e})"
     );
     Ok(())
 }
