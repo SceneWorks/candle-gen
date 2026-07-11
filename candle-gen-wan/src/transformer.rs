@@ -342,8 +342,13 @@ impl WanTransformer {
         self.text_l2.forward(&self.text_l1.forward(&x)?.gelu()?)
     }
 
-    /// One DiT forward: `latents [B,48,F,Hl,Wl]`, projected `context [B,S,dim]`, scalar `t`,
-    /// RoPE `cos`/`sin [L,64]` → predicted velocity `[B,48,F,Hl,Wl]`.
+    /// One DiT forward: `latents [B,in_c,F,Hl,Wl]`, projected `context [B,S,dim]`, scalar `t`,
+    /// RoPE `cos`/`sin [L,64]` → predicted velocity `[B,out_c,F,Hl,Wl]`.
+    ///
+    /// Composed from the three seams below (patch-embed → block-stack/head → unpatchify), byte-identical
+    /// to the previous monolithic body. The seams are exposed additively for the Bernini renderer's
+    /// token-axis packed conditioning (sc-11004), which patch-embeds the target + each source separately
+    /// and runs one packed [`forward_packed`](Self::forward_packed) over the concatenated token axis.
     pub fn forward(
         &self,
         latents: &Tensor,
@@ -352,6 +357,17 @@ impl WanTransformer {
         cos: &Tensor,
         sin: &Tensor,
     ) -> Result<Tensor> {
+        let (tokens, grid) = self.patch_embed_tokens(latents)?;
+        let out = self.forward_packed(&tokens, t, context, cos, sin)?;
+        self.unpatchify_tokens(&out, grid)
+    }
+
+    /// Patch-embed `latents [B, in_channels, F, Hl, Wl]` into the DiT token stream `[B, L, dim]` (bf16)
+    /// plus the patch grid `(ppf, pph, ppw)` — the embedding half of [`forward`](Self::forward), exposed
+    /// as a seam for the Bernini renderer (sc-11004), which patch-embeds the noisy target **and** each
+    /// conditioning source separately (each with its own source-id RoPE) and concatenates them on the
+    /// token axis before a single packed forward. `L = ppf·pph·ppw`.
+    pub fn patch_embed_tokens(&self, latents: &Tensor) -> Result<(Tensor, (usize, usize, usize))> {
         let (b, _c, f, hl, wl) = latents.dims5()?;
         let (pt, ph, pw) = self.cfg.patch;
         let (ppf, pph, ppw) = (f / pt, hl / ph, wl / pw);
@@ -364,12 +380,32 @@ impl WanTransformer {
             .to_dtype(self.dtype)?;
         let y = merged.conv2d(&self.patch_w, 0, ph, 1, 1)?; // [B*F,dim,pph,ppw]
         let y = y.broadcast_add(&self.patch_b)?;
-        let mut hidden = y
+        let hidden = y
             .reshape((b, f, self.cfg.dim, pph, ppw))?
             .permute((0, 1, 3, 4, 2))? // [B,F,pph,ppw,dim]
             .reshape((b, ppf * pph * ppw, self.cfg.dim))?
             .contiguous()?;
+        Ok((hidden, (ppf, pph, ppw)))
+    }
 
+    /// Run the block stack + output head over a **pre-embedded, pre-packed** token sequence
+    /// `tokens [B, L, dim]` (bf16) with caller-supplied RoPE `cos`/`sin [L, head_dim/2]` and the
+    /// projected cross-attention `context [B, S, dim]` — returning the per-token velocity
+    /// `[B, L, out_channels·∏patch]` (this DiT's dtype) **without** unpatchifying. This is
+    /// [`forward`](Self::forward)'s body minus the patch-embed in / unpatchify out, the seam the Bernini
+    /// renderer (sc-11004) uses: at batch 1 the packed `[sources…, target]` sequence is plain full
+    /// self-attention (the reference's varlen attention with a single `cu_seqlens` segment), so the
+    /// caller assembles the token + RoPE concat, calls this once, then slices the target tokens and
+    /// [`unpatchify_tokens`](Self::unpatchify_tokens) them.
+    pub fn forward_packed(
+        &self,
+        tokens: &Tensor,
+        t: f64,
+        context: &Tensor,
+        cos: &Tensor,
+        sin: &Tensor,
+    ) -> Result<Tensor> {
+        let (b, _l, _dim) = tokens.dims3()?;
         // Time embedding → temb [B,dim], and the per-block 6-vector temb6 [B,6,dim] (f32).
         let sinus =
             timestep_sinusoid(t, self.cfg.freq_dim, b, &self.device)?.to_dtype(self.dtype)?;
@@ -382,6 +418,7 @@ impl WanTransformer {
             .reshape((b, 6, self.cfg.dim))?
             .to_dtype(DType::F32)?;
 
+        let mut hidden = tokens.clone();
         for blk in &self.blocks {
             hidden = blk.forward(&hidden, &temb6, context, cos, sin)?;
         }
@@ -397,9 +434,16 @@ impl WanTransformer {
             .broadcast_mul(&(scale + 1.0)?)?
             .broadcast_add(&shift)?
             .to_dtype(self.dtype)?;
-        let out = self.proj_out.forward(&normed)?; // [B,L,out_c*patch]
+        self.proj_out.forward(&normed) // [B,L,out_c*patch]
+    }
 
-        // Unpatchify → [B,48,F,Hl,Wl].
+    /// Unpatchify a per-token velocity `[B, L, out_channels·∏patch]` (with `L = ppf·pph·ppw`) back to a
+    /// spatial latent `[B, out_channels, F, Hl, Wl]` (f32) — the tail of [`forward`](Self::forward),
+    /// exposed so the Bernini renderer can unpatchify the **target-sliced** packed output (sc-11004).
+    pub fn unpatchify_tokens(&self, out: &Tensor, grid: (usize, usize, usize)) -> Result<Tensor> {
+        let (ppf, pph, ppw) = grid;
+        let (b, _l, _op) = out.dims3()?;
+        let (pt, ph, pw) = self.cfg.patch;
         let oc = self.cfg.out_channels;
         out.reshape(&[b, ppf, pph, ppw, pt, ph, pw, oc][..])?
             .permute(&[0usize, 7, 1, 4, 2, 5, 3, 6][..])?
@@ -472,5 +516,193 @@ impl WanTransformer {
         }
         f("proj_out", &mut self.proj_out)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rope::{apply_source_id, WanRope};
+    use std::collections::HashMap;
+
+    /// A tiny dense config the CPU synthetic weights below fill (dim 16 = 2 heads × head_dim 8, z16
+    /// in/out, patch (1,2,2)). Keeps the packed-forward geometry (`ppf·pph·ppw` tokens, 3-axis RoPE) but
+    /// small enough to run on CPU without weights.
+    fn tiny_cfg() -> TransformerConfig {
+        TransformerConfig {
+            in_channels: 16,
+            out_channels: 16,
+            num_layers: 2,
+            num_heads: 2,
+            head_dim: 8,
+            dim: 16,
+            ffn_dim: 32,
+            freq_dim: 16,
+            text_dim: 16,
+            patch: (1, 2, 2),
+            eps: 1e-6,
+            rope_theta: 10000.0,
+            rope_max_seq_len: 64,
+        }
+    }
+
+    /// Build a synthetic `WanTransformer` (all dense) from randn weights — every tensor key
+    /// [`WanTransformer::new`] reads, at [`DType::F32`] so the whole forward runs on CPU.
+    fn tiny_dit(cfg: &TransformerConfig, dev: &Device) -> WanTransformer {
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        let mut put = |k: &str, shape: &[usize]| {
+            m.insert(
+                k.to_string(),
+                Tensor::randn(0f32, 0.2f32, shape, dev).unwrap(),
+            );
+        };
+        let (pt, ph, pw) = cfg.patch;
+        let d = cfg.dim;
+        put("patch_embedding.weight", &[d, cfg.in_channels, pt, ph, pw]);
+        put("patch_embedding.bias", &[d]);
+        put(
+            "condition_embedder.text_embedder.linear_1.weight",
+            &[d, cfg.text_dim],
+        );
+        put("condition_embedder.text_embedder.linear_1.bias", &[d]);
+        put("condition_embedder.text_embedder.linear_2.weight", &[d, d]);
+        put("condition_embedder.text_embedder.linear_2.bias", &[d]);
+        put(
+            "condition_embedder.time_embedder.linear_1.weight",
+            &[d, cfg.freq_dim],
+        );
+        put("condition_embedder.time_embedder.linear_1.bias", &[d]);
+        put("condition_embedder.time_embedder.linear_2.weight", &[d, d]);
+        put("condition_embedder.time_embedder.linear_2.bias", &[d]);
+        put("condition_embedder.time_proj.weight", &[6 * d, d]);
+        put("condition_embedder.time_proj.bias", &[6 * d]);
+        for i in 0..cfg.num_layers {
+            let b = format!("blocks.{i}");
+            put(&format!("{b}.scale_shift_table"), &[1, 6, d]);
+            for attn in ["attn1", "attn2"] {
+                for leaf in ["to_q", "to_k", "to_v", "to_out.0"] {
+                    put(&format!("{b}.{attn}.{leaf}.weight"), &[d, d]);
+                    put(&format!("{b}.{attn}.{leaf}.bias"), &[d]);
+                }
+                put(&format!("{b}.{attn}.norm_q.weight"), &[d]);
+                put(&format!("{b}.{attn}.norm_k.weight"), &[d]);
+            }
+            put(&format!("{b}.norm2.weight"), &[d]);
+            put(&format!("{b}.norm2.bias"), &[d]);
+            put(&format!("{b}.ffn.net.0.proj.weight"), &[cfg.ffn_dim, d]);
+            put(&format!("{b}.ffn.net.0.proj.bias"), &[cfg.ffn_dim]);
+            put(&format!("{b}.ffn.net.2.weight"), &[d, cfg.ffn_dim]);
+            put(&format!("{b}.ffn.net.2.bias"), &[d]);
+        }
+        put("proj_out.weight", &[cfg.out_channels * pt * ph * pw, d]);
+        put("proj_out.bias", &[cfg.out_channels * pt * ph * pw]);
+        put("scale_shift_table", &[1, 2, d]);
+        let vb = VarBuilder::from_tensors(m, DType::F32, dev);
+        WanTransformer::new(cfg, vb).unwrap()
+    }
+
+    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    /// The refactored [`WanTransformer::forward`] is byte-identical to the explicit
+    /// `patch_embed_tokens → forward_packed → unpatchify_tokens` composition — pins the additive seams
+    /// to the validated monolithic forward (the many-crates-depend-on-it invariant).
+    #[test]
+    fn forward_equals_seam_composition() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let dit = tiny_dit(&cfg, &dev);
+        let latents = Tensor::randn(0f32, 1f32, (1, 16, 2, 4, 4), &dev).unwrap();
+        let context = Tensor::randn(0f32, 1f32, (1, 3, cfg.dim), &dev).unwrap();
+        let (cos, sin) = WanRope::new(&cfg).cos_sin(2, 2, 2, &dev).unwrap(); // L = 8
+        let t = 833.0;
+        let want = dit.forward(&latents, &context, t, &cos, &sin).unwrap();
+
+        let (tokens, grid) = dit.patch_embed_tokens(&latents).unwrap();
+        assert_eq!(grid, (2, 2, 2));
+        assert_eq!(tokens.dims(), &[1, 8, cfg.dim]);
+        let out = dit
+            .forward_packed(&tokens, t, &context, &cos, &sin)
+            .unwrap();
+        assert_eq!(out.dims(), &[1, 8, cfg.out_channels * 4]);
+        let got = dit.unpatchify_tokens(&out, grid).unwrap();
+        assert_eq!(
+            max_abs(&got, &want),
+            0.0,
+            "seam composition must equal forward"
+        );
+    }
+
+    /// A conditioning source concatenated on the token axis extends the packed sequence, but the sliced
+    /// target velocity keeps the target's shape — and the source actually couples into the target through
+    /// self-attention (the packed target-slice differs from the target-only forward), with the source-id
+    /// RoPE shifting the result. Mirrors the mlx `conditioning_source_preserves_target_shape` intent.
+    #[test]
+    fn packed_source_preserves_target_shape_and_couples() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let dit = tiny_dit(&cfg, &dev);
+        let hd = cfg.head_dim;
+        let rope = WanRope::new(&cfg);
+        let t = 700.0;
+
+        let target = Tensor::randn(0f32, 1f32, (1, 16, 2, 4, 4), &dev).unwrap();
+        let source = Tensor::randn(0f32, 1f32, (1, 16, 1, 4, 4), &dev).unwrap();
+        let context = Tensor::randn(0f32, 1f32, (1, 3, cfg.dim), &dev).unwrap();
+
+        let (tok_t, grid_t) = dit.patch_embed_tokens(&target).unwrap();
+        let (cos_t, sin_t) = rope.cos_sin(grid_t.0, grid_t.1, grid_t.2, &dev).unwrap();
+        let (tok_s, grid_s) = dit.patch_embed_tokens(&source).unwrap();
+        let (cos_s0, sin_s0) = rope.cos_sin(grid_s.0, grid_s.1, grid_s.2, &dev).unwrap();
+        // source id 1 shifts the source segment's RoPE; the target stays id 0.
+        let (cos_s, sin_s) = apply_source_id(&cos_s0, &sin_s0, 1.0, hd).unwrap();
+
+        let l_t = grid_t.0 * grid_t.1 * grid_t.2;
+        let tokens = Tensor::cat(&[&tok_s, &tok_t], 1).unwrap();
+        let cos = Tensor::cat(&[&cos_s, &cos_t], 0).unwrap();
+        let sin = Tensor::cat(&[&sin_s, &sin_t], 0).unwrap();
+        let out = dit
+            .forward_packed(&tokens, t, &context, &cos, &sin)
+            .unwrap();
+        let total = out.dim(1).unwrap();
+        let target_tokens = out.narrow(1, total - l_t, l_t).unwrap();
+        let vel = dit.unpatchify_tokens(&target_tokens, grid_t).unwrap();
+        assert_eq!(
+            vel.dims(),
+            target.dims(),
+            "target velocity keeps target shape"
+        );
+
+        // Coupling: the packed target-slice differs from the target-only forward (the source tokens
+        // entered the target through self-attention).
+        let solo = dit.forward(&target, &context, t, &cos_t, &sin_t).unwrap();
+        assert!(
+            max_abs(&vel, &solo) > 1e-5,
+            "a conditioning source must couple into the target velocity"
+        );
+
+        // The source-id RoPE matters: id 0 on the source segment yields a different target velocity.
+        let cos0 = Tensor::cat(&[&cos_s0, &cos_t], 0).unwrap();
+        let sin0 = Tensor::cat(&[&sin_s0, &sin_t], 0).unwrap();
+        let out0 = dit
+            .forward_packed(&tokens, t, &context, &cos0, &sin0)
+            .unwrap();
+        let vel0 = dit
+            .unpatchify_tokens(&out0.narrow(1, total - l_t, l_t).unwrap(), grid_t)
+            .unwrap();
+        assert!(
+            max_abs(&vel, &vel0) > 1e-6,
+            "source-id RoPE (id 1 vs id 0) must change the coupled velocity"
+        );
     }
 }

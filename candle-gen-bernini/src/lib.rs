@@ -48,10 +48,12 @@ pub mod clip_diff;
 pub mod config;
 pub mod connector;
 pub mod convert;
+pub mod forward;
 pub mod guidance;
 pub mod mar;
 mod nn;
 pub mod pipeline;
+pub mod preprocess;
 pub mod process;
 pub mod qwen2_5_vl;
 pub mod template;
@@ -64,12 +66,14 @@ pub use clip_diff::{DiffLossFm, FlowMatchScheduler};
 pub use config::{resolve_mode, BerniniKnobs, Defaults, Mode};
 pub use connector::MlpConnector;
 pub use convert::{build_bernini_candle_tier, route_bernini_expert_key};
+pub use forward::{guided_velocity, num_momentum_buffers, Combos, GuidanceParams, PackedForward};
 pub use guidance::{apg_delta, normalized_guidance, normalized_guidance_chain, MomentumBuffer};
 pub use mar::{
     feat_to_renderer, four_streams, mar_schedule, post_process_input_embeds, sample_vit_embed,
     FourStreams, RendererFeat, SampledStreams, StreamState, VitCfg,
 };
 pub use pipeline::{descriptor, force_link, load, MODEL_ID};
+pub use preprocess::{encode_image, encode_videoclip};
 pub use process::{
     build_attention_mask_4d, generate_unified_inputs, mrope_position_ids, MRopeConfig,
 };
