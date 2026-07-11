@@ -423,9 +423,14 @@ resolver = "2"
 # so candle-gen (which links neither mlx-gen nor those provider crates) compiles UNCHANGED. This is a pure
 # rev-alignment: it exists solely so the SceneWorks worker's `--features backend-candle` skew gate resolves
 # ONE gen-core rev when it re-pins mlx-gen -> 3612d33 and candle-gen -> the rev carrying THIS edit together.
+# Rev 3612d33 -> 498a12c (mlx-gen sc-11000 / PR #694, epic 10834): qwen-image sequential component
+# residency (the fan-out sibling of sc-10839; PURE mlx-gen-qwen-image provider Rust). `git diff
+# 3612d33..498a12c -- gen-core/ gen-core-testkit/` is EMPTY — gen-core BYTE-IDENTICAL, so candle-gen
+# compiles UNCHANGED; same pure rev-alignment so the worker's `--features backend-candle` skew gate
+# resolves ONE gen-core rev when it re-pins mlx-gen -> 498a12c and candle-gen -> the rev carrying THIS edit.
 # Both lines below move as one.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "3612d333c91660cd4baf3e6e1432de42fb2d1257" }
-sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "3612d333c91660cd4baf3e6e1432de42fb2d1257" }
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "498a12c0d4386959ecff1ee5db2c4b19147b7348" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "498a12c0d4386959ecff1ee5db2c4b19147b7348" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
