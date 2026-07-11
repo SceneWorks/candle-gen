@@ -44,6 +44,7 @@
 //! `backend = "candle"`, `mac_only = false`.
 
 pub mod assembly;
+pub mod bernini;
 pub mod clip_diff;
 pub mod config;
 pub mod connector;
@@ -62,11 +63,15 @@ pub mod vit_guidance;
 pub mod vit_preprocess;
 
 pub use assembly::{concat_with_zero_init, format_mllm_inputs_embeds, pad_and_truncate};
+pub use bernini::{denoise_bernini_wvitcfg, BVitExpert, Bernini};
 pub use clip_diff::{DiffLossFm, FlowMatchScheduler};
 pub use config::{resolve_mode, BerniniKnobs, Defaults, Mode};
 pub use connector::MlpConnector;
 pub use convert::{build_bernini_candle_tier, route_bernini_expert_key};
-pub use forward::{guided_velocity, num_momentum_buffers, Combos, GuidanceParams, PackedForward};
+pub use forward::{
+    guided_velocity, num_momentum_buffers, vit_one_step, Combos, GuidanceParams, PackedForward,
+    VitGuidanceParams, VitMode, VitStreams,
+};
 pub use guidance::{apg_delta, normalized_guidance, normalized_guidance_chain, MomentumBuffer};
 pub use mar::{
     feat_to_renderer, four_streams, mar_schedule, post_process_input_embeds, sample_vit_embed,
