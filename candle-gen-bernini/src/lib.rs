@@ -67,7 +67,7 @@ pub use bernini::{denoise_bernini_wvitcfg, BVitExpert, Bernini};
 pub use clip_diff::{DiffLossFm, FlowMatchScheduler};
 pub use config::{resolve_mode, BerniniKnobs, Defaults, Mode};
 pub use connector::MlpConnector;
-pub use convert::{build_bernini_candle_tier, route_bernini_expert_key};
+pub use convert::{build_bernini_candle_tier, route_bernini_expert_key, route_bernini_planner_key};
 pub use forward::{
     guided_velocity, num_momentum_buffers, vit_one_step, Combos, GuidanceParams, PackedForward,
     VitGuidanceParams, VitMode, VitStreams,

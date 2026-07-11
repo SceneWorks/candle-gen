@@ -58,6 +58,11 @@ use crate::assembly::{concat_with_zero_init, format_mllm_inputs_embeds};
 use crate::clip_diff::DiffLossFm;
 use crate::config::BerniniKnobs;
 use crate::connector::MlpConnector;
+use crate::convert::{
+    PLANNER_CONNECTOR_DIR, PLANNER_MASK_TOKENS_FILE, PLANNER_MASK_TOKENS_KEY,
+    PLANNER_MLLM_BACKBONE_PP, PLANNER_MLLM_DIR, PLANNER_MLLM_VISION_PP, PLANNER_QWEN_CONFIG_FILE,
+    PLANNER_SIDECAR_FILE, PLANNER_TOKENIZER_FILE, PLANNER_VIT_DECODER_DIR, PLANNER_VIT_DECODER_PP,
+};
 use crate::forward::{vit_one_step, PackedForward, VitGuidanceParams, VitMode, VitStreams};
 use crate::mar::{mar_schedule, post_process_input_embeds, sample_vit_embed, StreamState, VitCfg};
 use crate::preprocess::{encode_image, encode_videoclip};
@@ -118,7 +123,7 @@ struct PlannerKnobs {
 
 impl PlannerKnobs {
     fn from_dir(root: &Path) -> Self {
-        let v: serde_json::Value = std::fs::read(root.join("bernini_planner.json"))
+        let v: serde_json::Value = std::fs::read(root.join(PLANNER_SIDECAR_FILE))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or(serde_json::Value::Null);
@@ -189,21 +194,29 @@ impl BerniniPlanner {
     /// Loaded dense bf16 (planner quantization is a follow-up; the renderer experts carry the dominant
     /// footprint and quantize separately via the packed-detect tier).
     fn load(root: &Path, device: &Device) -> CResult<Self> {
-        let cfg_path = root.join("qwen2_5_vl_config.json");
+        let cfg_path = root.join(PLANNER_QWEN_CONFIG_FILE);
         let qcfg = QwenVlTextConfig::from_config_json(&cfg_path)?;
         let vcfg = VisionConfig::from_config_json(&cfg_path)?;
 
-        let mllm_vb = candle_gen::component_vb(root, "mllm", PLANNER_DTYPE, device, MODEL_ID)?;
-        let backbone = Qwen25VlText::new(qcfg, mllm_vb.pp("model"))?;
-        let vision = VisionTower::new(vcfg, mllm_vb.pp("visual"))?;
+        let mllm_vb =
+            candle_gen::component_vb(root, PLANNER_MLLM_DIR, PLANNER_DTYPE, device, MODEL_ID)?;
+        let backbone = Qwen25VlText::new(qcfg, mllm_vb.pp(PLANNER_MLLM_BACKBONE_PP))?;
+        let vision = VisionTower::new(vcfg, mllm_vb.pp(PLANNER_MLLM_VISION_PP))?;
 
-        let conn_vb = candle_gen::component_vb(root, "connector", PLANNER_DTYPE, device, MODEL_ID)?;
+        let conn_vb =
+            candle_gen::component_vb(root, PLANNER_CONNECTOR_DIR, PLANNER_DTYPE, device, MODEL_ID)?;
         let connector = MlpConnector::new(conn_vb)?;
 
         let knobs = PlannerKnobs::from_dir(root);
-        let vd_vb = candle_gen::component_vb(root, "vit_decoder", PLANNER_DTYPE, device, MODEL_ID)?;
+        let vd_vb = candle_gen::component_vb(
+            root,
+            PLANNER_VIT_DECODER_DIR,
+            PLANNER_DTYPE,
+            device,
+            MODEL_ID,
+        )?;
         let clip_diff = DiffLossFm::new(
-            vd_vb.pp("net"),
+            vd_vb.pp(PLANNER_VIT_DECODER_PP),
             knobs.clip_diff_depth,
             knobs.clip_diff_in_channels,
             knobs.clip_diff_shift,
@@ -211,19 +224,22 @@ impl BerniniPlanner {
 
         // `self.mask_tokens[:, :1]` — a single mask token, broadcast over the n_query target slots.
         let mask_map = candle_gen::candle_core::safetensors::load(
-            root.join("mask_tokens.safetensors"),
+            root.join(PLANNER_MASK_TOKENS_FILE),
             device,
         )?;
         let mask_token = mask_map
-            .get("mask_tokens")
+            .get(PLANNER_MASK_TOKENS_KEY)
             .ok_or_else(|| {
-                CandleError::Msg("bernini: mask_tokens.safetensors missing `mask_tokens`".into())
+                CandleError::Msg(format!(
+                    "bernini: {PLANNER_MASK_TOKENS_FILE} missing `{PLANNER_MASK_TOKENS_KEY}`"
+                ))
             })?
             .narrow(1, 0, 1)?
             .to_dtype(PLANNER_DTYPE)?;
 
-        let template =
-            BerniniTemplate::from_tokenizer_file(root.join("mllm").join("tokenizer.json"))?;
+        let template = BerniniTemplate::from_tokenizer_file(
+            root.join(PLANNER_MLLM_DIR).join(PLANNER_TOKENIZER_FILE),
+        )?;
         Ok(Self {
             backbone,
             vision,
@@ -1185,6 +1201,47 @@ mod tests {
         assert_eq!(g.descriptor().backend, "candle");
         assert_eq!(g.descriptor().modality, Modality::Video);
         assert!(!g.descriptor().capabilities.mac_only);
+    }
+
+    /// sc-11061 layout contract (loader side): the exact on-disk paths [`BerniniPlanner::load`] reads
+    /// are built from the shared `crate::convert::PLANNER_*` consts, so the converter's emitted layout
+    /// and this reader can never drift. Pins those consts to the concrete relative paths under a snapshot
+    /// root — the mirror of `planner_layout_consts_are_stable` in `convert.rs`.
+    #[test]
+    fn planner_layout_consts_match_loader() {
+        let root = Path::new("/snap");
+        // Root-level files.
+        assert_eq!(
+            root.join(PLANNER_QWEN_CONFIG_FILE),
+            Path::new("/snap/qwen2_5_vl_config.json")
+        );
+        assert_eq!(
+            root.join(PLANNER_MASK_TOKENS_FILE),
+            Path::new("/snap/mask_tokens.safetensors")
+        );
+        assert_eq!(
+            root.join(PLANNER_SIDECAR_FILE),
+            Path::new("/snap/bernini_planner.json")
+        );
+        // Component dirs (mmap'd by `component_vb`) + the tokenizer inside `mllm/`.
+        assert_eq!(root.join(PLANNER_MLLM_DIR), Path::new("/snap/mllm"));
+        assert_eq!(
+            root.join(PLANNER_CONNECTOR_DIR),
+            Path::new("/snap/connector")
+        );
+        assert_eq!(
+            root.join(PLANNER_VIT_DECODER_DIR),
+            Path::new("/snap/vit_decoder")
+        );
+        assert_eq!(
+            root.join(PLANNER_MLLM_DIR).join(PLANNER_TOKENIZER_FILE),
+            Path::new("/snap/mllm/tokenizer.json")
+        );
+        // Intra-component `.pp(..)` namespaces the loader descends into.
+        assert_eq!(PLANNER_MLLM_BACKBONE_PP, "model");
+        assert_eq!(PLANNER_MLLM_VISION_PP, "visual");
+        assert_eq!(PLANNER_VIT_DECODER_PP, "net");
+        assert_eq!(PLANNER_MASK_TOKENS_KEY, "mask_tokens");
     }
 
     #[test]

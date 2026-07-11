@@ -20,8 +20,28 @@
 //! `BerniniRendererModel` itself loads T5/VAE from its `wan22_base`). A `bernini_renderer.json` sidecar
 //! preserves the Bernini knobs (switch boundary / flow shift / src-id rotary).
 //!
+//! In addition to the two renderer experts, this converter also extracts the **semantic-planner**
+//! components — the candle sibling of `mlx-gen-bernini/src/convert.rs` (sc-5144) — into the exact
+//! candle turnkey layout [`crate::bernini::BerniniPlanner::load`] reads (sc-11061), so a single
+//! converted directory is a complete full-`bernini` snapshot the whole planner→renderer pipeline can
+//! load real weights from:
+//!
+//! | source prefix (combined `bernini/` index) | candle layout destination                        |
+//! |-------------------------------------------|--------------------------------------------------|
+//! | `mllm.model.*`  / `mllm.visual.*`         | `mllm/` component (backbone `.pp("model")`, vision `.pp("visual")`) |
+//! | `mllm.lm_head.weight`                     | *dropped* (stateless extractor — no token head)  |
+//! | `connector.proj_gen.*` / `connector.pred_vit.*` | `connector/` component (`MlpConnector`)    |
+//! | `vit_decoder.net.*`                       | `vit_decoder/` component (`DiffLossFm` `.pp("net")`) |
+//! | `mask_tokens`                             | `mask_tokens.safetensors` (key `mask_tokens`)    |
+//!
+//! plus the copied Qwen2.5-VL `tokenizer.json` (into `mllm/`), a `qwen2_5_vl_config.json` (copy of the
+//! package's `mllm/config.json`, read by the backbone/vision/MRoPE configs), and a `bernini_planner.json`
+//! sidecar (`num_mask_token`, `max_sequence_length`, `clip_diff_cfg` z_channels + shift). The planner is
+//! written **dense bf16** — packed planner quant is the separate sc-11062, deliberately not done here.
+//!
 //! The [`build_bernini_candle_tier`] entry point is an `#[ignore]`d test (it needs the multi-GB package
-//! on disk); the pure [`route_bernini_expert_key`] routing core is unit-tested in CI (no weights).
+//! on disk); the pure [`route_bernini_expert_key`] / [`route_bernini_planner_key`] routing cores are
+//! unit-tested in CI (no weights), as is the on-disk layout contract vs. the loader.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -37,6 +57,46 @@ const EXPERT_PREFIXES: [(&str, &str); 2] = [
     ("diff_dec.transformer.", "transformer"),
 ];
 
+// --- Planner on-disk layout contract (shared with the loader) ---------------------------------------
+//
+// These consts are the SINGLE SOURCE OF TRUTH for the candle full-`bernini` planner layout: the
+// converter writes them and [`crate::bernini::BerniniPlanner::load`] reads them, so the two can never
+// drift (a rename breaks the compile of both). The `*_PP` consts are the intra-component weight-key
+// namespaces the loader `.pp(..)`s into (and that routing strips to).
+
+/// `mllm/` component dir — holds the Qwen2.5-VL backbone (`model.*`) + vision tower (`visual.*`) weights
+/// **and** the copied `tokenizer.json`.
+pub const PLANNER_MLLM_DIR: &str = "mllm";
+/// Backbone weight-key namespace inside `mllm/` (loader `.pp("model")`).
+pub const PLANNER_MLLM_BACKBONE_PP: &str = "model";
+/// Vision-tower weight-key namespace inside `mllm/` (loader `.pp("visual")`).
+pub const PLANNER_MLLM_VISION_PP: &str = "visual";
+/// `connector/` component dir — the `proj_gen.*` / `pred_vit.*` MLP connector.
+pub const PLANNER_CONNECTOR_DIR: &str = "connector";
+/// `vit_decoder/` component dir — the clip-diff flow head, keyed under `net.*`.
+pub const PLANNER_VIT_DECODER_DIR: &str = "vit_decoder";
+/// Clip-diff weight-key namespace inside `vit_decoder/` (loader `.pp("net")`).
+pub const PLANNER_VIT_DECODER_PP: &str = "net";
+/// The MAR mask-token file at the snapshot root (single tensor keyed [`PLANNER_MASK_TOKENS_KEY`]).
+pub const PLANNER_MASK_TOKENS_FILE: &str = "mask_tokens.safetensors";
+/// The tensor key inside [`PLANNER_MASK_TOKENS_FILE`].
+pub const PLANNER_MASK_TOKENS_KEY: &str = "mask_tokens";
+/// The Qwen2.5-VL config at the snapshot root (verbatim copy of the package `mllm/config.json`).
+pub const PLANNER_QWEN_CONFIG_FILE: &str = "qwen2_5_vl_config.json";
+/// The tokenizer copied into `mllm/` (loader reads `mllm/tokenizer.json`).
+pub const PLANNER_TOKENIZER_FILE: &str = "tokenizer.json";
+/// The distilled planner-knobs sidecar at the snapshot root.
+pub const PLANNER_SIDECAR_FILE: &str = "bernini_planner.json";
+
+/// The three prefix-routed planner component groups (dir-based). `mllm.lm_head` and the bare
+/// `mask_tokens` parameter are handled outside this table (see [`route_bernini_planner_key`]). No prefix
+/// here is a prefix of another, so first-match routing is unambiguous.
+const PLANNER_PREFIXES: [(&str, &str); 3] = [
+    ("mllm.", PLANNER_MLLM_DIR),
+    ("connector.", PLANNER_CONNECTOR_DIR),
+    ("vit_decoder.", PLANNER_VIT_DECODER_DIR),
+];
+
 /// Route a combined-index key to `(component dir, stripped diffusers key)`, or `None` if it is not a
 /// renderer-expert tensor (the planner MLLM / connector / vit_decoder / mask_tokens / the redundant T5
 /// copy are all skipped). `diff_dec_low.` is checked first, but the prefixes are disjoint anyway
@@ -50,10 +110,48 @@ pub fn route_bernini_expert_key(k: &str) -> Option<(&'static str, String)> {
     None
 }
 
-/// One sweep over the `bernini/` shards, routing each renderer-expert tensor to its component map with
-/// the prefix stripped (diffusers keys). Non-expert tensors are never retained. Returns
-/// `{"transformer" -> map, "transformer_2" -> map}`.
-fn extract_experts(bernini_dir: &Path) -> Result<HashMap<&'static str, HashMap<String, Tensor>>> {
+/// Route a combined-index key to `(planner destination, stripped key)`, or `None` if it is not a planner
+/// tensor (a renderer DiT, the redundant `t5_text_encoder.*` copy, or the dropped `mllm.lm_head`).
+///
+/// The destination is either a component dir ([`PLANNER_MLLM_DIR`] / [`PLANNER_CONNECTOR_DIR`] /
+/// [`PLANNER_VIT_DECODER_DIR`] — the stripped key stays in the diffusers key schema the corresponding
+/// loader reads: `model.*`/`visual.*`, `proj_gen.*`/`pred_vit.*`, `net.*`) or the special
+/// [`PLANNER_MASK_TOKENS_KEY`] sentinel for the bare `mask_tokens` parameter (no trailing segment, so its
+/// key is unchanged), which the writer routes to the root-level [`PLANNER_MASK_TOKENS_FILE`].
+pub fn route_bernini_planner_key(k: &str) -> Option<(&'static str, String)> {
+    // The planner is a stateless feature extractor — the Qwen LM head is never used.
+    if k == "mllm.lm_head.weight" {
+        return None;
+    }
+    // The bare MAR mask-token parameter has no trailing segment; its key is kept verbatim.
+    if k == PLANNER_MASK_TOKENS_KEY {
+        return Some((PLANNER_MASK_TOKENS_KEY, PLANNER_MASK_TOKENS_KEY.to_string()));
+    }
+    for (prefix, out) in PLANNER_PREFIXES {
+        if let Some(rest) = k.strip_prefix(prefix) {
+            return Some((out, rest.to_string()));
+        }
+    }
+    None
+}
+
+/// Everything extracted from the combined `bernini/` index in one shard sweep: the two renderer experts,
+/// the three prefix-routed planner component groups, and the single MAR mask-token tensor.
+struct Extracted {
+    /// `{"transformer" -> map, "transformer_2" -> map}` (diffusers keys).
+    experts: HashMap<&'static str, HashMap<String, Tensor>>,
+    /// `{"mllm" -> map, "connector" -> map, "vit_decoder" -> map}` (stripped planner keys).
+    planner: HashMap<&'static str, HashMap<String, Tensor>>,
+    /// The bare `mask_tokens` parameter.
+    mask_tokens: Option<Tensor>,
+}
+
+/// One sweep over the `bernini/` shards, routing each tensor to its renderer-expert **or** planner group
+/// with the prefix stripped. Every non-Bernini tensor (the redundant T5 copy, the dropped `mllm.lm_head`)
+/// is skipped. Reading the ~168 GB index once and routing both families together avoids a second full
+/// pass. Returns the experts (`transformer`/`transformer_2`), planner groups (`mllm`/`connector`/
+/// `vit_decoder`), and the mask token.
+fn extract_components(bernini_dir: &Path) -> Result<Extracted> {
     let mut shards: Vec<std::path::PathBuf> = std::fs::read_dir(bernini_dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
@@ -66,29 +164,56 @@ fn extract_experts(bernini_dir: &Path) -> Result<HashMap<&'static str, HashMap<S
             bernini_dir.display()
         )));
     }
-    let mut groups: HashMap<&'static str, HashMap<String, Tensor>> = HashMap::new();
-    groups.insert("transformer", HashMap::new());
-    groups.insert("transformer_2", HashMap::new());
+    let mut experts: HashMap<&'static str, HashMap<String, Tensor>> = HashMap::new();
+    experts.insert("transformer", HashMap::new());
+    experts.insert("transformer_2", HashMap::new());
+    let mut planner: HashMap<&'static str, HashMap<String, Tensor>> = HashMap::new();
+    planner.insert(PLANNER_MLLM_DIR, HashMap::new());
+    planner.insert(PLANNER_CONNECTOR_DIR, HashMap::new());
+    planner.insert(PLANNER_VIT_DECODER_DIR, HashMap::new());
+    let mut mask_tokens: Option<Tensor> = None;
+
     for shard in &shards {
         let map = cst::load(shard, &Device::Cpu)?;
         for (k, v) in map {
             if let Some((out, key)) = route_bernini_expert_key(&k) {
-                groups
+                experts
                     .get_mut(out)
-                    .expect("component group present")
+                    .expect("expert group present")
                     .insert(key, v);
+            } else if let Some((out, key)) = route_bernini_planner_key(&k) {
+                if out == PLANNER_MASK_TOKENS_KEY {
+                    mask_tokens = Some(v);
+                } else {
+                    planner
+                        .get_mut(out)
+                        .expect("planner group present")
+                        .insert(key, v);
+                }
             }
         }
     }
-    for (name, g) in &groups {
+
+    for (name, g) in experts.iter().chain(planner.iter()) {
         if g.is_empty() {
             return Err(candle_gen::candle_core::Error::Msg(format!(
                 "build_bernini_candle_tier: no tensors routed to {name}/ (expected the \
-                 diff_dec/diff_dec_low prefixes of a ByteDance/Bernini-Diffusers `bernini/` index)"
+                 diff_dec/diff_dec_low + mllm/connector/vit_decoder prefixes of a \
+                 ByteDance/Bernini-Diffusers `bernini/` index)"
             )));
         }
     }
-    Ok(groups)
+    if mask_tokens.is_none() {
+        return Err(candle_gen::candle_core::Error::Msg(
+            "build_bernini_candle_tier: no `mask_tokens` parameter found in the `bernini/` index"
+                .into(),
+        ));
+    }
+    Ok(Extracted {
+        experts,
+        planner,
+        mask_tokens,
+    })
 }
 
 /// Write one expert component `map` (diffusers keys) to `dst` as a single `model.safetensors`. When
@@ -119,6 +244,59 @@ fn write_expert(map: HashMap<String, Tensor>, dst: &Path, bits: usize) -> Result
         )?;
     }
     Ok(packed)
+}
+
+/// Write one **dense bf16** planner component `map` (already-stripped keys) to `dst` as a single
+/// `model.safetensors`. Unlike the renderer experts, the planner is never packed here — packed planner
+/// quant is the separate sc-11062; the loader reads these dense (bf16, the Qwen2.5-VL native dtype).
+fn write_planner_component(map: HashMap<String, Tensor>, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    let bf16: HashMap<String, Tensor> = map
+        .into_iter()
+        .map(|(k, v)| Ok((k, v.to_dtype(DType::BF16)?)))
+        .collect::<Result<_>>()?;
+    cst::save(&bf16, dst.join("model.safetensors"))?;
+    Ok(())
+}
+
+/// Write the single MAR `mask_tokens` parameter (dense bf16) to the root-level
+/// [`PLANNER_MASK_TOKENS_FILE`] under key [`PLANNER_MASK_TOKENS_KEY`] (the loader's
+/// `safetensors::load(..).get("mask_tokens")`).
+fn write_mask_tokens(mask: Tensor, out_dir: &Path) -> Result<()> {
+    let mut m: HashMap<String, Tensor> = HashMap::new();
+    m.insert(
+        PLANNER_MASK_TOKENS_KEY.to_string(),
+        mask.to_dtype(DType::BF16)?,
+    );
+    cst::save(&m, out_dir.join(PLANNER_MASK_TOKENS_FILE))?;
+    Ok(())
+}
+
+/// The planner knobs the [`crate::bernini::BerniniPlanner`] loader reads from `bernini_planner.json`:
+/// `num_mask_token`, `max_sequence_length`, and the `clip_diff_cfg` object (the loader pulls
+/// `z_channels` + `shift` from it). Distilled from the package `config.json`, with the upstream defaults
+/// where a field is absent (and a synthesized `clip_diff_cfg` so `z_channels`/`shift` always resolve).
+fn bernini_planner_knobs(pkg: &Path) -> serde_json::Value {
+    use serde_json::json;
+    let cfg: serde_json::Value = std::fs::read(pkg.join("config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_else(|| json!({}));
+    let i = |k: &str, d: i64| cfg.get(k).and_then(serde_json::Value::as_i64).unwrap_or(d);
+    let clip_diff_cfg = cfg
+        .get("clip_diff_cfg")
+        .cloned()
+        .unwrap_or_else(|| json!({ "z_channels": 3584, "shift": 2.0 }));
+    let connector_cfg = cfg
+        .get("connector_cfg")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    json!({
+        "num_mask_token": i("num_mask_token", 4096),
+        "max_sequence_length": i("max_sequence_length", 512),
+        "clip_diff_cfg": clip_diff_cfg,
+        "connector_cfg": connector_cfg,
+    })
 }
 
 /// Copy a base-snapshot component dir/file into the tier verbatim, recursively (following symlinks so
@@ -181,16 +359,38 @@ pub fn build_bernini_candle_tier(
     }
     std::fs::create_dir_all(out_dir)?;
 
-    // 1. The two renderer experts: strip prefix → diffusers keys → pack (or dense bf16).
-    let mut groups = extract_experts(&bernini_dir)?;
+    // 1. One sweep over the combined index: the two renderer experts + the planner components.
+    let Extracted {
+        mut experts,
+        mut planner,
+        mask_tokens,
+    } = extract_components(&bernini_dir)?;
+
+    // 1a. Renderer experts: strip prefix → diffusers keys → pack (or dense bf16).
     for (name, dir) in [
         ("transformer", "transformer"),
         ("transformer_2", "transformer_2"),
     ] {
-        let map = groups.remove(name).expect("expert group present");
+        let map = experts.remove(name).expect("expert group present");
         let n = write_expert(map, &out_dir.join(dir), bits)?;
         eprintln!("[[BERNINI-CANDLE-TIER]] {name}: packed {n} Linears (bits={bits})");
     }
+
+    // 1b. Planner components: dense bf16 (packed planner quant is sc-11062, deliberately not here).
+    for dir in [
+        PLANNER_MLLM_DIR,
+        PLANNER_CONNECTOR_DIR,
+        PLANNER_VIT_DECODER_DIR,
+    ] {
+        let map = planner.remove(dir).expect("planner group present");
+        let n = map.len();
+        write_planner_component(map, &out_dir.join(dir))?;
+        eprintln!("[[BERNINI-CANDLE-TIER]] {dir}: {n} dense bf16 tensors");
+    }
+    write_mask_tokens(
+        mask_tokens.expect("mask_tokens present (extract_components guarantees it)"),
+        out_dir,
+    )?;
 
     // 2. Stock Wan2.2 components copied verbatim from the base snapshot.
     for name in [
@@ -206,7 +406,27 @@ pub fn build_bernini_candle_tier(
         }
     }
 
-    // 3. Bernini knobs sidecar.
+    // 3a. Planner configs: the Qwen2.5-VL config (verbatim `mllm/config.json`) + the tokenizer copied
+    // into `mllm/` (the loader reads `mllm/tokenizer.json` for the chat template) + the knobs sidecar.
+    let pkg_mllm = bernini_diffusers_dir.join(PLANNER_MLLM_DIR);
+    let cfg_src = pkg_mllm.join("config.json");
+    if cfg_src.exists() {
+        copy_recursive(&cfg_src, &out_dir.join(PLANNER_QWEN_CONFIG_FILE))?;
+    }
+    let tok_src = pkg_mllm.join(PLANNER_TOKENIZER_FILE);
+    if tok_src.exists() {
+        copy_recursive(
+            &tok_src,
+            &out_dir.join(PLANNER_MLLM_DIR).join(PLANNER_TOKENIZER_FILE),
+        )?;
+    }
+    std::fs::write(
+        out_dir.join(PLANNER_SIDECAR_FILE),
+        serde_json::to_string_pretty(&bernini_planner_knobs(bernini_diffusers_dir))
+            .map_err(|e| candle_gen::candle_core::Error::Msg(e.to_string()))?,
+    )?;
+
+    // 3b. Bernini renderer knobs sidecar.
     std::fs::write(
         out_dir.join("bernini_renderer.json"),
         serde_json::to_string_pretty(&bernini_renderer_knobs(bernini_diffusers_dir))
@@ -272,6 +492,150 @@ mod tests {
             let got_ref = got.as_ref().map(|(o, s)| (*o, s.as_str()));
             assert_eq!(got_ref, *want, "routing {k}");
         }
+    }
+
+    /// sc-11061: the planner routing is a faithful prefix strip into the candle turnkey layout the
+    /// [`crate::bernini::BerniniPlanner`] loader reads — `mllm.model.*`/`mllm.visual.*` → `mllm/`
+    /// (keys stay `model.*`/`visual.*` for the loader's `.pp("model")`/`.pp("visual")`),
+    /// `connector.{proj_gen,pred_vit}.*` → `connector/`, `vit_decoder.net.*` → `vit_decoder/` (keeps
+    /// `net.*` for `.pp("net")`), the bare `mask_tokens` → the mask-tokens sentinel; the renderer DiTs,
+    /// the redundant T5 copy, and the dropped `mllm.lm_head` are all skipped.
+    #[test]
+    fn planner_key_routing() {
+        let cases: &[(&str, Option<(&str, &str)>)] = &[
+            // Qwen2.5-VL backbone + vision → `mllm/`, prefix stripped, `.pp` namespace preserved.
+            (
+                "mllm.model.layers.0.self_attn.q_proj.weight",
+                Some((PLANNER_MLLM_DIR, "model.layers.0.self_attn.q_proj.weight")),
+            ),
+            (
+                "mllm.model.embed_tokens.weight",
+                Some((PLANNER_MLLM_DIR, "model.embed_tokens.weight")),
+            ),
+            (
+                "mllm.model.norm.weight",
+                Some((PLANNER_MLLM_DIR, "model.norm.weight")),
+            ),
+            (
+                "mllm.visual.blocks.0.attn.qkv.weight",
+                Some((PLANNER_MLLM_DIR, "visual.blocks.0.attn.qkv.weight")),
+            ),
+            (
+                "mllm.visual.patch_embed.proj.weight",
+                Some((PLANNER_MLLM_DIR, "visual.patch_embed.proj.weight")),
+            ),
+            // Connector branches → `connector/`.
+            (
+                "connector.proj_gen.0.weight",
+                Some((PLANNER_CONNECTOR_DIR, "proj_gen.0.weight")),
+            ),
+            (
+                "connector.pred_vit.3.weight",
+                Some((PLANNER_CONNECTOR_DIR, "pred_vit.3.weight")),
+            ),
+            // ViT decoder (DiffLoss_FM) → `vit_decoder/`, keeps the `net.` substructure.
+            (
+                "vit_decoder.net.cond_embed.weight",
+                Some((PLANNER_VIT_DECODER_DIR, "net.cond_embed.weight")),
+            ),
+            (
+                "vit_decoder.net.res_blocks.7.adaLN_modulation.1.weight",
+                Some((
+                    PLANNER_VIT_DECODER_DIR,
+                    "net.res_blocks.7.adaLN_modulation.1.weight",
+                )),
+            ),
+            (
+                "vit_decoder.net.final_layer.linear.weight",
+                Some((PLANNER_VIT_DECODER_DIR, "net.final_layer.linear.weight")),
+            ),
+            // The bare MAR mask-token parameter → the mask-tokens sentinel, key unchanged.
+            (
+                "mask_tokens",
+                Some((PLANNER_MASK_TOKENS_KEY, PLANNER_MASK_TOKENS_KEY)),
+            ),
+            // Dropped / skipped.
+            ("mllm.lm_head.weight", None),
+            ("diff_dec.transformer.blocks.0.attn1.to_q.weight", None),
+            ("diff_dec_low.transformer_2.patch_embedding.weight", None),
+            ("t5_text_encoder.shared.weight", None),
+        ];
+        for (k, want) in cases {
+            let got = route_bernini_planner_key(k);
+            let got_ref = got.as_ref().map(|(o, s)| (*o, s.as_str()));
+            assert_eq!(got_ref, *want, "routing {k}");
+        }
+    }
+
+    /// The renderer-expert and planner routers partition the index: no key routes to both, and every
+    /// planner prefix is disjoint from the others (no first-match shadowing). The `mllm.` prefix does not
+    /// swallow the dropped `lm_head`, and `mask_tokens` (no trailing dot) does not shadow any prefix.
+    #[test]
+    fn expert_and_planner_routers_are_disjoint() {
+        let expert_keys = [
+            "diff_dec.transformer.blocks.0.attn1.to_q.weight",
+            "diff_dec_low.transformer_2.patch_embedding.weight",
+        ];
+        for k in expert_keys {
+            assert!(route_bernini_expert_key(k).is_some(), "{k} is an expert");
+            assert!(
+                route_bernini_planner_key(k).is_none(),
+                "{k} must NOT route to a planner group"
+            );
+        }
+        let planner_keys = [
+            "mllm.model.norm.weight",
+            "mllm.visual.patch_embed.proj.weight",
+            "connector.proj_gen.0.weight",
+            "vit_decoder.net.cond_embed.weight",
+            "mask_tokens",
+        ];
+        for k in planner_keys {
+            assert!(
+                route_bernini_planner_key(k).is_some(),
+                "{k} is a planner tensor"
+            );
+            assert!(
+                route_bernini_expert_key(k).is_none(),
+                "{k} must NOT route to a renderer expert"
+            );
+        }
+        // No planner prefix is a prefix of another (first-match routing is unambiguous).
+        for (i, (a, _)) in PLANNER_PREFIXES.iter().enumerate() {
+            for (j, (b, _)) in PLANNER_PREFIXES.iter().enumerate() {
+                if i != j {
+                    assert!(!a.starts_with(b), "planner prefix '{b}' shadows '{a}'");
+                }
+            }
+        }
+    }
+
+    /// sc-11061 layout contract: the on-disk layout the converter emits is EXACTLY what
+    /// [`crate::bernini::BerniniPlanner::load`] reads. This pins the shared path/namespace consts against
+    /// the literal strings the loader uses — a rename in either place must update the shared const, and
+    /// this test (plus the loader's own use of the same consts) is the tripwire. See the sibling
+    /// `planner_layout_consts_match_loader` test in `bernini.rs` which asserts the loader-side paths are
+    /// built from these very consts.
+    #[test]
+    fn planner_layout_consts_are_stable() {
+        assert_eq!(PLANNER_MLLM_DIR, "mllm");
+        assert_eq!(PLANNER_MLLM_BACKBONE_PP, "model");
+        assert_eq!(PLANNER_MLLM_VISION_PP, "visual");
+        assert_eq!(PLANNER_CONNECTOR_DIR, "connector");
+        assert_eq!(PLANNER_VIT_DECODER_DIR, "vit_decoder");
+        assert_eq!(PLANNER_VIT_DECODER_PP, "net");
+        assert_eq!(PLANNER_MASK_TOKENS_FILE, "mask_tokens.safetensors");
+        assert_eq!(PLANNER_MASK_TOKENS_KEY, "mask_tokens");
+        assert_eq!(PLANNER_QWEN_CONFIG_FILE, "qwen2_5_vl_config.json");
+        assert_eq!(PLANNER_TOKENIZER_FILE, "tokenizer.json");
+        assert_eq!(PLANNER_SIDECAR_FILE, "bernini_planner.json");
+        // The routing strips to keys under the loader's `.pp(..)` namespaces.
+        let (_, mk) = route_bernini_planner_key("mllm.model.norm.weight").unwrap();
+        assert!(mk.starts_with(&format!("{PLANNER_MLLM_BACKBONE_PP}.")));
+        let (_, vk) = route_bernini_planner_key("mllm.visual.merger.mlp.0.weight").unwrap();
+        assert!(vk.starts_with(&format!("{PLANNER_MLLM_VISION_PP}.")));
+        let (_, nk) = route_bernini_planner_key("vit_decoder.net.cond_embed.weight").unwrap();
+        assert!(nk.starts_with(&format!("{PLANNER_VIT_DECODER_PP}.")));
     }
 
     /// The two expert prefixes are disjoint (neither shadows the other in first-match routing) —
