@@ -154,6 +154,64 @@ fn tiny_dit_config() -> Krea2Config {
     }
 }
 
+/// **Edit-forward integrated smoke** (epic 10871 / sc-10877, sc-10878) on the committed tiny DiT — no
+/// 12B download needed. Exercises the real `forward_edit` plumbing (ref patch-embed through `img_in`,
+/// the `[text, refs…, target]` seq-concat, `build_edit` RoPE frames, the single-stream stack, the
+/// target-tail slice, unpatchify) end to end on real (tiny) weights:
+///  1. **Zero refs ≡ the base forward** — `forward_edit(…, &[])` must equal `forward(…)` to f32 noise
+///     (`build_edit(n_refs=0) ≡ build_t2i`, and `[ctx, target]` == `[ctx, img]`).
+///  2. **A reference influences the target** — one ref yields the same-shaped, finite velocity that
+///     *differs* from the base (the in-context tokens actually condition the output).
+///  3. **Two refs** — the scene/person path runs and stays finite + correctly shaped (sc-10878).
+#[test]
+fn edit_forward_reduces_to_base_and_refs_influence() -> Result<()> {
+    let w = load("dit_golden.safetensors");
+    let cfg = tiny_dit_config();
+    let dit = Krea2Transformer::load(&w, &cfg)?;
+    let latent = w.get("in.latent")?;
+    let timestep = w.get("in.timestep")?;
+    let context = w.get("in.context")?;
+
+    let base = dit.forward(&latent, &timestep, &context)?;
+
+    // 1. Zero references ≡ the base forward (byte-close: same ops, same RoPE table).
+    let edit0 = dit.forward_edit(&latent, &timestep, &context, &[])?;
+    assert_eq!(edit0.dims(), base.dims(), "zero-ref edit shape");
+    let d0 = max_abs_diff(&edit0, &base);
+    assert!(
+        d0 < 1e-5,
+        "forward_edit(&[]) must equal forward() (max abs {d0:e})"
+    );
+
+    // A synthetic reference latent at the target resolution (a transform of the noise latent — any
+    // same-shaped normalized latent exercises the ref path).
+    let ref0 = ((&latent * 0.5)? + 0.1)?;
+
+    // 2. One reference: same shape, finite, and materially different from the base.
+    let edit1 = dit.forward_edit(&latent, &timestep, &context, std::slice::from_ref(&ref0))?;
+    assert_eq!(edit1.dims(), base.dims(), "one-ref edit shape");
+    assert!(
+        vec_f32(&edit1).iter().all(|v| v.is_finite()),
+        "one-ref edit finite"
+    );
+    let d1 = max_abs_diff(&edit1, &base);
+    println!("edit-forward smoke: zero-ref Δ={d0:e} · one-ref Δ={d1:e}");
+    assert!(
+        d1 > 1e-4,
+        "a reference must influence the target velocity (Δ={d1:e})"
+    );
+
+    // 3. Two references (scene = image 1, person = image 2): runs, correct shape, finite.
+    let ref1 = ((&latent * (-0.3))? + 0.2)?;
+    let edit2 = dit.forward_edit(&latent, &timestep, &context, &[ref0, ref1])?;
+    assert_eq!(edit2.dims(), base.dims(), "two-ref edit shape");
+    assert!(
+        vec_f32(&edit2).iter().all(|v| v.is_finite()),
+        "two-ref edit finite"
+    );
+    Ok(())
+}
+
 /// Full `SingleStreamDiT` forward: img patch-embed, the custom timestep embedding + shared modulation,
 /// text fusion + `txt_in`, the joint single-stream stack under 3-axis RoPE, the final layer, and
 /// unpatchify — end to end vs the reference velocity.
