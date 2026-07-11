@@ -9,9 +9,12 @@
 //! vision tower + clip-diff modules it needs) is the follow-up beyond this slice — see the crate docs.
 
 use candle_gen::candle_core::Tensor;
-use candle_gen::Result as CResult;
+use candle_gen::gen_core::CancelFlag;
+use candle_gen::{CandleError, Result as CResult};
 
+use crate::clip_diff::DiffLossFm;
 use crate::connector::MlpConnector;
+use crate::qwen2_5_vl::Qwen25VlText;
 
 fn mask_to_idx(mask: &[bool], want: bool) -> Vec<u32> {
     mask.iter()
@@ -132,9 +135,8 @@ pub fn mar_schedule(n_query: i32, planning_step: usize, order: &[i32]) -> Vec<Ve
 /// `src[0, j]`), leaving the other rows untouched. `idx.len() == n`. Implemented as a pure row gather
 /// over `concat([base; src])`, so it is bit-exact (a one-hot matmul would pick up the f32 matmul floor).
 ///
-/// The MAR sampling loop that drives this per reveal step (`sample_vit_embed` in the reference) is the
-/// follow-up beyond this slice; the primitive + its unit test ship now so the loop can reuse it.
-#[allow(dead_code)]
+/// Consumed by [`sample_vit_embed`] (per reveal step) and [`crate::assembly::format_mllm_inputs_embeds`]
+/// (the `masked_scatter` of visual features).
 pub(crate) fn scatter_rows(base: &Tensor, idx: &[u32], src: &Tensor) -> CResult<Tensor> {
     let (_, l, h) = base.dims3()?;
     let n = idx.len();
@@ -146,6 +148,175 @@ pub(crate) fn scatter_rows(base: &Tensor, idx: &[u32], src: &Tensor) -> CResult<
     }
     let sel = Tensor::from_vec(gi, (l,), base.device())?;
     Ok(stacked.index_select(&sel, 0)?.reshape((1, l, h))?)
+}
+
+/// Bool mask of length `len` with `true` at every position in `idx` (the inverse of `mask_to_idx`).
+fn idx_to_bool(idx: &[u32], len: usize) -> Vec<bool> {
+    let mut m = vec![false; len];
+    for &i in idx {
+        m[i as usize] = true;
+    }
+    m
+}
+
+/// First `n` rows of a `[R, C]` tensor → `[n, C]` (`x[:n]`).
+fn take_first_rows(x: &Tensor, n: usize) -> CResult<Tensor> {
+    Ok(x.narrow(0, 0, n)?)
+}
+
+// ---------------------------------------------------------------------------
+// sample_vit_embed orchestration (`sample_vit_embed`, pipeline.py 724-884).
+// ---------------------------------------------------------------------------
+
+/// One conditioning stream's planner inputs (cond / uncond / imgcond). `input_embeds` is the
+/// post-processed embed `[1, L, H]` (gen-ViT slots already set to the `mask_token`); `position_ids`
+/// is `[3, L]` int; `mask` is the additive 4D attention mask (`[1, L, L]` or `[1, 1, L, L]`); `gen_idx`
+/// is the **sorted** target-ViT slot positions (`visual_output_token_mask`).
+pub struct StreamState {
+    pub input_embeds: Tensor,
+    pub position_ids: Tensor,
+    pub mask: Tensor,
+    pub gen_idx: Vec<u32>,
+}
+
+/// MAR planning knobs (`sample_vit_embed` / `__call__` defaults: 25 / 3 / 1.4 / 1.2).
+pub struct VitCfg {
+    pub planning_step: usize,
+    pub vit_denoising_step: usize,
+    pub vit_txt_cfg: f32,
+    pub vit_img_cfg: f32,
+}
+
+impl Default for VitCfg {
+    fn default() -> Self {
+        Self {
+            planning_step: 25,
+            vit_denoising_step: 3,
+            vit_txt_cfg: 1.4,
+            vit_img_cfg: 1.2,
+        }
+    }
+}
+
+/// The output of [`sample_vit_embed`]: the renderer's 4 conditioning streams (pre-UMT5) + the filled
+/// target ViT embeds.
+pub struct SampledStreams {
+    pub wtxt_wvit: Tensor,
+    pub wtxt_wovit: Tensor,
+    pub wotxt_wvit: Tensor,
+    pub wotxt_wovit: Tensor,
+    /// The fully-revealed target ViT embeds `[1, n_query, H]` (`pred_vit_embed`).
+    pub pred_vit_embed: Tensor,
+}
+
+/// Splice the shared target buffer `target` `[1, n_query, H]` into stream `s`'s gen-ViT slots.
+fn splice_target(s: &StreamState, target: &Tensor) -> CResult<Tensor> {
+    scatter_rows(&s.input_embeds, &s.gen_idx, target)
+}
+
+/// `[1, L, H]` penultimate hidden state at stream `s`'s gen slots → `connector.for_vit` → the ViT
+/// prediction `[1, n_query, H_vit]`.
+fn stream_for_vit(
+    backbone: &Qwen25VlText,
+    connector: &MlpConnector,
+    s: &StreamState,
+    target: &Tensor,
+) -> CResult<Tensor> {
+    let embeds = splice_target(s, target)?;
+    let hidden = backbone.penultimate(&embeds, &s.position_ids, &s.mask)?;
+    connector.for_vit(&take_seq(&hidden, &s.gen_idx)?)
+}
+
+/// The MAR planning loop (`sample_vit_embed`): fill the target ViT tokens over `cfg.planning_step`
+/// MaskGIT steps, then run the planner→renderer handoff ([`four_streams`]).
+///
+/// `order` is the seeded reveal permutation of `[0, n_query)`; `step_noise[step]` is the base FM noise
+/// `[n_revealed_step, H]` for that step's `clip_diff.sample` (`torch.randn(z.shape[0]//3, in)` in the
+/// reference — tiled ×3 internally). Both are injected so the trajectory matches torch bit-for-bit;
+/// a step whose revealed set is empty (or `{token 0}` only — the reference's `nonzero().sum()==0` skip)
+/// consumes no noise. `mask_token` is `[1, 1, H]`.
+#[allow(clippy::too_many_arguments)]
+pub fn sample_vit_embed(
+    backbone: &Qwen25VlText,
+    connector: &MlpConnector,
+    clip_diff: &mut DiffLossFm,
+    cond: &StreamState,
+    uncond: &StreamState,
+    imgcond: &StreamState,
+    cfg: &VitCfg,
+    order: &[i32],
+    step_noise: &[Tensor],
+    cancel: &CancelFlag,
+    mask_token: &Tensor,
+) -> CResult<SampledStreams> {
+    let n_query = order.len();
+    let h = mask_token.dim(2)?;
+    let schedule = mar_schedule(n_query as i32, cfg.planning_step, order);
+
+    // Single shared target buffer, init = mask_token broadcast over the n_query target slots.
+    let mut target = mask_token.broadcast_as((1, n_query, h))?.contiguous()?;
+
+    for (step, revealed) in schedule.iter().enumerate() {
+        // Honor the engine cancellation contract (F-003): the MAR planning loop runs 3 backbone passes
+        // per step over `planning_step` (default 25) steps — check before each.
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        // Every step runs all 3 backbones over the current (partially-filled) embeds.
+        let cond_vit = stream_for_vit(backbone, connector, cond, &target)?;
+        let uncond_vit = stream_for_vit(backbone, connector, uncond, &target)?;
+        let imgcond_vit = stream_for_vit(backbone, connector, imgcond, &target)?;
+
+        // `nonzero().sum() == 0` → nothing to predict this step (empty, or {token 0} only).
+        if revealed.iter().sum::<i32>() == 0 {
+            continue;
+        }
+        let np = revealed.len();
+        let hv = cond_vit.dim(2)?;
+        let rev: Vec<u32> = revealed.iter().map(|&x| x as u32).collect();
+
+        // z = cat([cond, uncond, imgcond], dim=1)[0] → [3·np, H_vit] (pre-tiled triple-CFG cond).
+        let c = take_seq(&cond_vit, &rev)?;
+        let u = take_seq(&uncond_vit, &rev)?;
+        let ic = take_seq(&imgcond_vit, &rev)?;
+        let z = Tensor::cat(&[&c, &u, &ic], 1)?.reshape((3 * np, hv))?;
+
+        // Triple-CFG denoise; take the first third (the cond tile) → [1, np, H].
+        let sampled = clip_diff.sample(
+            &z,
+            cfg.vit_txt_cfg,
+            cfg.vit_denoising_step,
+            Some(cfg.vit_img_cfg),
+            &step_noise[step],
+        )?;
+        let cur = take_first_rows(&sampled, np)?.reshape((1, np, h))?;
+
+        target = scatter_rows(&target, &rev, &cur)?;
+    }
+
+    // ---- handoff: final cond + uncond forwards → feat_from_planner_to_renderer → 4 streams ----
+    let cond_embeds = splice_target(cond, &target)?;
+    let uncond_embeds = splice_target(uncond, &target)?;
+    let cond_hidden = backbone.penultimate(&cond_embeds, &cond.position_ids, &cond.mask)?;
+    let uncond_hidden = backbone.penultimate(&uncond_embeds, &uncond.position_ids, &uncond.mask)?;
+
+    let cond_gen = idx_to_bool(&cond.gen_idx, cond.input_embeds.dim(1)?);
+    let uncond_gen = idx_to_bool(&uncond.gen_idx, uncond.input_embeds.dim(1)?);
+    let s = four_streams(
+        &cond_hidden,
+        &cond_gen,
+        &uncond_hidden,
+        &uncond_gen,
+        connector,
+    )?;
+
+    Ok(SampledStreams {
+        wtxt_wvit: s.wtxt_wvit,
+        wtxt_wovit: s.wtxt_wovit,
+        wotxt_wvit: s.wotxt_wvit,
+        wotxt_wovit: s.wotxt_wovit,
+        pred_vit_embed: target,
+    })
 }
 
 #[cfg(test)]

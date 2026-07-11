@@ -33,13 +33,18 @@
 //! host-side input shaping ([`process`] — `generate_unified_inputs` / position ids / flex mask), the
 //! [`connector::MlpConnector`] (`for_gen`/`for_vit`), the planner→renderer [`mar`] handoff
 //! (`four_streams` / `post_process_input_embeds` / `mar_schedule`), and the ViT-conditioned
-//! [`vit_guidance`] combine modes. These are **library modules** — the full `bernini` end-to-end
-//! generator (the MAR sampling loop `mar::sample_vit_embed`, the vision tower, the clip-diff
-//! flow-matching head, the packed-conditioning renderer forward, and the `bernini` registration) is the
-//! precise follow-up beyond this slice; nothing here fakes an end-to-end pipeline.
+//! [`vit_guidance`] combine modes. Part 2 adds the remaining planner modules: the Qwen2.5-VL
+//! [`vision`] tower (windowed/full attention + patch merger) + its [`vit_preprocess`] (smart_resize /
+//! patch pack / nframes), the [`clip_diff`] flow-matching ViT diffusion head (AdaLN-zero + triple-CFG
+//! `sample`), the MAR reveal loop ([`mar::sample_vit_embed`]), and the [`assembly`] + [`template`]
+//! input glue. These are **library modules** — the remaining follow-up beyond this slice is the
+//! packed-conditioning renderer forward (candle-gen-wan, sc-11004) and the full `bernini` generator
+//! registration that assembles them end-to-end; nothing here fakes an end-to-end pipeline.
 //!
 //! `backend = "candle"`, `mac_only = false`.
 
+pub mod assembly;
+pub mod clip_diff;
 pub mod config;
 pub mod connector;
 pub mod convert;
@@ -49,19 +54,29 @@ mod nn;
 pub mod pipeline;
 pub mod process;
 pub mod qwen2_5_vl;
+pub mod template;
+pub mod vision;
 pub mod vit_guidance;
+pub mod vit_preprocess;
 
+pub use assembly::{concat_with_zero_init, format_mllm_inputs_embeds, pad_and_truncate};
+pub use clip_diff::{DiffLossFm, FlowMatchScheduler};
 pub use config::{resolve_mode, BerniniKnobs, Defaults, Mode};
 pub use connector::MlpConnector;
 pub use convert::{build_bernini_candle_tier, route_bernini_expert_key};
 pub use guidance::{apg_delta, normalized_guidance, normalized_guidance_chain, MomentumBuffer};
 pub use mar::{
-    feat_to_renderer, four_streams, mar_schedule, post_process_input_embeds, FourStreams,
-    RendererFeat,
+    feat_to_renderer, four_streams, mar_schedule, post_process_input_embeds, sample_vit_embed,
+    FourStreams, RendererFeat, SampledStreams, StreamState, VitCfg,
 };
 pub use pipeline::{descriptor, force_link, load, MODEL_ID};
 pub use process::{
     build_attention_mask_4d, generate_unified_inputs, mrope_position_ids, MRopeConfig,
 };
 pub use qwen2_5_vl::{Qwen25VlText, QwenVlTextConfig};
+pub use template::{BerniniTemplate, TemplateOutput};
+pub use vision::{split_vit_features, VisionConfig, VisionTower};
 pub use vit_guidance::{rv2v_chain, vae_txt_vit};
+pub use vit_preprocess::{
+    pack_patches, preprocess_image, smart_resize, smart_video_nframes, IMAGE_MEAN, IMAGE_STD,
+};

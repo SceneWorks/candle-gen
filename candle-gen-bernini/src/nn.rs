@@ -32,3 +32,21 @@ pub fn rms_norm(x: &Tensor, w: &Tensor, eps: f64) -> Result<Tensor> {
     let denom = (mean + eps)?.sqrt()?;
     Ok(x.broadcast_div(&denom)?.broadcast_mul(w)?)
 }
+
+/// Torch `nn.LayerNorm` over the last dim: `(x − mean)/sqrt(var + eps)`, with **biased** variance
+/// (divide by N, no Bessel) matching torch, then optional affine `·w + b`. The candle twin of
+/// `mlx_rs::fast::layer_norm`; `w`/`b` `None` is the `elementwise_affine=False` variant (the clip-diff
+/// `FinalLayer`'s `norm_final`). Reductions run in the input dtype (the goldens are f32).
+pub fn layer_norm(x: &Tensor, w: Option<&Tensor>, b: Option<&Tensor>, eps: f64) -> Result<Tensor> {
+    let mean = x.mean_keepdim(D::Minus1)?;
+    let centered = x.broadcast_sub(&mean)?;
+    let var = centered.sqr()?.mean_keepdim(D::Minus1)?;
+    let mut y = centered.broadcast_div(&(var + eps)?.sqrt()?)?;
+    if let Some(w) = w {
+        y = y.broadcast_mul(w)?;
+    }
+    if let Some(b) = b {
+        y = y.broadcast_add(b)?;
+    }
+    Ok(y)
+}
