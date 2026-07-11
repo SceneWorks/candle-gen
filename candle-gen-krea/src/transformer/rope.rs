@@ -51,6 +51,47 @@ impl RopeTables {
         from_positions(&positions, axes, theta, device)
     }
 
+    /// Build the joint table for a **Kontext-style edit** forward (epic 10871 / sc-10877): `cap_len`
+    /// text positions `(0,0,0)`, then `n_refs` reference-image grids, then the target (noise) grid — the
+    /// sequence order `[text, refs…, target]` from the reference `ComfyUI-Krea2Edit` node (refs BEFORE
+    /// the noise, unlike Qwen-Edit). All grids share the target `h_tokens × w_tokens` shape (references
+    /// are VAE-encoded at the target resolution). The `(frame, row, col)` position tuple carries the
+    /// reference index on the **t-axis** (sub-dim `axes[0]`, unused/`0` in t2i): text = `(0,0,0)`, the
+    /// target = `(0, row, col)` (frame 0, identical to t2i), and reference `i` = `(i+1, row, col)`.
+    ///
+    /// `n_refs == 0` reduces to `[text, target]` — **byte-identical** to [`Self::build_t2i`] (the target
+    /// grid sits at frame 0, exactly the t2i image grid).
+    pub fn build_edit(
+        cap_len: usize,
+        h_tokens: usize,
+        w_tokens: usize,
+        n_refs: usize,
+        axes: [usize; 3],
+        theta: f64,
+        device: &Device,
+    ) -> Result<Self> {
+        let img_len = h_tokens * w_tokens;
+        let mut positions = Vec::with_capacity(cap_len + (n_refs + 1) * img_len);
+        for _ in 0..cap_len {
+            positions.push((0.0, 0.0, 0.0));
+        }
+        // References first (frame i+1), then the target/noise grid (frame 0).
+        for i in 0..n_refs {
+            let frame = (i + 1) as f64;
+            for r in 0..h_tokens {
+                for c in 0..w_tokens {
+                    positions.push((frame, r as f64, c as f64));
+                }
+            }
+        }
+        for r in 0..h_tokens {
+            for c in 0..w_tokens {
+                positions.push((0.0, r as f64, c as f64));
+            }
+        }
+        from_positions(&positions, axes, theta, device)
+    }
+
     /// `(cos, sin)` for the full joint `[text; image]` sequence (the single-stream blocks).
     pub fn joint(&self) -> (Tensor, Tensor) {
         (self.cos.clone(), self.sin.clone())
@@ -164,6 +205,65 @@ mod tests {
             .unwrap();
         assert!(cos_text.iter().all(|&v| (v - 1.0).abs() < 1e-6));
         assert!(sin_text.iter().all(|&v| v.abs() < 1e-6));
+    }
+
+    #[test]
+    fn build_edit_zero_refs_equals_t2i() {
+        // With no references, `[text, target]` is byte-identical to the t2i `[text, image]` table.
+        let dev = Device::Cpu;
+        let (cap, ht, wt) = (5usize, 4usize, 3usize);
+        let t2i = RopeTables::build_t2i(cap, ht, wt, AXES, THETA, &dev).unwrap();
+        let edit = RopeTables::build_edit(cap, ht, wt, 0, AXES, THETA, &dev).unwrap();
+        for (a, b) in [(t2i.cos, edit.cos), (t2i.sin, edit.sin)] {
+            assert_eq!(a.dims(), b.dims());
+            let av = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let bv = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            assert_eq!(
+                av, bv,
+                "build_edit(n_refs=0) must equal build_t2i byte-for-byte"
+            );
+        }
+    }
+
+    #[test]
+    fn build_edit_places_refs_at_successive_frames() {
+        // Sequence `[text(cap), ref0(img), ref1(img), target(img)]`. The frame (t-axis, sub-dim 32 →
+        // 16 freqs) distinguishes each reference; text + target stay at frame 0.
+        let dev = Device::Cpu;
+        let (cap, ht, wt, n_refs) = (2usize, 2usize, 2usize, 2usize);
+        let img_len = ht * wt;
+        let r = RopeTables::build_edit(cap, ht, wt, n_refs, AXES, THETA, &dev).unwrap();
+        let (cos, _sin) = r.joint();
+        let total = cap + (n_refs + 1) * img_len;
+        assert_eq!(cos.dims(), &[1, total, 64]);
+
+        // The first `axes[0]/2 = 16` freqs are the frame (t-axis). Frame 0 → cos = 1 over that block.
+        let frame_block = |tok: usize| -> Vec<f32> {
+            cos.narrow(1, tok, 1)
+                .unwrap()
+                .narrow(2, 0, 16)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
+        };
+        // Text token (frame 0) and target token (last block, frame 0) → identity in the frame block.
+        assert!(frame_block(0).iter().all(|&v| (v - 1.0).abs() < 1e-6));
+        assert!(frame_block(total - 1)
+            .iter()
+            .all(|&v| (v - 1.0).abs() < 1e-6));
+        // ref0 (frame 1) and ref1 (frame 2) rotate the frame block → NOT all ones.
+        let ref0_tok = cap; // first reference token
+        let ref1_tok = cap + img_len;
+        assert!(frame_block(ref0_tok)
+            .iter()
+            .any(|&v| (v - 1.0).abs() > 1e-4));
+        assert!(frame_block(ref1_tok)
+            .iter()
+            .any(|&v| (v - 1.0).abs() > 1e-4));
+        // ref0 and ref1 differ (frame 1 vs 2).
+        assert_ne!(frame_block(ref0_tok), frame_block(ref1_tok));
     }
 
     #[test]

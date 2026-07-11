@@ -55,6 +55,8 @@ fn tiny_te_config() -> KreaTeConfig {
         rope_theta: 5_000_000.0,
         select_hidden: vec![2, 4],
         prefix_tokens: 3,
+        image_token_id: 151655,
+        mrope_section: [24, 20, 20],
     }
 }
 

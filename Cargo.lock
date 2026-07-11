@@ -393,6 +393,7 @@ name = "candle-gen-krea"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-boogu",
  "candle-gen-pid",
  "candle-gen-qwen-image",
  "image",

@@ -55,6 +55,9 @@ struct KreaRopeCache {
     cap_len: usize,
     ht: usize,
     wt: usize,
+    /// Reference-image count baked into the table (`0` = the plain t2i `[text, image]` geometry; `>0`
+    /// = the edit `[text, refs…, target]` geometry, sc-10877).
+    n_refs: usize,
     cos: Tensor,
     sin: Tensor,
 }
@@ -116,56 +119,59 @@ impl Krea2Transformer {
     }
 
     /// Build (or reuse) the joint RoPE `(cos, sin)` table for this render's fixed geometry (sc-8992).
-    /// Recomputed only when `(cap_len, ht, wt)` changes; otherwise the Arc-backed handles are cloned.
-    /// Construction is identical to building it inline, so every step is byte-identical.
-    fn rope_tables(&self, cap_len: usize, ht: usize, wt: usize) -> Result<(Tensor, Tensor)> {
+    /// Recomputed only when `(cap_len, ht, wt, n_refs)` changes; otherwise the Arc-backed handles are
+    /// cloned. `n_refs == 0` builds the plain t2i `[text, image]` table (byte-identical to building it
+    /// inline); `n_refs > 0` builds the edit `[text, refs…, target]` table (sc-10877). Since
+    /// `build_edit(n_refs = 0) ≡ build_t2i`, the t2i call stays on the exact `build_t2i` path.
+    fn rope_tables(
+        &self,
+        cap_len: usize,
+        ht: usize,
+        wt: usize,
+        n_refs: usize,
+    ) -> Result<(Tensor, Tensor)> {
         let mut guard = self.rope_cache.lock().unwrap();
         if let Some(c) = guard.as_ref() {
-            if c.cap_len == cap_len && c.ht == ht && c.wt == wt {
+            if c.cap_len == cap_len && c.ht == ht && c.wt == wt && c.n_refs == n_refs {
                 return Ok((c.cos.clone(), c.sin.clone()));
             }
         }
-        let rope = RopeTables::build_t2i(
-            cap_len,
-            ht,
-            wt,
-            self.cfg.axes_dims_rope,
-            self.cfg.rope_theta as f64,
-            &self.device,
-        )?;
+        let (axes, theta) = (self.cfg.axes_dims_rope, self.cfg.rope_theta as f64);
+        let rope = if n_refs == 0 {
+            RopeTables::build_t2i(cap_len, ht, wt, axes, theta, &self.device)?
+        } else {
+            RopeTables::build_edit(cap_len, ht, wt, n_refs, axes, theta, &self.device)?
+        };
         let (cos, sin) = rope.joint();
         *guard = Some(KreaRopeCache {
             cap_len,
             ht,
             wt,
+            n_refs,
             cos: cos.clone(),
             sin: sin.clone(),
         });
         Ok((cos, sin))
     }
 
-    /// Velocity prediction.
-    ///
-    /// - `latent`: `[b, 16, H, W]` (H, W multiples of `patch_size`),
-    /// - `timestep`: `[b]` f32 (raw flow time in `[0, 1]`),
-    /// - `context`: `[b, n_tokens, num_text_layers, text_hidden]` — the stacked Qwen3-VL select-layer
-    ///   hidden states (sc-7569), already trimmed to the valid token count (no padding).
-    ///
-    /// Returns the velocity `[b, 16, H, W]`.
-    pub fn forward(&self, latent: &Tensor, timestep: &Tensor, context: &Tensor) -> Result<Tensor> {
+    /// Patch-embed a normalized `[b, 16, H, W]` latent through the (adapter-carrying) `img_in` →
+    /// `[b, img_len, hidden]`. Shared by the target-latent embed and the edit reference-latent embeds
+    /// (sc-10877) so every image token — noise or reference — goes through the identical projection.
+    fn embed_image(&self, latent: &Tensor) -> Result<Tensor> {
+        self.img_in.forward(&patchify(
+            &latent.to_dtype(self.dtype)?,
+            self.cfg.patch_size,
+        )?)
+    }
+
+    /// The shared timestep + text front-end (sc-10877): the sinusoidal timestep embed `t`, the shared
+    /// modulation `tvec = time_mod_proj(GELU(t))`, and the projected text context `ctx`
+    /// `[b, cap, hidden]`. Both [`forward`](Self::forward) (t2i) and [`forward_edit`](Self::forward_edit)
+    /// call this, so the t2i front-end stays byte-identical.
+    fn front_end(&self, timestep: &Tensor, context: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
         let cfg = &self.cfg;
-        let p = cfg.patch_size;
         let dt = self.dtype;
-        let (_, _, h, w) = latent.dims4()?;
-        let (ht, wt) = (h / p, w / p);
-        let img_len = ht * wt;
-        let latent_ch = cfg.in_channels / (p * p);
-
-        let cap_len = context.dim(1)?;
         let context = context.to_dtype(dt)?;
-
-        // Image patch embed.
-        let img = self.img_in.forward(&patchify(&latent.to_dtype(dt)?, p)?)?; // [b, img_len, hidden]
 
         // Timestep embed → `t`; shared modulation `tvec = time_mod_proj(GELU(t))`.
         let t_sin = temb(timestep, cfg.timestep_embed_dim, &self.device)?.to_dtype(dt)?; // [b, 1, tdim]
@@ -180,12 +186,35 @@ impl Krea2Transformer {
         let ctx = self
             .txt_in_l2
             .forward(&self.txt_in_l1.forward(&ctx)?.gelu()?)?; // [b, cap, hidden]
+        Ok((t, tvec, ctx))
+    }
+
+    /// Velocity prediction.
+    ///
+    /// - `latent`: `[b, 16, H, W]` (H, W multiples of `patch_size`),
+    /// - `timestep`: `[b]` f32 (raw flow time in `[0, 1]`),
+    /// - `context`: `[b, n_tokens, num_text_layers, text_hidden]` — the stacked Qwen3-VL select-layer
+    ///   hidden states (sc-7569), already trimmed to the valid token count (no padding).
+    ///
+    /// Returns the velocity `[b, 16, H, W]`.
+    pub fn forward(&self, latent: &Tensor, timestep: &Tensor, context: &Tensor) -> Result<Tensor> {
+        let cfg = &self.cfg;
+        let p = cfg.patch_size;
+        let (_, _, h, w) = latent.dims4()?;
+        let (ht, wt) = (h / p, w / p);
+        let img_len = ht * wt;
+        let latent_ch = cfg.in_channels / (p * p);
+        let cap_len = context.dim(1)?;
+
+        // Image patch embed + shared timestep/text front-end.
+        let img = self.embed_image(latent)?; // [b, img_len, hidden]
+        let (t, tvec, ctx) = self.front_end(timestep, context)?;
 
         // Fuse to the joint sequence and run the single-stream stack under the joint RoPE.
         let mut combined = Tensor::cat(&[&ctx, &img], 1)?; // [b, cap+img_len, hidden]
 
         // The joint RoPE table is step-invariant (fixed geometry), so cache it per render (sc-8992).
-        let (rcos, rsin) = self.rope_tables(cap_len, ht, wt)?;
+        let (rcos, rsin) = self.rope_tables(cap_len, ht, wt, 0)?;
         for blk in &self.blocks {
             combined = blk.forward(&combined, &tvec, &rcos, &rsin)?;
         }
@@ -193,6 +222,72 @@ impl Krea2Transformer {
         // Continuous-AdaLN output (SimpleModulation on `t`), then slice the image tokens + unpatchify.
         let out = self.final_layer(&combined, &t)?; // [b, cap+img_len, in_channels]
         let img_out = out.narrow(1, cap_len, img_len)?;
+        unpatchify(&img_out, ht, wt, p, latent_ch)
+    }
+
+    /// **Kontext-style edit velocity prediction** (epic 10871 / sc-10877). Identical to
+    /// [`forward`](Self::forward) but with one or more in-context reference latents prepended between the
+    /// text and the noise: the joint sequence is `[text, refs…, target]`, each reference embedded through
+    /// the same frozen `img_in` and positioned at its own RoPE frame ([`RopeTables::build_edit`]). The
+    /// `in_channels` is unchanged (64) — this is **sequence** concat, not channel concat.
+    ///
+    /// - `latent`: the noise target `[b, 16, H, W]`.
+    /// - `refs`: the VAE-encoded reference latents, **each at the target resolution** `[b, 16, H, W]`
+    ///   (they share the target patch grid); fixed order (scene, then person — sc-10878). Empty ⇒
+    ///   byte-identical to [`forward`](Self::forward) (the rope table falls back to `build_t2i`).
+    /// - `context`: the (optionally image-grounded, P2) `[b, n_tokens, num_text_layers, text_hidden]`.
+    ///
+    /// Returns the velocity for the **target** tokens only `[b, 16, H, W]` (the reference tokens are
+    /// conditioning; their output slice is discarded).
+    pub fn forward_edit(
+        &self,
+        latent: &Tensor,
+        timestep: &Tensor,
+        context: &Tensor,
+        refs: &[Tensor],
+    ) -> Result<Tensor> {
+        let cfg = &self.cfg;
+        let p = cfg.patch_size;
+        let (_, _, h, w) = latent.dims4()?;
+        let (ht, wt) = (h / p, w / p);
+        let img_len = ht * wt;
+        let latent_ch = cfg.in_channels / (p * p);
+        let n_refs = refs.len();
+        let cap_len = context.dim(1)?;
+
+        // Target + reference image tokens (references must share the target grid — VAE-encoded at the
+        // target resolution). All go through the identical `img_in` projection.
+        let img = self.embed_image(latent)?;
+        let mut ref_toks = Vec::with_capacity(n_refs);
+        for (i, r) in refs.iter().enumerate() {
+            let (_, _, rh, rw) = r.dims4()?;
+            if rh != h || rw != w {
+                return Err(candle_gen::candle_core::Error::Msg(format!(
+                    "krea edit: reference {i} is {rh}x{rw} but the target latent is {h}x{w}; \
+                     references must be VAE-encoded at the target resolution"
+                )));
+            }
+            ref_toks.push(self.embed_image(r)?);
+        }
+
+        let (t, tvec, ctx) = self.front_end(timestep, context)?;
+
+        // Joint sequence `[ctx, refs…, target]` (references BEFORE the noise — the Krea2Edit contract).
+        let mut parts: Vec<&Tensor> = Vec::with_capacity(2 + n_refs);
+        parts.push(&ctx);
+        parts.extend(ref_toks.iter());
+        parts.push(&img);
+        let mut combined = Tensor::cat(&parts, 1)?;
+
+        let (rcos, rsin) = self.rope_tables(cap_len, ht, wt, n_refs)?;
+        for blk in &self.blocks {
+            combined = blk.forward(&combined, &tvec, &rcos, &rsin)?;
+        }
+
+        // Slice the TARGET tokens (they sit last, after the text + all reference blocks) + unpatchify.
+        let out = self.final_layer(&combined, &t)?;
+        let target_offset = cap_len + n_refs * img_len;
+        let img_out = out.narrow(1, target_offset, img_len)?;
         unpatchify(&img_out, ht, wt, p, latent_ch)
     }
 

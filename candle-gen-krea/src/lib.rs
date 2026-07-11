@@ -37,6 +37,7 @@ pub mod text_encoder;
 pub mod tokenizer;
 pub mod transformer;
 pub mod vae;
+pub mod vision;
 
 // The candle Krea LoRA/LoKr trainer (sc-7577) + its vendored composable-op trainable DiT. Private
 // (reached through gen-core's trainer registry by id, like the SDXL/Z-Image trainers); the
