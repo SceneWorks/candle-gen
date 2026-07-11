@@ -97,6 +97,20 @@ const PLANNER_PREFIXES: [(&str, &str); 3] = [
     ("vit_decoder.", PLANNER_VIT_DECODER_DIR),
 ];
 
+/// Authoritative exact tensor counts for the three dir-based planner components, mirroring the
+/// mlx-gen-bernini converter's `Component::expect` asserts (`mlx-gen-bernini/src/convert.rs`):
+///   - `mllm` **728**: Qwen2.5-VL-7B `visual.*` (390) + `model.*` (338), after dropping `mllm.lm_head.weight`.
+///   - `connector` **12**: `MLPConnector` (`proj_gen` 5 + `pred_vit` 7).
+///   - `vit_decoder` **140**: `DiffLoss_FM` net (time/cond embed + input proj + 16 res blocks + final layer).
+///
+/// The single `mask_tokens` parameter (mlx `expect: 1`) is guarded separately by its `Option` presence
+/// check ([`extract_components`]). Do NOT loosen these — a mismatch means the package layout changed.
+const PLANNER_EXPECTED_COUNTS: [(&str, usize); 3] = [
+    (PLANNER_MLLM_DIR, 728),
+    (PLANNER_CONNECTOR_DIR, 12),
+    (PLANNER_VIT_DECODER_DIR, 140),
+];
+
 /// Route a combined-index key to `(component dir, stripped diffusers key)`, or `None` if it is not a
 /// renderer-expert tensor (the planner MLLM / connector / vit_decoder / mask_tokens / the redundant T5
 /// copy are all skipped). `diff_dec_low.` is checked first, but the prefixes are disjoint anyway
@@ -194,15 +208,19 @@ fn extract_components(bernini_dir: &Path) -> Result<Extracted> {
         }
     }
 
-    for (name, g) in experts.iter().chain(planner.iter()) {
+    // Renderer experts have no fixed count guard here (the diffusers-key strip is a pass-through; the
+    // packer/loader validate their schema) — only assert they are non-empty.
+    for (name, g) in experts.iter() {
         if g.is_empty() {
             return Err(candle_gen::candle_core::Error::Msg(format!(
                 "build_bernini_candle_tier: no tensors routed to {name}/ (expected the \
-                 diff_dec/diff_dec_low + mllm/connector/vit_decoder prefixes of a \
-                 ByteDance/Bernini-Diffusers `bernini/` index)"
+                 diff_dec/diff_dec_low prefixes of a ByteDance/Bernini-Diffusers `bernini/` index)"
             )));
         }
     }
+    // Planner components: HARD exact per-component tensor-count guard, mirroring the mlx-gen-bernini
+    // converter's `Component::expect` asserts.
+    validate_planner_counts(&planner)?;
     if mask_tokens.is_none() {
         return Err(candle_gen::candle_core::Error::Msg(
             "build_bernini_candle_tier: no `mask_tokens` parameter found in the `bernini/` index"
@@ -214,6 +232,48 @@ fn extract_components(bernini_dir: &Path) -> Result<Extracted> {
         planner,
         mask_tokens,
     })
+}
+
+/// HARD exact per-component tensor-count guard for the three dir-based planner groups, mirroring the
+/// mlx-gen-bernini converter's `Component::expect` asserts ([`PLANNER_EXPECTED_COUNTS`]). Returns a
+/// clear `Err` naming the component + expected-vs-actual on any mismatch (a re-layout in a future
+/// package revision), so the expensive on-device build fails loud and early instead of at GPU-val load.
+/// Do NOT loosen these counts.
+fn validate_planner_counts(planner: &HashMap<&'static str, HashMap<String, Tensor>>) -> Result<()> {
+    for (dir, expect) in PLANNER_EXPECTED_COUNTS {
+        let got = planner.get(dir).map(HashMap::len).unwrap_or(0);
+        if got != expect {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "build_bernini_candle_tier: planner component {dir}/ expected {expect} tensors, got \
+                 {got} — the ByteDance/Bernini-Diffusers planner layout may have changed"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Assert both planner source files the loader requires exist in the package `mllm/` dir, returning
+/// their paths. The mlx-gen-bernini converter `place()`s `config.json` + `tokenizer.json`
+/// unconditionally (erroring if absent); this mirrors that — a missing source is a loud build-time
+/// `Err`, not a silently-incomplete snapshot the loader later chokes on.
+fn require_planner_sources(pkg_mllm: &Path) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let cfg_src = pkg_mllm.join("config.json");
+    if !cfg_src.exists() {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "build_bernini_candle_tier: missing required planner config {} (the \
+             ByteDance/Bernini-Diffusers package must contain `mllm/config.json`)",
+            cfg_src.display()
+        )));
+    }
+    let tok_src = pkg_mllm.join(PLANNER_TOKENIZER_FILE);
+    if !tok_src.exists() {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "build_bernini_candle_tier: missing required planner tokenizer {} (the \
+             ByteDance/Bernini-Diffusers package must contain `mllm/{PLANNER_TOKENIZER_FILE}`)",
+            tok_src.display()
+        )));
+    }
+    Ok((cfg_src, tok_src))
 }
 
 /// Write one expert component `map` (diffusers keys) to `dst` as a single `model.safetensors`. When
@@ -408,18 +468,16 @@ pub fn build_bernini_candle_tier(
 
     // 3a. Planner configs: the Qwen2.5-VL config (verbatim `mllm/config.json`) + the tokenizer copied
     // into `mllm/` (the loader reads `mllm/tokenizer.json` for the chat template) + the knobs sidecar.
+    // Both the Qwen2.5-VL `config.json` and `tokenizer.json` are REQUIRED by the planner loader — fail
+    // loud at build time (mirroring mlx-gen-bernini's unconditional `place()`) rather than silently
+    // emitting a snapshot the loader can't read.
     let pkg_mllm = bernini_diffusers_dir.join(PLANNER_MLLM_DIR);
-    let cfg_src = pkg_mllm.join("config.json");
-    if cfg_src.exists() {
-        copy_recursive(&cfg_src, &out_dir.join(PLANNER_QWEN_CONFIG_FILE))?;
-    }
-    let tok_src = pkg_mllm.join(PLANNER_TOKENIZER_FILE);
-    if tok_src.exists() {
-        copy_recursive(
-            &tok_src,
-            &out_dir.join(PLANNER_MLLM_DIR).join(PLANNER_TOKENIZER_FILE),
-        )?;
-    }
+    let (cfg_src, tok_src) = require_planner_sources(&pkg_mllm)?;
+    copy_recursive(&cfg_src, &out_dir.join(PLANNER_QWEN_CONFIG_FILE))?;
+    copy_recursive(
+        &tok_src,
+        &out_dir.join(PLANNER_MLLM_DIR).join(PLANNER_TOKENIZER_FILE),
+    )?;
     std::fs::write(
         out_dir.join(PLANNER_SIDECAR_FILE),
         serde_json::to_string_pretty(&bernini_planner_knobs(bernini_diffusers_dir))
@@ -651,6 +709,94 @@ mod tests {
         let (dir, _) =
             route_bernini_expert_key("diff_dec.transformer.blocks.0.attn1.to_q.weight").unwrap();
         assert_eq!(dir, "transformer");
+    }
+
+    /// The exact planner counts match the mlx-gen-bernini `Component::expect` asserts.
+    #[test]
+    fn planner_expected_counts_match_mlx() {
+        assert_eq!(
+            PLANNER_EXPECTED_COUNTS,
+            [("mllm", 728), ("connector", 12), ("vit_decoder", 140)]
+        );
+    }
+
+    /// Build a synthetic planner map with `count` dummy tensors under `dir`.
+    fn synth_group(
+        dir: &'static str,
+        count: usize,
+    ) -> HashMap<&'static str, HashMap<String, Tensor>> {
+        let dev = Device::Cpu;
+        let mut inner: HashMap<String, Tensor> = HashMap::new();
+        for i in 0..count {
+            inner.insert(format!("w{i}"), Tensor::zeros(1, DType::F32, &dev).unwrap());
+        }
+        let mut m: HashMap<&'static str, HashMap<String, Tensor>> = HashMap::new();
+        m.insert(dir, inner);
+        m
+    }
+
+    /// sc-11061 count guard: the exact-count guard REJECTS a synthetically short component map and
+    /// ACCEPTS a full one — naming the offending component in the error.
+    #[test]
+    fn planner_count_guard_rejects_short_map() {
+        // A full planner map (all three at their expected counts) passes.
+        let mut full: HashMap<&'static str, HashMap<String, Tensor>> = HashMap::new();
+        for (dir, expect) in PLANNER_EXPECTED_COUNTS {
+            full.extend(synth_group(dir, expect));
+        }
+        assert!(validate_planner_counts(&full).is_ok(), "full map must pass");
+
+        // Drop one tensor from `mllm` → short by one → Err naming `mllm`.
+        let mut short = HashMap::new();
+        short.extend(synth_group(PLANNER_MLLM_DIR, 727));
+        short.extend(synth_group(PLANNER_CONNECTOR_DIR, 12));
+        short.extend(synth_group(PLANNER_VIT_DECODER_DIR, 140));
+        let err = validate_planner_counts(&short).unwrap_err().to_string();
+        assert!(err.contains("mllm/"), "error names the component: {err}");
+        assert!(err.contains("727"), "error reports actual count: {err}");
+
+        // A missing component group (count 0) is also rejected.
+        let mut missing = HashMap::new();
+        missing.extend(synth_group(PLANNER_MLLM_DIR, 728));
+        missing.extend(synth_group(PLANNER_CONNECTOR_DIR, 12));
+        // no vit_decoder
+        assert!(validate_planner_counts(&missing).is_err());
+    }
+
+    /// sc-11061 required-sources guard: a missing `mllm/config.json` or `mllm/tokenizer.json` yields a
+    /// clear `Err`; both present yields `Ok` with the two source paths.
+    #[test]
+    fn require_planner_sources_errs_on_missing() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bernini_req_src_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mllm = tmp.join("mllm");
+        std::fs::create_dir_all(&mllm).unwrap();
+
+        // Empty dir → missing config.
+        let err = require_planner_sources(&mllm).unwrap_err().to_string();
+        assert!(err.contains("config.json"), "names missing config: {err}");
+
+        // config present, tokenizer still missing.
+        std::fs::write(mllm.join("config.json"), b"{}").unwrap();
+        let err = require_planner_sources(&mllm).unwrap_err().to_string();
+        assert!(
+            err.contains(PLANNER_TOKENIZER_FILE),
+            "names missing tokenizer: {err}"
+        );
+
+        // Both present → Ok.
+        std::fs::write(mllm.join(PLANNER_TOKENIZER_FILE), b"{}").unwrap();
+        let (cfg, tok) = require_planner_sources(&mllm).unwrap();
+        assert!(cfg.ends_with("config.json"));
+        assert!(tok.ends_with(PLANNER_TOKENIZER_FILE));
+
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     /// On-device tier build (`#[ignore]`d — needs the ByteDance/Bernini-Diffusers package + a base
