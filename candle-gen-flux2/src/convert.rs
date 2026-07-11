@@ -156,7 +156,15 @@ fn count_blocks<'a>(keys: impl Iterator<Item = &'a str>, prefix: &str) -> usize 
 }
 
 /// Row-split a `[3·d, …]` tensor into three equal `[d, …]` chunks along axis 0 (the candle twin of
-/// `mx.split(t, 3, 0)`). Contiguous slices — no arithmetic, dtype-preserving.
+/// `mx.split(t, 3, 0)`). Pure memory copies — no arithmetic, dtype-preserving.
+///
+/// Each chunk is materialized into **owned zero-offset storage** (`force_contiguous` — NOT
+/// `.contiguous()`, which is a no-op on a dim-0 narrow's contiguous strides, and NOT `.copy()`,
+/// which clones the whole fused buffer layout-included): `QTensor::quantize{,_onto}` reads the raw
+/// backing storage and ignores a view's start offset, so feeding narrow views into the
+/// in-memory-map → quantize path (sc-10680) loaded every to_k/to_v as a copy of to_q (sc-11028).
+/// Owned chunks also let the fused parent storage free instead of being pinned three times by the
+/// map.
 fn chunk3(t: &Tensor) -> Result<[Tensor; 3]> {
     let rows = t.dim(0)?;
     if !rows.is_multiple_of(3) {
@@ -166,9 +174,9 @@ fn chunk3(t: &Tensor) -> Result<[Tensor; 3]> {
         )));
     }
     let each = rows / 3;
-    let q = t.narrow(0, 0, each)?.contiguous()?;
-    let k = t.narrow(0, each, each)?.contiguous()?;
-    let v = t.narrow(0, 2 * each, each)?.contiguous()?;
+    let q = t.narrow(0, 0, each)?.force_contiguous()?;
+    let k = t.narrow(0, each, each)?.force_contiguous()?;
+    let v = t.narrow(0, 2 * each, each)?.force_contiguous()?;
     Ok([q, k, v])
 }
 
@@ -616,6 +624,17 @@ mod tests {
         );
         // A non-divisible row count is rejected.
         assert!(chunk3(&ramp(5, 2, 0.0)).is_err());
+        // sc-11028: the chunks must be OWNED zero-offset tensors, not views into the fused
+        // storage — `QTensor::quantize{,_onto}` reads the raw backing storage (ignoring a view's
+        // start offset), so an offset-view k/v fed into the in-memory-map → quantize path would
+        // quantize q's rows instead.
+        for (name, c) in [("q", &q), ("k", &k), ("v", &v)] {
+            assert_eq!(
+                c.layout().start_offset(),
+                0,
+                "chunk3 `{name}` must be materialized (owned, zero-offset), not an offset view"
+            );
+        }
     }
 
     #[test]

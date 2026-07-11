@@ -546,6 +546,31 @@ impl QLinear {
         let (w_out_in, bias) = dense.out_in_weight_bias()?;
         let device = onto.unwrap_or(w_out_in.device().clone());
         let w_cpu = w_out_in.to_device(&Device::Cpu)?.to_dtype(DType::F32)?;
+        // `QTensor::quantize_onto` reads the tensor's RAW backing storage (its `flatten_all` is a
+        // zero-copy reshape on a strides-contiguous layout), not the logical view: on CUDA an
+        // offset view silently quantizes the WRONG rows (flux2's ComfyUI in-place DiT loaded every
+        // double block's to_k/to_v as copies of to_q — an incoherent render with per-layer weight
+        // parity ~1.0, sc-11028); on the CPU any strict subview trips a length assert (a panic).
+        // A dim-0 narrow keeps contiguous strides, so `.contiguous()` upstream is a no-op — the
+        // view shape reaches here (and `Tensor::copy` is no help: it clones the whole backing
+        // buffer, layout included). Materialize the source into owned zero-offset storage
+        // (`force_contiguous`) unless it already covers EXACTLY its whole backing buffer.
+        let covers_storage = {
+            let (storage, layout) = w_cpu.storage_and_layout();
+            let full_len = match &*storage {
+                candle_core::Storage::Cpu(s) => s.as_slice::<f32>().map(<[f32]>::len).ok(),
+                // Non-CPU cannot happen (`to_device` above); force the copy if it somehow does.
+                _ => None,
+            };
+            layout.start_offset() == 0
+                && w_cpu.is_contiguous()
+                && full_len == Some(w_cpu.elem_count())
+        };
+        let w_cpu = if covers_storage {
+            w_cpu
+        } else {
+            w_cpu.force_contiguous()?
+        };
         let qtensor = QTensor::quantize_onto(&w_cpu, ggml_dtype(quant), &device)?;
         let weight = match strategy {
             MatmulStrategy::DequantDense => QuantWeight::Dequant(std::sync::Arc::new(qtensor)),
@@ -1018,6 +1043,48 @@ mod tests {
         let after = packed.forward(&x)?;
         let dev_max = (before.sub(&after)?).abs()?.max_all()?.to_scalar::<f32>()?;
         assert_eq!(dev_max, 0.0, "no-op quantize changed the forward");
+        Ok(())
+    }
+
+    /// **sc-11028 regression.** `QTensor::quantize{,_onto}` reads the tensor's RAW backing storage
+    /// (its `flatten_all` is a zero-copy reshape on a strides-contiguous layout), ignoring a view's
+    /// start offset. Folding a dim-0 narrow (a fused-qkv row chunk — `.contiguous()` is a no-op on
+    /// it) therefore used to quantize the WRONG rows: flux2's ComfyUI in-place DiT loaded every
+    /// double block's to_k/to_v as a copy of to_q — an incoherent render while per-layer weight
+    /// parity read ~1.0 (the view API is offset-aware; the fold was not). The fold must
+    /// materialize offset views into owned storage first: each folded chunk's forward must track
+    /// the matching chunk of the dense fused weight (Q8, near-lossless) — chunks 1/2 fail without
+    /// the guard, chunk 0 (offset 0) vacuously passes.
+    #[test]
+    fn fold_materializes_offset_views() -> Result<()> {
+        let dev = Device::Cpu;
+        let (d, in_dim) = (64usize, 32usize);
+        let fused = Tensor::randn(0f32, 1f32, (3 * d, in_dim), &dev)?;
+        let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+        for (i, name) in ["q", "k", "v"].iter().enumerate() {
+            // The trap shape: a dim-0 narrow keeps contiguous strides, so `.contiguous()` no-ops
+            // and the chunk stays a VIEW into `fused` at storage offset i·d·in_dim.
+            let view = fused.narrow(0, i * d, d)?.contiguous()?;
+            assert!(
+                view.is_contiguous(),
+                "narrow must look contiguous (the trap)"
+            );
+            let dense_ref = Linear::new(view.copy()?, None).forward(&x)?;
+            for (label, onto) in [("quantize", false), ("quantize_onto", true)] {
+                let mut lin = QLinear::Dense(DenseLinear::Linear(Linear::new(view.clone(), None)));
+                if onto {
+                    lin.quantize_onto(Quant::Q8, &dev)?;
+                } else {
+                    lin.quantize(Quant::Q8)?;
+                }
+                let cos = cosine(&lin.forward(&x)?, &dense_ref);
+                assert!(
+                    cos > 0.999,
+                    "chunk {name} via {label}: cos {cos:.6} — an offset view quantized the wrong \
+                     rows (sc-11028)"
+                );
+            }
+        }
         Ok(())
     }
 
