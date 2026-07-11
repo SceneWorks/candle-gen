@@ -415,8 +415,16 @@ resolver = "2"
 # ONE additive commit (rebased onto the pinned rev, no unrelated catch-up), so this is a pure surface
 # add. LOCKSTEP: SceneWorks must move its mlx-gen pins -> `4df97dc` and its candle-gen pins -> the
 # candle-gen rev carrying THIS edit, together, in one PR. Both lines below move as one.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "4df97dcebc283f556e983289075119b21ccba459" }
-sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "4df97dcebc283f556e983289075119b21ccba459" }
+# Rev 4df97dc -> 3612d33 (mlx-gen sc-10839, epic 10834): gen-core is BYTE-IDENTICAL — `git diff
+# 4df97dc..3612d33 -- gen-core/` is EMPTY. The mlx-gen range only adds SDXL + Z-Image sequential
+# component residency to those PROVIDER crates (which candle does NOT link), so candle-gen compiles
+# UNCHANGED and no new candle provider is pulled. This re-pin exists ONLY so the SceneWorks worker's
+# `--features backend-candle` skew gate resolves ONE gen-core rev after it moves its mlx-gen pins ->
+# `3612d33`: cargo skews on git REV, not tree, so a byte-identical gen-core at a new rev still needs
+# this lockstep move. Both lines below move as one; SceneWorks re-pins mlx-gen -> 3612d33 + candle-gen
+# -> the rev carrying THIS edit, together.
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "3612d333c91660cd4baf3e6e1432de42fb2d1257" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "3612d333c91660cd4baf3e6e1432de42fb2d1257" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
