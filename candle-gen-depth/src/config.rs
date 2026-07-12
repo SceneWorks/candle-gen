@@ -9,6 +9,12 @@
 
 /// DINOv2 ViT backbone + DPT neck/head hyperparameters. Defaults are the shipped
 /// `depth-anything/Depth-Anything-V2-Small-hf` values.
+///
+/// The channel/intermediate scalars (`num_channels`, `mlp_ratio`, `neck_hidden_sizes`,
+/// `fusion_hidden_size`, `head_hidden_size`) don't drive any runtime tensor shape on their own —
+/// every affected shape rides the loaded checkpoint — but `DepthAnythingV2::from_weights` asserts
+/// them against the checkpoint at load time (F-160, sc-11244), so a Base/Large plug-in that edits
+/// them without swapping weights fails loudly instead of silently changing nothing.
 #[derive(Clone, Debug)]
 pub struct DepthAnythingConfig {
     // --- backbone (DINOv2 ViT) ---

@@ -67,6 +67,7 @@ impl DepthAnythingV2 {
 
     /// Load from already-read [`Weights`] with an explicit config + device (for Base/Large or testing).
     pub fn from_weights(w: &Weights, cfg: DepthAnythingConfig, device: &Device) -> Result<Self> {
+        assert_config_matches_weights(&cfg, w)?;
         let backbone = backbone::Dinov2Backbone::from_weights(w, "backbone", cfg.clone())?;
         let neck = neck::DptNeck::from_weights(w, "neck", &cfg)?;
         let head = head::DepthHead::from_weights(w, "head", &cfg)?;
@@ -92,6 +93,10 @@ impl DepthAnythingV2 {
     /// Build the model's NHWC input tensor `[1, size, size, 3]` from an arbitrary RGB8 HWC image,
     /// resized + ImageNet-normalized. Exposed for parity/testing.
     pub fn preprocess_rgb8(&self, rgb: &[u8], width: u32, height: u32) -> Result<Tensor> {
+        // Public boundary: a zero dimension or an undersized buffer would panic inside
+        // `resize_rgb8_to_unit` (`in_h - 1` underflow in debug, `rgb[..]` out-of-bounds index in
+        // release). Reject both with a typed error naming the bad input (F-139, sc-11244).
+        validate_rgb8(rgb, width, height)?;
         let size = self.cfg.image_size;
         let buf = preprocess::rgb8_to_input_buf(rgb, width, height, size);
         Ok(Tensor::from_vec(buf, (1, size, size, 3), &self.device)?)
@@ -119,6 +124,13 @@ impl DepthAnythingV2 {
     /// `width`·`height` (min/max-normalized, grayscale broadcast; near = bright). The model runs at
     /// its native 518² and the result is bilinearly resized back to the input dimensions on the host.
     pub fn estimate_control_rgb8(&self, rgb: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+        // Reject a zero dimension first: a 0×0 image has `expected == 0`, so an empty buffer would
+        // otherwise slip past the exact-size check below and panic downstream (F-139, sc-11244).
+        if width == 0 || height == 0 {
+            return Err(CandleError::Msg(format!(
+                "depth input image has a zero dimension ({width}×{height})"
+            )));
+        }
         let expected = width as usize * height as usize * 3;
         if rgb.len() != expected {
             return Err(CandleError::Msg(format!(
@@ -140,4 +152,85 @@ impl DepthAnythingV2 {
             width as usize,
         ))
     }
+}
+
+/// Public-boundary guard for an RGB8 HWC image: reject a zero dimension or a buffer too small for
+/// `width·height·3` with a typed error naming the bad input, so the host-side resize (which indexes
+/// `rgb[..]` and computes `in_h - 1`) can never panic on a malformed worker image (F-139, sc-11244;
+/// mirrors the `candle-gen-face` F-041/F-042 boundary guards).
+fn validate_rgb8(rgb: &[u8], width: u32, height: u32) -> Result<()> {
+    if width == 0 || height == 0 {
+        return Err(CandleError::Msg(format!(
+            "depth input image has a zero dimension ({width}×{height})"
+        )));
+    }
+    let expected = width as usize * height as usize * 3;
+    if rgb.len() < expected {
+        return Err(CandleError::Msg(format!(
+            "depth input buffer is {} bytes, too small for {width}×{height}×3 ({expected})",
+            rgb.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Load-time shape assertions tying the config's channel/intermediate scalars to the loaded
+/// checkpoint (F-160, sc-11244). These fields (`num_channels`, `mlp_ratio` via
+/// [`DepthAnythingConfig::intermediate_size`], `neck_hidden_sizes`, `fusion_hidden_size`,
+/// `head_hidden_size`) don't otherwise drive any runtime shape — every affected tensor rides the
+/// checkpoint — so a Base/Large plug-in that edits them *without* swapping weights would silently
+/// change nothing. Validating them here turns that class of misconfiguration into a loud load error.
+fn assert_config_matches_weights(cfg: &DepthAnythingConfig, w: &Weights) -> Result<()> {
+    let check = |field: &str, key: &str, got: usize, want: usize| -> Result<()> {
+        if got != want {
+            return Err(CandleError::Msg(format!(
+                "depth config {field} = {want} disagrees with checkpoint tensor {key} \
+                 (leading dim {got}); config and weights must match"
+            )));
+        }
+        Ok(())
+    };
+    // num_channels: patch-embed conv in-channels (OIHW dim 1).
+    let key = "backbone.embeddings.patch_embeddings.projection.weight";
+    check(
+        "num_channels",
+        key,
+        w.require(key)?.dim(1)?,
+        cfg.num_channels,
+    )?;
+    // mlp_ratio (⇒ intermediate_size): layer-0 fc1 out-features.
+    let key = "backbone.encoder.layer.0.mlp.fc1.weight";
+    check(
+        "intermediate_size",
+        key,
+        w.require(key)?.dim(0)?,
+        cfg.intermediate_size(),
+    )?;
+    // neck_hidden_sizes[i]: per-stage reassemble projection out-channels.
+    for i in 0..4 {
+        let key = format!("neck.reassemble_stage.layers.{i}.projection.weight");
+        check(
+            &format!("neck_hidden_sizes[{i}]"),
+            &key,
+            w.require(&key)?.dim(0)?,
+            cfg.neck_hidden_sizes[i],
+        )?;
+    }
+    // fusion_hidden_size: neck `convs` project every level to this width.
+    let key = "neck.convs.0.weight";
+    check(
+        "fusion_hidden_size",
+        key,
+        w.require(key)?.dim(0)?,
+        cfg.fusion_hidden_size,
+    )?;
+    // head_hidden_size: head conv2 out-channels.
+    let key = "head.conv2.weight";
+    check(
+        "head_hidden_size",
+        key,
+        w.require(key)?.dim(0)?,
+        cfg.head_hidden_size,
+    )?;
+    Ok(())
 }

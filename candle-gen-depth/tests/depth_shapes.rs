@@ -238,6 +238,74 @@ fn rejects_wrong_buffer_size() {
     );
 }
 
+/// F-139 (sc-11244): a zero dimension must be a typed error, not a panic. A 0×0 image has
+/// `expected == 0`, so an empty buffer would otherwise slip past the exact-size check and panic
+/// inside the host resize (`in_h - 1` underflow / empty-slice index).
+#[test]
+fn rejects_zero_dimension() {
+    let cfg = tiny_cfg();
+    let w = synth_weights(&cfg);
+    let model = DepthAnythingV2::from_weights(&w, cfg, &dev()).unwrap();
+    for (rgb, wd, ht) in [
+        (Vec::<u8>::new(), 0u32, 0u32),
+        (vec![0u8; 0], 4, 0),
+        (vec![0u8; 0], 0, 4),
+    ] {
+        let err = model.estimate_control_rgb8(&rgb, wd, ht).unwrap_err();
+        assert!(
+            err.to_string().contains("zero dimension"),
+            "zero-dimension input must be a typed error ({wd}×{ht}), got: {err}"
+        );
+    }
+}
+
+/// F-139 (sc-11244): the raw `preprocess_rgb8` boundary (no exact-size gate of its own) must also
+/// reject a zero dimension and an undersized buffer rather than panic inside the resize.
+#[test]
+fn preprocess_rejects_zero_dimension_and_undersized() {
+    let cfg = tiny_cfg();
+    let w = synth_weights(&cfg);
+    let model = DepthAnythingV2::from_weights(&w, cfg, &dev()).unwrap();
+    let zero = model.preprocess_rgb8(&[], 0, 4).unwrap_err();
+    assert!(
+        zero.to_string().contains("zero dimension"),
+        "preprocess must reject a zero dimension: {zero}"
+    );
+    // 4×4×3 = 48 bytes required; a 10-byte buffer is undersized.
+    let small = model.preprocess_rgb8(&[0u8; 10], 4, 4).unwrap_err();
+    assert!(
+        small.to_string().contains("too small"),
+        "preprocess must reject an undersized buffer: {small}"
+    );
+    // A correctly sized buffer still builds the [1, size, size, 3] input.
+    let size = tiny_cfg().image_size;
+    let good = model
+        .preprocess_rgb8(&[0u8; 4 * 4 * 3], 4, 4)
+        .expect("valid buffer preprocesses");
+    assert_eq!(good.dims(), &[1, size, size, 3]);
+}
+
+/// F-160 (sc-11244): the reference-only config scalars are now asserted against the checkpoint at
+/// load time, so editing one without swapping weights fails loudly instead of changing nothing.
+#[test]
+fn config_mismatch_fails_load() {
+    let base = tiny_cfg();
+    let w = synth_weights(&base); // weights built for the correct scalars
+    let mut bad = tiny_cfg();
+    bad.head_hidden_size += 1; // now disagrees with head.conv2.weight in the checkpoint
+    let err = match DepthAnythingV2::from_weights(&w, bad, &dev()) {
+        Ok(_) => panic!("a config/checkpoint scalar mismatch must fail to load"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("head_hidden_size") && err.contains("disagrees"),
+        "a config/checkpoint scalar mismatch must name the offending field: {err}"
+    );
+
+    // The matching config still loads cleanly (success path preserved).
+    DepthAnythingV2::from_weights(&w, tiny_cfg(), &dev()).expect("matching config loads");
+}
+
 /// Real-weight CUDA/CPU smoke (the maintainer's on-device gate). Set `DEPTH_ANYTHING_V2_DIR` to a
 /// local `depth-anything/Depth-Anything-V2-Small-hf` snapshot dir (containing `model.safetensors`).
 ///
