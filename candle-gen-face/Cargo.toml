@@ -18,6 +18,11 @@ candle-gen = { path = "../candle-gen" }
 candle-core = { workspace = true }
 candle-nn = { workspace = true }
 
+[dev-dependencies]
+# `face_cosine` example (epic 10871 P4.2 identity scoring, sc-10886) loads PNG/JPG inputs. Mirrors the
+# `mlx-gen-face` dev-dep; PNG + JPEG so it can score either the person ref or an edit output.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
 [features]
 # Pass the backend selection through to the core crate so a downstream `--features cuda`/`metal` on
 # this crate selects the matching candle backend everywhere (the face stack itself runs f32, but the

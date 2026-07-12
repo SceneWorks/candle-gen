@@ -295,6 +295,7 @@ dependencies = [
  "candle-core",
  "candle-gen",
  "candle-nn",
+ "image",
 ]
 
 [[package]]
