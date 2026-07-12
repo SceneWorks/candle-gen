@@ -7,133 +7,109 @@ backend-neutral [`gen_core`](https://github.com/michaeltrefry/mlx-gen/tree/main/
 (SceneWorks epic 3720), so a consumer pins one backend by git SHA, links its provider crates, and
 calls the identical `Generator` / registry API regardless of which tensor backend is underneath.
 
-> **Status: SDXL txt2img implemented on the Candle/CUDA lane.** `SdxlGenerator::generate` runs the
-> full pipeline — dual CLIP → UNet (real CFG) → f16 VAE — for both `sdxl` and `realvisxl`
-> (sc-3675, RealVisXL + parity tests sc-3677). Output is deterministic and launch-portable per seed
-> (CPU-seeded noise + non-ancestral DDIM, sc-3673). Perf/VRAM work has landed: f16 CLIP + optional
-> flash-attention (sc-3674), VAE tiling + staged CLIP free for torch-parity peak VRAM at 1024²
-> (sc-4987), and UNet/VAE component caching across `generate` calls (sc-5037). The provider still
-> self-registers into the shared `gen_core` inventory registry, with the
-> `CandleError → gen_core::Error` bridge + device plumbing wired (sc-4946).
+> **Status: a maturing multi-family engine on the Candle/CUDA lane.** candle-gen now hosts **20+
+> registered model families** across image and video, plus a captioner, text/image embedders, and
+> host-side conditioning utilities — every provider self-registers into the shared `gen_core` inventory
+> registry (`candle_gen::register_*!`), keeps the deterministic CPU-seeded-noise contract
+> (launch-portable per seed), and rides the `CandleError → gen_core::Error` bridge. The families below
+> are GPU-validated on an RTX PRO 6000 (Blackwell **sm_120**). The core `candle-gen` crate supplies the
+> shared device/dtype seam, weight loaders, seeded noise, the unified sampler/scheduler framework (epic
+> 7114), the LoRA/LoKr training + inference-merge harness, and the Q4/Q8 + MLX-packed quantization seam.
 >
-> **Z-Image txt2img** is the first model-family expansion beyond SDXL (epic 3692, sc-3693):
-> `ZImageGenerator::generate` adapts the `candle-transformers` `z_image` reference (Qwen3 text
-> encoder → DiT flow-match Euler, distilled 4-step, **no CFG** → AutoencoderKL VAE), registered under
-> `"z_image_turbo"`. Same deterministic CPU-seeded-noise contract; the Qwen chat-template tokenization
-> is reused from gen-core (`TextTokenizer` / `ChatTemplate::QwenInstruct`). txt2img-only first slice
-> (img2img / LoRA / quantization are rejected, not silently dropped). **GPU-verified** on RTX PRO 6000
-> (sm_120): real 1024² renders + the conformance suite pass.
+> **Image generators**
 >
-> **FLUX.1 [schnell] + [dev] txt2img** is the second model-family expansion (epic 3692, sc-3694):
-> `FluxGenerator::generate` adapts the `candle-transformers` `flux` reference (dual **CLIP-L + T5-XXL**
-> text encoders → FLUX DiT flow-match Euler → FLUX AutoencoderKL VAE), registered under both
-> `"flux1_schnell"` (Apache-2.0, timestep-distilled: 4-step, **no guidance**) and `"flux1_dev"`
-> (gated, guidance-distilled: 25-step time-shifted schedule, embedded guidance ~3.5). The DiT + VAE
-> load directly from the black-forest-labs **root** checkpoints (`flux1-*.safetensors`,
-> `ae.safetensors`) — candle's `flux` speaks the BFL key layout, so no diffusers→BFL remap is needed —
-> while the text encoders come from the `text_encoder/` (CLIP) and `text_encoder_2/` (T5) subdirs. The
-> CLIP `tokenizer.json` is **vendored** (the snapshot ships CLIP only as `vocab.json`+`merges.txt`,
-> which a byte-level BPE mis-tokenizes; sc-2787 parity). Same deterministic CPU-seeded-noise contract;
-> FLUX.1[dev] license/credential gating stays upstream in the worker (no descriptor gating flag,
-> consistent with the mlx provider). txt2img-only first slice (Reference/IP-adapter, LoRA,
-> quantization rejected). **GPU-verified** on RTX PRO 6000 (sm_120): real 1024² schnell + dev renders
-> + both conformance suites pass.
+> | family | registered engine id(s) | architecture / notes |
+> |--------|-------------------------|----------------------|
+> | SDXL | `sdxl` | dual-CLIP UNet (`sdxl` + RealVisXL); img2img, LoRA train+merge, quant |
+> | Z-Image | `z_image`, `z_image_turbo` | Qwen3 TE → DiT flow-match; base CFG + distilled Turbo; LoRA trainer |
+> | FLUX.1 | `flux1_schnell`, `flux1_dev` | CLIP-L + T5-XXL → FLUX DiT flow-match |
+> | FLUX.2 | `flux2_klein_9b`, `flux2_dev`, `flux2_dev_edit`, `flux2_dev_control` | from-scratch MMDiT; txt2img + Edit + Fun-Controlnet-Union |
+> | Qwen-Image | `qwen_image` | 60-layer dual-stream MMDiT; txt2img + Edit + Fun-Controlnet-Union (VACE) + Lightning + LoRA/LoKr + MLX-packed quant |
+> | Anima | `anima_base`, `anima_aesthetic`, `anima_turbo` | Cosmos-Predict2 DiT anime T2I (ER-SDE-3 sampler) |
+> | Chroma | `chroma1_hd`, `chroma1_base`, `chroma1_flash` | FLUX-schnell-derived MMDiT |
+> | Kolors | `kolors` | SDXL UNet + ChatGLM3-6B encoder |
+> | SenseNova-U1 | `sensenova_u1_8b` | NEO-Unify dual-path Qwen3 MoT + flow head; + distilled fast tier |
+> | Ideogram 4 | `ideogram_4` | + Turbo + edit |
+> | Boogu-Image | `boogu_image`, `boogu_image_turbo`, `boogu_image_edit` | Lumina2/OmniGen2 MMDiT; Base/Turbo/Edit |
+> | Krea 2 | `krea_2_turbo`, `krea_2_raw`, `krea_2_edit`, `krea_2_control`, `krea_2_turbo_edit` | 12B DiT; Turbo/Raw/Edit/Control + CFG-free Turbo-edit; LoRA/LoKr trainer |
+> | SD3.5 | `sd3_5_large`, `sd3_5_large_turbo`, `sd3_5_medium` | MMDiT + triple text-encoder aggregator + 16-ch VAE |
+> | Lens | `lens`, `lens_turbo` | gpt-oss-20B MoE encoder + dual-stream MMDiT + FLUX.2 VAE |
+> | Bernini | `bernini`, `bernini_renderer` | ByteDance Wan2.2-T2V-A14B dual-expert renderer (planner + renderer) |
 >
-> **FLUX.2-klein-9B txt2img** is the third model-family expansion (epic 3692, sc-3695) and the first
-> **from-scratch** port — `candle-transformers` has no FLUX.2, so the whole architecture is ported from
-> `mlx-gen-flux2` on candle-core/candle-nn: a **Qwen3** text encoder (36-layer dense LM; the hidden
-> states of layers 9/18/27 concatenate into a 12288-wide `prompt_embeds`), the **MMDiT** transformer
-> (8 joint + 24 fused-parallel single blocks, **4-axis interleaved RoPE**, global per-stream
-> modulation), and the **AutoencoderKL-Flux2** VAE (32-ch latent, a 2×2 pack into 128-ch transformer
-> space, BatchNorm-stats latent normalization). Registered under `"flux2_klein_9b"`, distilled 4-step
-> flow-match Euler with the empirical-mu sigma shift, guidance 1.0 (>1.0 runs a CFG negative pass).
-> Same deterministic CPU-seeded-noise contract; tokenization reuses gen-core's `TextTokenizer`
-> (`ChatTemplate::QwenInstructNoThink`). Runs the reference math in f32 (~59 GB resident on the 96 GB
-> Blackwell; a bf16 pass is a follow-up). txt2img-only first slice — the edit variants
-> (`flux2_klein_9b_edit` / `_kv_edit`, single/multi Reference + reference-KV cache), LoRA, and
-> quantization are deferred. **GPU-verified** on RTX PRO 6000 (sm_120): real 1024² render + conformance
-> suite pass.
+> Identity-preserving stacks compose the above rather than registering standalone engines:
+> **InstantID** (`candle-gen-instantid`) layers the IP-Adapter/ControlNet + kps/openpose control render +
+> `gen_core::FaceEmbedder` onto candle SDXL, and **PuLID-FLUX** (`candle-gen-pulid`) injects an
+> EVA02-CLIP + IDFormer perceiver into FLUX.1-dev.
 >
-> **Qwen-Image txt2img** is the fourth model-family expansion (epic 3692, sc-3696) — the largest
-> from-scratch port, the ~20B 60-layer dual-stream MMDiT. Ported from `mlx-gen-qwen-image`: a
-> **Qwen2.5-VL** text encoder (28-layer LM; the last normed hidden state with the 34-token system
-> prefix dropped → 3584-wide `prompt_embeds`), the **dual-stream MMDiT** (60 blocks, joint `[txt,img]`
-> attention, **3-axis interleaved RoPE**, per-stream AdaLN modulation, timestep-only conditioning),
-> and the **AutoencoderKLQwenImage** VAE (a causal-Conv3d VAE that, for a single image, reduces to
-> conv2d on the last depth tap; **channel-L2** normalization; per-channel latent mean/std). Registered
-> under `"qwen_image"`, dynamic-μ flow-match Euler with **true CFG** (norm-rescaled) and a negative
-> prompt. The encoder runs **f32** and the MMDiT **bf16** (~74 GB resident; an all-f32 load would not
-> fit). txt2img-only first slice — img2img / Edit / ControlNet / Lightning / LoRA / quantization are
-> deferred. **GPU-verified** on RTX PRO 6000 (sm_120): real 1024² render + conformance suite pass.
-> (The snapshot's `tokenizer/tokenizer.json` is built by the worker from `vocab.json`+`merges.txt`;
-> the provider requires it, matching the mlx provider.)
+> **Video generators**
 >
-> **Wan2.2 TI2V-5B txt2video** is the fifth model-family expansion (epic 3692, sc-3697) — the first
-> **video** family (modality `Video`), emitting `GenerationOutput::Video`. Ported from the diffusers
-> checkpoint (`Wan-AI/Wan2.2-TI2V-5B-Diffusers`): a **UMT5-XXL** encoder (24-layer `UMT5EncoderModel`
-> — per-layer relative-position bias, gated-GELU, no attention scaling), the 30-layer
-> **`WanTransformer3DModel`** DiT (**3-axis interleaved RoPE**, AdaLN modulation, cross-attention to
-> text, classifier-free guidance), and the **`AutoencoderKLWan`** temporal VAE. Since candle ships **no
-> conv3d**, the causal Conv3d is implemented as a left-pad-in-time + summed conv2d taps
-> (`candle-gen-wan/src/conv3d.rs`); temporal upsampling reproduces the reference `time_conv` doubling +
-> `DupUp3D` residual in one pass. **UniPC** flow-match scheduler (order-2 bh2, default) with a Euler
-> fallback. UMT5 + VAE run **f32**, the 5B DiT **bf16** (~33 GB resident). The text context is
-> **zero-padded to 512 tokens** before the DiT (the model trained that way — feeding only the real
-> tokens silently collapses the latent). txt2video-only first slice — image/keyframe conditioning
-> (TI2V/I2V), VACE, LoRA, quantization, and tiling are deferred. **GPU-verified** on RTX PRO 6000
-> (sm_120): real 512² cat-walking clip + conformance suite pass; UMT5 / DiT / VAE forward passes are
-> **bit-exact** vs diffusers.
+> | family | registered engine id(s) | architecture / notes |
+> |--------|-------------------------|----------------------|
+> | Wan2.2 | `wan2_2_ti2v_5b`, `wan2_2_t2v_14b`, `wan2_2_i2v_14b`, `wan_vace` | UMT5-XXL + WanTransformer3D (from-scratch conv3d); TI2V/I2V, dual-expert 14B, VACE, LoRA, quant, tiling |
+> | LTX-2.3 | `ltx_2_3_distilled` | distilled 22B; Gemma-3-12B TE + connector + AVTransformer3D + CausalVideoAutoencoder |
+> | SVD | `svd_xt` | Stable Video Diffusion img2vid-xt |
+> | SCAIL-2 | `scail2_14b` | Wan2.1-14B I2V character animation / cross-identity replacement |
+> | SeedVR2 | `seedvr2` | one-step DiT + 3D causal video VAE super-resolution upscaler (image **and** video) |
 >
-> **LTX-2.3 (distilled 22B) txt2video** is the sixth model-family expansion (epic 3692, sc-3698) — the
-> heaviest port: a **Gemma-3-12B** text encoder (48-layer GQA, alternating local/global RoPE, q/k-norm;
-> all 49 hidden states extracted) feeding a **per-token-RMS aggregation** (3840×49 → 188160) → text
-> projection → an 8-layer **learnable-register connector** (128 registers replace the left-pad), then
-> the 48-layer **`AVTransformer3DModel`** video DiT (**split 3-D RoPE** with per-head float64 freqs,
-> per-head **2·sigmoid gated** attention, adaLN-single 9-row modulation, prompt-adaLN text conditioning),
-> and the **`CausalVideoAutoencoder`** temporal VAE (latent 128-ch, patch 4, 8× temporal / 32× spatial;
-> pixel-norm; depth-to-space upsampling). Single flat 22B safetensors bundles DiT + VAE + projection +
-> connector; the Gemma encoder is a separate snapshot (`LTX_GEMMA_DIR`). Since candle ships **no conv3d**,
-> the VAE causal Conv3d is summed conv2d taps with frame-replication temporal pad
-> (`candle-gen-ltx/src/conv3d.rs`). **Rectified-flow** distilled scheduler (fixed 8-step σ schedule, no
-> CFG — guidance is distilled in). DiT + connector + projection + Gemma run **bf16** (22B+12B doesn't fit
-> f32 on one 96 GB GPU), the VAE **f32**, attention/norms upcast to f32. txt2video-only first slice — the
-> **audio stack** (audio-VAE + vocoder + AV-joint DiT), the 2-stage latent upsampler, I2V conditioning,
-> prompt-enhance, LoRA/IC-LoRA, and fp8/quant are deferred. **GPU-verified** on RTX PRO 6000 (sm_120):
-> real cat-walking clip renders coherently on the first visual try.
+> **Captioner, embedders & conditioning utilities**
 >
-> **JoyCaption (Llama-JoyCaption-beta-one) image captioning** is the seventh model-family expansion
-> (epic 3692, sc-3699) and the first **`Captioner`** (image → text, not `Generator`): a
-> `LlavaForConditionalGeneration` ported from scratch (no candle-transformers — the contract needs the
-> SigLIP **`-2`** hidden state and a Llama fed pre-spliced `inputs_embeds`, neither of which it exposes).
-> A **SigLIP-so400m/14@384** vision tower (27 layers, 1152-d; returns the penultimate hidden state, all
-> 729 patch tokens) → a **gelu-MLP** multimodal projector (1152→4096) → the single `<|image|>` marker is
-> expanded to 729 placeholders and the projected rows are spliced over them → a **Llama-3.1-8B** decoder
-> (GQA 32/8, head-dim 128, **llama3 RoPE scaling**, KV-cache) generates the caption autoregressively
-> (greedy or temperature/top-p with a small CTRL-style repetition penalty; stops at the eot/eom/eos set).
-> The whole assembly runs **bf16** (native checkpoint dtype), logits upcast to f32 for sampling; the
-> SceneWorks caption prompt map (12 caption types × length templates) and the Llama-3 chat wrapper port
-> verbatim. Single snapshot dir (4 shards + `tokenizer.json`). **GPU-verified** on RTX PRO 6000 (sm_120):
-> a real photo captions coherently and on-subject. `backend = "candle"`, `mac_only = false`.
+> - **JoyCaption** (`candle-gen-joycaption`) — the first `Captioner`: a from-scratch LLaVA
+>   (SigLIP-so400m tower + gelu-MLP projector + Llama-3.1-8B decoder) turning an image into a caption.
+> - **CLIP ViT-L/14** (`candle-gen-clip`) — `clip_vit_l14` image embedder + `clip_vit_l14_text` text
+>   embedder providers (Dataset Doctor).
+> - **Face** (`candle-gen-face`) — SCRFD detector + ArcFace embedder implementing `gen_core::FaceEmbedder`
+>   for the InstantID / PuLID ports.
+> - **SAM3** (`candle-gen-sam3`) — a Segment-Anything-3 concept segmenter (off-Mac person-track PCS), a
+>   plain utility rather than a registered generator.
+> - **Depth Anything V2** (`candle-gen-depth`) — monocular depth estimator used as a host-side ControlNet
+>   depth preprocessor.
+> - **PiD** (`candle-gen-pid`) — NVIDIA Pixel-Diffusion latent→pixel super-resolving decoder seam.
 >
 > **candle pinned to git main (post-0.10.2)** — REQUIRED for Blackwell sm_120. The crates.io 0.10.2
 > release throws `CUDA_ERROR_INVALID_PTX` at the first candle-kernels kernel whenever
-> candle-transformers is linked (SDXL + Z-Image both; plain candle-core works). The git rev clears it
-> and is source-compatible. See `[workspace.dependencies]`.
+> candle-transformers is linked (plain candle-core works). The git rev clears it and is
+> source-compatible. See `[workspace.dependencies]`.
 
 ## Layout
 
 ```
 candle-gen/                 # workspace root
-  candle-gen/               # core crate: re-exports gen_core + candle; device/dtype helpers;
-                            #   CandleError -> gen_core::Error bridge
-  candle-gen-sdxl/          # SDXL provider crate: Generator impl + descriptor + inventory::submit!
-  candle-gen-z-image/       # Z-Image (Z-Image-Turbo) provider crate: txt2img via candle-transformers
-  candle-gen-flux/          # FLUX.1 [schnell]+[dev] provider crate: txt2img via candle-transformers `flux`
-  candle-gen-flux2/         # FLUX.2-klein-9B provider crate: from-scratch MMDiT + Qwen3 + AutoencoderKL-Flux2
-  candle-gen-qwen-image/    # Qwen-Image provider crate: from-scratch 60-layer MMDiT + Qwen2.5-VL + causal-Conv3d VAE
-  candle-gen-wan/           # Wan2.2 TI2V-5B video provider crate: WanTransformer3DModel + UMT5-XXL + temporal AutoencoderKLWan (from-scratch conv3d)
-  candle-gen-ltx/           # LTX-2.3 (distilled 22B) video provider crate: AVTransformer3DModel DiT + Gemma-3-12B encoder + connector + CausalVideoAutoencoder (from-scratch conv3d)
-  candle-gen-joycaption/    # JoyCaption image-captioning provider crate (first Captioner): SigLIP-so400m tower + gelu-MLP projector + Llama-3.1-8B decoder (from-scratch LLaVA)
+  candle-gen/               # core crate: gen_core + candle re-exports; device/dtype seam, weight
+                            #   loaders, seeded noise, unified sampler/scheduler, LoRA/LoKr train +
+                            #   inference-merge harness, Q4/Q8 + MLX-packed quant; CandleError bridge
+  # --- image generators ---
+  candle-gen-sdxl/          # SDXL / RealVisXL (dual-CLIP UNet) — txt2img, img2img, LoRA, quant
+  candle-gen-z-image/       # Z-Image / Z-Image-Turbo (Qwen3 TE → DiT flow-match) + LoRA trainer
+  candle-gen-flux/          # FLUX.1 [schnell]+[dev] (CLIP-L + T5-XXL → FLUX DiT)
+  candle-gen-flux2/         # FLUX.2 klein-9B + dev + dev-edit + dev-control (from-scratch MMDiT + Qwen3)
+  candle-gen-qwen-image/    # Qwen-Image: txt2img + Edit + Fun-Controlnet-Union + Lightning + LoRA + packed quant
+  candle-gen-anima/         # Anima (Cosmos-Predict2 DiT) anime T2I — base/aesthetic/turbo
+  candle-gen-chroma/        # Chroma (chroma1_hd/base/flash) FLUX-schnell-derived MMDiT
+  candle-gen-kolors/        # Kolors (SDXL UNet + ChatGLM3-6B encoder)
+  candle-gen-sensenova/     # SenseNova-U1 (NEO-Unify Qwen3 MoT + flow head) + distilled fast tier
+  candle-gen-ideogram/      # Ideogram 4 (+ Turbo, edit)
+  candle-gen-boogu/         # Boogu-Image-0.1 (Lumina2/OmniGen2 MMDiT) — base/turbo/edit
+  candle-gen-krea/          # Krea 2 — turbo/raw/edit/control/turbo-edit + LoRA/LoKr trainer
+  candle-gen-sd3/           # Stable Diffusion 3.5 Large/Large-Turbo/Medium (MMDiT + triple TE + 16-ch VAE)
+  candle-gen-lens/          # Lens / Lens-Turbo (gpt-oss-20B MoE encoder + dual-stream MMDiT + FLUX.2 VAE)
+  candle-gen-bernini/       # Bernini (ByteDance Wan2.2-T2V-A14B dual-expert renderer)
+  candle-gen-instantid/     # InstantID identity-preserving SDXL (IP-Adapter/ControlNet + FaceEmbedder)
+  candle-gen-pulid/         # PuLID-FLUX identity injection (EVA02-CLIP + IDFormer into FLUX.1-dev)
+  # --- video generators ---
+  candle-gen-wan/           # Wan2.2 TI2V-5B + T2V/I2V-14B + VACE (from-scratch conv3d); LoRA, quant, tiling
+  candle-gen-ltx/           # LTX-2.3 (distilled 22B) txt2video (Gemma-3-12B TE + connector + AVTransformer3D)
+  candle-gen-svd/           # Stable Video Diffusion (img2vid-xt)
+  candle-gen-scail2/        # SCAIL-2 (Wan2.1-14B I2V character animation / identity replacement)
+  candle-gen-seedvr2/       # SeedVR2 one-step DiT super-resolution upscaler (image + video)
+  # --- captioner / embedders / conditioning utilities ---
+  candle-gen-joycaption/    # JoyCaption (LLaVA: SigLIP + Llama-3.1-8B) image→caption Captioner
+  candle-gen-clip/          # CLIP ViT-L/14 image + text embedder providers
+  candle-gen-face/          # SCRFD detector + ArcFace embedder (gen_core FaceEmbedder)
+  candle-gen-sam3/          # SAM3 concept segmenter (person-track PCS utility)
+  candle-gen-depth/         # Depth Anything V2 monocular depth (ControlNet preprocessor)
+  candle-gen-pid/           # NVIDIA PiD pixel-diffusion latent→pixel decoder seam
+  vendor/
+    candle-kernels/         # local fork: multi-arch fatbin for the CUDA quant path (sc-7544; see Packaging)
   scripts/
     check-gen-core-skew.sh  # version-skew gate: fails if >1 sceneworks-gen-core resolves
     check-cuda.ps1          # local cuda gate: vcvars + cargo build/test --features cuda (run pre-push)
@@ -141,10 +117,10 @@ candle-gen/                 # workspace root
   .github/workflows/ci.yml  # macOS/Linux fmt+clippy+check+test + skew self-test; manual Windows/CUDA lane
 ```
 
-A provider crate self-registers just by being linked (`inventory::submit!`), so adding a model is
-purely additive — there is no central match statement to edit. `candle-gen-sdxl` registers a single
-descriptor under the id `"sdxl"` (the SceneWorks worker maps both `sdxl` and `realvisxl` to engine
-id `"sdxl"`), with `backend: "candle"`.
+A provider crate self-registers just by being linked (`candle_gen::register_*!` → `inventory::submit!`),
+so adding a model is purely additive — there is no central match statement to edit. Each crate submits
+one or more `ModelDescriptor`s under a stable engine id (e.g. `candle-gen-sdxl` registers `"sdxl"`, which
+the SceneWorks worker maps both `sdxl` and `realvisxl` onto), all with `backend: "candle"`.
 
 ## Backends / features
 
