@@ -197,7 +197,7 @@ impl Generator for KreaGenerator {
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
         let id = self.descriptor.id;
-        if req.prompt.is_empty() {
+        if req.prompt.trim().is_empty() {
             return Err(gen_core::Error::Msg(format!(
                 "{id}: prompt must not be empty"
             )));
@@ -606,6 +606,27 @@ mod tests {
             },
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
+        }
+    }
+
+    /// F-154 (sc-11210): the empty-prompt guard rejects a whitespace-only prompt (`trim().is_empty()`),
+    /// matching the chroma and krea control-provider siblings — a whitespace prompt would otherwise
+    /// reach the TE as an effectively-empty sequence.
+    #[test]
+    fn validate_rejects_whitespace_only_prompt() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(KREA_2_TURBO_ID, &spec).unwrap();
+        for ws in ["   ", "\t", "\n", " \t\n "] {
+            let req = GenerationRequest {
+                prompt: ws.into(),
+                width: 1024,
+                height: 1024,
+                ..Default::default()
+            };
+            assert!(
+                g.validate(&req).is_err(),
+                "whitespace-only prompt {ws:?} must be rejected"
+            );
         }
     }
 

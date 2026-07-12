@@ -278,10 +278,22 @@ pub(crate) fn render_turbo(
             // Predict (clean estimate): x += (1 − sigma)·v, in f32.
             lat =
                 (lat.to_dtype(DType::F32)? + (pred.to_dtype(DType::F32)? * (1.0 - sigma) as f64)?)?;
-            // Renoise to the next sigma level with fresh noise (all but the final step).
+            // Renoise to the next sigma level with fresh noise (all but the final step). Key the
+            // renoise stream with STEP_RNG_SALT (sc-11210 / F-117): the initial latent is keyed by
+            // `seed`, so an unsalted `seed + step` renoise draw is byte-identical to image `i+step`'s
+            // initial-noise stream in the same `count`-batch (each image renders at `base_seed + i`),
+            // correlating batch noise. Offsetting the renoise family by the golden-ratio salt separates
+            // it from every initial-noise stream — the same prior-vs-step separation the conditioned
+            // SDXL/InstantID lanes use. Output-changing: mirrors the mlx twin lockstep.
             if i + 1 < steps {
                 let sigma_next = sigmas[i + 1];
-                let noise = init_noise(req.height, req.width, seed, (i + 1) as u64, device)?;
+                let noise = init_noise(
+                    req.height,
+                    req.width,
+                    seed.wrapping_add(candle_gen::STEP_RNG_SALT),
+                    (i + 1) as u64,
+                    device,
+                )?;
                 lat = ((noise * (1.0 - sigma_next) as f64)? + (&lat * sigma_next as f64)?)?;
             }
             on_progress(Progress::Step {
@@ -680,5 +692,58 @@ mod tests {
         let curated = candle_gen::resolve_flow_schedule(Some("sgm_uniform"), 0.0, steps, &native);
         assert_ne!(curated, native);
         assert!(curated.len() >= 2 && curated.last().copied() == Some(0.0));
+    }
+
+    /// F-117 (sc-11210): the salted DMD renoise stream must not collide with any sibling image's
+    /// initial-noise stream. In a `count`-batch each image `i` renders at `base_seed + i` and its
+    /// initial latent is `init_noise(.., base_seed + i, 0)` = `StdRng(base_seed + i)`. Before the fix,
+    /// image 0's renoise at step index `k` drew `init_noise(.., base_seed, k)` = `StdRng(base_seed + k)`
+    /// — byte-identical to image `k`'s initial noise. Keying the renoise seed with `STEP_RNG_SALT`
+    /// offsets the whole renoise family away, so the collision is gone while the draw stays
+    /// deterministic. GPU-free (CPU device).
+    #[test]
+    fn renoise_stream_is_salted_off_the_initial_noise_streams() {
+        let (h, w) = (16u32, 16u32);
+        let base_seed = 0u64;
+        // The salted renoise draw for image 0 at step indices 1..=3.
+        for k in 1u64..=3 {
+            let renoise = init_noise(
+                h,
+                w,
+                base_seed.wrapping_add(candle_gen::STEP_RNG_SALT),
+                k,
+                &Device::Cpu,
+            )
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+            // The pre-fix collision target: sibling image `k`'s initial-noise stream.
+            let sibling_init = init_noise(h, w, base_seed.wrapping_add(k), 0, &Device::Cpu)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_ne!(
+                renoise, sibling_init,
+                "salted renoise at step {k} must differ from image {k}'s initial noise"
+            );
+            // Still a pure function of its inputs (same call ⇒ same draw).
+            let again = init_noise(
+                h,
+                w,
+                base_seed.wrapping_add(candle_gen::STEP_RNG_SALT),
+                k,
+                &Device::Cpu,
+            )
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+            assert_eq!(renoise, again, "renoise draw must be deterministic");
+        }
     }
 }
