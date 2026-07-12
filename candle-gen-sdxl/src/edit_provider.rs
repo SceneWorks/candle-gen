@@ -176,20 +176,21 @@ impl SdxlEdit {
     /// (σ=0) decoder bound to the prompt + seed is correct; the request cancel threads in for a
     /// cancellable SR decode.
     fn pid_decoder_for(&self, req: &SdxlEditRequest) -> Result<Option<PidDecoder>> {
-        if !req.use_pid {
-            return Ok(None);
-        }
-        let engine = self.pid.as_ref().ok_or_else(|| {
-            CandleError::Msg(
-                "sdxl edit: use_pid was requested but no PiD decoder is loaded (call with_pid)"
-                    .into(),
-            )
-        })?;
-        Ok(Some(
-            engine
-                .decoder(&req.prompt, 0.0, req.seed)?
-                .with_cancel(req.cancel.clone()),
-        ))
+        // Route through the shared guarded seam (sc-11242 / F-091) so the SR decode is budgeted
+        // (F-013 sc-9095) and spatially tiled (sc-10087). The edit denoise runs to the clean σ=0
+        // latent; single image.
+        candle_gen_pid::resolve_pid_decoder_for_fields(
+            self.pid.as_ref(),
+            req.use_pid,
+            &req.prompt,
+            1,
+            req.width,
+            req.height,
+            &req.cancel,
+            req.seed,
+            "sdxl edit",
+            0.0,
+        )
     }
 
     /// **img2img**: regenerate `source` toward `req.prompt` at `req.strength`.

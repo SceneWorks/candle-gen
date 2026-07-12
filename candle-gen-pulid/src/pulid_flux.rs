@@ -253,19 +253,20 @@ impl PulidFlux {
     /// [`with_pid`](Self::with_pid). A clean-latent (σ=0) decoder bound to the prompt + seed; the request
     /// cancel threads in for a cancellable SR decode.
     fn pid_decoder_for(&self, req: &PulidFluxRequest) -> Result<Option<PidDecoder>> {
-        if !req.use_pid {
-            return Ok(None);
-        }
-        let engine = self.pid.as_ref().ok_or_else(|| {
-            CandleError::Msg(
-                "pulid: use_pid was requested but no PiD decoder is loaded (call with_pid)".into(),
-            )
-        })?;
-        Ok(Some(
-            engine
-                .decoder(&req.prompt, 0.0, req.seed)?
-                .with_cancel(req.cancel.clone()),
-        ))
+        // Route through the shared guarded seam (sc-11242 / F-091) so the SR decode is budgeted
+        // (F-013 sc-9095) and spatially tiled (sc-10087). Clean-latent σ=0 decode, single image.
+        candle_gen_pid::resolve_pid_decoder_for_fields(
+            self.pid.as_ref(),
+            req.use_pid,
+            &req.prompt,
+            1,
+            req.width,
+            req.height,
+            &req.cancel,
+            req.seed,
+            "pulid",
+            0.0,
+        )
     }
 
     /// Reference face (RGB [`Image`]) → `id_embedding` `[1,32,2048]` (f32). Mirrors PuLID's

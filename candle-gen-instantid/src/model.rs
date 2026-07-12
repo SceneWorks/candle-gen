@@ -300,20 +300,22 @@ impl InstantId {
     /// latent sits at the clean σ=0; the prompt is the PiD caption and the seed comes from the request.
     /// The request cancel threads into the decoder so the ~4-step SR decode stays cancellable per step.
     fn pid_decoder_for(&self, req: &InstantIdRequest) -> Result<Option<PidDecoder>> {
-        if !req.use_pid {
-            return Ok(None);
-        }
-        let engine = self.pid.as_ref().ok_or_else(|| {
-            CandleError::Msg(
-                "instantid: use_pid was requested but no PiD decoder is loaded (call with_pid)"
-                    .into(),
-            )
-        })?;
-        Ok(Some(
-            engine
-                .decoder(&req.prompt, 0.0, req.seed)?
-                .with_cancel(req.cancel.clone()),
-        ))
+        // Route through the shared guarded seam (sc-11242 / F-091) so the SR decode is budgeted
+        // (F-013 sc-9095) and spatially tiled (sc-10087) — a large `use_pid` decode (4× SR) otherwise
+        // ran the whole-image forward and reproduced the CUDA sysmem-fallback silent hang. InstantID
+        // runs a full denoise to the clean σ=0 latent (count=1, single image).
+        candle_gen_pid::resolve_pid_decoder_for_fields(
+            self.pid.as_ref(),
+            req.use_pid,
+            &req.prompt,
+            1,
+            req.width,
+            req.height,
+            &req.cancel,
+            req.seed,
+            "instantid",
+            0.0,
+        )
     }
 
     /// Detect + embed the largest face in `image` (the reference): bbox + 5 kps + 512-d ArcFace

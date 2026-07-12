@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use candle_gen::candle_core::{DType, Device};
+use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::flow_capture_plan;
 use candle_gen::gen_core::{GenerationRequest, PidWeights, WeightsSource};
 use candle_gen::{CandleError, Result, Weights};
@@ -179,7 +180,47 @@ pub fn resolve_pid_decoder_at_sigma(
     model_id: &str,
     capture_sigma: f32,
 ) -> Result<Option<PidDecoder>> {
-    if !req.use_pid {
+    resolve_pid_decoder_for_fields(
+        pid,
+        req.use_pid,
+        &req.prompt,
+        req.count,
+        req.width,
+        req.height,
+        &req.cancel,
+        base_seed,
+        model_id,
+        capture_sigma,
+    )
+}
+
+/// Field-parameterized sibling of [`resolve_pid_decoder_at_sigma`] for the providers that carry a
+/// bespoke request type instead of a [`GenerationRequest`] (InstantID / PuLID / z-image-control /
+/// sdxl-IP, plus the flux2-control / flux2-edit / kolors-control / sdxl-edit siblings). It applies the
+/// **same** memory-budget guard (F-013 sc-9095) and spatial-tiling plan (sc-10087) as the registered
+/// seam — the whole point of sc-11242 / F-091: before this, every bespoke `pid_decoder_for` copy minted
+/// the decoder via `engine.decoder(…).with_cancel(…)` with no `budget::guard` and no `with_tiling`, so a
+/// large `use_pid` decode (e.g. 1536² → 6144² at 4×) ran the whole-image forward and reproduced the CUDA
+/// sysmem-fallback silent hang the guard/tiling were built to prevent. Route all such copies through
+/// here so they are budgeted and tiled, and the copy-drift collapses to one implementation.
+///
+/// `capture_sigma` is `0.0` for a clean-latent decode (every current bespoke caller runs a full denoise
+/// to σ=0). Returns `None` when `use_pid` is unset; errors loudly when `use_pid` is set but no engine is
+/// loaded (never a silent VAE fallback).
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_pid_decoder_for_fields(
+    pid: Option<&PidEngine>,
+    use_pid: bool,
+    prompt: &str,
+    count: u32,
+    width: u32,
+    height: u32,
+    cancel: &CancelFlag,
+    base_seed: u64,
+    model_id: &str,
+    capture_sigma: f32,
+) -> Result<Option<PidDecoder>> {
+    if !use_pid {
         return Ok(None);
     }
     let engine = pid.ok_or_else(|| {
@@ -188,7 +229,7 @@ pub fn resolve_pid_decoder_at_sigma(
         ))
     })?;
     // Memory budget + tiling (F-013 sc-9095, tiling sc-10087). PiD super-resolves in pixel space by
-    // `engine.scale()`, so a `max_size`-legal `req.width × req.height` decodes at `(width·scale) ×
+    // `engine.scale()`, so a `max_size`-legal `width × height` decodes at `(width·scale) ×
     // (height·scale)` — a 1536² request → 6144², whose whole-image forward exhausts VRAM (→ the CUDA
     // sysmem-fallback silent hang). We now **tile** rather than refuse: size the tile against the
     // machine's safe budget (`nvidia-smi` total × 0.85, or the `PID_DECODE_BUDGET_GIB` override) and only
@@ -196,21 +237,21 @@ pub fn resolve_pid_decoder_at_sigma(
     let safe_gib = candle_gen::vae_tiling::safe_budget_gib(PID_BUDGET_ENV, 0.85, 16.0);
     crate::budget::guard(
         model_id,
-        req.count,
-        req.width,
-        req.height,
+        count,
+        width,
+        height,
         engine.scale(),
         engine.config(),
         safe_gib,
     )?;
     let scale = engine.scale();
     let (th, tw) = (
-        (req.height * scale as u32) as i32,
-        (req.width * scale as u32) as i32,
+        (height * scale as u32) as i32,
+        (width * scale as u32) as i32,
     );
     let cfg = engine.config();
     let plan = crate::budget::plan_tile_edge(
-        req.count.max(1) as i32,
+        count.max(1) as i32,
         th,
         tw,
         cfg.patch_size,
@@ -220,8 +261,8 @@ pub fn resolve_pid_decoder_at_sigma(
     // Thread the request's cancel flag into the minted decoder so the 4-step decode honors a cancel
     // per sampler step (F-006) — the `LatentDecoder::decode` trait signature carries no flag.
     let mut decoder = engine
-        .decoder(&req.prompt, capture_sigma, base_seed)?
-        .with_cancel(req.cancel.clone());
+        .decoder(prompt, capture_sigma, base_seed)?
+        .with_cancel(cancel.clone());
     if !plan.whole_fits {
         decoder = decoder.with_tiling(plan.edge, plan.overlap);
     }
@@ -352,5 +393,86 @@ mod tests {
         assert!(resolve_pid_decoder(None, &req, 0, "flux")
             .unwrap()
             .is_none());
+    }
+
+    // --- Field-parameterized shared seam (sc-11242 / F-091) -----------------------------------------
+    // The bespoke providers (InstantID / PuLID / z-image-control / sdxl-IP, and the flux2-control /
+    // flux2-edit / kolors-control / sdxl-edit siblings) now funnel their `pid_decoder_for` through
+    // `resolve_pid_decoder_for_fields`, which applies the same budget guard + tiling as the registered
+    // seam. Their per-lane `use_pid` decodes therefore honor the guard/tiling exactly like the guarded
+    // path — the numeric guard/plan behavior itself is covered by the `crate::budget` tests. These
+    // assert the shared funnel's off/loaded-engine contract that every bespoke lane inherits.
+
+    #[test]
+    fn field_helper_off_is_none() {
+        // use_pid unset → native VAE (None), regardless of size — every bespoke lane inherits this.
+        assert!(resolve_pid_decoder_for_fields(
+            None,
+            false,
+            "a fox",
+            1,
+            1536,
+            1536,
+            &CancelFlag::default(),
+            0,
+            "instantid",
+            0.0,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn field_helper_requested_without_engine_errors() {
+        // use_pid set but no engine loaded → the shared loud refusal (never a silent VAE fallback).
+        let err = err_string(resolve_pid_decoder_for_fields(
+            None,
+            true,
+            "a fox",
+            1,
+            1536,
+            1536,
+            &CancelFlag::default(),
+            0,
+            "pulid",
+            0.0,
+        ));
+        assert!(err.contains("no PiD decoder is loaded"), "got: {err}");
+    }
+
+    // Reachability guard for F-091: `resolve_pid_decoder_at_sigma` (the registered seam) and the
+    // field helper share one implementation, so a bespoke lane cannot drift back to an unguarded
+    // whole-image decode without also breaking the registered path. This asserts the delegation stays
+    // wired — `resolve_pid_decoder_at_sigma` must agree with the field helper on the off/error contract.
+    #[test]
+    fn request_seam_delegates_to_field_helper() {
+        let req = GenerationRequest {
+            prompt: "a fox".into(),
+            use_pid: true,
+            width: 1536,
+            height: 1536,
+            count: 1,
+            ..Default::default()
+        };
+        let via_req = err_string(resolve_pid_decoder_at_sigma(
+            None,
+            &req,
+            0,
+            "sdxl ip-adapter",
+            0.0,
+        ));
+        let via_fields = err_string(resolve_pid_decoder_for_fields(
+            None,
+            true,
+            &req.prompt,
+            req.count,
+            req.width,
+            req.height,
+            &req.cancel,
+            0,
+            "sdxl ip-adapter",
+            0.0,
+        ));
+        assert_eq!(via_req, via_fields);
     }
 }
