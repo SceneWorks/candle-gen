@@ -22,10 +22,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
 use candle_gen::gen_core::runtime::CancelFlag;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
+use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{AdapterSpec, Image, OffloadPolicy, Progress};
 use candle_gen::{CandleError, Result};
 
@@ -297,14 +297,12 @@ impl QwenEdit {
         let root = paths.root.clone();
         let te_cfg = TextEncoderConfig::qwen_image();
 
+        // Shared tokenizer policy (F-134 / sc-11190) with the edit lane's own `-2511` processor-bundle
+        // path resolution — one `tokenizer_config()` home keeps edit's caption tokenization identical to
+        // the txt2img lane's.
         let tokenizer = TextTokenizer::from_file(
             tokenizer_json_path(&root)?,
-            TokenizerConfig {
-                max_length: te_cfg.max_length,
-                pad_token_id: te_cfg.pad_token_id,
-                chat_template: ChatTemplate::QwenImage,
-                pad_to_max_length: false,
-            },
+            crate::control_common::tokenizer_config(&te_cfg),
         )
         .map_err(|e| CandleError::Msg(format!("qwen edit: load tokenizer: {e}")))?;
 
@@ -542,7 +540,7 @@ impl QwenEdit {
         on_progress(Progress::Decoding);
         let lat = pipeline::unpack_latents(&latents, req.width, req.height)?;
         let decoded = vae.decode(&lat)?;
-        to_image(&decoded)
+        crate::control_common::to_image(&decoded)
     }
 
     /// Reference-conditioned edit. `references` is the (validated non-empty) reference image set: the
@@ -633,22 +631,6 @@ fn image_input(im: &Image) -> ImageInput<'_> {
         height: im.height as usize,
         width: im.width as usize,
     }
-}
-
-/// VAE output `[1, 3, H, W]` in `[-1, 1]` → an RGB8 [`Image`].
-fn to_image(decoded: &Tensor) -> Result<Image> {
-    let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
-    let img = img.i(0)?.to_device(&Device::Cpu)?;
-    let (c, h, w) = img.dims3()?;
-    if c != 3 {
-        return Err(CandleError::Msg(format!("expected 3 channels, got {c}")));
-    }
-    let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
-    Ok(Image {
-        width: w as u32,
-        height: h as u32,
-        pixels,
-    })
 }
 
 #[cfg(test)]

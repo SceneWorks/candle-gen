@@ -15,7 +15,7 @@
 //!     ([`load_image_tensor`]), encode the **deterministic latent mean** (the stock z_image
 //!     [`Encoder`](VaeEncoder) → `(mean − shift)·scale`; the `reg` sampling is skipped so caching is
 //!     reproducible), and encode the caption through the Qwen3 text encoder with the *exact* gen-core
-//!     [`TokenizerConfig`] inference uses → `(L, 2560)`. The VAE + text encoder are dropped after
+//!     [`TokenizerConfig`](candle_gen::gen_core::tokenizer::TokenizerConfig) inference uses → `(L, 2560)`. The VAE + text encoder are dropped after
 //!     caching.
 //!  2. **Loop** (driver-owned) — sample a flow-match `σ ∈ [1e-3, 1−1e-3]`
 //!     ([`sample_unit_timestep`](candle_gen::train::flow_match::sample_unit_timestep)), form
@@ -56,7 +56,7 @@ use candle_core::{DType, Device, IndexOp, Tensor, Var};
 
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
+use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::train::{
     Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress, TrainingRequest,
 };
@@ -81,9 +81,7 @@ use candle_transformers::models::z_image::vae::{AutoEncoderKL, Encoder as VaeEnc
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::dit::{ZImageTransformer2DModel, Z_IMAGE_ATTN_TARGETS};
-use crate::pipeline::{
-    LATENT_CHANNELS, PATCH_SIZE, QWEN_PAD_TOKEN_ID, SPATIAL_SCALE, TOKENIZER_MAX_LEN,
-};
+use crate::pipeline::{LATENT_CHANNELS, PATCH_SIZE, SPATIAL_SCALE};
 use crate::MODEL_ID;
 
 /// Cap on preview prompts rendered per [`TrainingConfig::sample_every`] cadence (sc-8650) — the
@@ -209,7 +207,7 @@ fn vae_encode_mean(encoder: &VaeEncoder, img: &Tensor, shift: f64, scale: f64) -
 }
 
 /// Tokenize `caption` with the Qwen chat template + encode it through the Qwen3 text encoder to the
-/// cached conditioning `(L, cap_feat_dim)` at f32 — the exact [`TokenizerConfig`] / encoder the
+/// cached conditioning `(L, cap_feat_dim)` at f32 — the exact [`TokenizerConfig`](candle_gen::gen_core::tokenizer::TokenizerConfig) / encoder the
 /// inference [`crate::pipeline`] uses (parity), minus the device-dtype cast (caching keeps f32).
 fn encode_caption(
     tok: &TextTokenizer,
@@ -283,20 +281,6 @@ fn decode_preview(vae: &AutoEncoderKL, latents: &Tensor) -> Result<Image> {
         height: h as u32,
         pixels,
     })
-}
-
-/// Load the Qwen tokenizer with the inference-identical config.
-fn load_tokenizer(root: &Path) -> Result<TextTokenizer> {
-    TextTokenizer::from_file(
-        root.join("tokenizer/tokenizer.json"),
-        TokenizerConfig {
-            max_length: TOKENIZER_MAX_LEN,
-            pad_token_id: QWEN_PAD_TOKEN_ID,
-            chat_template: ChatTemplate::QwenInstruct,
-            pad_to_max_length: false,
-        },
-    )
-    .map_err(|e| CandleError::Msg(format!("z_image trainer: load tokenizer: {e}")))
 }
 
 /// Build the vendored, trainable DiT from the snapshot `transformer/` safetensors at `dtype`.
@@ -409,7 +393,10 @@ impl FlowMatchTrainer for ZImageTrainer {
             &vae_cfg,
             flow_match::component_vb(&self.root, "vae", device, DType::F32, LABEL)?.pp("encoder"),
         )?;
-        let tokenizer = load_tokenizer(&self.root)?;
+        // F-133 (sc-11190): the trainer's caption encode is parity-critical with inference, so the
+        // tokenizer policy lives in one home (`common::tokenizer_config`) — a policy change (sc-8646
+        // class) now can't land in inference and silently miss the trainer.
+        let tokenizer = crate::common::build_tokenizer(&self.root, "z_image trainer")?;
         let text_encoder = ZImageTextEncoder::new(
             &TextEncoderConfig::z_image(),
             flow_match::component_vb(&self.root, "text_encoder", device, DType::F32, LABEL)?,

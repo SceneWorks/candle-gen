@@ -46,14 +46,22 @@ pub(crate) fn load_tokenizer(
 ) -> Result<TextTokenizer> {
     TextTokenizer::from_file(
         root.join("tokenizer/tokenizer.json"),
-        TokenizerConfig {
-            max_length: te_cfg.max_length,
-            pad_token_id: te_cfg.pad_token_id,
-            chat_template: ChatTemplate::QwenImage,
-            pad_to_max_length: false,
-        },
+        tokenizer_config(te_cfg),
     )
     .map_err(|e| CandleError::Msg(format!("{label}: load tokenizer: {e}")))
+}
+
+/// The Qwen-Image [`TokenizerConfig`] — one home for the max-length / pad / chat-template policy so no
+/// lane can silently drift (F-134 / sc-11190). [`load_tokenizer`] loads it from `root/tokenizer/`; the
+/// edit lane (`edit.rs`) reuses this config with its own `-2511` processor-bundle path resolution.
+/// `pad_to_max_length: false` is load-bearing for the empty-uncond CFG path (sc-8646 class).
+pub(crate) fn tokenizer_config(te_cfg: &TextEncoderConfig) -> TokenizerConfig {
+    TokenizerConfig {
+        max_length: te_cfg.max_length,
+        pad_token_id: te_cfg.pad_token_id,
+        chat_template: ChatTemplate::QwenImage,
+        pad_to_max_length: false,
+    }
 }
 
 /// Tokenize + encode `prompt` → `prompt_embeds` `[1, seq, 3584]` at `dit_dtype` (bf16). Mirrors the
@@ -180,5 +188,18 @@ mod tests {
         let out = to_image(&t).unwrap();
         assert_eq!((out.width, out.height), (4, 2));
         assert_eq!(out.pixels.len(), 4 * 2 * 3);
+    }
+
+    #[test]
+    fn tokenizer_config_matches_qwen_image_policy() {
+        // F-134 (sc-11190): the one `tokenizer_config()` home must reproduce the byte-identical policy
+        // the txt2img / sequential-TE / edit lanes previously built inline — any drift here silently
+        // changes the caption ids (the sc-8646 `pad_to_max_length: false` uncond path especially).
+        let te_cfg = TextEncoderConfig::qwen_image();
+        let cfg = tokenizer_config(&te_cfg);
+        assert_eq!(cfg.max_length, te_cfg.max_length);
+        assert_eq!(cfg.pad_token_id, te_cfg.pad_token_id);
+        assert!(matches!(cfg.chat_template, ChatTemplate::QwenImage));
+        assert!(!cfg.pad_to_max_length);
     }
 }

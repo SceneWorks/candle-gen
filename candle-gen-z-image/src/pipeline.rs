@@ -149,9 +149,7 @@ pub(crate) const BASE_DEFAULT_GUIDANCE: f32 = 4.0;
 // The shared Z-Image geometry/tokenizer constants now live in [`crate::common`] (sc-9002 / F-022) —
 // re-exported here at their historical `crate::pipeline::…` paths so the trainer's preview-sample path
 // (sc-8650) keeps importing them from one place. Single source of truth: [`crate::common`].
-pub(crate) use crate::common::{
-    ENC_DTYPE, LATENT_CHANNELS, PATCH_SIZE, QWEN_PAD_TOKEN_ID, SPATIAL_SCALE, TOKENIZER_MAX_LEN,
-};
+pub(crate) use crate::common::{ENC_DTYPE, LATENT_CHANNELS, PATCH_SIZE, SPATIAL_SCALE};
 
 /// img2img start step — the Z-Image "structure-preservation" convention (the fork's `init_time_step`,
 /// mirrored from `mlx-gen`'s shared `img2img::init_time_step`): for a reference with `strength` in

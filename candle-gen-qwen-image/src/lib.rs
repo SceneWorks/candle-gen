@@ -9,7 +9,7 @@
 //! 34 template tokens dropped → 3584-wide `prompt_embeds`) → the MMDiT (interleaved 3-axis RoPE,
 //! dynamic-μ flow-match Euler, **true CFG** with norm-rescale) → the AutoencoderKLQwenImage decoder,
 //! registered under `"qwen_image"`. Deterministic CPU-seeded noise (sc-3673); tokenization reuses
-//! gen-core's [`TextTokenizer`] with [`ChatTemplate::QwenImage`].
+//! gen-core's [`TextTokenizer`] with [`ChatTemplate::QwenImage`](candle_gen::gen_core::tokenizer::ChatTemplate::QwenImage).
 //!
 //! **Dtypes:** the Qwen2.5-VL encoder runs in **f32** (the fork rounds only the embeds to bf16) and
 //! the 20B MMDiT in **bf16** (its native checkpoint dtype) — ~74 GB resident, which fits the 96 GB
@@ -90,9 +90,9 @@ mod comfyui_vae_validate;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::candle_nn::VarBuilder;
-use candle_gen::gen_core::tokenizer::{ChatTemplate, TextTokenizer, TokenizerConfig};
+use candle_gen::gen_core::tokenizer::TextTokenizer;
 use candle_gen::gen_core::{
     self, Capabilities, GenerationOutput, GenerationRequest, Generator, Image, LoadSpec, Modality,
     ModelDescriptor, OffloadPolicy, PidWeights, Progress, Quant, WeightsSource,
@@ -237,16 +237,7 @@ impl Pipeline {
             }
             None => QwenVae::new(self.component_vb("vae", ENC_DTYPE)?)?,
         };
-        let tokenizer = TextTokenizer::from_file(
-            self.root.join("tokenizer/tokenizer.json"),
-            TokenizerConfig {
-                max_length: self.te_cfg.max_length,
-                pad_token_id: self.te_cfg.pad_token_id,
-                chat_template: ChatTemplate::QwenImage,
-                pad_to_max_length: false,
-            },
-        )
-        .map_err(|e| CandleError::Msg(format!("qwen-image: load tokenizer: {e}")))?;
+        let tokenizer = control_common::load_tokenizer(&self.root, &self.te_cfg, "qwen-image")?;
         // Load the optional PiD super-resolving decoder once (epic 7840 / sc-7853) when the caller
         // opted in via `LoadSpec::pid`; otherwise `None` and the render path uses the native QwenVae.
         let pid = match &self.pid_spec {
@@ -398,7 +389,7 @@ impl Pipeline {
                 Some(pid) => pid.decode(&lat)?,
                 None => vae.decode(&lat)?,
             };
-            to_image(&decoded)
+            control_common::to_image(&decoded)
         })
     }
 
@@ -407,16 +398,7 @@ impl Pipeline {
     /// DiT loads. Same loads as [`load_components`](Self::load_components), minus the DiT / VAE / PiD.
     fn load_te_seq(&self) -> CResult<(QwenTextEncoder, TextTokenizer)> {
         let te = QwenTextEncoder::new(&self.te_cfg, self.component_vb("text_encoder", ENC_DTYPE)?)?;
-        let tokenizer = TextTokenizer::from_file(
-            self.root.join("tokenizer/tokenizer.json"),
-            TokenizerConfig {
-                max_length: self.te_cfg.max_length,
-                pad_token_id: self.te_cfg.pad_token_id,
-                chat_template: ChatTemplate::QwenImage,
-                pad_to_max_length: false,
-            },
-        )
-        .map_err(|e| CandleError::Msg(format!("qwen-image: load tokenizer: {e}")))?;
+        let tokenizer = control_common::load_tokenizer(&self.root, &self.te_cfg, "qwen-image")?;
         Ok((te, tokenizer))
     }
 
@@ -537,21 +519,6 @@ pub(crate) fn transformer_is_packed(dit_dir: &Path) -> bool {
         .is_some()
 }
 
-fn to_image(decoded: &Tensor) -> CResult<Image> {
-    let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
-    let img = img.i(0)?.to_device(&Device::Cpu)?;
-    let (c, h, w) = img.dims3()?;
-    if c != 3 {
-        return Err(CandleError::Msg(format!("expected 3 channels, got {c}")));
-    }
-    let pixels = img.permute((1, 2, 0))?.flatten_all()?.to_vec1::<u8>()?;
-    Ok(Image {
-        width: w as u32,
-        height: h as u32,
-        pixels,
-    })
-}
-
 /// Whether the sequential-residency offload path is force-enabled by env (epic 10765 Phase 1c,
 /// sc-10867). Reads `CANDLE_GEN_OFFLOAD`: `sequential` (case-insensitive) selects the phased
 /// load→encode→drop path regardless of `LoadSpec::offload_policy`; unset or any other value defers to
@@ -652,6 +619,13 @@ impl Generator for QwenImageGenerator {
         let sequential = self.comfyui_dit.is_none()
             && (self.offload_policy == OffloadPolicy::Sequential || sequential_offload_enabled());
         let images = if sequential {
+            // F-132 (sc-11190): evict any resident component set a prior *resident* request populated
+            // before we phase-load. `CANDLE_GEN_OFFLOAD` / the offload policy are re-read every
+            // `generate`, so a resident request can leave `self.components` holding a live TE+DiT+VAE
+            // Arc set; without this take, a later sequential request would load its phased copies on
+            // top of that, peaking at resident + sequential — the opposite of the flag's purpose.
+            // Dropping the cached Arc set here frees the resident residency first. Poison-tolerant.
+            *candle_gen::lock_recover(&self.components) = None;
             pipe.render_sequential(req, on_progress)?
         } else {
             let components = self.components(&pipe)?;
