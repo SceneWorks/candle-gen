@@ -323,6 +323,21 @@ impl Generator for SdxlGenerator {
                 req.width, req.height
             )));
         }
+        // F-116: `lightning` (sc-6128) runs its own fixed Euler-trailing schedule and never consults
+        // `req.scheduler` — so a caller-selected curated scheduler (karras / sgm_uniform / …) would be
+        // silently dropped (the F-004 shape). Reject the combination loudly instead of misleading. A
+        // recognized curated scheduler is rejected; `None` and the native-fallback `discrete` alias
+        // (both resolve to lightning's own schedule anyway) are left alone.
+        if req.sampler.as_deref() == Some(pipeline::LIGHTNING_SAMPLER) {
+            if let Some(sched) = req.scheduler.as_deref() {
+                if gen_core::sampling::Scheduler::from_name(sched).is_some() {
+                    return Err(gen_core::Error::Msg(format!(
+                        "sdxl: the `lightning` sampler uses its own fixed trailing schedule and \
+                         ignores the `scheduler` axis (got `{sched}`) — omit `scheduler` for lightning"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -658,6 +673,26 @@ mod tests {
             ..Default::default()
         };
         assert!(g.validate(&bogus).is_err());
+
+        // F-116: `lightning` + a curated scheduler is rejected — lightning ignores the scheduler axis,
+        // so honoring the selection is impossible and silently dropping it would mislead.
+        let lightning_sched = GenerationRequest {
+            prompt: "x".into(),
+            sampler: Some("lightning".into()),
+            scheduler: Some("karras".into()),
+            ..Default::default()
+        };
+        assert!(g.validate(&lightning_sched).is_err());
+
+        // …but `lightning` with no scheduler (or the native-fallback `discrete` alias) is fine — both
+        // resolve to lightning's own trailing schedule, so nothing is dropped.
+        let lightning_discrete = GenerationRequest {
+            prompt: "x".into(),
+            sampler: Some("lightning".into()),
+            scheduler: Some("discrete".into()),
+            ..Default::default()
+        };
+        assert!(g.validate(&lightning_discrete).is_ok());
     }
 
     /// sc-5165: `load` now ACCEPTS LoRA/LoKr adapters — it carries them for a load-time merge into the

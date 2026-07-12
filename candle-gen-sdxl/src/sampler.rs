@@ -70,9 +70,12 @@ impl EulerAncestralSampler {
         beta_end: f64,
         ancestral: bool,
     ) -> Result<Self> {
-        if train_steps == 0 {
+        // `train_steps < 2` is rejected, not just `== 0` (F-115): the per-step `i / (n - 1)` β interp
+        // divides by `n - 1`, so `n == 1` computes `0.0 / 0.0 = NaN`, yielding `sigmas = [0.0, NaN]`
+        // and NaN latents downstream. Two steps is the floor for a well-defined linear β schedule.
+        if train_steps < 2 {
             return Err(CandleError::Msg(
-                "euler sampler: train_steps must be >= 1".into(),
+                "euler sampler: train_steps must be >= 2".into(),
             ));
         }
         let n = train_steps;
@@ -466,9 +469,14 @@ mod tests {
         }
     }
 
-    /// `new(0, …)` is rejected (an empty σ table would make `sigma_last` panic and the denoise NaN).
+    /// `new(< 2, …)` is rejected (F-115): `0` would make `sigma_last` panic on an empty table, and `1`
+    /// would divide `0 / 0` in the β interp and seed the σ table with a NaN. `2` is the valid floor.
     #[test]
-    fn zero_train_steps_is_rejected() {
+    fn under_two_train_steps_is_rejected() {
         assert!(EulerAncestralSampler::new(0, SDXL_BETA_START, SDXL_BETA_END, true).is_err());
+        assert!(EulerAncestralSampler::new(1, SDXL_BETA_START, SDXL_BETA_END, true).is_err());
+        // The floor is accepted and yields a finite, monotone σ table (no NaN leak).
+        let s = EulerAncestralSampler::new(2, SDXL_BETA_START, SDXL_BETA_END, true).unwrap();
+        assert!(s.sigma_last().is_finite());
     }
 }

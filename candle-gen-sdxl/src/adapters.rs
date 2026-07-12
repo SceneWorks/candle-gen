@@ -214,6 +214,24 @@ fn merge_lora_file(
     Ok(())
 }
 
+/// Read an optional `f32` scalar (`rank` / `alpha`) from a LoKr file's `__metadata__`, distinguishing
+/// **absent** (`Ok(None)` — the caller substitutes its default) from **present-but-unparseable**
+/// (a typed error naming the key). The old `.and_then(|s| s.parse().ok()).unwrap_or(default)` silently
+/// collapsed a malformed user-supplied value (e.g. `rank = "4x"`) to the default, mis-scaling the
+/// merged delta on untrusted input (F-114, the F-009 class). Mirrors `read_scalar_opt`'s
+/// absent-vs-invalid contract for the tensor-form `.alpha`.
+fn parse_lokr_meta_scalar(meta: &HashMap<String, String>, key: &str) -> Result<Option<f32>> {
+    match meta.get(key) {
+        None => Ok(None),
+        Some(raw) => match raw.trim().parse::<f32>() {
+            Ok(v) if v.is_finite() => Ok(Some(v)),
+            _ => Err(CandleError::Msg(format!(
+                "LoKr adapter metadata `{key}` = `{raw}` is not a finite number"
+            ))),
+        },
+    }
+}
+
 /// Merge one LoKr file into `base` at `scale`: `rank`/`alpha` from file metadata (alpha defaults to
 /// rank), per-module factors grouped, `δ = (alpha/rank)·kron(w1,w2)·scale` reconstructed and merged.
 fn merge_lokr_file(
@@ -223,16 +241,8 @@ fn merge_lokr_file(
     table: &BTreeMap<String, String>,
     report: &mut MergeReport,
 ) -> Result<()> {
-    let rank = af
-        .meta
-        .get("rank")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(1.0);
-    let alpha = af
-        .meta
-        .get("alpha")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(rank);
+    let rank = parse_lokr_meta_scalar(&af.meta, "rank")?.unwrap_or(1.0);
+    let alpha = parse_lokr_meta_scalar(&af.meta, "alpha")?.unwrap_or(rank);
 
     let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
     for (key, t) in &af.tensors {
@@ -511,16 +521,8 @@ fn resolve_lokr_file(
     pending: &mut BTreeMap<String, Vec<PendingLokr>>,
     skipped_keys: &mut usize,
 ) -> Result<()> {
-    let rank = af
-        .meta
-        .get("rank")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(1.0);
-    let alpha = af
-        .meta
-        .get("alpha")
-        .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(rank);
+    let rank = parse_lokr_meta_scalar(&af.meta, "rank")?.unwrap_or(1.0);
+    let alpha = parse_lokr_meta_scalar(&af.meta, "alpha")?.unwrap_or(rank);
     let full = (alpha as f64 / rank as f64) * scale as f64;
     let mut grouped: BTreeMap<String, BTreeMap<&'static str, Tensor>> = BTreeMap::new();
     for (key, t) in &af.tensors {
@@ -1946,5 +1948,29 @@ mod tests {
             (p.scale - 1.0).abs() < 1e-6,
             "full scale (alpha/rank)·user = 1.0"
         );
+    }
+
+    /// F-114: LoKr `rank`/`alpha` metadata distinguishes absent (default) from present-but-unparseable
+    /// (a typed error naming the key) — a malformed value never silently collapses to the default and
+    /// mis-scales the merged delta.
+    #[test]
+    fn lokr_meta_scalar_absent_vs_unparseable() {
+        // Absent → None (caller substitutes its default).
+        let empty = HashMap::new();
+        assert_eq!(parse_lokr_meta_scalar(&empty, "rank").unwrap(), None);
+
+        // Present + valid → parsed (whitespace tolerated).
+        let good = HashMap::from([("rank".to_string(), " 4 ".to_string())]);
+        assert_eq!(parse_lokr_meta_scalar(&good, "rank").unwrap(), Some(4.0));
+
+        // Present + malformed → error naming the key (NOT a silent default to 1.0).
+        for bad in ["4x", "", "NaN", "inf"] {
+            let m = HashMap::from([("alpha".to_string(), bad.to_string())]);
+            let err = parse_lokr_meta_scalar(&m, "alpha").unwrap_err();
+            assert!(
+                err.to_string().contains("alpha"),
+                "error must name the offending key `alpha`, got: {err}"
+            );
+        }
     }
 }
