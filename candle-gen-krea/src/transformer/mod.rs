@@ -44,22 +44,53 @@ pub struct Krea2Transformer {
     final_norm: RmsScale,
     final_linear: QLinear,
     final_sstable: Tensor, // [1, 2, hidden]
-    /// Per-render RoPE-table cache (sc-8992 / F-012). The joint `(cos, sin)` table depends only on the
-    /// fixed geometry `(cap_len, ht, wt)` — not on the flow time / the current latent — so it is
-    /// identical across every denoise step. Cache it keyed on that geometry; hits Arc-clone the stored
-    /// handles. `Mutex` (not `RefCell`): the DiT is shared as `Arc<Krea2Transformer>` (`Send + Sync`).
-    rope_cache: std::sync::Mutex<Option<KreaRopeCache>>,
+    /// Per-render RoPE-table cache (sc-8992 / F-012, made multi-entry in sc-11201 / F-089). The joint
+    /// `(cos, sin)` table depends only on the fixed geometry `(cap_len, ht, wt, n_refs)` — not on the
+    /// flow time / the current latent — so it is identical across every denoise step. Keyed on that
+    /// geometry; hits Arc-clone the stored handles. Bounded to a few entries so the two true-CFG legs
+    /// (cond + uncond, which usually differ in `cap_len`) stay resident and don't evict each other.
+    rope_cache: RopeCache<(usize, usize, usize, usize), (Tensor, Tensor)>,
 }
 
-struct KreaRopeCache {
-    cap_len: usize,
-    ht: usize,
-    wt: usize,
-    /// Reference-image count baked into the table (`0` = the plain t2i `[text, image]` geometry; `>0`
-    /// = the edit `[text, refs…, target]` geometry, sc-10877).
-    n_refs: usize,
-    cos: Tensor,
-    sin: Tensor,
+/// How many distinct RoPE geometries to keep cached per render. Under true CFG each denoise step
+/// runs two forwards (cond + uncond) whose contexts usually differ in `cap_len`, i.e. two geometries
+/// alternate across the render. A single-entry cache thrashed — evicting + rebuilding the host trig
+/// tables (plus an H2D upload) on every forward (sc-11201 / F-089). Holding a few entries keeps both
+/// legs resident; the small headroom absorbs any incidental extra geometry.
+const ROPE_CACHE_CAP: usize = 4;
+
+/// A tiny bounded, geometry-keyed cache for the per-render RoPE tables (sc-8992 / F-012, sc-11201 /
+/// F-089). Holds up to [`ROPE_CACHE_CAP`] distinct geometries so both true-CFG legs stay resident
+/// across every denoise step instead of evicting each other on every forward. On a miss the value is
+/// built and inserted; on overflow the oldest entry is evicted (FIFO — with two alternating keys and
+/// `cap ≥ 2` no eviction ever happens once both are cached). Hits clone the (Arc-backed) `V`.
+/// `Mutex` (not `RefCell`): the DiT is shared as `Arc<…>` (`Send + Sync`).
+struct RopeCache<K, V> {
+    entries: std::sync::Mutex<Vec<(K, V)>>,
+    cap: usize,
+}
+
+impl<K: PartialEq, V: Clone> RopeCache<K, V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: std::sync::Mutex::new(Vec::new()),
+            cap,
+        }
+    }
+
+    /// Return the cached value for `key`, building + inserting it on a miss.
+    fn get_or_build(&self, key: K, build: impl FnOnce() -> Result<V>) -> Result<V> {
+        let mut guard = self.entries.lock().unwrap();
+        if let Some((_, v)) = guard.iter().find(|(k, _)| *k == key) {
+            return Ok(v.clone());
+        }
+        let v = build()?;
+        if guard.len() >= self.cap {
+            guard.remove(0);
+        }
+        guard.push((key, v.clone()));
+        Ok(v)
+    }
 }
 
 impl Krea2Transformer {
@@ -114,7 +145,7 @@ impl Krea2Transformer {
             final_norm: RmsScale::load(w, "final_layer.norm.weight", eps)?,
             final_linear: linear_detect(w, "final_layer.linear", true)?,
             final_sstable,
-            rope_cache: std::sync::Mutex::new(None),
+            rope_cache: RopeCache::new(ROPE_CACHE_CAP),
         })
     }
 
@@ -130,28 +161,15 @@ impl Krea2Transformer {
         wt: usize,
         n_refs: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let mut guard = self.rope_cache.lock().unwrap();
-        if let Some(c) = guard.as_ref() {
-            if c.cap_len == cap_len && c.ht == ht && c.wt == wt && c.n_refs == n_refs {
-                return Ok((c.cos.clone(), c.sin.clone()));
-            }
-        }
-        let (axes, theta) = (self.cfg.axes_dims_rope, self.cfg.rope_theta as f64);
-        let rope = if n_refs == 0 {
-            RopeTables::build_t2i(cap_len, ht, wt, axes, theta, &self.device)?
-        } else {
-            RopeTables::build_edit(cap_len, ht, wt, n_refs, axes, theta, &self.device)?
-        };
-        let (cos, sin) = rope.joint();
-        *guard = Some(KreaRopeCache {
-            cap_len,
-            ht,
-            wt,
-            n_refs,
-            cos: cos.clone(),
-            sin: sin.clone(),
-        });
-        Ok((cos, sin))
+        self.rope_cache.get_or_build((cap_len, ht, wt, n_refs), || {
+            let (axes, theta) = (self.cfg.axes_dims_rope, self.cfg.rope_theta as f64);
+            let rope = if n_refs == 0 {
+                RopeTables::build_t2i(cap_len, ht, wt, axes, theta, &self.device)?
+            } else {
+                RopeTables::build_edit(cap_len, ht, wt, n_refs, axes, theta, &self.device)?
+            };
+            Ok(rope.joint())
+        })
     }
 
     /// Patch-embed a normalized `[b, 16, H, W]` latent through the (adapter-carrying) `img_in` →
@@ -391,5 +409,61 @@ mod tests {
             v[4..].iter().all(|&x| x.abs() < 1e-6),
             "sin half = 0 at t=0"
         );
+    }
+
+    // sc-11201 / F-089: the RoPE cache must hold both true-CFG geometries at once so alternating
+    // cond/uncond forwards don't thrash it (rebuild every step). We exercise the bounded cache
+    // directly (it is model-independent) rather than standing up a full DiT.
+    #[test]
+    fn rope_cache_keeps_both_cfg_legs_resident() {
+        let cache: RopeCache<usize, i32> = RopeCache::new(ROPE_CACHE_CAP);
+        // Two alternating geometries stand in for the CFG cond (cap_len=77) and uncond (cap_len=12)
+        // token counts. `builds` counts how many times the (expensive) table build actually runs.
+        let mut builds = 0usize;
+        let (cond, uncond) = (77usize, 12usize);
+        for step in 0..52 {
+            for &cap in &[cond, uncond] {
+                let v = cache
+                    .get_or_build(cap, || {
+                        builds += 1;
+                        Ok(cap as i32 * 10)
+                    })
+                    .unwrap();
+                // Every hit returns exactly what a fresh build would (value keyed on geometry).
+                assert_eq!(v, cap as i32 * 10, "cached value must equal a fresh build");
+                let _ = step;
+            }
+        }
+        // 52 steps × 2 legs = 104 forwards, but only the first touch of each geometry builds:
+        // the single-entry cache would have rebuilt on all 104. This proves no thrash.
+        assert_eq!(
+            builds, 2,
+            "each CFG geometry built exactly once across all steps"
+        );
+    }
+
+    #[test]
+    fn rope_cache_evicts_oldest_beyond_capacity() {
+        // With more distinct geometries than capacity, the oldest is evicted (FIFO) and a re-touch
+        // rebuilds — but the two-geometry CFG case (cap ≥ 2) never reaches this.
+        let cache: RopeCache<usize, i32> = RopeCache::new(2);
+        let builds = std::cell::Cell::new(0usize);
+        let build = |k: usize| {
+            cache
+                .get_or_build(k, || {
+                    builds.set(builds.get() + 1);
+                    Ok(k as i32)
+                })
+                .unwrap()
+        };
+        build(1);
+        build(2);
+        assert_eq!(builds.get(), 2);
+        build(1); // still cached
+        assert_eq!(builds.get(), 2);
+        build(3); // evicts key 1 (oldest)
+        assert_eq!(builds.get(), 3);
+        build(1); // 1 was evicted → rebuild
+        assert_eq!(builds.get(), 4);
     }
 }

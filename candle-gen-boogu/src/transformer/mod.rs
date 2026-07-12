@@ -53,20 +53,57 @@ pub struct BooguTransformer {
     single_stream: Vec<ModBlock>,
     norm_out_lin1: QLinear,
     norm_out_lin2: QLinear,
-    /// Per-render RoPE-table cache (sc-8992 / F-012). The `RopeTables` (all its cos/sin slices) depend
-    /// only on the fixed geometry `(cap_len, ht, wt, ref_grids)` — not on the flow time / the current
-    /// latent — so it is identical across every denoise step (×2 under true-CFG). Cache it keyed on
-    /// that geometry; hits clone the (Arc-backed) tables. `Mutex` (not `RefCell`): the DiT is shared as
-    /// `Arc<BooguTransformer>` (`Send + Sync`).
-    rope_cache: std::sync::Mutex<Option<BooguRopeCache>>,
+    /// Per-render RoPE-table cache (sc-8992 / F-012, made multi-entry in sc-11201 / F-089). The
+    /// `RopeTables` (all its cos/sin slices) depend only on the fixed geometry
+    /// `(cap_len, ht, wt, ref_grids)` — not on the flow time / the current latent — so they are
+    /// identical across every denoise step. Keyed on that geometry; hits clone the (Arc-backed) tables.
+    /// Bounded to a few entries so the two true-CFG legs (cond + uncond, which usually differ in
+    /// `cap_len`) stay resident and don't evict each other on every forward.
+    rope_cache: RopeCache<RopeGeom, RopeTables>,
 }
 
-struct BooguRopeCache {
-    cap_len: usize,
-    ht: usize,
-    wt: usize,
-    ref_grids: Vec<(usize, usize)>,
-    rope: RopeTables,
+/// The geometry key the RoPE cache is keyed on: `(cap_len, ht, wt, ref_grids)`.
+type RopeGeom = (usize, usize, usize, Vec<(usize, usize)>);
+
+/// How many distinct RoPE geometries to keep cached per render. Under true CFG each denoise step runs
+/// two forwards (cond + uncond) whose contexts usually differ in `cap_len`, i.e. two geometries
+/// alternate across the render. A single-entry cache thrashed — evicting + rebuilding the host trig
+/// tables (plus an H2D upload) on every forward (sc-11201 / F-089). Holding a few entries keeps both
+/// legs resident; the small headroom absorbs any incidental extra geometry.
+const ROPE_CACHE_CAP: usize = 4;
+
+/// A tiny bounded, geometry-keyed cache for the per-render RoPE tables (sc-8992 / F-012, sc-11201 /
+/// F-089). Holds up to [`ROPE_CACHE_CAP`] distinct geometries so both true-CFG legs stay resident
+/// across every denoise step instead of evicting each other on every forward. On a miss the value is
+/// built and inserted; on overflow the oldest entry is evicted (FIFO — with two alternating keys and
+/// `cap ≥ 2` no eviction ever happens once both are cached). Hits clone the (Arc-backed) `V`.
+/// `Mutex` (not `RefCell`): the DiT is shared as `Arc<…>` (`Send + Sync`).
+struct RopeCache<K, V> {
+    entries: std::sync::Mutex<Vec<(K, V)>>,
+    cap: usize,
+}
+
+impl<K: PartialEq, V: Clone> RopeCache<K, V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            entries: std::sync::Mutex::new(Vec::new()),
+            cap,
+        }
+    }
+
+    /// Return the cached value for `key`, building + inserting it on a miss.
+    fn get_or_build(&self, key: K, build: impl FnOnce() -> Result<V>) -> Result<V> {
+        let mut guard = self.entries.lock().unwrap();
+        if let Some((_, v)) = guard.iter().find(|(k, _)| *k == key) {
+            return Ok(v.clone());
+        }
+        let v = build()?;
+        if guard.len() >= self.cap {
+            guard.remove(0);
+        }
+        guard.push((key, v.clone()));
+        Ok(v)
+    }
 }
 
 impl BooguTransformer {
@@ -107,7 +144,7 @@ impl BooguTransformer {
                 .collect::<Result<_>>()?,
             norm_out_lin1: linear_detect(w, "norm_out.linear_1", true)?,
             norm_out_lin2: linear_detect(w, "norm_out.linear_2", true)?,
-            rope_cache: std::sync::Mutex::new(None),
+            rope_cache: RopeCache::new(ROPE_CACHE_CAP),
         })
     }
 
@@ -123,29 +160,22 @@ impl BooguTransformer {
         axes_dim: usize,
         theta: f32,
     ) -> Result<RopeTables> {
-        let mut guard = self.rope_cache.lock().unwrap();
-        if let Some(c) = guard.as_ref() {
-            if c.cap_len == cap_len
-                && c.ht == ht
-                && c.wt == wt
-                && c.ref_grids.as_slice() == ref_grids
-            {
-                return Ok(c.rope.clone());
-            }
-        }
-        let rope = if ref_grids.is_empty() {
-            RopeTables::build_t2i(cap_len, ht, wt, axes_dim, theta, &self.device)?
-        } else {
-            RopeTables::build_edit(cap_len, ref_grids, ht, wt, axes_dim, theta, &self.device)?
-        };
-        *guard = Some(BooguRopeCache {
-            cap_len,
-            ht,
-            wt,
-            ref_grids: ref_grids.to_vec(),
-            rope: rope.clone(),
-        });
-        Ok(rope)
+        self.rope_cache
+            .get_or_build((cap_len, ht, wt, ref_grids.to_vec()), || {
+                if ref_grids.is_empty() {
+                    RopeTables::build_t2i(cap_len, ht, wt, axes_dim, theta, &self.device)
+                } else {
+                    RopeTables::build_edit(
+                        cap_len,
+                        ref_grids,
+                        ht,
+                        wt,
+                        axes_dim,
+                        theta,
+                        &self.device,
+                    )
+                }
+            })
     }
 
     /// Text-to-image velocity prediction.
@@ -350,4 +380,64 @@ fn unpatchify(tokens: &Tensor, ht: usize, wt: usize, p: usize, c: usize) -> Resu
     let x = tokens.contiguous()?.reshape((b, ht, wt, p, p, c))?; // B, h, w, p1, p2, C
     let x = x.permute((0, 5, 1, 3, 2, 4))?; // B, C, h, p1, w, p2
     x.contiguous()?.reshape((b, c, ht * p, wt * p))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // sc-11201 / F-089: the RoPE cache must hold both true-CFG geometries at once so alternating
+    // cond/uncond forwards don't thrash it (rebuild every step). We exercise the bounded cache
+    // directly (it is model-independent) rather than standing up a full DiT.
+    #[test]
+    fn rope_cache_keeps_both_cfg_legs_resident() {
+        let cache: RopeCache<usize, i32> = RopeCache::new(ROPE_CACHE_CAP);
+        // Two alternating geometries stand in for the CFG cond (cap_len=64) and uncond (cap_len=8)
+        // token counts. `builds` counts how many times the (expensive) table build actually runs.
+        let mut builds = 0usize;
+        let (cond, uncond) = (64usize, 8usize);
+        for _step in 0..40 {
+            for &cap in &[cond, uncond] {
+                let v = cache
+                    .get_or_build(cap, || {
+                        builds += 1;
+                        Ok(cap as i32 * 10)
+                    })
+                    .unwrap();
+                // Every hit returns exactly what a fresh build would (value keyed on geometry).
+                assert_eq!(v, cap as i32 * 10, "cached value must equal a fresh build");
+            }
+        }
+        // 40 steps × 2 legs = 80 forwards, but only the first touch of each geometry builds: the
+        // single-entry cache would have rebuilt on all 80. This proves no thrash.
+        assert_eq!(
+            builds, 2,
+            "each CFG geometry built exactly once across all steps"
+        );
+    }
+
+    #[test]
+    fn rope_cache_evicts_oldest_beyond_capacity() {
+        // With more distinct geometries than capacity, the oldest is evicted (FIFO) and a re-touch
+        // rebuilds — but the two-geometry CFG case (cap ≥ 2) never reaches this.
+        let cache: RopeCache<usize, i32> = RopeCache::new(2);
+        let builds = std::cell::Cell::new(0usize);
+        let build = |k: usize| {
+            cache
+                .get_or_build(k, || {
+                    builds.set(builds.get() + 1);
+                    Ok(k as i32)
+                })
+                .unwrap()
+        };
+        build(1);
+        build(2);
+        assert_eq!(builds.get(), 2);
+        build(1); // still cached
+        assert_eq!(builds.get(), 2);
+        build(3); // evicts key 1 (oldest)
+        assert_eq!(builds.get(), 3);
+        build(1); // 1 was evicted → rebuild
+        assert_eq!(builds.get(), 4);
+    }
 }
