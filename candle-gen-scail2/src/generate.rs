@@ -204,6 +204,25 @@ fn build_segments(total: usize, len: usize, overlap: usize) -> Vec<(usize, usize
     segs
 }
 
+/// Global denoise progress for step `i` (0-based) of segment `seg_idx` (0-based), given `steps` denoise
+/// steps per segment over `num_segments` segments (F-125 / sc-11225).
+///
+/// A multi-segment SCAIL-2 job runs the same `steps` denoise once per segment. Reporting `current = i+1`
+/// / `total = steps` per segment makes percent-complete jump backwards at every segment boundary — on
+/// exactly the long clips where progress matters most. Instead this accumulates prior segments' steps so
+/// the whole job is one monotonic `1 → steps·num_segments` sweep, matching the single-segment worker-UI
+/// contract the testkit monotonicity check encodes.
+fn segment_step_progress(
+    seg_idx: usize,
+    i: usize,
+    steps: usize,
+    num_segments: usize,
+) -> (u32, u32) {
+    let current = (seg_idx * steps + i + 1) as u32;
+    let total = (steps * num_segments) as u32;
+    (current, total)
+}
+
 /// Tokenize + UMT5-encode `prompt` → `[L, 4096]` (f32, un-padded; the DiT's `embed_text` pads to
 /// `text_len`).
 fn encode_text(
@@ -343,6 +362,11 @@ pub fn generate(
     let mut out_pieces: Vec<Tensor> = Vec::new();
     let mut prev_history_pixel: Option<Tensor> = None;
 
+    // Progress is reported **globally** across all segments (F-125 / sc-11225) — see
+    // `segment_step_progress`. `Decoding` is likewise emitted once (on the final segment) rather than
+    // mid-sweep, so the step count reaches 100% before the single decode signal.
+    let seg_count = segments.len();
+
     for (seg_idx, &(seg_start, seg_end)) in segments.iter().enumerate() {
         // Pose latent (half spatial res) + driving mask for this segment.
         let pose_seg = driving.narrow(0, seg_start, seg_end - seg_start)?; // [T,3,H,W]
@@ -389,7 +413,6 @@ pub fn generate(
 
         // --- denoise (plain CFG, clean-history pinned) ---
         let mut sched = FlowScheduler::new(job.sampler, job.steps, job.shift);
-        let total = sched.num_steps() as u32;
         let mut latent = apply_clean_history(&noise, history_latent.as_ref())?;
         for i in 0..job.steps {
             if cancel() {
@@ -421,14 +444,16 @@ pub fn generate(
             };
             latent = sched.step(&pred, &latent)?;
             latent = apply_clean_history(&latent, history_latent.as_ref())?;
-            on_progress(Progress::Step {
-                current: (i + 1) as u32,
-                total,
-            });
+            let (current, total) = segment_step_progress(seg_idx, i, job.steps, seg_count);
+            on_progress(Progress::Step { current, total });
         }
 
         // --- decode this segment → pixels; stitch + carry history ---
-        on_progress(Progress::Decoding);
+        // Emit `Decoding` once, after the final segment's denoise completes, so the global step sweep
+        // reaches 100% before the single decode signal (rather than firing mid-sweep per segment).
+        if seg_idx + 1 == seg_count {
+            on_progress(Progress::Decoding);
+        }
         let video = comps
             .vae
             .decode(&latent.reshape((1, 16, lat_t, lat_h, lat_w))?)?; // [1,3,T_out,H,W]
@@ -459,7 +484,7 @@ pub fn generate(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_segments, vae_align, TEMPORAL_STRIDE};
+    use super::{build_segments, segment_step_progress, vae_align, TEMPORAL_STRIDE};
 
     // Shipped defaults (see `pipeline.rs`).
     const LEN: usize = 81;
@@ -588,5 +613,61 @@ mod tests {
         assert!(build_segments(200, 81, 81).is_empty());
         assert!(build_segments(200, 81, 200).is_empty());
         assert!(build_segments(200, 0, 0).is_empty());
+    }
+
+    /// Replays the exact `(current, total)` sequence `generate`'s denoise loop emits over a multi-segment
+    /// job and asserts the worker-UI progress contract (F-125 / sc-11225): one strictly monotonic sweep
+    /// that never resets per segment and lands exactly on `total` at the final step.
+    fn assert_global_progress_monotonic(steps: usize, num_segments: usize) {
+        let expected_total = (steps * num_segments) as u32;
+        let mut sweep = Vec::new();
+        for seg_idx in 0..num_segments {
+            for i in 0..steps {
+                let (current, total) = segment_step_progress(seg_idx, i, steps, num_segments);
+                assert_eq!(total, expected_total, "total must be the GLOBAL step count");
+                sweep.push(current);
+            }
+        }
+        // First reported step is 1, last is exactly `total`.
+        assert_eq!(sweep.first().copied(), Some(1));
+        assert_eq!(sweep.last().copied(), Some(expected_total));
+        // Strictly increasing by 1 — no per-segment reset to 1, no backwards jump at a segment boundary.
+        for pair in sweep.windows(2) {
+            assert_eq!(
+                pair[1],
+                pair[0] + 1,
+                "progress must advance by exactly 1 and never restart per segment"
+            );
+        }
+        assert_eq!(sweep.len(), steps * num_segments);
+    }
+
+    /// The core F-125 regression: with >1 segment the old per-segment counting reset `current` to 1 at
+    /// every boundary (percent-complete jumped backwards). Progress must instead be one global 1→total
+    /// sweep. A driving clip of 200 frames tiles into multiple 81-frame segments (see
+    /// `long_clip_covers_all_frames_with_uniform_overlap`).
+    #[test]
+    fn multi_segment_progress_is_global_and_monotonic() {
+        let num_segments = build_segments(200, LEN, OVERLAP).len();
+        assert!(
+            num_segments >= 3,
+            "expected a multi-segment tiling for the regression"
+        );
+        assert_global_progress_monotonic(30, num_segments);
+        // A couple of other shapes for good measure.
+        assert_global_progress_monotonic(1, 4);
+        assert_global_progress_monotonic(50, 2);
+    }
+
+    /// A single-segment clip (the common short case) is unchanged: a plain 1→steps sweep with
+    /// `total == steps`.
+    #[test]
+    fn single_segment_progress_matches_step_count() {
+        let steps = 20;
+        for i in 0..steps {
+            let (current, total) = segment_step_progress(0, i, steps, 1);
+            assert_eq!(current, (i + 1) as u32);
+            assert_eq!(total, steps as u32);
+        }
     }
 }
