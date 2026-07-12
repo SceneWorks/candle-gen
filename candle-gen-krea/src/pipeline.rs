@@ -406,10 +406,10 @@ pub fn render_edit(
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     check_reference_count(references.len())?;
-    let steps = req
-        .steps
-        .map(|s| s as usize)
-        .unwrap_or(if distilled { TURBO_STEPS } else { RAW_STEPS });
+    let steps =
+        req.steps
+            .map(|s| s as usize)
+            .unwrap_or(if distilled { TURBO_STEPS } else { RAW_STEPS });
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
     // Turbo edit is CFG-free: force guidance 0 so the unconditional grounded encode is skipped and the
     // sampler runs a single conditional forward. Raw edit honors the request guidance (default 3.5).
