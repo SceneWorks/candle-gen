@@ -202,7 +202,15 @@ impl Qwen25VlText {
     /// `get_input_embeddings()`).
     pub fn embed(&self, input_ids: &Tensor) -> CResult<Tensor> {
         let (b, l) = input_ids.dims2()?;
-        let flat = input_ids.reshape((b * l,))?.to_dtype(DType::U32)?;
+        // The token ids are host-assembled on CPU (`format_mllm_inputs_embeds`); the embedding weight
+        // lives on the model device (CUDA when rendering). `index_select` requires both operands on the
+        // same device — move the indices to the weight's device (a no-op on CPU, so the CPU parity
+        // goldens stay bit-identical). sc-11003: the planner GPU path was never exercised (CPU-only
+        // parity), so this device skew only surfaces on-device.
+        let flat = input_ids
+            .reshape((b * l,))?
+            .to_dtype(DType::U32)?
+            .to_device(self.embed_tokens.device())?;
         let h = self.embed_tokens.dim(1)?;
         let g = self.embed_tokens.index_select(&flat, 0)?;
         Ok(g.reshape((b, l, h))?)
@@ -333,7 +341,14 @@ impl Qwen25VlText {
         position_ids: &Tensor,
         mask: &Tensor,
     ) -> CResult<Vec<Tensor>> {
-        let (cos, sin) = self.mrope_cos_sin(position_ids, embeds.dtype())?;
+        // `embeds` is authoritative for the device (it came off the embedding weight). The
+        // host-assembled `position_ids` (mrope) and additive `mask` are built on CPU, so move them onto
+        // the embeds device before they meet GPU tensors in `mrope_cos_sin` / `broadcast_add` (a no-op
+        // on CPU → parity goldens unchanged). sc-11003 planner-on-GPU device fix.
+        let dev = embeds.device();
+        let position_ids = position_ids.to_device(dev)?;
+        let mask = mask.to_device(dev)?;
+        let (cos, sin) = self.mrope_cos_sin(&position_ids, embeds.dtype())?;
         // Normalize the mask to a 4D [B?,1,L,L]-broadcastable shape.
         let mask = match mask.rank() {
             3 => mask.unsqueeze(1)?, // [1,L,L] -> [1,1,L,L]
