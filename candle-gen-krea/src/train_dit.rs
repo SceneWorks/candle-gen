@@ -9,16 +9,18 @@
 //! In the backward, the chain runs `loss → final_layer → block_{N-1} → … → block_0`. Every module on
 //! that path must be differentiable, so the **single-stream blocks** ([`TrainBlock`]) and the
 //! **`final_layer`** are re-implemented here with composable softmax ([`candle_nn::ops::softmax`]) and a
-//! composable `+1` RMSNorm ([`rms_scale_diff`]). The LoRA seam lives in each block's attention
-//! `to_q/to_k/to_v/to_out.0` projections, which become [`LoraLinear`]s; everything else in a block
-//! (the `to_gate` projection, the SwiGLU FFN, the modulation table) is the **frozen** base.
+//! composable `+1` RMSNorm ([`rms_scale_diff`]). The **trainable** seam is each block's attention
+//! `to_q/to_k/to_v/to_out.0` projections ([`KREA_ATTN_TARGETS`], what [`LoraHost::visit_lora_mut`]
+//! exposes); the modulation table stays frozen.
 //!
-//! The **pre-main** front-end (`img_in`, the timestep MLP + `time_mod_proj`, `txt_in`, and the
-//! `text_fusion` aggregator) is *upstream* of every adapter: it only produces the joint sequence that
-//! enters block 0, and it holds no trainable factor. candle's `sorted_nodes` prunes any backward branch
-//! that leads to no `Var`, so those modules are never differentiated — which means the trainer can
-//! **reuse the inference crate's fused-op front-end structs verbatim** ([`TextFusionTransformer`],
-//! [`RmsScale`], the `Linear`s), guaranteeing train/infer parity for the conditioning at zero cost.
+//! Since sc-11720, every Linear leaf on the frozen base — the attention `to_gate`, the SwiGLU FFN, and
+//! the pre-main front-end (`img_in`, the timestep MLP, `txt_in.linear_1/2`, `final_layer.linear`) — is
+//! also wrapped so it can host a **forward-time additive USER LoRA** at control-lane inference (the
+//! [`crate::adapters::AdditiveDit`] surface, disjoint from the trainer surface above). These wrappers
+//! carry no trainable factor, so training and `control_scale=0` are byte-identical to a plain `Linear`:
+//! candle's `sorted_nodes` prunes any backward branch that reaches no `Var`, so the front-end is still
+//! never differentiated and train/infer conditioning parity holds at zero cost. `time_mod_proj` stays a
+//! plain `Linear` (out of the adapter surface, matching the txt2img front-end set).
 //!
 //! ## Velocity sign
 //!
@@ -95,8 +97,8 @@ pub(crate) fn sdpa_diff(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64) -> Resul
 /// Build a frozen base `Linear` (no bias) from the mmap'd `Weights` and wrap it as a trainable
 /// [`LoraLinear`], reading `in`/`out` from the on-disk shape (`[out, in]`) and recording `path` as the
 /// PEFT module path the harness matches against.
-fn lora_proj(w: &Weights, path: &str) -> Result<LoraLinear> {
-    let base = linear(w, path, false)?;
+fn lora_proj(w: &Weights, path: &str, bias: bool) -> Result<LoraLinear> {
+    let base = linear(w, path, bias)?;
     let (out_f, in_f) = base.weight().dims2()?;
     Ok(LoraLinear::from_linear(base, in_f, out_f, path.to_string()))
 }
@@ -108,7 +110,7 @@ struct TrainAttention {
     q: LoraLinear,
     k: LoraLinear,
     v: LoraLinear,
-    gate: Linear,
+    gate: LoraLinear,
     o: LoraLinear,
     norm_q: Tensor, // f32, scale + 1
     norm_k: Tensor, // f32, scale + 1
@@ -129,11 +131,11 @@ impl TrainAttention {
         eps: f64,
     ) -> Result<Self> {
         Ok(Self {
-            q: lora_proj(w, &format!("{prefix}.to_q"))?,
-            k: lora_proj(w, &format!("{prefix}.to_k"))?,
-            v: lora_proj(w, &format!("{prefix}.to_v"))?,
-            gate: linear(w, &format!("{prefix}.to_gate"), false)?,
-            o: lora_proj(w, &format!("{prefix}.to_out.0"))?,
+            q: lora_proj(w, &format!("{prefix}.to_q"), false)?,
+            k: lora_proj(w, &format!("{prefix}.to_k"), false)?,
+            v: lora_proj(w, &format!("{prefix}.to_v"), false)?,
+            gate: lora_proj(w, &format!("{prefix}.to_gate"), false)?,
+            o: lora_proj(w, &format!("{prefix}.to_out.0"), false)?,
             norm_q: rms_scale_weight(w, &format!("{prefix}.norm_q.weight"))?,
             norm_k: rms_scale_weight(w, &format!("{prefix}.norm_k.weight"))?,
             heads,
@@ -283,20 +285,23 @@ pub struct KreaTrainDit {
     cfg: Krea2Config,
     device: Device,
     dtype: DType,
-    // --- pre-main front-end (frozen, fused-op, upstream of every adapter → reused verbatim) ---
-    img_in: Linear,
-    time_embed_l1: Linear,
-    time_embed_l2: Linear,
+    // --- pre-main front-end. Upstream of the control branch (never trained); the Linear leaves are
+    //     `LoraLinear` so a USER LoRA (control-lane inference, sc-11720) can ride additively — identity
+    //     to the plain Linear when unadapted, so training / control_scale=0 stay byte-exact. `time_mod_
+    //     proj` stays plain Linear (out of the adapter surface, matching the txt2img front-end set). ---
+    img_in: LoraLinear,
+    time_embed_l1: LoraLinear,
+    time_embed_l2: LoraLinear,
     time_mod_proj: Linear,
     txt_in_norm: RmsScale,
-    txt_in_l1: Linear,
-    txt_in_l2: Linear,
+    txt_in_l1: LoraLinear,
+    txt_in_l2: LoraLinear,
     text_fusion: TextFusionTransformer,
     // --- trainable single-stream stack ---
     blocks: Vec<TrainBlock>,
     // --- final layer (composable; on the backward path to every adapter) ---
     final_norm: Tensor, // f32, scale + 1
-    final_linear: Linear,
+    final_linear: LoraLinear,
     final_sstable: Tensor, // [1, 2, hidden]
 }
 
@@ -320,13 +325,13 @@ impl KreaTrainDit {
             cfg: cfg.clone(),
             device: w.device().clone(),
             dtype: w.dtype(),
-            img_in: linear(w, "img_in", true)?,
-            time_embed_l1: linear(w, "time_embed.linear_1", true)?,
-            time_embed_l2: linear(w, "time_embed.linear_2", true)?,
+            img_in: lora_proj(w, "img_in", true)?,
+            time_embed_l1: lora_proj(w, "time_embed.linear_1", true)?,
+            time_embed_l2: lora_proj(w, "time_embed.linear_2", true)?,
             time_mod_proj: linear(w, "time_mod_proj", true)?,
             txt_in_norm: RmsScale::load(w, "txt_in.norm.weight", eps)?,
-            txt_in_l1: linear(w, "txt_in.linear_1", true)?,
-            txt_in_l2: linear(w, "txt_in.linear_2", true)?,
+            txt_in_l1: lora_proj(w, "txt_in.linear_1", true)?,
+            txt_in_l2: lora_proj(w, "txt_in.linear_2", true)?,
             text_fusion: TextFusionTransformer::load(
                 w,
                 cfg.num_layerwise_text_blocks,
@@ -350,7 +355,7 @@ impl KreaTrainDit {
                 })
                 .collect::<Result<_>>()?,
             final_norm: rms_scale_weight(w, "final_layer.norm.weight")?,
-            final_linear: linear(w, "final_layer.linear", true)?,
+            final_linear: lora_proj(w, "final_layer.linear", true)?,
             final_sstable,
         })
     }
@@ -484,5 +489,54 @@ impl LoraHost for KreaTrainDit {
             blk.attn.visit(f)?;
         }
         Ok(())
+    }
+}
+
+impl crate::adapters::AdditiveDit for KreaTrainDit {
+    /// The control-lane adapter surface (sc-11720): per-block attention (`to_q|to_k|to_v|to_gate|
+    /// to_out.0`, all [`LoraLinear`]) + SwiGLU FFN (`ff.gate|ff.up|ff.down`, the shared inference
+    /// [`SwiGlu`]'s `AdaptLinear` leaves) + the text-fusion blocks + the front-end / final leaves. This is
+    /// the INFERENCE user-LoRA surface only — disjoint from [`LoraHost::visit_lora_mut`], which the
+    /// control-branch trainer walks and which stays attention-only, so training is unaffected. USER
+    /// residuals fold onto this frozen base DiT; the control branch is never adapted.
+    fn visit_additive(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut dyn crate::adapters::AdditiveProj) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        for (i, blk) in self.blocks.iter_mut().enumerate() {
+            let p = format!("transformer_blocks.{i}");
+            f(&format!("{p}.attn.to_q"), &mut blk.attn.q)?;
+            f(&format!("{p}.attn.to_k"), &mut blk.attn.k)?;
+            f(&format!("{p}.attn.to_v"), &mut blk.attn.v)?;
+            f(&format!("{p}.attn.to_gate"), &mut blk.attn.gate)?;
+            f(&format!("{p}.attn.to_out.0"), &mut blk.attn.o)?;
+            blk.mlp
+                .visit_adaptable_mut(&format!("{p}.ff"), &mut |path, a| f(path, a))?;
+        }
+        self.text_fusion
+            .visit_adaptable_mut(&mut |path, a| f(path, a))?;
+        for (path, proj) in [
+            ("img_in", &mut self.img_in),
+            ("time_embed.linear_1", &mut self.time_embed_l1),
+            ("time_embed.linear_2", &mut self.time_embed_l2),
+            ("txt_in.linear_1", &mut self.txt_in_l1),
+            ("txt_in.linear_2", &mut self.txt_in_l2),
+            ("final_layer.linear", &mut self.final_linear),
+        ] {
+            f(path, proj)?;
+        }
+        Ok(())
+    }
+
+    fn adapter_device(&self) -> Device {
+        self.device.clone()
+    }
+
+    fn adapter_surface_hint(&self) -> &'static str {
+        "expected bare/PEFT `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` (LoKr) over the \
+         control-base DiT attention (to_q|to_k|to_v|to_gate|to_out.0) + SwiGLU FFN (ff.gate|ff.up|ff.\
+         down) across the single-stream transformer_blocks and text_fusion blocks, plus the front-end \
+         (img_in|time_embed.linear_1/2|txt_in.linear_1/2|final_layer.linear) projections. The pose \
+         control branch is never adapted; conv-layer / text-encoder adapters are out of surface"
     }
 }

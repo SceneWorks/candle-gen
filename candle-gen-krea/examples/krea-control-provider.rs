@@ -97,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = Krea2Control::load(&Krea2ControlPaths {
         root: a.snapshot,
         control: a.ckpt,
+        adapters: Vec::new(),
     })?;
     eprintln!(
         "loaded Krea2Control; rendering {}x{} @ scale {}",

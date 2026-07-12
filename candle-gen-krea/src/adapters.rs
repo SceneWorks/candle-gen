@@ -37,10 +37,12 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use candle_gen::candle_core::{DType, Tensor};
+use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::{AdapterKind, AdapterSpec};
-use candle_gen::quant::LokrFactors;
-use candle_gen::train::lora::{reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta};
+use candle_gen::quant::{AdaptLinear, LokrFactors};
+use candle_gen::train::lora::{
+    reconstruct_lokr_delta, reconstruct_lora_delta, LoraAdapterMeta, LoraLinear,
+};
 // The shared adapter-merge skeleton (sc-8998 / F-018): the format-parsing + merge-report primitives
 // this crate previously hand-copied. Only the Krea-specific key→module resolution (ai-toolkit native
 // rename + the bespoke file-meta-or-lycoris LoKr grouping) stays local below.
@@ -54,7 +56,6 @@ use candle_gen::{CandleError, Result};
 
 use crate::config::Krea2Config;
 use crate::loader::Weights;
-use crate::transformer::Krea2Transformer;
 
 /// PEFT key prefixes tolerated on read, longest-first. The candle Krea trainer writes **bare** dotted
 /// paths (no prefix), but community adapters and `peft.save_pretrained()` wrap the DiT under one of
@@ -626,16 +627,71 @@ fn resolve_lokr_file(
     Ok(())
 }
 
-/// Install `specs` as **forward-time additive residuals** on a **packed** DiT (sc-11105): resolve each
-/// LoRA/LoKr file into unmerged factors, then walk the DiT once pushing residuals onto matched
-/// projections — the base is never dequantized or folded, so a q4/q8 tier keeps its footprint while the
-/// user adapter applies. Routing mirrors [`merge_adapters`] (a key-sniffed third-party LyCORIS LoKr is
-/// handled additively too, via the structured Kronecker vec-trick). A LoKr with no allocation-free
-/// structured form (a tucker/CP `lokr_t2`, or a base that does not factor as a·b × c·d) is rejected with
-/// a pointer to the dense tier. Like [`merge_adapters`], a non-empty spec set that matches **no** target
-/// errors (never renders unadapted).
-pub fn install_additive(
-    dit: &mut Krea2Transformer,
+/// A projection that can host **forward-time additive** LoRA/LoKr inference residuals. Implemented by
+/// BOTH the txt2img DiT's [`AdaptLinear`] leaves (dense or packed) and the control DiT's [`LoraLinear`]
+/// leaves (sc-11720), so a single installer ([`install_additive`]) serves either Krea DiT. Both back the
+/// residual with the SAME shared `candle_gen::quant` math (the LoRA two-small-matmul arm / the structured
+/// Kronecker vec-trick for LoKr), so additive equals the old dense fold to f32 tolerance (~1 ULP).
+pub trait AdditiveProj {
+    /// `(out_features, in_features)` of the base projection — the shape guard each resolved factor is
+    /// checked against before it is pushed.
+    fn out_in(&self) -> (usize, usize);
+    /// Push an additive LoRA residual `scale·((x·a)·b)` (`a`: `[in, rank]`, `b`: `[rank, out]`).
+    fn add_lora(&mut self, a: Tensor, b: Tensor, scale: f64);
+    /// Push an additive structured-LoKr residual (the allocation-free Kronecker form).
+    fn add_lokr(&mut self, factors: LokrFactors);
+}
+
+impl AdditiveProj for AdaptLinear {
+    fn out_in(&self) -> (usize, usize) {
+        self.base_shape()
+    }
+    fn add_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
+        self.push_lora(a, b, scale);
+    }
+    fn add_lokr(&mut self, factors: LokrFactors) {
+        self.push_lokr_structured(factors);
+    }
+}
+
+impl AdditiveProj for LoraLinear {
+    fn out_in(&self) -> (usize, usize) {
+        (self.out_features(), self.in_features())
+    }
+    fn add_lora(&mut self, a: Tensor, b: Tensor, scale: f64) {
+        // The inherent inference-residual push (sc-11103) — NOT this trait method (distinct name).
+        LoraLinear::push_additive_lora(self, a, b, scale);
+    }
+    fn add_lokr(&mut self, factors: LokrFactors) {
+        LoraLinear::push_additive_lokr(self, factors);
+    }
+}
+
+/// A Krea DiT that exposes its adaptable projection surface to [`install_additive`]. Both the txt2img
+/// [`Krea2Transformer`] and the control [`KreaTrainDit`] implement it; the closure is invoked once per
+/// leaf with its canonical dotted path (the key a PEFT/kohya adapter targets) and the projection as a
+/// `&mut dyn AdditiveProj`, so one resolve+attach body drives either DiT regardless of its leaf type.
+pub trait AdditiveDit {
+    fn visit_additive(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut dyn AdditiveProj) -> Result<()>,
+    ) -> Result<()>;
+    /// The device the base weights live on (residual factors are moved onto it at push).
+    fn adapter_device(&self) -> Device;
+    /// The adaptable-surface description used in the "matched no target" error.
+    fn adapter_surface_hint(&self) -> &'static str;
+}
+
+/// Install `specs` as **forward-time additive residuals** on a Krea DiT (sc-11105 / sc-11720): resolve
+/// each LoRA/LoKr file into unmerged factors, then walk the DiT's [`AdditiveDit`] surface once pushing
+/// residuals onto matched projections — the base is never dequantized or folded, so a packed q4/q8 tier
+/// keeps its footprint and a dense bf16 base stays an evictable mmap while the user adapter applies.
+/// Routing mirrors [`merge_adapters`] (a key-sniffed third-party LyCORIS LoKr is handled additively too,
+/// via the structured Kronecker vec-trick). A LoKr with no allocation-free structured form (a tucker/CP
+/// `lokr_t2`, or a base that does not factor as a·b × c·d) is rejected. Like [`merge_adapters`], a
+/// non-empty spec set that matches **no** target errors (never renders unadapted).
+pub fn install_additive<D: AdditiveDit + ?Sized>(
+    dit: &mut D,
     specs: &[AdapterSpec],
 ) -> Result<AdditiveReport> {
     let mut report = AdditiveReport::default();
@@ -644,7 +700,7 @@ pub fn install_additive(
     // Linear, rank-2), so a `lora_transformer_<flat>` key resolves exactly as the dense fold's
     // `build_kohya_table` would (the additive-path analog with no base tensor map at hand).
     let mut paths: Vec<String> = Vec::new();
-    dit.visit_adaptable_mut(&mut |path, _lin| {
+    dit.visit_additive(&mut |path, _proj| {
         paths.push(path.to_string());
         Ok(())
     })?;
@@ -691,12 +747,12 @@ pub fn install_additive(
     // factors are read on the CPU but the base weight lives on the DiT device (CUDA on a packed tier), so
     // they are moved onto it at push. A factor whose dims don't match is surfaced as a skipped key, never
     // a crashing forward (the additive analog of the fold path's shape guard).
-    let device = dit.device().clone();
+    let device = dit.adapter_device();
     let mut matched: HashSet<String> = HashSet::new();
     let mut applied = 0usize;
     let mut skipped_keys = 0usize;
-    dit.visit_adaptable_mut(&mut |path, lin| {
-        let (out_f, in_f) = lin.base_shape();
+    dit.visit_additive(&mut |path, proj| {
+        let (out_f, in_f) = proj.out_in();
         if let Some(list) = pending_lora.get(path) {
             matched.insert(path.to_string());
             for p in list {
@@ -704,7 +760,7 @@ pub fn install_additive(
                     skipped_keys += 1;
                     continue;
                 }
-                lin.push_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale);
+                proj.add_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale);
                 applied += 1;
             }
         }
@@ -723,14 +779,14 @@ pub fn install_additive(
                     p.w2_b.as_ref(),
                 )? {
                     Some(factors) => {
-                        lin.push_lokr_structured(factors.to_device(&device)?);
+                        proj.add_lokr(factors.to_device(&device)?);
                         applied += 1;
                     }
                     None => {
                         return Err(CandleError::Msg(format!(
-                            "krea: LoKr target `{path}` is not deferrable on a packed tier (a tucker/CP \
-                             `lokr_t2`, or a base that does not factor as a·b × c·d) — no \
-                             allocation-free structured form. Use a dense bf16 snapshot."
+                            "krea: LoKr target `{path}` is not deferrable (a tucker/CP `lokr_t2`, or a \
+                             base that does not factor as a·b × c·d) — no allocation-free structured \
+                             form. Use a dense bf16 snapshot."
                         )));
                     }
                 }
@@ -750,10 +806,7 @@ pub fn install_additive(
     if !specs.is_empty() && report.applied == 0 {
         return Err(no_target_matched(
             "krea",
-            "expected bare/PEFT `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` (LoKr) over \
-             the DiT attention (to_q|to_k|to_v|to_gate|to_out.0) and SwiGLU FFN (ff.gate|ff.up|ff.down) \
-             projections across the single-stream transformer_blocks and text_fusion blocks. Conv-layer \
-             / text-encoder adapters are out of surface",
+            dit.adapter_surface_hint(),
             specs.len(),
         ));
     }
@@ -1685,5 +1738,117 @@ mod tests {
         let dd = max_abs(&(additive.forward(&x).unwrap() - folded.forward(&x).unwrap()).unwrap());
         assert!(dd < 1e-4, "resolved additive LoKr != folded ({dd})");
         assert_eq!(skipped, 0);
+    }
+
+    /// **Generic wide-surface install over both leaf types (sc-11720).** [`install_additive`] drives a DiT
+    /// through the [`AdditiveDit`] trait, pushing residuals onto BOTH a control-DiT [`LoraLinear`] leaf and
+    /// a txt2img [`AdaptLinear`] leaf, and onto a FRONT-END path (`img_in`) outside the attention set —
+    /// covering the trait unification AND the widened surface in one shot. Each adapted forward equals the
+    /// folded `x·(W + δ)ᵀ` to f32 tolerance (default alpha = rank ⇒ ratio 1).
+    #[test]
+    fn install_additive_drives_lora_and_adapt_leaves_wide_surface() {
+        use candle_gen::candle_nn::{Linear, Module};
+        use candle_gen::quant::AdaptLinear;
+        use candle_gen::train::lora::LoraLinear;
+
+        let dev = Device::Cpu;
+        let (out_dim, in_dim, rank) = (8usize, 6usize, 2usize);
+        let wq = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
+        let wi = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev).unwrap();
+        let leg = || {
+            (
+                Tensor::randn(0f32, 1f32, (rank, in_dim), &dev).unwrap(),
+                Tensor::randn(0f32, 1f32, (out_dim, rank), &dev).unwrap(),
+            )
+        };
+        let (dq, uq) = leg();
+        let (di, ui) = leg();
+
+        // One adapter file targeting an ATTENTION leaf (→ LoraLinear) and a FRONT-END leaf (→ AdaptLinear).
+        let dir = std::env::temp_dir().join("krea_sc11720_wide");
+        std::fs::create_dir_all(&dir).unwrap();
+        let adapter_file = dir.join("wide.safetensors");
+        save_tensors(
+            &HashMap::from([
+                (
+                    "transformer_blocks.0.attn.to_q.lora_A.weight".to_string(),
+                    dq.clone(),
+                ),
+                (
+                    "transformer_blocks.0.attn.to_q.lora_B.weight".to_string(),
+                    uq.clone(),
+                ),
+                ("img_in.lora_A.weight".to_string(), di.clone()),
+                ("img_in.lora_B.weight".to_string(), ui.clone()),
+            ]),
+            &adapter_file,
+        )
+        .unwrap();
+
+        struct MockDit {
+            device: Device,
+            to_q: LoraLinear,
+            img_in: AdaptLinear,
+        }
+        impl AdditiveDit for MockDit {
+            fn visit_additive(
+                &mut self,
+                f: &mut dyn FnMut(&str, &mut dyn AdditiveProj) -> Result<()>,
+            ) -> Result<()> {
+                f("transformer_blocks.0.attn.to_q", &mut self.to_q)?;
+                f("img_in", &mut self.img_in)?;
+                Ok(())
+            }
+            fn adapter_device(&self) -> Device {
+                self.device.clone()
+            }
+            fn adapter_surface_hint(&self) -> &'static str {
+                "mock"
+            }
+        }
+
+        let mut dit = MockDit {
+            device: dev.clone(),
+            to_q: LoraLinear::from_linear(
+                Linear::new(wq.clone(), None),
+                in_dim,
+                out_dim,
+                "transformer_blocks.0.attn.to_q".into(),
+            ),
+            img_in: AdaptLinear::from_dense(Linear::new(wi.clone(), None), in_dim, out_dim),
+        };
+        let report = install_additive(
+            &mut dit,
+            &[AdapterSpec::new(adapter_file, 1.0, AdapterKind::Lora)],
+        )
+        .unwrap();
+        assert_eq!(
+            report.applied, 2,
+            "both the attention LoraLinear and the front-end AdaptLinear must adapt"
+        );
+        assert!(report.skipped_targets.is_empty());
+
+        let x = Tensor::randn(0f32, 1f32, (2usize, in_dim), &dev).unwrap();
+        let q_delta = reconstruct_lora_delta(&dq, &uq, rank as f32, rank as f32, 1.0).unwrap();
+        let q_folded =
+            AdaptLinear::from_dense(Linear::new((wq + q_delta).unwrap(), None), in_dim, out_dim);
+        let q_diff =
+            max_abs(&(dit.to_q.forward(&x).unwrap() - q_folded.forward(&x).unwrap()).unwrap());
+        assert!(
+            q_diff < 1e-4,
+            "LoraLinear attention leaf additive != fold ({q_diff})"
+        );
+
+        let i_delta = reconstruct_lora_delta(&di, &ui, rank as f32, rank as f32, 1.0).unwrap();
+        let i_folded =
+            AdaptLinear::from_dense(Linear::new((wi + i_delta).unwrap(), None), in_dim, out_dim);
+        let i_diff =
+            max_abs(&(dit.img_in.forward(&x).unwrap() - i_folded.forward(&x).unwrap()).unwrap());
+        assert!(
+            i_diff < 1e-4,
+            "AdaptLinear front-end leaf additive != fold ({i_diff})"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

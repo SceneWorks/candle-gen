@@ -161,8 +161,9 @@ impl Krea2Transformer {
     /// `crate::adapters::merge_surface_keys`). The additive installer
     /// ([`crate::adapters::install_additive`]) pushes a resolved LoRA/LoKr residual onto each matched
     /// projection so a user adapter applies on a packed q4/q8 tier with the base kept packed (sc-11105).
-    /// The `img_in`/`txt_in`/`time_*`/`final_layer.linear`/`text_fusion.projector` leaves are out of the
-    /// adapter surface (matching the dense merge), so they are not visited.
+    /// This inner walk covers the per-block attention + FFN; the front-end (`img_in`/`txt_in`/`time_*`/
+    /// `final_layer.linear`) leaves are added on top by the [`crate::adapters::AdditiveDit`] impl below
+    /// (sc-11720 wide surface), so they are NOT visited here. `text_fusion.projector` stays out of surface.
     pub fn visit_adaptable_mut(
         &mut self,
         f: &mut dyn FnMut(&str, &mut candle_gen::quant::AdaptLinear) -> candle_gen::Result<()>,
@@ -346,6 +347,45 @@ impl Krea2Transformer {
             .broadcast_mul(&(scale + 1.0)?)?
             .broadcast_add(&shift)?;
         self.final_linear.forward(&normed)
+    }
+}
+
+impl crate::adapters::AdditiveDit for Krea2Transformer {
+    /// The txt2img adapter surface: per-block attention + SwiGLU FFN (via the inner
+    /// [`Self::visit_adaptable_mut`]) PLUS the front-end + final leaves (sc-11720 wide surface). The
+    /// front-end `QLinear`s yield an [`AdaptLinear`](candle_gen::quant::AdaptLinear) only on a dense tier
+    /// (`as_adapt_mut`); on a packed tier they stay quantized and are simply skipped — user adapters
+    /// almost never target them, and the attention+FFN surface is unchanged.
+    fn visit_additive(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut dyn crate::adapters::AdditiveProj) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        self.visit_adaptable_mut(&mut |path, a| f(path, a))?;
+        for (path, proj) in [
+            ("img_in", &mut self.img_in),
+            ("time_embed.linear_1", &mut self.time_embed_l1),
+            ("time_embed.linear_2", &mut self.time_embed_l2),
+            ("txt_in.linear_1", &mut self.txt_in_l1),
+            ("txt_in.linear_2", &mut self.txt_in_l2),
+            ("final_layer.linear", &mut self.final_linear),
+        ] {
+            if let Some(a) = proj.as_adapt_mut() {
+                f(path, a)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn adapter_device(&self) -> Device {
+        self.device.clone()
+    }
+
+    fn adapter_surface_hint(&self) -> &'static str {
+        "expected bare/PEFT `<path>.lora_A/B.weight` (LoRA) or `<module>.lokr_w1/w2` (LoKr) over the DiT \
+         attention (to_q|to_k|to_v|to_gate|to_out.0) + SwiGLU FFN (ff.gate|ff.up|ff.down) across the \
+         single-stream transformer_blocks and text_fusion blocks, plus the front-end \
+         (img_in|time_embed.linear_1/2|txt_in.linear_1/2|final_layer.linear) projections. Conv-layer / \
+         text-encoder adapters are out of surface"
     }
 }
 

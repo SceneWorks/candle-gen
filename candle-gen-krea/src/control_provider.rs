@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use candle_gen::candle_core::{DType, Device, Tensor};
 use candle_gen::gen_core::runtime::CancelFlag;
 use candle_gen::gen_core::sampling::TimestepConvention;
-use candle_gen::gen_core::{Image, Progress};
+use candle_gen::gen_core::{AdapterSpec, Image, Progress};
 use candle_gen::train::flow_match::component_vb;
 use candle_gen::{CandleError, Result};
 use candle_gen_qwen_image::vae::{QwenVae, QwenVaeEncoder};
@@ -59,6 +59,10 @@ pub struct Krea2ControlPaths {
     pub root: PathBuf,
     /// The trained control-branch overlay checkpoint (`.safetensors`, e.g. `control_step5000.safetensors`).
     pub control: PathBuf,
+    /// User LoRA/LoKr adapters applied **additively** to the frozen base DiT (sc-11720) — a character /
+    /// style adapter reshapes the generated subject while the control branch keeps the pose lock. The
+    /// control branch is never adapted. Empty ⇒ the stock control build.
+    pub adapters: Vec<AdapterSpec>,
 }
 
 /// One Krea 2 strict-pose control request. Krea 2 Turbo is CFG-free (no guidance / negative pass) —
@@ -121,8 +125,15 @@ impl Krea2Control {
 
         // Frozen base DiT (bf16, composable — the train-time forward the branch was trained against).
         let dit_w = Weights::from_dir(&paths.root.join("transformer"), &device, DType::BF16)?;
-        let dit = KreaTrainDit::load(&dit_w, &cfg)?;
+        let mut dit = KreaTrainDit::load(&dit_w, &cfg)?;
         drop(dit_w);
+        // User LoRA/LoKr adapters ride additively on the frozen base DiT (sc-11720): the base stays an
+        // unmutated mmap and each adapter is pushed as a forward-time residual, so pose lock (the control
+        // branch, untouched below) is preserved while a character/style LoRA reshapes the subject. Empty
+        // ⇒ the stock build — no residual, so control_scale=0 stays byte-identical to base.
+        if !paths.adapters.is_empty() {
+            crate::adapters::install_additive(&mut dit, &paths.adapters)?;
+        }
 
         // Trained control branch. Freeze (detach weight reads so the sampler builds no autograd graph)
         // and set the fixed recipe residual clamp — identical to train time (S0: τ = 0.15).

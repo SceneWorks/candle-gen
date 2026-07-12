@@ -98,9 +98,11 @@ pub struct Components {
 
 /// Load all Turbo components from a Krea 2 snapshot (`tokenizer/ text_encoder/ transformer/ vae/`).
 ///
-/// `adapters` (when non-empty) are trained `krea_2_raw` LoRA/LoKr `.safetensors` merged into the dense
-/// DiT attention projections at load (sc-7836, [`crate::adapters::merge_into_weights`]) — **merge, not
-/// residual** (the flow-match sampler is chaos-sensitive). Empty ⇒ the stock unadapted build.
+/// `adapters` (when non-empty) are trained `krea_2_raw` LoRA/LoKr `.safetensors` applied as **forward-
+/// time additive residuals** on the DiT's projections (sc-11105 / sc-11720, [`crate::adapters::install_
+/// additive`]) — the base (dense mmap or packed) is never folded, so it stays evictable and the adapter
+/// equals the old fold to f32 tolerance. The surface spans attention + SwiGLU FFN + the front-end leaves.
+/// Empty ⇒ the stock unadapted build.
 pub fn load_components(
     root: &Path,
     device: &Device,
