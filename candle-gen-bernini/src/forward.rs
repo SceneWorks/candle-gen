@@ -335,6 +335,26 @@ impl VitMode {
     fn apg(self) -> bool {
         matches!(self, VitMode::VaeTxtVitWapg | VitMode::R2vWapg)
     }
+
+    /// Whether this full-Bernini mode **requires** source conditioning (a reference image / video clip):
+    /// the reference-video (`rv2v_wapg` / `r2v_wapg`) and video-edit (`v2v_apg`) modes consume packed
+    /// source latents, so with no source present they would silently render text-only. The
+    /// `vae_txt_vit`/`vae_txt_vit_wapg` modes cover t2i **and** i2i — a source is optional there — so they
+    /// do not require conditioning (F-096, the full-pipeline mirror of [`crate::config::Mode`]).
+    pub fn needs_conditioning(self) -> bool {
+        matches!(self, VitMode::Rv2vWapg | VitMode::R2vWapg | VitMode::V2vApg)
+    }
+}
+
+/// Number of APG momentum buffers a full-Bernini ViT mode needs across the denoise loop (1 for the
+/// x-space `v2v_apg` stream, 0 for the v-space combine modes). The buffer is allocated **once** before
+/// the loop and threaded per step so a nonzero momentum default would actually carry across steps rather
+/// than resetting each call (F-161).
+pub fn num_vit_momentum_buffers(mode: VitMode) -> usize {
+    match mode {
+        VitMode::V2vApg => 1,
+        _ => 0,
+    }
 }
 
 /// The planner's 4 prepared prompt-embed streams, each already `embed_text`-projected to this expert's
@@ -370,8 +390,10 @@ pub struct VitGuidanceParams {
 ///
 /// The combine is the slice-A math ([`vae_txt_vit`] / [`rv2v_chain`]) directly on the target-sliced
 /// spatial velocities — which are already `[1, 16, T, H8, W8]` (batch-first) on candle, so no extra
-/// batch juggling is needed. `v2v_apg` routes through the x-space [`normalized_guidance`] (momentum 0).
-/// Returns `[1, 16, T, H8, W8]`.
+/// batch juggling is needed. `v2v_apg` routes through the x-space [`normalized_guidance`], carrying its
+/// momentum through the caller-owned `mbufs` (allocated once before the denoise loop via
+/// [`num_vit_momentum_buffers`]) so a nonzero momentum default actually persists across steps instead of
+/// resetting each call (F-161); an empty `mbufs` degrades to no momentum. Returns `[1, 16, T, H8, W8]`.
 #[allow(clippy::too_many_arguments)]
 pub fn vit_one_step(
     pf: &PackedForward,
@@ -384,6 +406,7 @@ pub fn vit_one_step(
     sigma: f32,
     streams: &VitStreams,
     g: &VitGuidanceParams,
+    mbufs: &mut [MomentumBuffer],
 ) -> CResult<Tensor> {
     let wvae: Vec<(Tensor, f64)> = images.iter().chain(videos).cloned().collect();
     let v = |sources: &[(Tensor, f64)], ctx: &Tensor| pf.velocity(dit, noisy, sources, t, ctx);
@@ -446,12 +469,13 @@ pub fn vit_one_step(
             let eps_t = v(&wvae, streams.wtxt_wvit)?; // wvae · wtxt_wvit
             let x0 = to_x(noisy, sigma, &eps_uncond)?;
             let xt = to_x(noisy, sigma, &eps_t)?;
-            let mut buf = MomentumBuffer::new(0.0);
+            // Persistent momentum buffer threaded from the caller (F-161): reuse `mbufs[0]` so the
+            // running average carries across denoise steps; degrade to no momentum if none was provided.
             let xg = normalized_guidance(
                 &xt,
                 &x0,
                 g.omega_txt,
-                Some(&mut buf),
+                mbufs.first_mut(),
                 g.eta,
                 g.norm_threshold,
             )?;
@@ -740,8 +764,11 @@ mod tests {
                 VitMode::VaeTxtVit | VitMode::VaeTxtVitWapg => (vec![(im.clone(), 1.0)], vec![]),
                 _ => (vec![(im.clone(), 1.0)], vec![(vid.clone(), 2.0)]),
             };
+            let mut mbufs: Vec<MomentumBuffer> = (0..num_vit_momentum_buffers(mode))
+                .map(|_| MomentumBuffer::new(0.0))
+                .collect();
             let out = vit_one_step(
-                &pf, &dit, mode, &noisy, &images, &videos, 700.0, 0.9, &streams, &g,
+                &pf, &dit, mode, &noisy, &images, &videos, 700.0, 0.9, &streams, &g, &mut mbufs,
             )
             .unwrap_or_else(|e| panic!("vit mode {mode:?} failed: {e}"));
             assert_eq!(out.dims(), noisy.dims(), "{mode:?} keeps target shape");
@@ -754,6 +781,89 @@ mod tests {
                 .all(|x| x.is_finite());
             assert!(finite, "{mode:?} produced non-finite velocity");
         }
+    }
+
+    /// F-096/F-161: the ViT-mode conditioning requirement + momentum-buffer count mappings.
+    #[test]
+    fn vit_mode_conditioning_and_momentum_maps() {
+        // t2i/i2i modes accept an optional source → no requirement.
+        assert!(!VitMode::VaeTxtVit.needs_conditioning());
+        assert!(!VitMode::VaeTxtVitWapg.needs_conditioning());
+        // reference-video / video-edit modes require a source.
+        assert!(VitMode::Rv2vWapg.needs_conditioning());
+        assert!(VitMode::R2vWapg.needs_conditioning());
+        assert!(VitMode::V2vApg.needs_conditioning());
+        // Only the x-space v2v_apg stream carries a momentum buffer.
+        assert_eq!(num_vit_momentum_buffers(VitMode::V2vApg), 1);
+        for m in [
+            VitMode::VaeTxtVit,
+            VitMode::VaeTxtVitWapg,
+            VitMode::Rv2vWapg,
+            VitMode::R2vWapg,
+        ] {
+            assert_eq!(num_vit_momentum_buffers(m), 0);
+        }
+    }
+
+    /// F-161: the `v2v_apg` momentum buffer is threaded from the caller, so a persistent (nonzero-
+    /// momentum) buffer carries its running average across steps — a fresh buffer each step would not.
+    /// The second step sharing a buffer with the first must differ from that same step run against a
+    /// fresh buffer.
+    #[test]
+    fn v2v_apg_momentum_persists_across_steps() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let dit = tiny_dit(&cfg, &dev);
+        let pf = PackedForward::new(cfg, 5.0, true);
+        let noisy = Tensor::randn(0f32, 1f32, (1, 16, 2, 4, 4), &dev).unwrap();
+        let mk = |s: f32| {
+            let r = Tensor::randn(0f32, 1f32, (1, 3, 16), &dev).unwrap();
+            dit.embed_text(&r.affine(s as f64, 0.0).unwrap()).unwrap()
+        };
+        let (s0, s1, s2, s3) = (mk(1.0), mk(0.7), mk(0.4), mk(0.2));
+        let streams = VitStreams {
+            wtxt_wvit: &s0,
+            wtxt_wovit: &s1,
+            wotxt_wvit: &s2,
+            wotxt_wovit: &s3,
+        };
+        let vid = Tensor::randn(0f32, 1f32, (1, 16, 2, 4, 4), &dev).unwrap();
+        let videos = [(vid, 2.0)];
+        let g = VitGuidanceParams {
+            omega_txt: 4.0,
+            omega_img: 4.5,
+            omega_vid: 1.25,
+            omega_tgt: 0.5,
+            eta: 1.0,
+            norm_threshold: 50.0,
+        };
+        let run = |mbufs: &mut [MomentumBuffer], t: f64| {
+            vit_one_step(
+                &pf,
+                &dit,
+                VitMode::V2vApg,
+                &noisy,
+                &[],
+                &videos,
+                t,
+                0.9,
+                &streams,
+                &g,
+                mbufs,
+            )
+            .unwrap()
+        };
+        // Shared buffer across two steps (momentum 0.5): step 2 sees step 1's running average.
+        let mut shared: Vec<MomentumBuffer> = vec![MomentumBuffer::new(0.5)];
+        let _ = run(&mut shared, 800.0);
+        let carried = run(&mut shared, 700.0);
+        // Same second step but with a fresh buffer (no carried history — the old per-call behavior).
+        let mut fresh: Vec<MomentumBuffer> = vec![MomentumBuffer::new(0.5)];
+        let fresh_second = run(&mut fresh, 700.0);
+        assert!(
+            max_abs(&carried, &fresh_second) > 0.0,
+            "persistent momentum must change the second step"
+        );
     }
 
     /// `vae_txt_vit` dispatch: [`vit_one_step`] must equal the manual 4-forward combine via
@@ -788,6 +898,7 @@ mod tests {
             eta: 1.0,
             norm_threshold: 50.0,
         };
+        let mut mbufs: Vec<MomentumBuffer> = Vec::new();
         let got = vit_one_step(
             &pf,
             &dit,
@@ -799,6 +910,7 @@ mod tests {
             1.0,
             &streams,
             &g,
+            &mut mbufs,
         )
         .unwrap();
         // Manual: the four shared_step forwards, combined by the (separately validated) combine math.

@@ -36,9 +36,8 @@ use candle_gen::gen_core::{
 use candle_gen::{CandleError, Result as CResult};
 
 use candle_gen_wan::config::{
-    TextEncoderConfig, TransformerConfig, Vae16Config, DEFAULT_FRAMES_14B, MAX_AREA_14B,
-    NEGATIVE_FALLBACK, NUM_TRAIN_TIMESTEPS, SIZE_MULTIPLE_14B, VAE16_STRIDE_SPATIAL,
-    VAE16_STRIDE_TEMPORAL,
+    TextEncoderConfig, TransformerConfig, Vae16Config, DEFAULT_FRAMES_14B, NEGATIVE_FALLBACK,
+    NUM_TRAIN_TIMESTEPS, VAE16_STRIDE_SPATIAL, VAE16_STRIDE_TEMPORAL,
 };
 use candle_gen_wan::pipeline::{create_noise, frames_to_images};
 use candle_gen_wan::scheduler::{flow_sigmas, FlowScheduler, Sampler};
@@ -46,7 +45,9 @@ use candle_gen_wan::text_encoder::Umt5Encoder;
 use candle_gen_wan::transformer::WanTransformer;
 use candle_gen_wan::vae16::WanVae16;
 
-use crate::config::{resolve_mode, BerniniKnobs, Defaults};
+use crate::config::{
+    check_mode_conditioning, resolve_mode, validate_bernini_geometry, BerniniKnobs, Defaults,
+};
 use crate::forward::{guided_velocity, num_momentum_buffers, GuidanceParams, PackedForward};
 use crate::guidance::MomentumBuffer;
 use crate::preprocess::{encode_image, encode_videoclip};
@@ -442,7 +443,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     // `spec.quantize` is a no-op tier-select marker (mirrors wan14b/ltx): a q4/q8 A14B tier is
     // pre-packed (the packed-detect loaders read its `.scales`), a dense tier loads dense — so it does
     // NOT reject here; both experts load through the sc-10025 packed-detect seam.
-    let knobs = BerniniKnobs::from_dir(&root);
+    let knobs = BerniniKnobs::from_dir(&root)?;
     let device = candle_gen::default_device()?;
     Ok(Box::new(BerniniRenderer {
         descriptor: descriptor(),
@@ -472,34 +473,22 @@ impl Generator for BerniniRenderer {
                 "{id}: prompt must not be empty"
             )));
         }
-        if req.steps == Some(0) {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
-            )));
-        }
-        if !req.width.is_multiple_of(SIZE_MULTIPLE_14B)
-            || !req.height.is_multiple_of(SIZE_MULTIPLE_14B)
-        {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: width/height must be multiples of {SIZE_MULTIPLE_14B} (got {}x{})",
-                req.width, req.height
-            )));
-        }
-        let area = req.width as usize * req.height as usize;
-        if area > MAX_AREA_14B {
-            return Err(gen_core::Error::Msg(format!(
-                "{id}: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_14B} px \
-                 (704×1280); reduce the resolution",
-                req.width, req.height
-            )));
-        }
-        if let Some(f) = req.frames {
-            if f == 0 || f % 4 != 1 {
-                return Err(gen_core::Error::Msg(format!(
-                    "{id}: num_frames must be 1 + 4·k (got {f})"
-                )));
-            }
-        }
+        // Shared geometry guard (steps==0 / off-grid size / over-area / bad frame count), F-095.
+        validate_bernini_geometry(id, req)?;
+        // Reject a resolved-mode/conditioning mismatch before loading weights (F-096): a conditioning
+        // mode with no source silently renders text-only; a text-only mode with a source drops it.
+        let has_video = req
+            .conditioning
+            .iter()
+            .any(|c| matches!(c, Conditioning::VideoClip { .. }));
+        let has_image = req.conditioning.iter().any(|c| {
+            matches!(
+                c,
+                Conditioning::Reference { .. } | Conditioning::MultiReference { .. }
+            )
+        });
+        let mode = resolve_mode(req.video_mode.as_deref(), has_video, has_image);
+        check_mode_conditioning(id, mode, has_video || has_image)?;
         Ok(())
     }
 
@@ -617,6 +606,49 @@ mod tests {
         ] {
             assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
         }
+    }
+
+    /// F-096: `validate` rejects a conditioning-mode name with no source (would silently render
+    /// text-only) and a text-only mode name with a source present (would silently drop it). The
+    /// text-only default with no conditioning stays valid.
+    #[test]
+    fn validate_rejects_mode_conditioning_mismatch() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(MODEL_ID, &spec).unwrap();
+        // Conditioning mode name, no conditioning → reject.
+        let v2v_no_src = GenerationRequest {
+            prompt: "x".into(),
+            width: 256,
+            height: 256,
+            video_mode: Some("v2v".into()),
+            ..Default::default()
+        };
+        assert!(g.validate(&v2v_no_src).is_err());
+        // Text-only default, no conditioning → ok.
+        let t2v = GenerationRequest {
+            prompt: "x".into(),
+            width: 256,
+            height: 256,
+            ..Default::default()
+        };
+        assert!(g.validate(&t2v).is_ok());
+        // Text-only mode name WITH conditioning → reject (would be silently dropped).
+        let t2v_with_src = GenerationRequest {
+            prompt: "x".into(),
+            width: 256,
+            height: 256,
+            video_mode: Some("t2v_apg".into()),
+            conditioning: vec![Conditioning::Reference {
+                image: candle_gen::gen_core::Image {
+                    width: 2,
+                    height: 2,
+                    pixels: vec![0u8; 2 * 2 * 3],
+                },
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        assert!(g.validate(&t2v_with_src).is_err());
     }
 
     /// The dual-expert switch + omega-scale-once latch (the story AC's "expert selection" test). Asserts

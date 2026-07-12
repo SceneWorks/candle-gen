@@ -63,7 +63,10 @@ use crate::convert::{
     PLANNER_MLLM_BACKBONE_PP, PLANNER_MLLM_DIR, PLANNER_MLLM_VISION_PP, PLANNER_QWEN_CONFIG_FILE,
     PLANNER_SIDECAR_FILE, PLANNER_TOKENIZER_FILE, PLANNER_VIT_DECODER_DIR, PLANNER_VIT_DECODER_PP,
 };
-use crate::forward::{vit_one_step, PackedForward, VitGuidanceParams, VitMode, VitStreams};
+use crate::forward::{
+    num_vit_momentum_buffers, vit_one_step, PackedForward, VitGuidanceParams, VitMode, VitStreams,
+};
+use crate::guidance::MomentumBuffer;
 use crate::mar::{mar_schedule, post_process_input_embeds, sample_vit_embed, StreamState, VitCfg};
 use crate::preprocess::{encode_image, encode_videoclip};
 use crate::process::{
@@ -106,6 +109,9 @@ impl FullDefaults {
     const FLOW_SHIFT: f64 = 5.0;
     const ETA: f32 = 1.0;
     const NORM_THRESHOLD: f32 = 50.0;
+    /// APG momentum for the `v2v_apg` ViT stream (reference default 0.0 — inert). Persisted across the
+    /// denoise loop so a future nonzero default actually carries (F-161).
+    const MOMENTUM: f32 = 0.0;
     /// Source-media ViT pixel budget (`preprocess_inputs` `vit_min/max_pixels`).
     const VIT_MIN_PIXELS: i64 = 3136;
     const VIT_MAX_PIXELS: i64 = 50176;
@@ -122,11 +128,15 @@ struct PlannerKnobs {
 }
 
 impl PlannerKnobs {
-    fn from_dir(root: &Path) -> Self {
-        let v: serde_json::Value = std::fs::read(root.join(PLANNER_SIDECAR_FILE))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or(serde_json::Value::Null);
+    /// A **missing** `bernini_planner.json` sidecar is a legitimate snapshot shape (→ package-config
+    /// defaults); a **present but malformed** sidecar surfaces an error naming the file rather than
+    /// silently downgrading the planner knobs (F-145).
+    fn from_dir(root: &Path) -> CResult<Self> {
+        let v = crate::config::read_optional_json(
+            &root.join(PLANNER_SIDECAR_FILE),
+            "bernini planner sidecar",
+        )?
+        .unwrap_or(serde_json::Value::Null);
         let i = |k: &str, d: i64| v.get(k).and_then(serde_json::Value::as_i64).unwrap_or(d);
         let cd = v
             .get("clip_diff_cfg")
@@ -134,7 +144,7 @@ impl PlannerKnobs {
             .unwrap_or(serde_json::Value::Null);
         let cdi = |k: &str, d: i64| cd.get(k).and_then(serde_json::Value::as_i64).unwrap_or(d);
         let cdf = |k: &str, d: f64| cd.get(k).and_then(serde_json::Value::as_f64).unwrap_or(d);
-        Self {
+        Ok(Self {
             max_sequence_length: i("max_sequence_length", 512).max(1) as usize,
             num_mask_token: i("num_mask_token", 4096) as i32,
             // `vit_decoder` (`SimpleMLPAdaLN`) depth is fixed at 16 in the released checkpoint; the
@@ -142,16 +152,16 @@ impl PlannerKnobs {
             clip_diff_depth: 16,
             clip_diff_in_channels: cdi("z_channels", 3584) as usize,
             clip_diff_shift: cdf("shift", 2.0) as f32,
-        }
+        })
     }
 }
 
-/// Read the planner's MRoPE / token-id config from `qwen2_5_vl_config.json`.
-fn read_mrope_config(path: &Path) -> MRopeConfig {
+/// Read the planner's MRoPE / token-id config from `qwen2_5_vl_config.json`. A **missing** config is a
+/// legitimate snapshot shape (→ defaults); a **present but malformed** config surfaces an error naming
+/// the file rather than silently swapping the MRoPE sections / token ids (F-145).
+fn read_mrope_config(path: &Path) -> CResult<MRopeConfig> {
     let d = MRopeConfig::default();
-    let v: serde_json::Value = std::fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
+    let v = crate::config::read_optional_json(path, "bernini qwen2_5_vl_config")?
         .unwrap_or(serde_json::Value::Null);
     let vc = v.get("vision_config").unwrap_or(&v);
     let i = |o: &serde_json::Value, k: &str, dv: i64| {
@@ -160,13 +170,13 @@ fn read_mrope_config(path: &Path) -> MRopeConfig {
     let f = |o: &serde_json::Value, k: &str, dv: f64| {
         o.get(k).and_then(serde_json::Value::as_f64).unwrap_or(dv)
     };
-    MRopeConfig {
+    Ok(MRopeConfig {
         spatial_merge_size: i(vc, "spatial_merge_size", d.spatial_merge_size),
         tokens_per_second: f(vc, "tokens_per_second", d.tokens_per_second),
         image_token_id: i(&v, "image_token_id", d.image_token_id),
         video_token_id: i(&v, "video_token_id", d.video_token_id),
         vision_start_token_id: i(&v, "vision_start_token_id", d.vision_start_token_id),
-    }
+    })
 }
 
 /// The loaded Bernini semantic planner: Qwen2.5-VL backbone + vision tower + connector + clip-diff head
@@ -207,7 +217,7 @@ impl BerniniPlanner {
             candle_gen::component_vb(root, PLANNER_CONNECTOR_DIR, PLANNER_DTYPE, device, MODEL_ID)?;
         let connector = MlpConnector::new(conn_vb)?;
 
-        let knobs = PlannerKnobs::from_dir(root);
+        let knobs = PlannerKnobs::from_dir(root)?;
         let vd_vb = candle_gen::component_vb(
             root,
             PLANNER_VIT_DECODER_DIR,
@@ -246,7 +256,7 @@ impl BerniniPlanner {
             connector,
             clip_diff,
             mask_token,
-            mrope: read_mrope_config(&cfg_path),
+            mrope: read_mrope_config(&cfg_path)?,
             template,
             knobs,
         })
@@ -496,6 +506,39 @@ fn resolve_vit_mode(
     }
 }
 
+/// The canonical **task** name for the planner's system prompt ([`BerniniTemplate`] / `system_prompt`).
+/// The request's `video_mode` may be a **guidance-mode** name (e.g. `rv2v_wapg`) rather than a task name,
+/// which the template does not recognize — it would silently fall through to the generic
+/// "You are a helpful assistant." Honor an explicit task name the template recognizes; otherwise derive
+/// the task from the conditioning + output kind so a guidance-mode (or absent) `video_mode` still gets a
+/// task-specialized system prompt (F-161).
+fn canonical_task(
+    video_mode: Option<&str>,
+    has_video: bool,
+    has_image: bool,
+    out_video: bool,
+) -> &'static str {
+    if let Some(s) = video_mode {
+        match s {
+            "t2i" => return "t2i",
+            "t2v" => return "t2v",
+            "i2i" => return "i2i",
+            "v2v" => return "v2v",
+            "r2v" => return "r2v",
+            "rv2v" => return "rv2v",
+            _ => {}
+        }
+    }
+    match (has_video, has_image, out_video) {
+        (true, true, _) => "rv2v", // video + reference → video editing with reference
+        (true, false, _) => "v2v", // video → video editing
+        (false, true, true) => "r2v", // image refs → video (subject-to-video)
+        (false, true, false) => "i2i", // image → image editing
+        (false, false, true) => "t2v", // text → video
+        (false, false, false) => "t2i", // text → image
+    }
+}
+
 /// Upstream task_type → full-pipeline guidance mode (fallback when `video_mode` is a task name).
 fn task_to_vit_mode(task: &str) -> Option<VitMode> {
     Some(match task {
@@ -566,7 +609,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
             "bernini does not support control / VACE / IP-adapter overlays".into(),
         ));
     }
-    let knobs = BerniniKnobs::from_dir(&root);
+    let knobs = BerniniKnobs::from_dir(&root)?;
     let device = candle_gen::default_device()?;
     Ok(Box::new(Bernini {
         descriptor: descriptor(),
@@ -588,22 +631,38 @@ impl Generator for Bernini {
     }
 
     fn validate(&self, req: &GenerationRequest) -> gen_core::Result<()> {
-        self.descriptor
-            .capabilities
-            .validate_request(self.descriptor.id, req)?;
+        let id = self.descriptor.id;
+        self.descriptor.capabilities.validate_request(id, req)?;
         if req.prompt.is_empty() {
-            return Err(gen_core::Error::Msg(
-                "bernini: prompt must not be empty".into(),
-            ));
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: prompt must not be empty"
+            )));
         }
-        if let Some(frames) = req.frames {
-            if frames == 0 || frames % 4 != 1 {
-                return Err(gen_core::Error::Msg(format!(
-                    "bernini: num_frames must be 1 + 4·k (got {frames})"
-                )));
-            }
-        }
+        // Shared geometry guard (steps==0 / off-grid size / over-area / bad frame count), F-095: the
+        // full pipeline was missing these — a 328-px request died with an opaque shape error at denoise
+        // step 1 and `steps: Some(0)` was silently promoted to 1.
+        crate::config::validate_bernini_geometry(id, req)?;
         validate_conditioning_video_clips(req).map_err(|e| gen_core::Error::Msg(e.to_string()))?;
+        // Reject a resolved-mode/conditioning mismatch before loading weights (F-096): a conditioning
+        // mode (`v2v`/`rv2v`/`r2v`) with no source would silently render text-only.
+        let has_video = req
+            .conditioning
+            .iter()
+            .any(|c| matches!(c, Conditioning::VideoClip { .. }));
+        let has_image = req.conditioning.iter().any(|c| {
+            matches!(
+                c,
+                Conditioning::Reference { .. } | Conditioning::MultiReference { .. }
+            )
+        });
+        let out_video = req.frames.unwrap_or(DEFAULT_FRAMES_14B).max(1) > 1;
+        let mode = resolve_vit_mode(req.video_mode.as_deref(), has_video, has_image, out_video);
+        if mode.needs_conditioning() && !(has_video || has_image) {
+            return Err(gen_core::Error::Msg(format!(
+                "{id}: guidance mode {mode:?} needs source conditioning (a reference image / video \
+                 clip) but none was provided — pass conditioning or select a text/edit mode"
+            )));
+        }
         Ok(())
     }
 
@@ -624,7 +683,6 @@ impl Bernini {
         on_progress: &mut dyn FnMut(Progress),
     ) -> CResult<GenerationOutput> {
         let dev = &self.device;
-        let task = req.video_mode.as_deref().unwrap_or("");
 
         // --- Geometry + knobs ---
         let frames = req.frames.unwrap_or(DEFAULT_FRAMES_14B).max(1) as usize;
@@ -650,6 +708,9 @@ impl Bernini {
             )
         });
         let mode = resolve_vit_mode(req.video_mode.as_deref(), has_video, has_image, out_video);
+        // The planner's system prompt keys off a *task* name; map a guidance-mode / absent `video_mode`
+        // to a canonical task so it doesn't fall through to the generic system prompt (F-161).
+        let task = canonical_task(req.video_mode.as_deref(), has_video, has_image, out_video);
 
         on_progress(Progress::Step {
             current: 0,
@@ -1015,6 +1076,11 @@ pub fn denoise_bernini_wvitcfg(
     let mut latent = init_noise.clone();
     let mut switched = false;
     let mut g = base_g.clone();
+    // APG momentum buffer(s) allocated ONCE before the loop and threaded per step, so the running
+    // average carries across steps (F-161) rather than resetting inside each `vit_one_step` call.
+    let mut mbufs: Vec<MomentumBuffer> = (0..num_vit_momentum_buffers(mode))
+        .map(|_| MomentumBuffer::new(FullDefaults::MOMENTUM))
+        .collect();
 
     #[allow(clippy::needless_range_loop)]
     for i in 0..steps {
@@ -1046,6 +1112,7 @@ pub fn denoise_bernini_wvitcfg(
             sigmas[i],
             &expert.streams(),
             &g,
+            &mut mbufs,
         )?;
         latent = sched.step(&v, &latent)?;
     }
@@ -1315,6 +1382,95 @@ mod tests {
     fn grid_token_count() {
         assert_eq!(grid_tokens([1, 12, 20]), 60);
         assert_eq!(grid_tokens([5, 12, 20]), 300);
+    }
+
+    /// F-161: a guidance-mode name (or absent `video_mode`) maps to a real task name (never the generic
+    /// system-prompt fallback); an explicit task name is honored verbatim.
+    #[test]
+    fn canonical_task_maps_guidance_mode_and_conditioning() {
+        // Guidance-mode names are NOT task names → derive from conditioning/output.
+        assert_eq!(canonical_task(Some("rv2v_wapg"), true, true, true), "rv2v");
+        assert_eq!(
+            canonical_task(Some("vae_txt_vit_wapg"), false, false, false),
+            "t2i"
+        );
+        assert_eq!(canonical_task(Some("v2v_apg"), true, false, true), "v2v");
+        // Explicit task names are honored verbatim.
+        assert_eq!(canonical_task(Some("i2i"), false, true, false), "i2i");
+        assert_eq!(canonical_task(Some("t2v"), false, false, true), "t2v");
+        // Absent → conditioning/output-derived task.
+        assert_eq!(canonical_task(None, false, false, false), "t2i");
+        assert_eq!(canonical_task(None, false, false, true), "t2v");
+        assert_eq!(canonical_task(None, false, true, false), "i2i");
+        assert_eq!(canonical_task(None, false, true, true), "r2v");
+        assert_eq!(canonical_task(None, true, false, true), "v2v");
+        assert_eq!(canonical_task(None, true, true, true), "rv2v");
+    }
+
+    /// F-095 + F-096: the full-pipeline `validate` enforces the shared geometry guard (zero steps /
+    /// off-grid size / over-area / bad frame count) and rejects a conditioning-mode name with no source.
+    #[test]
+    fn validate_geometry_and_mode_conditioning() {
+        force_link();
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let ok = GenerationRequest {
+            prompt: "a cat walking across a garden".into(),
+            width: 256,
+            height: 256,
+            frames: Some(17),
+            sampler: Some("uni_pc".into()),
+            ..Default::default()
+        };
+        assert!(g.validate(&ok).is_ok());
+        for bad in [
+            // off-grid size (328 not a multiple of the 14B size multiple) — the F-095 opaque-shape case.
+            GenerationRequest {
+                prompt: "x".into(),
+                width: 328,
+                height: 256,
+                sampler: Some("uni_pc".into()),
+                ..Default::default()
+            },
+            // explicit zero steps (was silently promoted to 1).
+            GenerationRequest {
+                prompt: "x".into(),
+                width: 256,
+                height: 256,
+                steps: Some(0),
+                sampler: Some("uni_pc".into()),
+                ..Default::default()
+            },
+            // over the max-area envelope.
+            GenerationRequest {
+                prompt: "x".into(),
+                width: 1280,
+                height: 1024,
+                frames: Some(17),
+                sampler: Some("uni_pc".into()),
+                ..Default::default()
+            },
+            // frames not ≡ 1 (mod 4).
+            GenerationRequest {
+                prompt: "x".into(),
+                width: 256,
+                height: 256,
+                frames: Some(16),
+                sampler: Some("uni_pc".into()),
+                ..Default::default()
+            },
+            // F-096: a conditioning-mode name with no source would silently render text-only.
+            GenerationRequest {
+                prompt: "x".into(),
+                width: 256,
+                height: 256,
+                video_mode: Some("v2v".into()),
+                sampler: Some("uni_pc".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(g.validate(&bad).is_err(), "should reject: {bad:?}");
+        }
     }
 
     /// Image targets are single-frame (`t = 1`); video targets sample `vit_fps` frames so `t > 1`; the
