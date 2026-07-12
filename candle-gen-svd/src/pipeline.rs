@@ -11,7 +11,7 @@ use candle_gen::{CandleError, Result as CResult};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
-use crate::config::SchedulerConfig;
+use crate::config::{SchedulerConfig, DEFAULT_CONDITIONING_FPS, DEFAULT_FRAMES, DEFAULT_STEPS};
 use crate::scheduler::EdmSchedule;
 use crate::unet::SvdUnet;
 use crate::vae::SvdVae;
@@ -34,14 +34,15 @@ pub struct SvdParams {
 impl Default for SvdParams {
     fn default() -> Self {
         Self {
-            num_frames: 25,
-            num_inference_steps: 25,
+            num_frames: DEFAULT_FRAMES as usize,
+            num_inference_steps: DEFAULT_STEPS as usize,
             min_guidance_scale: 1.0,
             max_guidance_scale: 3.0,
-            fps: 7,
+            fps: DEFAULT_CONDITIONING_FPS,
             motion_bucket_id: 127.0,
             noise_aug_strength: 0.02,
-            decode_chunk_size: 25,
+            // diffusers default = `num_frames`.
+            decode_chunk_size: DEFAULT_FRAMES as usize,
         }
     }
 }

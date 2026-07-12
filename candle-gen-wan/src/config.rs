@@ -249,7 +249,6 @@ pub const DEFAULT_STEPS_VACE: u32 = 50;
 pub const DEFAULT_GUIDANCE_VACE: f32 = 5.0;
 pub const VACE_FLOW_SHIFT: f64 = 5.0;
 pub const DEFAULT_FPS_VACE: u32 = 16;
-pub const DEFAULT_FRAMES_VACE: u32 = 81;
 
 /// `WanVACETransformer3DModel` config: the dimension-parametric Wan DiT ([`TransformerConfig`]) plus the
 /// two VACE-only fields. The base dims are the Wan2.1-14B preset (z16 VAE, stride 4×8×8, dim 5120, 40

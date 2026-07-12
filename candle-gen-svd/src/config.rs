@@ -116,13 +116,12 @@ impl Default for SchedulerConfig {
 /// Public registry id: `candle_gen::load("svd_xt", spec)`.
 pub const MODEL_ID: &str = "svd_xt";
 
-/// SVD-XT default denoise steps / frame count (the request overrides each).
+/// SVD-XT default denoise steps / frame count — the canonical defaults [`crate::pipeline::SvdParams`]
+/// builds from (the request overrides each).
 pub const DEFAULT_STEPS: u32 = 25;
 pub const DEFAULT_FRAMES: u32 = 25;
 /// Default motion-conditioning cadence (the `fps_id` SVD was trained on).
 pub const DEFAULT_CONDITIONING_FPS: u32 = 7;
-/// Default playback cadence when the request omits `fps`.
-pub const DEFAULT_FPS: u32 = 7;
 /// VAE spatial compression (8×).
 pub const VAE_SCALE: u32 = 8;
 /// Output `width`/`height` must be divisible by this: VAE 8× × UNet 8× (3 stride-2 stages).

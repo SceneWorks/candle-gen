@@ -131,10 +131,12 @@ fn dequant_scaled_fp8_map(
 ) -> Result<HashMap<String, Tensor>> {
     // Pass 1: index the per-module `.scale_weight` scalars (base = key without the `.scale_weight`
     // suffix, e.g. `blocks.0.self_attn.q`). A weight `{base}.weight` dequants against `scales[base]`.
-    let mut scales: HashMap<&str, &Tensor> = HashMap::new();
+    // The scalars (shape `[]`) are cloned out — a cheap Arc bump on tiny storage — so pass 2 can *drain*
+    // `src` without an outstanding borrow, letting each fp8 source drop as its bf16 twin is inserted.
+    let mut scales: HashMap<String, Tensor> = HashMap::new();
     for (key, tensor) in &src {
         if let Some(base) = key.strip_suffix(".scale_weight") {
-            scales.insert(base, tensor);
+            scales.insert(base.to_owned(), tensor.clone());
         }
     }
     if scales.is_empty() {
@@ -144,8 +146,11 @@ fn dequant_scaled_fp8_map(
         )));
     }
 
+    // Pass 2: consume `src` by value (`into_iter`) so each source tensor drops at the end of its
+    // iteration rather than staying resident for the whole map — the fp8 source (~14 GB per expert)
+    // never sits alongside the *entire* bf16 output (~28 GB), only the single tensor being converted.
     let mut out = HashMap::with_capacity(src.len());
-    for (key, tensor) in &src {
+    for (key, tensor) in src {
         // Drop the marker, the rope `freqs` buffer (candle recomputes it; absent on UMT5), and both
         // scale companions.
         if key == SCALED_FP8_MARKER || key == "freqs" || key.ends_with(".freqs") {
@@ -159,18 +164,22 @@ fn dequant_scaled_fp8_map(
             .strip_suffix(".weight")
             .and_then(|base| scales.get(base))
         {
-            Some(scale) => dequant_scaled_fp8(what, key, tensor, scale, dtype)?,
-            None => cast_dense(what, key, tensor, dtype)?,
+            Some(scale) => dequant_scaled_fp8(what, &key, &tensor, scale, dtype)?,
+            None => cast_dense(what, &key, &tensor, dtype)?,
         };
-        out.insert(remap(key), value);
+        // Free the fp8 source before the (possibly reallocating) insert, so peak host RAM tracks the
+        // shrinking source + growing output rather than both maps in full.
+        drop(tensor);
+        out.insert(remap(&key), value);
     }
     Ok(out)
 }
 
 /// `w = (w_fp8 → f32 · scale_weight) → dtype`. `scale_weight` is a per-tensor **scalar** (shape `[]`),
 /// applied via `affine` (multiply-by-f64) — reconstructing the real weight ComfyUI stored as fp8. The
-/// f32 intermediate is per-tensor (immediately downcast), so peak host memory stays one tensor, not the
-/// whole expert.
+/// f32 intermediate is per-tensor (immediately downcast), so it never accumulates: the only f32 buffer
+/// resident is the one weight mid-conversion. (Map-level peak — the shrinking fp8 source vs. the growing
+/// bf16 output — is bounded by [`dequant_scaled_fp8_map`]'s drain, not by this f32 step.)
 fn dequant_scaled_fp8(
     what: &str,
     key: &str,
@@ -410,6 +419,39 @@ mod tests {
             out.get("blocks.0.norm2.weight").unwrap().dtype(),
             DType::BF16
         );
+    }
+
+    #[test]
+    fn drain_preserves_all_entries_across_many_weights() {
+        // Guards the sc-11222 F-122 drain: consuming `src` by value (so each fp8 source drops as its
+        // bf16 twin is inserted) must still emit every dequanted weight with its own scale — no entry
+        // lost, each key dequanted against its *own* companion.
+        let mut src = HashMap::new();
+        for (i, s) in [(0usize, 2.0f32), (1, 3.0), (2, 4.0)] {
+            src.insert(
+                format!("blocks.{i}.self_attn.q.weight"),
+                w(&[2, 2], DType::F8E4M3),
+            );
+            src.insert(format!("blocks.{i}.self_attn.q.scale_weight"), scalar(s));
+        }
+        let out = remap_and_dequant_comfyui_expert(src, DType::BF16).unwrap();
+        for (i, s) in [(0usize, 2.0f32), (1, 3.0), (2, 4.0)] {
+            let t = out
+                .get(&format!("blocks.{i}.attn1.to_q.weight"))
+                .unwrap_or_else(|| panic!("weight {i} survived the drain"));
+            let v = t
+                .to_dtype(DType::F32)
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert!(
+                (v[0] - s).abs() < 0.05,
+                "block {i}: 1.0 * scale {s} = {s}, got {}",
+                v[0]
+            );
+        }
     }
 
     #[test]
