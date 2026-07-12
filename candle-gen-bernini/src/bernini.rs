@@ -1256,44 +1256,22 @@ fn sample_vit_frames(frames: &[RgbImage]) -> Vec<RgbImage> {
         .collect()
 }
 
-// --- Deterministic host RNG (splitmix64 → Box-Muller) for the MAR reveal order + per-step FM noise. ---
-// The MAR trajectory's torch bit-parity needs the reference CPU draw injected (a follow-up); the
-// coherence bar uses this deterministic host RNG (seed-stable + injectable in tests).
+// --- MAR reveal order + per-step FM noise (reference torch/numpy MT19937 draws, sc-11671). ---
+// The reference `sample_vit_embed` draws the reveal permutation via numpy `np.random.shuffle` and the
+// per-step FM base noise via `torch.randn`; both are reimplemented bit-for-bit in `crate::rng` so the
+// candle MAR trajectory matches torch/numpy exactly (golden `mar_mt19937_golden`). A u64 request seed is
+// reduced to its low 32 bits (numpy's legacy scalar seeding rejects seeds ≥ 2³²; torch's MT19937 seeds
+// from `seed & 0xffffffff` regardless).
 
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-fn uniform(state: &mut u64) -> f64 {
-    (splitmix64(state) >> 11) as f64 / (1u64 << 53) as f64
-}
-
-fn gaussian(state: &mut u64) -> f32 {
-    let u1 = uniform(state).max(1e-12);
-    let u2 = uniform(state);
-    ((-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()) as f32
-}
-
-/// A deterministic reveal permutation of `[0, n)` from the seed (argsort of seeded normal noise — a
-/// stable, injectable order).
+/// The reveal permutation of `[0, n)` — numpy `RandomState(seed).shuffle(arange(n))` (bit-exact).
 fn seeded_permutation(n: i32, seed: u64) -> Vec<i32> {
-    let mut state = seed ^ 0x4d_a4;
-    let vals: Vec<f32> = (0..n).map(|_| gaussian(&mut state)).collect();
-    let mut idx: Vec<i32> = (0..n).collect();
-    idx.sort_by(|&a, &b| {
-        vals[a as usize]
-            .partial_cmp(&vals[b as usize])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    idx
+    crate::rng::numpy_shuffle(n.max(0) as usize, seed as u32)
 }
 
 /// Per-step base FM noise for the MAR loop — one `[revealed, in]` tensor per planning step (the
-/// reference's `torch.randn(n_revealed, in)`, tiled ×3 inside `DiffLossFm::sample`).
+/// reference's `torch.randn(n_revealed, in)`, tiled ×3 inside `DiffLossFm::sample`). Skipped steps
+/// (`revealed.sum() == 0`) draw no torch noise and get a placeholder `[max(1, np), in]` zero tensor
+/// that `sample_vit_embed` never reads (it `continue`s before the `step_noise[step]` lookup).
 fn seeded_step_noise(
     n_query: i32,
     planning_step: usize,
@@ -1303,14 +1281,15 @@ fn seeded_step_noise(
     dev: &Device,
 ) -> CResult<Vec<Tensor>> {
     let schedule = mar_schedule(n_query, planning_step, order);
+    let per_step = crate::rng::torch_step_noise(&schedule, in_channels, seed as u32);
     let mut out = Vec::with_capacity(planning_step);
-    for (s, revealed) in schedule.iter().enumerate() {
-        let np = revealed.len().max(1);
-        let mut state = seed ^ 0x9e37 ^ ((s as u64).wrapping_mul(0x100_0001));
-        let data: Vec<f32> = (0..np * in_channels)
-            .map(|_| gaussian(&mut state))
-            .collect();
-        out.push(Tensor::from_vec(data, (np, in_channels), dev)?);
+    for (revealed, data) in schedule.iter().zip(per_step) {
+        if data.is_empty() {
+            let np = revealed.len().max(1);
+            out.push(Tensor::zeros((np, in_channels), DType::F32, dev)?);
+        } else {
+            out.push(Tensor::from_vec(data, (revealed.len(), in_channels), dev)?);
+        }
     }
     Ok(out)
 }

@@ -57,6 +57,7 @@ pub mod pipeline;
 pub mod preprocess;
 pub mod process;
 pub mod qwen2_5_vl;
+pub mod rng;
 pub mod template;
 pub mod vision;
 pub mod vit_guidance;
