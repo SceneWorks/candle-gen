@@ -90,8 +90,9 @@ use std::sync::{Arc, Mutex};
 
 use candle_gen::candle_core::Device;
 use candle_gen::gen_core::{
-    self, AdapterSpec, Capabilities, GenerationOutput, GenerationRequest, Generator, LoadSpec,
-    Modality, ModelDescriptor, PidWeights, Progress, Quant, WeightsSource,
+    self, AdapterSpec, Capabilities, Conditioning, ConditioningKind, GenerationOutput,
+    GenerationRequest, Generator, Image, LoadSpec, Modality, ModelDescriptor, PidWeights, Progress,
+    Quant, WeightsSource,
 };
 
 /// Registry id for the Krea 2 Turbo text-to-image variant. Matches the SceneWorks worker's
@@ -103,6 +104,13 @@ pub const KREA_2_TURBO_ID: &str = "krea_2_turbo";
 /// both the training base and a first-class generator; the trainer + generator live in separate
 /// registries so the shared id never collides. Matches the worker `payload.model` + manifest `engine_id`.
 pub const KREA_2_RAW_ID: &str = "krea_2_raw";
+
+/// Registry id for the **image-edit** variant (epic 10871 / sc-11085). Kontext-style instruction edit
+/// over one or two source references (scene = image 1, person = image 2) on the undistilled full-CFG
+/// base. The engine (pipeline `render_edit` + edit components) landed via #416 but was unreachable
+/// through the `Generator` seam until this id was registered — the candle mirror of the mlx-gen #693
+/// `krea_2_edit` seam. Matches the worker `payload.model` + manifest `engine_id`.
+pub const KREA_2_EDIT_ID: &str = "krea_2_edit";
 
 /// patch_size(2)·vae_downsample(8) = 16 — patchify requires latent dims divisible by this.
 const SIZE_MULTIPLE: u32 = 16;
@@ -131,6 +139,10 @@ pub struct KreaGenerator {
     /// canonical `root` snapshot; `None` ⇒ the dense/packed `transformer/` snapshot path (unchanged).
     convrot_dit: Option<PathBuf>,
     components: Mutex<Option<Arc<Components>>>,
+    /// The image-edit-only components (Qwen-Image VAE **encoder** + Qwen3-VL **vision tower**), loaded
+    /// lazily on the first edit so the txt2img (Turbo/Raw) paths keep their footprint (epic 10871).
+    /// Only ever populated for the `krea_2_edit` id.
+    edit_components: Mutex<Option<Arc<pipeline::EditComponents>>>,
 }
 
 impl KreaGenerator {
@@ -154,6 +166,17 @@ impl KreaGenerator {
                     self.pid_spec.as_ref(),
                 )?),
             })
+        })
+    }
+
+    /// The image-edit-only components (VAE encoder + Qwen3-VL vision tower), loaded once on the first
+    /// edit and cached (epic 10871). Both read weights that already ship in the Krea 2 snapshot.
+    fn edit_components(&self) -> gen_core::Result<Arc<pipeline::EditComponents>> {
+        candle_gen::cached(&self.edit_components, || {
+            Ok(Arc::new(pipeline::load_edit_components(
+                &self.root,
+                &self.device,
+            )?))
         })
     }
 }
@@ -180,6 +203,12 @@ impl Generator for KreaGenerator {
                 req.width, req.height
             )));
         }
+        // The Edit variant needs 1..=2 source references (scene, then person). The capability floor
+        // above (empty `conditioning` on Turbo/Raw) already rejects any Reference/MultiReference on the
+        // txt2img ids; only `krea_2_edit` advertises them, so resolve + count-check here.
+        if self.descriptor.id == KREA_2_EDIT_ID {
+            resolve_edit_references(req)?;
+        }
         Ok(())
     }
 
@@ -190,10 +219,18 @@ impl Generator for KreaGenerator {
     ) -> gen_core::Result<GenerationOutput> {
         self.validate(req)?;
         let comps = self.components()?;
-        // Variant read off the descriptor id: Raw = full-CFG undistilled (52-step, dynamic-mu, two
-        // forwards/step); Turbo = CFG-free distilled (8-step, one forward). One generator struct, two
-        // render paths (the mlx-gen-krea `generate_impl` branch).
-        let images = if self.descriptor.id == KREA_2_RAW_ID {
+        // Variant read off the descriptor id (the mlx-gen-krea `generate_impl` branch): Edit = Kontext
+        // instruction edit over 1-2 references on the full-CFG base; Raw = full-CFG undistilled txt2img
+        // (52-step, dynamic-mu, two forwards/step); Turbo = CFG-free distilled (8-step, one forward).
+        // One generator struct, three render paths.
+        let images = if self.descriptor.id == KREA_2_EDIT_ID {
+            // Extract the fixed-order source set (scene = image 1, person = image 2) from the request
+            // conditioning, load the edit-only components lazily, and run the Kontext edit path.
+            let references: Vec<Image> =
+                resolve_edit_references(req)?.into_iter().cloned().collect();
+            let edit = self.edit_components()?;
+            pipeline::render_edit(&comps, &edit, req, &references, &self.device, on_progress)?
+        } else if self.descriptor.id == KREA_2_RAW_ID {
             pipeline::render_base(&comps, req, &self.device, on_progress)?
         } else {
             pipeline::render(&comps, req, &self.device, on_progress)?
@@ -257,6 +294,54 @@ pub fn raw_descriptor() -> ModelDescriptor {
     d.capabilities.supports_guidance = true;
     d.capabilities.supports_true_cfg = false;
     d
+}
+
+/// Krea 2 **Edit** identity + capabilities (epic 10871 / sc-11085) — the Kontext-style instruction-edit
+/// variant. Derived from [`raw_descriptor`] (the edit runs the undistilled **full-CFG** loop from pure
+/// noise, with the references as in-context conditioning), so it inherits the Raw surface — real
+/// guidance + a user negative prompt, packed quants, LoRA/LoKr (the edit LoRA merges through the shared
+/// [`build`] adapter path) — and additionally advertises the source-reference conditioning:
+/// [`ConditioningKind::Reference`] for a single source and [`ConditioningKind::MultiReference`] for two
+/// (scene = image 1, person = image 2; [`pipeline::MAX_EDIT_REFERENCES`]).
+pub fn edit_descriptor() -> ModelDescriptor {
+    let mut d = raw_descriptor();
+    d.id = KREA_2_EDIT_ID;
+    d.capabilities.conditioning = vec![
+        ConditioningKind::Reference,
+        ConditioningKind::MultiReference,
+    ];
+    d
+}
+
+/// The image-edit source references, in fixed order (scene = image 1, person = image 2; sc-10878) —
+/// collected from both [`Conditioning::Reference`] (a single source) and [`Conditioning::MultiReference`]
+/// (two sources). At least one and at most [`pipeline::MAX_EDIT_REFERENCES`] is required; zero or more
+/// than the cap is an error. Borrows from `req.conditioning`; the generate path clones the resolved set
+/// into the owned `&[Image]` the pipeline consumes. Pure so it is unit-testable without weights.
+fn resolve_edit_references(req: &GenerationRequest) -> gen_core::Result<Vec<&Image>> {
+    let mut refs: Vec<&Image> = Vec::new();
+    for c in &req.conditioning {
+        match c {
+            Conditioning::Reference { image, .. } => refs.push(image),
+            Conditioning::MultiReference { images } => refs.extend(images.iter()),
+            _ => {} // the capability floor already rejects the other conditioning kinds.
+        }
+    }
+    if refs.is_empty() {
+        return Err(gen_core::Error::Msg(format!(
+            "{KREA_2_EDIT_ID}: an instruction edit requires at least one source reference image \
+             (scene = image 1, person = image 2)"
+        )));
+    }
+    if refs.len() > pipeline::MAX_EDIT_REFERENCES {
+        return Err(gen_core::Error::Msg(format!(
+            "{KREA_2_EDIT_ID}: at most {} references are supported (scene = image 1, person = image \
+             2); got {}",
+            pipeline::MAX_EDIT_REFERENCES,
+            refs.len()
+        )));
+    }
+    Ok(refs)
 }
 
 /// sc-9300 ConvRot selection: decode whether a [`LoadSpec`] selects the community INT8-ConvRot DiT
@@ -332,6 +417,7 @@ fn build(spec: &LoadSpec, descriptor: ModelDescriptor) -> gen_core::Result<Box<d
         pid_spec: spec.pid.clone(),
         convrot_dit,
         components: Mutex::new(None),
+        edit_components: Mutex::new(None),
     }))
 }
 
@@ -357,15 +443,26 @@ pub fn load_raw(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     build(spec, raw_descriptor())
 }
 
-// Link-time registration: both variants register here — `krea_2_turbo` (distilled, CFG-free) and
-// `krea_2_raw` (undistilled, full-CFG; sc-9994 / epic 9992).
+/// Construct a lazy candle Krea 2 **Edit** generator (`krea_2_edit`, epic 10871 / sc-11085). Identical
+/// snapshot assembly to [`load`] / [`load_raw`] — one [`build`] serves all three ids — but stores the
+/// [`edit_descriptor`] so `generate` routes the reference-conditioned [`pipeline::render_edit`] path and
+/// lazily loads the edit-only components (VAE encoder + vision tower). The edit LoRA rides the shared
+/// `spec.adapters` merge path, exactly like a Raw-trained adapter on the txt2img ids.
+pub fn load_edit(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
+    build(spec, edit_descriptor())
+}
+
+// Link-time registration: all three variants register here — `krea_2_turbo` (distilled, CFG-free),
+// `krea_2_raw` (undistilled, full-CFG; sc-9994 / epic 9992), and `krea_2_edit` (Kontext instruction
+// edit over 1-2 references; epic 10871 / sc-11085).
 candle_gen::register_generators! {
     descriptor => load,
     raw_descriptor => load_raw,
+    edit_descriptor => load_edit,
 }
 
-/// Force-link hook (keeps the `inventory::submit!` registrations — the `krea_2_turbo` + `krea_2_raw`
-/// generators and the `krea_2_raw` trainer — from being dead-stripped).
+/// Force-link hook (keeps the `inventory::submit!` registrations — the `krea_2_turbo`, `krea_2_raw`,
+/// and `krea_2_edit` generators and the `krea_2_raw` trainer — from being dead-stripped).
 pub fn force_link() {}
 
 #[cfg(test)]
@@ -598,6 +695,119 @@ mod tests {
             load(&convrot_pid).is_err(),
             "ConvRot + PiD is rejected (the int8 DiT path is not PiD-wired)"
         );
+    }
+
+    // --- Edit (Kontext instruction edit, full-CFG) variant — epic 10871 / sc-11085 ---
+
+    #[test]
+    fn registers_krea_2_edit_as_candle() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(KREA_2_EDIT_ID, &spec).expect("krea_2_edit is registered");
+        assert_eq!(g.descriptor().id, KREA_2_EDIT_ID);
+        assert_eq!(g.descriptor().family, "krea_2");
+        assert_eq!(g.descriptor().backend, "candle");
+        assert!(!g.descriptor().capabilities.mac_only);
+    }
+
+    #[test]
+    fn edit_descriptor_is_cfg_capable_and_advertises_references() {
+        let d = edit_descriptor();
+        assert_eq!(d.id, KREA_2_EDIT_ID);
+        assert_eq!(d.family, "krea_2");
+        assert_eq!(d.backend, "candle");
+        assert_eq!(d.modality, Modality::Image);
+        // Derived from the Raw surface: real CFG guidance + a user negative prompt (the edit runs the
+        // undistilled full-CFG loop with the references as in-context conditioning).
+        assert!(d.capabilities.supports_guidance);
+        assert!(d.capabilities.supports_negative_prompt);
+        assert!(!d.capabilities.supports_true_cfg);
+        // And it advertises BOTH single- and two-reference conditioning (Turbo/Raw advertise neither).
+        assert_eq!(
+            d.capabilities.conditioning,
+            vec![
+                ConditioningKind::Reference,
+                ConditioningKind::MultiReference
+            ]
+        );
+        assert!(descriptor().capabilities.conditioning.is_empty());
+        assert!(raw_descriptor().capabilities.conditioning.is_empty());
+        // Shared surface stays in lockstep with Raw/Turbo (derived from `raw_descriptor()`).
+        assert!(d.capabilities.supports_lora && d.capabilities.supports_lokr);
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
+    }
+
+    #[test]
+    fn load_edit_rejects_single_file_accepts_dir_and_lora() {
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+        // Same snapshot loader as Turbo/Raw — a single-file weights source is rejected.
+        let file = LoadSpec::new(WeightsSource::File("/tmp/x.safetensors".into()));
+        assert!(load_edit(&file).is_err());
+        // A plain snapshot dir loads lazily.
+        let dir = LoadSpec::new(WeightsSource::Dir("/snap".into()));
+        assert!(load_edit(&dir).is_ok());
+        // The edit LoRA rides the shared `spec.adapters` merge path (accepted + lazy).
+        let lora = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_adapters(vec![
+            AdapterSpec::new("/edit_lora.safetensors".into(), 1.0, AdapterKind::Lora),
+        ]);
+        assert!(load_edit(&lora).is_ok(), "edit LoRA load is wired + lazy");
+    }
+
+    fn ref_image(w: u32, h: u32) -> Image {
+        Image {
+            width: w,
+            height: h,
+            pixels: vec![0u8; (w * h * 3) as usize],
+        }
+    }
+
+    #[test]
+    fn resolve_edit_references_single_and_pair_fixed_order() {
+        // A single `Reference` → one source (the scene).
+        let one = GenerationRequest {
+            prompt: "make it autumn".into(),
+            conditioning: vec![Conditioning::Reference {
+                image: ref_image(2, 2),
+                strength: None,
+            }],
+            ..Default::default()
+        };
+        let refs = resolve_edit_references(&one).unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!((refs[0].width, refs[0].height), (2, 2));
+
+        // A two-image `MultiReference` → scene (image 1) then person (image 2), order preserved.
+        let two = GenerationRequest {
+            prompt: "put the person in the scene".into(),
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![ref_image(4, 4), ref_image(6, 6)],
+            }],
+            ..Default::default()
+        };
+        let refs = resolve_edit_references(&two).unwrap();
+        assert_eq!(refs.len(), 2);
+        assert_eq!((refs[0].width, refs[0].height), (4, 4), "scene = image 1");
+        assert_eq!((refs[1].width, refs[1].height), (6, 6), "person = image 2");
+    }
+
+    #[test]
+    fn resolve_edit_references_rejects_zero_and_over_cap() {
+        // Zero references → error (an edit needs a source).
+        let none = GenerationRequest {
+            prompt: "make it autumn".into(),
+            ..Default::default()
+        };
+        assert!(resolve_edit_references(&none).is_err());
+
+        // Three references → past the fixed-order cap (scene, person).
+        let three = GenerationRequest {
+            prompt: "x".into(),
+            conditioning: vec![Conditioning::MultiReference {
+                images: vec![ref_image(2, 2), ref_image(2, 2), ref_image(2, 2)],
+            }],
+            ..Default::default()
+        };
+        let err = resolve_edit_references(&three).unwrap_err().to_string();
+        assert!(err.contains("at most 2"), "got: {err}");
     }
 
     /// Test helper: attach a ConvRot DiT single-file selector on `text_encoder` (sc-9300).
