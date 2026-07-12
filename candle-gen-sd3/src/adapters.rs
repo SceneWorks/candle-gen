@@ -318,7 +318,8 @@ fn merge_lora_file(
                 modules.entry(stem.to_string()).or_default().up = Some(t.clone())
             }
             Some((stem, Role::Alpha)) => {
-                modules.entry(stem.to_string()).or_default().alpha = Some(read_scalar(key, t)?)
+                modules.entry(stem.to_string()).or_default().alpha =
+                    Some(read_scalar(key, "alpha", t)?)
             }
             None => report.skipped_keys += 1,
         }
@@ -541,7 +542,8 @@ fn resolve_lora_file(
                 modules.entry(stem.to_string()).or_default().up = Some(t.clone())
             }
             Some((stem, Role::Alpha)) => {
-                modules.entry(stem.to_string()).or_default().alpha = Some(read_scalar(key, t)?)
+                modules.entry(stem.to_string()).or_default().alpha =
+                    Some(read_scalar(key, "alpha", t)?)
             }
             None => *skipped_keys += 1,
         }

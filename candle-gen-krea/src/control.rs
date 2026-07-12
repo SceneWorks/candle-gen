@@ -324,7 +324,10 @@ impl ControlBranch {
             // A malformed/truncated overlay can ship a size-0 `meta.inject_offset`; route the read
             // through the hardened scalar reader (F-119 / sc-11208, F-009 class) so a corrupt
             // studio-trained checkpoint is a typed error at `Krea2Control::load`, not a worker panic.
-            Some(t) => candle_gen::train::merge::read_scalar(META_INJECT_OFFSET, t)? as usize,
+            Some(t) => {
+                candle_gen::train::merge::read_scalar(META_INJECT_OFFSET, "inject_offset", t)?
+                    as usize
+            }
             None => 0,
         };
         let get = |key: &str| -> Result<Tensor> {

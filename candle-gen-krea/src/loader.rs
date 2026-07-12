@@ -496,7 +496,10 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
                     } else {
                         None
                     };
-                    return QLinear::convrot_int8(w_i8, scale, group_size, dense_bias);
+                    // Pass the model's resident COMPUTE device (where activations live), NOT
+                    // `w_i8.device()` — the codes are CPU-materialized here to save VRAM, but the int8
+                    // IGEMM leg must be built on the CUDA compute device (F-121 / sc-11208).
+                    return QLinear::convrot_int8(w_i8, scale, group_size, dense_bias, w.device());
                 }
             }
         }

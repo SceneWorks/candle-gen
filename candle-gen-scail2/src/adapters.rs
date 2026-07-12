@@ -132,7 +132,7 @@ fn merge_lora_file(
             Some((path, Role::Down)) => triples.entry(path).or_default().down = Some(t.clone()),
             Some((path, Role::Up)) => triples.entry(path).or_default().up = Some(t.clone()),
             Some((path, Role::Alpha)) => {
-                triples.entry(path).or_default().alpha = Some(read_scalar(key, t)?)
+                triples.entry(path).or_default().alpha = Some(read_scalar(key, "alpha", t)?)
             }
             // Not a low-rank key (could be a diff-patch tensor or out of surface) — diff-patch is
             // counted in its own pass; everything else is surfaced there or here as appropriate.

@@ -157,7 +157,7 @@ fn merge_lora_file(
             Some((path, Role::Down)) => triples.entry(path).or_default().down = Some(t.clone()),
             Some((path, Role::Up)) => triples.entry(path).or_default().up = Some(t.clone()),
             Some((path, Role::Alpha)) => {
-                triples.entry(path).or_default().alpha = Some(read_scalar(key, t)?)
+                triples.entry(path).or_default().alpha = Some(read_scalar(key, "alpha", t)?)
             }
             None => report.skipped_keys += 1,
         }
@@ -476,7 +476,7 @@ fn resolve_lora_file(
             Some((path, Role::Down)) => triples.entry(path).or_default().down = Some(t.clone()),
             Some((path, Role::Up)) => triples.entry(path).or_default().up = Some(t.clone()),
             Some((path, Role::Alpha)) => {
-                triples.entry(path).or_default().alpha = Some(read_scalar(key, t)?)
+                triples.entry(path).or_default().alpha = Some(read_scalar(key, "alpha", t)?)
             }
             None => *skipped_keys += 1,
         }
@@ -727,7 +727,7 @@ fn fold_conv_lora_file(
             Some((path, Role::Down)) => triples.entry(path).or_default().down = Some(t.clone()),
             Some((path, Role::Up)) => triples.entry(path).or_default().up = Some(t.clone()),
             Some((path, Role::Alpha)) => {
-                triples.entry(path).or_default().alpha = Some(read_scalar(key, t)?)
+                triples.entry(path).or_default().alpha = Some(read_scalar(key, "alpha", t)?)
             }
             None => {} // out-of-surface keys are counted by the additive resolver, not here
         }
@@ -807,7 +807,7 @@ fn resolve_conv_lora_file(
             Some((path, Role::Down)) => triples.entry(path).or_default().down = Some(t.clone()),
             Some((path, Role::Up)) => triples.entry(path).or_default().up = Some(t.clone()),
             Some((path, Role::Alpha)) => {
-                triples.entry(path).or_default().alpha = Some(read_scalar(key, t)?)
+                triples.entry(path).or_default().alpha = Some(read_scalar(key, "alpha", t)?)
             }
             None => {} // out-of-surface keys are counted by the Linear resolver, not here
         }
