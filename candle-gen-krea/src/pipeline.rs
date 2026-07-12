@@ -397,13 +397,27 @@ pub fn render_edit(
     edit: &EditComponents,
     req: &GenerationRequest,
     references: &[Image],
+    // `true` = the CFG-free distilled Turbo edit (`krea_2_turbo_edit`, sc-11640): few-step
+    // `turbo_schedule` (fixed mu), guidance forced to 0 (a single conditional forward). `false` = the
+    // undistilled Raw edit (`krea_2_edit`, epic 10871): the resolution-dynamic `base_schedule` under
+    // full CFG. Mirrors mlx-gen-krea `render_edit(distilled)`.
+    distilled: bool,
     device: &Device,
     on_progress: &mut dyn FnMut(Progress),
 ) -> Result<Vec<Image>> {
     check_reference_count(references.len())?;
-    let steps = req.steps.map(|s| s as usize).unwrap_or(RAW_STEPS);
+    let steps = req
+        .steps
+        .map(|s| s as usize)
+        .unwrap_or(if distilled { TURBO_STEPS } else { RAW_STEPS });
     let base_seed = req.seed.unwrap_or_else(gen_core::default_seed);
-    let guidance = req.guidance.unwrap_or(RAW_GUIDANCE);
+    // Turbo edit is CFG-free: force guidance 0 so the unconditional grounded encode is skipped and the
+    // sampler runs a single conditional forward. Raw edit honors the request guidance (default 3.5).
+    let guidance = if distilled {
+        0.0
+    } else {
+        req.guidance.unwrap_or(RAW_GUIDANCE)
+    };
 
     // Wire (b): run the vision tower ONCE per reference (shared across the pos/neg instruction encodings).
     let grounding = encode_vision(&edit.vision, references, device)?;
@@ -423,8 +437,13 @@ pub fn render_edit(
     let ref_latents =
         encode_references(&edit.vae_encoder, references, req.width, req.height, device)?;
 
-    // Resolution-dynamic Raw schedule (the edit path is undistilled, like `render_base`).
-    let sigmas = base_schedule(steps, req.width, req.height, req.scheduler.as_deref());
+    // Turbo edit runs the distilled few-step `turbo_schedule` (fixed mu) the CFG-free student expects;
+    // Raw edit runs the resolution-dynamic `base_schedule` (undistilled, like `render_base`).
+    let sigmas = if distilled {
+        turbo_schedule(steps, req.scheduler.as_deref())
+    } else {
+        base_schedule(steps, req.width, req.height, req.scheduler.as_deref())
+    };
 
     candle_gen::for_each_image_seed(base_seed, req.count, |seed| {
         let noise = init_noise(req.height, req.width, seed, device)?;
@@ -585,6 +604,16 @@ pub fn base_schedule(steps: usize, width: u32, height: u32, scheduler: Option<&s
     let mu = dynamic_mu(seq_len);
     let native = krea_sigmas(steps, mu);
     candle_gen::resolve_flow_schedule(scheduler, mu as f32, steps, &native)
+}
+
+/// The **Turbo** flow-match sigma schedule for `steps`: the TDM-distilled fixed-mu (`TURBO_MU = 1.15`)
+/// exponential-shift `turbo_sigmas`, optionally reshaped by a curated scheduler over the same mu. Length
+/// `steps + 1`, descending with a trailing `0.0`. The distilled CFG-free Turbo edit (`krea_2_turbo_edit`,
+/// sc-11640) denoises on this trajectory the few-step student was trained on, NOT the resolution-dynamic
+/// `base_schedule`. Mirrors mlx-gen-krea `turbo_schedule` + the `render_turbo` inline build.
+pub fn turbo_schedule(steps: usize, scheduler: Option<&str>) -> Vec<f32> {
+    let native = turbo_sigmas(steps);
+    candle_gen::resolve_flow_schedule(scheduler, TURBO_MU as f32, steps, &native)
 }
 
 /// Krea's classifier-free-guidance velocity combine — the reference `sampling.py:129`

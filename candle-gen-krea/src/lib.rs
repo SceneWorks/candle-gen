@@ -229,7 +229,19 @@ impl Generator for KreaGenerator {
             let references: Vec<Image> =
                 resolve_edit_references(req)?.into_iter().cloned().collect();
             let edit = self.edit_components()?;
-            pipeline::render_edit(&comps, &edit, req, &references, &self.device, on_progress)?
+            // The registered `krea_2_edit` seam is the undistilled full-CFG edit (`distilled = false`);
+            // the CFG-free distilled Turbo edit (sc-11640) is driven through the worker's bespoke
+            // `generate_candle_krea_edit_stream` lane (which calls `render_edit(distilled = true)`
+            // directly), matching how every candle edit lane bypasses the registered seam.
+            pipeline::render_edit(
+                &comps,
+                &edit,
+                req,
+                &references,
+                false,
+                &self.device,
+                on_progress,
+            )?
         } else if self.descriptor.id == KREA_2_RAW_ID {
             pipeline::render_base(&comps, req, &self.device, on_progress)?
         } else {
