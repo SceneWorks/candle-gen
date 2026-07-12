@@ -566,19 +566,31 @@ impl Pipeline {
             None => {
                 let unet_file =
                     snapshot_file(&self.root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
-                let unet = if self.adapters.is_empty() {
-                    // No adapters: the stock mmap build — byte-identical to pre-sc-5165 (zero regression).
-                    self.config.build_unet(
-                        unet_file,
-                        &self.device,
-                        4,
-                        use_flash_attn,
-                        self.dtype,
-                    )?
+                if use_flash_attn {
+                    // The fused flash-attn kernel never materializes the full `[B·H, S, S]` scores
+                    // tensor, so it does not hit the i32-overflow (sc-11154 / F-081); keep the stock
+                    // candle UNet so the fused kernel is used (byte-identical to pre-sc-5165).
+                    let unet = if self.adapters.is_empty() {
+                        self.config
+                            .build_unet(unet_file, &self.device, 4, true, self.dtype)?
+                    } else {
+                        self.build_unet_with_adapters(&unet_file, true)?
+                    };
+                    SdxlUnet::Stock(Arc::new(unet))
                 } else {
-                    self.build_unet_with_adapters(&unet_file, use_flash_attn)?
-                };
-                SdxlUnet::Stock(Arc::new(unet))
+                    // Math-path attention (the default — no `flash-attn` feature): the stock candle
+                    // UNet materializes a full `[B·H, S, S]` scores tensor that overflows i32 at
+                    // ≥ ~1664² (2048²: `2·10·16384² ≈ 5.4e9 > i32::MAX`) and silently corrupts on CUDA
+                    // (sc-11154 / F-081). Route the dense load through the vendored UNet, whose math
+                    // attention is the i32-overflow-safe `sdpa_budgeted_flat` — bit-identical to the
+                    // stock forward per `vendored_unet_matches_stock_forward`.
+                    let vendored = if self.adapters.is_empty() {
+                        self.load_dense_vendored_unet(&unet_file)?
+                    } else {
+                        self.load_dense_vendored_unet_with_adapters(&unet_file)?
+                    };
+                    SdxlUnet::Vendored(Arc::new(vendored))
+                }
             }
         };
         let vae = self.config.build_vae(
@@ -675,6 +687,32 @@ impl Pipeline {
         let vs = VarBuilder::from_tensors(tensors, self.dtype, &self.device);
         let unet = UNet2DConditionModel::new(vs, 4, 4, use_flash_attn, sdxl_stock_unet_config())?;
         Ok(unet)
+    }
+
+    /// Build the **dense** SDXL UNet through the vendored stack (sc-11154 / F-081). The vendored math
+    /// attention routes through the shared i32-overflow-safe [`candle_gen::sdpa_budgeted_flat`], so the
+    /// dense (no-flash) path no longer materializes an over-`i32::MAX` `[B·H, S, S]` scores tensor at
+    /// the advertised 2048² envelope (the stock candle UNet does — silent CUDA corruption). The
+    /// vendored copy is bit-identical to the stock forward (`vendored_unet_matches_stock_forward`), and
+    /// the diffusers fp16 checkpoint layout is shared: its `linear_detect` leaves see no `.scales`
+    /// siblings and load every Linear dense (the same code path the packed loader takes for un-packed
+    /// tensors). No adapter is installed, so each attention projection's base is its dense Linear.
+    fn load_dense_vendored_unet(&self, unet_file: &Path) -> Result<VendoredUNet> {
+        let vs =
+            candle_gen::mmap_var_builder(&[unet_file.to_path_buf()], self.dtype, &self.device)?;
+        Ok(VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?)
+    }
+
+    /// Dense vendored UNet with the [`AdapterSpec`]s merged in (sc-11154 / F-081) — the adapted
+    /// counterpart of [`Self::load_dense_vendored_unet`]. Mirrors [`Self::build_unet_with_adapters`]
+    /// (base tensors on CPU → [`crate::adapters::merge_adapters`] f32 fold → `from_tensors`) but targets
+    /// the vendored stack so the i32-overflow-safe budgeted attention applies. SDXL merges the delta
+    /// into the dense weights (not a forward residual) for chaos-sensitivity; see [`crate::adapters`].
+    fn load_dense_vendored_unet_with_adapters(&self, unet_file: &Path) -> Result<VendoredUNet> {
+        let mut tensors = candle_gen::candle_core::safetensors::load(unet_file, &Device::Cpu)?;
+        crate::adapters::merge_adapters(&mut tensors, &self.adapters)?;
+        let vs = VarBuilder::from_tensors(tensors, self.dtype, &self.device);
+        Ok(VendoredUNet::new(vs, 4, 4, false, sdxl_unet_config())?)
     }
 
     /// Render `req` against pre-resolved `text_embeddings` and (caller-cached, sc-5037) `unet`/`vae`,

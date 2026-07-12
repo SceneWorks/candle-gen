@@ -262,10 +262,21 @@ impl Attention {
         let v = repeat_kv(&v, nh / nkv)?;
 
         let scale = (hd as f64).powf(-0.5);
-        let scores = (q.contiguous()?.matmul(&k.transpose(2, 3)?.contiguous()?)? * scale)?;
-        let scores = scores.broadcast_add(mask)?;
-        let probs = softmax_last_dim(&scores)?;
-        let o = probs.matmul(&v)?; // [B, nh, S, D]
+        // i32-overflow guard (sc-11154 / F-081): image-grounded edit prompts run right up to the
+        // inclusive `MAX_EDIT_TOKENS = 8192` cap, so the `[B, nh, S, S]` scores tensor reaches
+        // `32·8192² = 2^31 > i32::MAX` — candle's CUDA kernels index scores with i32 and silently
+        // corrupt the tail, subtly wrong grounding on the krea edit engine. Chunk over the query rows
+        // via the shared helper (the additive causal mask is `[B,1,S,S]`, narrowed per chunk); single
+        // un-chunked pass (byte-identical) below budget, exact fused `softmax_last_dim` preserved.
+        let o = candle_gen::sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            scale,
+            Some(mask),
+            softmax_last_dim,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?; // [B, nh, S, D]
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
         self.o_proj.forward(&o)
     }

@@ -28,6 +28,11 @@
 
 mod pipeline;
 
+// Vendored, i32-overflow-safe FLUX.1 VAEs (sc-11154 / F-081): faithful copies of the BFL/native
+// `flux::autoencoder` and the diffusers `z_image::vae` with the mid-block spatial self-attention routed
+// through the shared budgeted helper (the stock upstream overflows i32 on CUDA at a 2048² decode).
+mod vae;
+
 // Shared FLUX.1 component-loading stack (sc-9003 / F-023): the CLIP-L + T5-XXL text encoders, the DiT
 // checkpoint mmap, the AutoEncoder VAE, and the CPU-seeded initial noise — the block the three FLUX.1
 // providers (txt2img / IP-Adapter / control) used to copy-paste. One home over `candle_gen::loader`

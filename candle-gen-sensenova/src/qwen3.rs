@@ -507,10 +507,21 @@ impl Qwen3Backbone {
         let v_all = repeat_kv_bhsd(&v_all, groups)?;
 
         let scale = 1.0 / (hd as f64).sqrt();
-        let scores = (q.matmul(&k_all.transpose(2, 3)?.contiguous()?)? * scale)?;
-        let scores = scores.broadcast_add(&rm.mask)?;
-        let weights = ops::softmax_last_dim(&scores)?;
-        let out = weights.matmul(&v_all)?; // [B,H,S,D]
+        // i32-overflow guard (sc-11154 / F-081): an image-bearing VQA/interleave prefill can reach
+        // ~8.2k tokens, so the `[B, H, S, past+S]` scores tensor overflows `i32::MAX` (`H·S² > 2.15e9`)
+        // — candle's CUDA kernels index scores with i32 and silently corrupt the tail, yielding wrong
+        // answers. Chunk over the query rows via the shared helper; the additive mask is
+        // `[1,1,S_new, past+S_new]` (dim-2 == the new-query length, narrowed per chunk). Single
+        // un-chunked pass (byte-identical) below budget, exact fused `softmax_last_dim` preserved.
+        let out = candle_gen::sdpa_budgeted_bhsd(
+            &q,
+            &k_all,
+            &v_all,
+            scale,
+            Some(&rm.mask),
+            ops::softmax_last_dim,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?; // [B,H,S,D]
         let out = out
             .transpose(1, 2)?
             .contiguous()?

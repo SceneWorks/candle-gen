@@ -237,6 +237,34 @@ mod tests {
     }
 
     #[test]
+    fn guard_fires_at_advertised_sizes_sc11154() {
+        // sc-11154 / F-081: the five newly-swept sites overflow i32 *within* their advertised,
+        // `validate`-accepted envelopes. Assert the shared budget (`ATTN_SCORES_BUDGET`) engages the
+        // query-row chunking at each site's advertised over-threshold size — and, critically, does NOT
+        // chunk a comfortably in-budget size (so the common path stays the byte-identical single pass).
+        // `rows_per_query` is the element count contributed by ONE query row (`N·Sk` flat, `B·H·Sk` 4-D).
+        let b = ATTN_SCORES_BUDGET;
+
+        // (a) stock SDXL UNet self-attn @ 2048² (heads-into-batch flat): N = B·H = 2·10, Sk = Sq = 16384
+        // → 2·10·16384² ≈ 5.4e9. Chunk length must be < Sq.
+        assert!(query_block(2 * 10 * 16384, 16384, b) < 16384);
+        // (b) FLUX.1 VAE mid-block @ 2048² (single-head flat): N = 1, Sk = Sq = 65536 → 65536² ≈ 4.3e9.
+        assert!(query_block(65536, 65536, b) < 65536);
+        // (c) boogu Qwen3-VL ViT at a ~3.0 MP reference (4-D): B·H = 1·16, Sk = Sq = 11585 → 16·11585².
+        assert!(query_block(16 * 11585, 11585, b) < 11585);
+        // (d) krea grounded TE at the inclusive 8192-token cap (4-D): B·H = 1·32, Sk = Sq = 8192 → 2^31.
+        assert!(query_block(32 * 8192, 8192, b) < 8192);
+        // (e) sensenova ~8.2k-token image prefill (4-D), heads = 32: 32·8192² > i32::MAX.
+        assert!(query_block(32 * 8192, 8200, b) < 8200);
+
+        // Below the budget every one of these families runs a SINGLE un-chunked pass (block == Sq). A
+        // 512² SDXL attn (Sq = 4096, N = 20 → 20·4096² ≈ 3.4e8) and a 1024² FLUX VAE (Sq = 16384 →
+        // 16384² ≈ 2.7e8) both fit, so the guard is a no-op there.
+        assert_eq!(query_block(20 * 4096, 4096, b), 4096);
+        assert_eq!(query_block(16384, 16384, b), 16384);
+    }
+
+    #[test]
     fn flat_chunked_matches_single_pass() {
         // The 3-D (heads-folded / single-head VAE) shape, same invariant.
         let dev = Device::Cpu;

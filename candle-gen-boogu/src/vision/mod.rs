@@ -133,9 +133,21 @@ impl Block {
         let k = rope(&to_heads(1)?, cos, sin)?;
         let v = to_heads(2)?;
 
-        let scores = (q.matmul(&k.transpose(2, 3)?.contiguous()?)? * self.scale)?;
-        let probs = softmax_last_dim(&scores)?;
-        let o = probs.matmul(&v)?; // [1, h, seq, hd]
+        // i32-overflow guard (sc-11154 / F-081): the ViT runs full-image self-attention over every
+        // patch token BEFORE any downstream token cap, so a single ~3.0 MP reference already gives a
+        // `[1, h, seq, seq]` scores tensor of `16·11585² ≈ 2.15e9 > i32::MAX` — candle's CUDA kernels
+        // index scores with i32 and silently corrupt the tail (this tower feeds boogu edit AND the new
+        // `krea_2_edit` grounding). Chunk over the query rows via the shared helper; single un-chunked
+        // pass (byte-identical) for in-budget sizes, exact fused `softmax_last_dim` preserved.
+        let o = candle_gen::sdpa_budgeted_bhsd(
+            &q,
+            &k,
+            &v,
+            self.scale,
+            None,
+            softmax_last_dim,
+            candle_gen::ATTN_SCORES_BUDGET,
+        )?; // [1, h, seq, hd]
         let o = o
             .squeeze(0)? // [h, seq, hd]
             .transpose(0, 1)? // [seq, h, hd]

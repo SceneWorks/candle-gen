@@ -19,10 +19,10 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::vae::native::AutoEncoder;
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::clip::text_model::ClipTextTransformer;
-use candle_transformers::models::flux::autoencoder::AutoEncoder;
 use candle_transformers::models::t5::{Config as T5Config, T5EncoderModel};
 use rand::{rngs::StdRng, SeedableRng};
 

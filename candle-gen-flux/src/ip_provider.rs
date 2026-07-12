@@ -18,9 +18,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::vae::native::AutoEncoder;
 use candle_core::{DType, Device, Tensor};
 use candle_transformers::models::clip::text_model::ClipTextTransformer;
-use candle_transformers::models::flux::autoencoder::AutoEncoder;
 use candle_transformers::models::flux::sampling::{get_schedule, State};
 use candle_transformers::models::t5::T5EncoderModel;
 

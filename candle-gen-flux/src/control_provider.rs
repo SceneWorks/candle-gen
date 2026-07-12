@@ -30,10 +30,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::vae::native::{AutoEncoder, DiagonalGaussian, Encoder};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use candle_transformers::models::clip::text_model::ClipTextTransformer;
-use candle_transformers::models::flux::autoencoder::{AutoEncoder, DiagonalGaussian, Encoder};
 use candle_transformers::models::flux::sampling::{get_schedule, State};
 use candle_transformers::models::t5::T5EncoderModel;
 
@@ -498,8 +498,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    use crate::vae::native::Config as AeCfg;
     use candle_nn::VarMap;
-    use candle_transformers::models::flux::autoencoder::Config as AeCfg;
     use rand::{rngs::StdRng, SeedableRng};
 
     /// A tiny FLUX AE config (real BFL shift/scale, `ch = 32` — the AE's `group_norm(32, ·)` floor).
