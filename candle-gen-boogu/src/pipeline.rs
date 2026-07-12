@@ -72,10 +72,12 @@ pub(crate) const MAX_TEXT_TOKENS: usize = 1280;
 /// never pass, misdirecting the failure onto the prompt). Unlike the t2i path this is NOT bounded by
 /// the encoder's RoPE-table size: the grounded [`crate::text_encoder::BooguTextEncoder::last_hidden_with_images`]
 /// builds a fresh interleaved-MRoPE table sized to the actual sequence. The cap mirrors krea's
-/// `MAX_EDIT_TOKENS` and is the i32-safe ceiling of the (now budgeted, sc-11193) TE attention: at the
-/// inclusive cap `[1, 32, S, S]` scores = `32·8192² = 2^31`, the point the shared
-/// [`candle_gen::sdpa_budgeted_bhsd`] guard chunks the query rows. Larger reference sets are rejected up
-/// front with an error naming the reference-token count (not the prompt).
+/// `MAX_EDIT_TOKENS` and is a practical RoPE-and-memory ceiling — NOT an i32-safety limit. The shared
+/// [`candle_gen::sdpa_budgeted_bhsd`] path this PR (sc-11193) routes the grounded TE attention through
+/// chunks the query rows for ANY sequence length, so the i32 `[1, 32, S, S]` score overflow no longer
+/// bounds the cap and it could in principle be raised further if the advertised multi-reference edit
+/// surface needs it. Larger reference sets are rejected up front with an error naming the
+/// reference-token count (not the prompt).
 pub(crate) const MAX_EDIT_TOKENS: usize = 8192;
 
 /// Component compute dtypes. The Qwen3-VL TE runs in **f32** (parity-grade for this encoder, shared
