@@ -22,7 +22,7 @@
 //! block masks are handed to the candle graph. Validated near-bit (f32) against the same synthetic
 //! `tests/fixtures/vision_tower_golden.safetensors` the MLX lane asserts.
 
-use candle_gen::candle_core::{Tensor, D};
+use candle_gen::candle_core::{DType, Tensor, D};
 use candle_gen::candle_nn::{ops::softmax_last_dim, Linear, Module, VarBuilder};
 use candle_gen::{CandleError, Result as CResult};
 
@@ -303,6 +303,10 @@ pub struct VisionTower {
     blocks: Vec<Block>,
     merger: Merger,
     cfg: VisionConfig,
+    /// The tower's weight/activation dtype (bf16 in production via `PLANNER_DTYPE`, f32 in the parity
+    /// fixture). Every runtime input — pixels, RoPE `cos`/`sin`, the additive masks — is cast to this
+    /// so candle's dtype-strict matmul/binary ops don't hard-error on a mixed-dtype forward (sc-11150).
+    dtype: DType,
 }
 
 impl VisionTower {
@@ -311,6 +315,7 @@ impl VisionTower {
         // Fold the bias-free Conv3d weight `[embed, in, t, ph, pw]` → `[embed, in·t·ph·pw]` so the
         // full-kernel conv runs as a per-patch matmul.
         let conv = vb.get_unchecked("patch_embed.proj.weight")?;
+        let dtype = conv.dtype();
         let embed = conv.dim(0)?;
         let in_dim: usize = conv.dims().iter().skip(1).product();
         let patch_embed = Linear::new(conv.reshape((embed, in_dim))?, None);
@@ -325,6 +330,7 @@ impl VisionTower {
             blocks,
             merger,
             cfg,
+            dtype,
         })
     }
 
@@ -458,8 +464,13 @@ impl VisionTower {
         let plan = self.build_plan(grid_thw, dev)?;
         let (seq, merged) = (plan.seq, plan.merged);
 
+        // Cast the f32 pixels to the tower's weight dtype (bf16 in production) — candle's matmul
+        // hard-errors on mixed dtypes, so `patch_embed.forward` against bf16 weights needs bf16
+        // activations (sc-11150).
+        let pixel_values = pixel_values.to_dtype(self.dtype)?;
+
         // Patch embed, then reorder hidden + rope by the window permutation (merge-unit granularity).
-        let h = self.patch_embed.forward(pixel_values)?; // [seq, dim]
+        let h = self.patch_embed.forward(&pixel_values)?; // [seq, dim]
         let h = h
             .reshape((merged, mu, dim))?
             .index_select(&plan.window_index, 0)?
@@ -469,12 +480,16 @@ impl VisionTower {
             .reshape((merged, mu, rd))?
             .index_select(&plan.window_index, 0)?
             .reshape((seq, rd))?;
+        // Build the rotary tables in f32 for precision, then cast `cos`/`sin` to the activation dtype
+        // so the per-block `broadcast_mul` against bf16 q/k does not fault (sc-11150).
         let emb = Tensor::cat(&[&rope, &rope], 1)?; // [seq, head_dim] f32
-        let cos = emb.cos()?;
-        let sin = emb.sin()?;
+        let cos = emb.cos()?.to_dtype(self.dtype)?;
+        let sin = emb.sin()?.to_dtype(self.dtype)?;
 
-        let full_mask = additive_mask(&plan.full_bid, seq, dev)?;
-        let win_mask = additive_mask(&plan.win_bid, seq, dev)?;
+        // The additive masks are built f32 (0 / -inf); cast to the activation dtype so `broadcast_add`
+        // onto the bf16 attention scores matches (sc-11150). f32 -inf casts to a bf16 -inf.
+        let full_mask = additive_mask(&plan.full_bid, seq, dev)?.to_dtype(self.dtype)?;
+        let win_mask = additive_mask(&plan.win_bid, seq, dev)?.to_dtype(self.dtype)?;
 
         let mut h = h;
         for (i, blk) in self.blocks.iter().enumerate() {

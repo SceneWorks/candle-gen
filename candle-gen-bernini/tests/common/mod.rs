@@ -155,13 +155,19 @@ impl Golden {
     /// A `VarBuilder` over **all F32 tensors** in the fixture (weights + f32 io), rooted at the file
     /// top level. Navigate to the model / connector namespace with `.pp("w.model")` etc.
     pub fn var_builder(&self, dev: &Device) -> VarBuilder<'static> {
+        self.var_builder_dtype(dev, DType::F32)
+    }
+
+    /// Like [`Golden::var_builder`], but every weight is cast to `dtype`. Used to exercise the
+    /// production bf16 weight layout against f32 inputs (sc-11150 — the vision-tower dtype contract).
+    pub fn var_builder_dtype(&self, dev: &Device, dtype: DType) -> VarBuilder<'static> {
         let mut map: HashMap<String, Tensor> = HashMap::new();
         for (k, e) in &self.entries {
             if e.dtype == "F32" {
-                map.insert(k.clone(), self.tensor(k, dev));
+                map.insert(k.clone(), self.tensor(k, dev).to_dtype(dtype).unwrap());
             }
         }
-        VarBuilder::from_tensors(map, DType::F32, dev)
+        VarBuilder::from_tensors(map, dtype, dev)
     }
 }
 
