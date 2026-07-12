@@ -166,25 +166,18 @@ pub fn load_components_turbo(
     let dit = Ideogram4DitConfig::v4();
     let te_cfg = Ideogram4TextEncoderConfig::qwen3_vl_8b();
 
-    let mut cond_w =
-        crate::loader::Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
-    let lora_path = root.join(TURBO_LORA_FILE);
-    // Two routes by tier (sc-11104): a packed q4/q8 tier keeps its base quantized and attaches the
-    // TurboTime LoRA as forward-time additive residuals (built after load); a dense bf16 tier folds the
-    // delta bit-exactly into the weights before load (the flow-matching goldens expect `(W+δ)·x`).
-    let cond = if cond_w.is_packed() {
-        let mut cond = Ideogram4Transformer::load(&cond_w, &dit)?;
-        let n =
-            crate::adapters::install_turbo_lora_additive(&mut cond, &lora_path, TURBO_LORA_SCALE)?;
-        eprintln!(
-            "ideogram turbo: applied {n} TurboTime LoRA residual(s) additively (packed base kept quantized)"
-        );
-        cond
-    } else {
-        let n = crate::adapters::merge_turbo_lora(&mut cond_w, &lora_path, TURBO_LORA_SCALE)?;
-        eprintln!("ideogram turbo: merged {n} TurboTime LoRA target module(s) (dense fold)");
-        Ideogram4Transformer::load(&cond_w, &dit)?
-    };
+    let cond_w = crate::loader::Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
+    // Build the DiT with its base (dense or packed) loaded straight from the mmap, then attach the
+    // bundled TurboTime LoRA as forward-time additive residuals (sc-11104). The base is never mutated —
+    // it stays a clean disk-backed mmap the offload/eviction machinery can drop and restore cheaply, and
+    // a packed q4/q8 base keeps its footprint. The residual equals a fold `(W+δ)·x` to f32 tolerance.
+    let mut cond = Ideogram4Transformer::load(&cond_w, &dit)?;
+    let n = crate::adapters::install_turbo_lora_additive(
+        &mut cond,
+        &root.join(TURBO_LORA_FILE),
+        TURBO_LORA_SCALE,
+    )?;
+    eprintln!("ideogram turbo: applied {n} TurboTime LoRA residual(s) additively");
 
     let te = Ideogram4TextEncoder::new(
         &te_cfg,

@@ -23,10 +23,10 @@
 //! **The projection type is the SHARED [`candle_gen::quant::AdaptLinear`] (sc-11104).** It wraps a
 //! frozen base — dense (`candle_nn::Linear`) or MLX-packed ([`candle_gen::quant::QLinear`],
 //! dequant-on-forward, sc-7702) — plus zero or more **forward-time additive LoRA residuals**. With no
-//! residual attached its forward is byte-identical to the bare base, so the plain T2I and the
-//! dense-tier fold paths are unchanged. On the **packed** q4/q8 tier the bundled TurboTime LoRA rides
-//! as an *unmerged* residual (`y = base(x) + Σ scale·((x·A)·B)`, the base kept quantized) instead of
-//! being dequant-folded into a materialized dense weight
+//! residual attached its forward is byte-identical to the bare base, so the plain T2I path is
+//! unchanged. On **both** tiers the bundled TurboTime LoRA rides as an *unmerged* residual
+//! (`y = base(x) + Σ scale·((x·A)·B)`) — never folded into a base weight, so a packed base stays
+//! quantized and a dense base stays a clean disk-backed mmap (eviction-friendly)
 //! ([`crate::adapters::install_turbo_lora_additive`]). The DiT loader is a thin `MmapedSafetensors`
 //! wrapper ([`crate::loader::Weights`]), so this seam builds the base from **raw tensors** pulled
 //! through `Weights` (`from_packed_gs` / `Linear::new`) wrapped via
@@ -44,8 +44,8 @@ use candle_gen::quant as shared;
 /// additive LoRA/LoKr residuals** — the shared [`candle_gen::quant::AdaptLinear`] (sc-11104). Built
 /// dense ([`QLinear::from_dense`]) or packed ([`QLinear::from_packed`], from the raw MLX triple via the
 /// shared [`candle_gen::quant::QLinear::from_packed_gs`]); the loader ([`crate::loader::linear_detect`])
-/// picks the arm. Residuals are pushed post-load by [`crate::adapters::install_turbo_lora_additive`] on
-/// the packed tier (the dense tier folds bit-exactly into an override instead).
+/// picks the arm. The TurboTime LoRA is pushed post-load as a forward-time residual on **both** tiers
+/// ([`crate::adapters::install_turbo_lora_additive`]) — the base is never mutated.
 pub use candle_gen::quant::AdaptLinear as QLinear;
 
 /// A token embedding that is **dense** (`candle_nn::Embedding`) or **packed** (loaded straight from the
