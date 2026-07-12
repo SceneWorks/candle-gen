@@ -78,10 +78,6 @@ pub struct TransformerConfig {
     pub num_layers: usize,
     pub num_heads: usize,
     pub head_dim: usize,
-    pub in_channels: usize,
-    pub out_channels: usize,
-    /// adaLN-single row count: 9 for the gated family (msa/ff/text-ca × shift/scale/gate).
-    pub adaln_coeff: usize,
     pub norm_eps: f64,
     pub rope_theta: f64,
     pub rope_max_pos: [i32; 3],
@@ -94,9 +90,6 @@ impl TransformerConfig {
             num_layers: 48,
             num_heads: 32,
             head_dim: 128,
-            in_channels: 128,
-            out_channels: 128,
-            adaln_coeff: 9,
             norm_eps: 1e-6,
             rope_theta: 10000.0,
             rope_max_pos: [20, 2048, 2048],
@@ -200,7 +193,6 @@ pub struct GemmaConfig {
     pub rope_theta_global: f64,
     /// Local (sliding-window) RoPE base.
     pub rope_theta_local: f64,
-    pub sliding_window: usize,
     /// Every Nth layer is global attention (1-indexed): `(i+1) % pattern == 0`.
     pub sliding_window_pattern: usize,
     /// Attention scale denominator (query_pre_attn_scalar = head_dim for 12B → scale 256^-0.5).
@@ -222,16 +214,10 @@ impl GemmaConfig {
             rms_eps: 1e-6,
             rope_theta_global: 1_000_000.0,
             rope_theta_local: 10_000.0,
-            sliding_window: 1024,
             sliding_window_pattern: 6,
             query_pre_attn_scalar: 256.0,
             vocab_size: 262_144,
         }
-    }
-    /// Number of hidden states produced (embeddings + one per layer) — concatenated by the text
-    /// aggregator into the `[., ., hidden_size * num_states]` projection input.
-    pub fn num_hidden_states(&self) -> usize {
-        self.num_layers + 1
     }
     pub fn is_global_layer(&self, i: usize) -> bool {
         (i + 1).is_multiple_of(self.sliding_window_pattern)

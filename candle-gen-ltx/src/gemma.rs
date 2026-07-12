@@ -7,8 +7,9 @@
 //! (bf16); **per-layer RoPE base** (local 1e4 on sliding layers `(i+1)%6 != 0`, global 1e6
 //! otherwise); **q/k RMSNorm over head_dim** (256); GQA (16 q / 8 kv heads); attention scale
 //! `256^-0.5`; MLP `down(gelu_tanh(gate(x)) * up(x))`; norm-sandwich block. Our checkpoint is dense
-//! bf16 (no quant). The prompt is ≤ `sliding_window` (1024), so one full causal+padding mask serves
-//! every layer (only the RoPE base differs). Runs bf16; RoPE + attention compute in f32 for fidelity.
+//! bf16 (no quant). The prompt is ≤ the sliding-window size (1024), so one full causal+padding mask
+//! serves every layer (only the RoPE base differs) — the window never truncates, so it is not
+//! modeled. Runs bf16; RoPE + attention compute in f32 for fidelity.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor, D};
 use candle_gen::candle_nn::{ops::rms_norm as candle_rms_norm, ops::softmax_last_dim, VarBuilder};

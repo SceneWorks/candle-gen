@@ -36,9 +36,6 @@ const NUM_MASKMEM: i32 = 7;
 const MAX_COND_FRAME_NUM: i32 = 4;
 const MAX_OBJ_PTRS: i32 = 16; // max_object_pointers_in_encoder
 const RECONDITION_EVERY: i32 = 16;
-const INIT_KEEP_ALIVE: i32 = 30;
-const MAX_KEEP_ALIVE: i32 = 30;
-const MIN_KEEP_ALIVE: i32 = -1;
 const HOTSTART_DELAY: i32 = 15;
 const HOTSTART_UNMATCH: usize = 8;
 const HOTSTART_DUP: usize = 8;
@@ -65,7 +62,6 @@ struct FrameMem {
     maskmem_features: Option<Tensor>, // [5184,1,64] seq-first (bf16-cast); None until memory-encoded
     maskmem_pos_enc: Option<Tensor>,  // [5184,1,64]
     object_pointer: Tensor,           // [1,256]
-    object_score: f32,
 }
 
 /// Per-object memory bank: conditioning-frame outputs (user/detection-seeded) + tracked-frame outputs.
@@ -96,7 +92,6 @@ struct SessionState {
     // hotstart metadata (keyed by obj_id)
     first_frame: BTreeMap<i32, i32>,
     unmatched_frames: BTreeMap<i32, Vec<i32>>,
-    keep_alive: BTreeMap<i32, i32>,
     overlap_pairs: BTreeMap<(i32, i32), Vec<i32>>,
     removed: std::collections::BTreeSet<i32>,
     last_occluded: BTreeMap<i32, i32>,
@@ -112,7 +107,6 @@ impl Default for SessionState {
             num_frames: 0,
             first_frame: BTreeMap::new(),
             unmatched_frames: BTreeMap::new(),
-            keep_alive: BTreeMap::new(),
             overlap_pairs: BTreeMap::new(),
             removed: std::collections::BTreeSet::new(),
             last_occluded: BTreeMap::new(),
@@ -247,7 +241,6 @@ impl Sam3VideoModel {
                     maskmem_features: None,
                     maskmem_pos_enc: None,
                     object_pointer: out.object_pointer.clone(),
-                    object_score: out.object_score,
                 },
             );
             trk_scores.push(out.object_score);
@@ -313,7 +306,6 @@ impl Sam3VideoModel {
                     maskmem_features: Some(seq_first(&mem.features, true)?),
                     maskmem_pos_enc: Some(seq_first(&mem.pos, false)?),
                     object_pointer: out.object_pointer,
-                    object_score: out.object_score,
                 },
             );
         }
@@ -500,27 +492,18 @@ impl Sam3VideoModel {
     }
 
     // ----- hotstart (_process_hotstart) -----
+    // F-129 (sc-11235): the reference's per-track `trk_keep_alive` counter feeds ONLY the
+    // `suppressed_obj_ids` per-frame suppression branch (`modeling_sam3_video.py::_process_hotstart`),
+    // which is gated on `not suppress_unmatched_only_within_hotstart`. facebook/sam3 ships that config
+    // `True` (default), so the counter has no reader in the reference and never affects tracking or
+    // removal — removal is driven solely by `unmatched_frames` / `overlap_pairs`, exactly as here. The
+    // write-only counter (and its INIT/MAX/MIN constants) was therefore deleted rather than wired, and
+    // the mlx twin carries the same dead state. E2E video parity against facebook/sam3 is unchanged.
     fn process_hotstart(&mut self, frame_idx: i32, a: &Assoc, new_obj_ids: &[i32]) -> Vec<i32> {
         let mut newly_removed = Vec::new();
         let hotstart_diff = frame_idx - HOTSTART_DELAY;
         for &oid in new_obj_ids {
             self.session.first_frame.entry(oid).or_insert(frame_idx);
-            self.session.keep_alive.insert(oid, INIT_KEEP_ALIVE);
-        }
-        let mut matched: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
-        for trks in &a.det_to_matched_trk {
-            matched.extend(trks.iter().copied());
-        }
-        for &oid in &matched {
-            let k = self
-                .session
-                .keep_alive
-                .get(&oid)
-                .copied()
-                .unwrap_or(INIT_KEEP_ALIVE);
-            self.session
-                .keep_alive
-                .insert(oid, MAX_KEEP_ALIVE.min(k + 1));
         }
         for &oid in &a.unmatched_trk {
             self.session
@@ -528,15 +511,6 @@ impl Sam3VideoModel {
                 .entry(oid)
                 .or_default()
                 .push(frame_idx);
-            let k = self
-                .session
-                .keep_alive
-                .get(&oid)
-                .copied()
-                .unwrap_or(INIT_KEEP_ALIVE);
-            self.session
-                .keep_alive
-                .insert(oid, MIN_KEEP_ALIVE.max(k - 1));
         }
         let unmatched_snapshot: Vec<(i32, usize, i32)> = self
             .session
@@ -694,11 +668,9 @@ impl Sam3VideoModel {
             if let Some(fm) = self.session.banks[obj_idx].cond.get_mut(&frame_idx) {
                 fm.maskmem_features = Some(feat);
                 fm.maskmem_pos_enc = Some(pos);
-                fm.object_score = object_score;
             } else if let Some(fm) = self.session.banks[obj_idx].non_cond.get_mut(&frame_idx) {
                 fm.maskmem_features = Some(feat);
                 fm.maskmem_pos_enc = Some(pos);
-                fm.object_score = object_score;
             }
         }
         Ok(())
@@ -995,7 +967,6 @@ mod tests {
             maskmem_features: Some(t(0.0)),
             maskmem_pos_enc: Some(t(0.0)),
             object_pointer: t(0.0),
-            object_score: 0.0,
         }
     }
 
@@ -1331,7 +1302,6 @@ mod tests {
         assert!(s.obj_prompt.is_empty());
         assert!(s.first_frame.is_empty());
         assert!(s.unmatched_frames.is_empty());
-        assert!(s.keep_alive.is_empty());
         assert!(s.overlap_pairs.is_empty());
         assert!(s.removed.is_empty());
         assert!(s.last_occluded.is_empty());
@@ -1354,7 +1324,6 @@ mod tests {
         s.num_frames = 99;
         s.first_frame.insert(7, 2);
         s.unmatched_frames.insert(7, vec![1, 2]);
-        s.keep_alive.insert(7, 5);
         s.overlap_pairs.insert((1, 7), vec![3]);
         s.removed.insert(9);
         s.last_occluded.insert(7, 4);
@@ -1377,7 +1346,6 @@ mod tests {
         assert!(s.obj_prompt.is_empty());
         assert!(s.first_frame.is_empty());
         assert!(s.unmatched_frames.is_empty());
-        assert!(s.keep_alive.is_empty());
         assert!(s.overlap_pairs.is_empty());
         assert!(s.removed.is_empty(), "removed-id bans must not carry over");
         assert!(s.last_occluded.is_empty());

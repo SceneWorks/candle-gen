@@ -53,10 +53,8 @@ use candle_gen::{run_av_curated_sampler, AvLatents, CandleError, Result as CResu
 use audio_vae::AudioDecoder;
 use config::{
     compute_audio_frames, AudioVaeConfig, AvConfig, ConnectorConfig, GemmaConfig, VocoderConfig,
-    DEFAULT_FPS, DEFAULT_FRAMES, DEFAULT_HEIGHT, DEFAULT_WIDTH, MODEL_ID, NATIVE_STEPS,
-    STAGE1_SIGMAS, TEXT_MAX_LENGTH,
+    DEFAULT_FPS, DEFAULT_FRAMES, MODEL_ID, NATIVE_STEPS, STAGE1_SIGMAS, TEXT_MAX_LENGTH,
 };
-use gemma::GemmaEncoder;
 use text_encoder::LtxTextEncoder;
 use transformer::AvDiT;
 use vae::LtxVideoVae;
@@ -576,11 +574,6 @@ candle_gen::register_generators! { descriptor => load }
 
 /// Force-link hook (keeps the `inventory::submit!` registration from being dead-stripped).
 pub fn force_link() {}
-
-#[allow(dead_code)]
-fn _defaults_referenced() {
-    let _ = (DEFAULT_WIDTH, DEFAULT_HEIGHT, GemmaEncoder::forward);
-}
 
 #[cfg(test)]
 mod tests {
