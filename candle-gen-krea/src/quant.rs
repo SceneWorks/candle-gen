@@ -81,8 +81,12 @@ pub struct ConvRotInt8 {
     /// The `[group_size, group_size]` rotation `R = H/√group_size`, built lazily on the activation's
     /// device on first forward and cached (tiny — 256² f32 — but shouldn't rebuild per projection/step).
     rot: std::sync::OnceLock<Tensor>,
+    /// The cuBLASLt IGEMM leg, built eagerly at construction on the CUDA path (F-121 / sc-11208):
+    /// a cublasLt init failure surfaces as the crate's typed error from [`QLinear::convrot_int8`]
+    /// (where `?` is available) instead of aborting the sampler thread via `.expect()` mid-render.
+    /// `None` when the weight isn't resident on a CUDA device (CPU fallback in [`Self::forward`]).
     #[cfg(feature = "cuda")]
-    lt: std::sync::OnceLock<std::sync::Arc<candle_gen::quant::Int8Linear>>,
+    lt: Option<std::sync::Arc<candle_gen::quant::Int8Linear>>,
 }
 
 impl ConvRotInt8 {
@@ -111,21 +115,11 @@ impl ConvRotInt8 {
 
         #[cfg(feature = "cuda")]
         if x.device().is_cuda() {
-            let lin = self.lt.get_or_init(|| {
-                std::sync::Arc::new(
-                    candle_gen::quant::Int8Linear::from_per_channel_parts(
-                        self.w_i8.clone(),
-                        self.scale.clone(),
-                        self.bias.clone(),
-                        std::sync::Arc::new(
-                            candle_gen::quant::CublasLt::new(x.device())
-                                .expect("cublasLt handle for int8 convrot"),
-                        ),
-                    )
-                    .expect("build Int8Linear from convrot parts"),
-                )
-            });
-            return lin.forward(&xr);
+            // Eagerly built in `convrot_int8` (F-121 / sc-11208); present whenever the weight is
+            // CUDA-resident. If it's absent (weight on CPU), fall through to the dequant-dense path.
+            if let Some(lin) = &self.lt {
+                return lin.forward(&xr);
+            }
         }
         // CPU / non-CUDA fallback: dequant-to-dense matmul (sc-7702-style; keeps activations full-precision).
         let in_dtype = x.dtype();
@@ -196,6 +190,22 @@ impl QLinear {
                 "krea convrot: group_size {group_size} must be a power of four dividing K ({k})"
             )));
         }
+        // Build the cuBLASLt IGEMM leg eagerly on the CUDA path so a cublasLt init failure is this
+        // typed error (F-121 / sc-11208), not an `.expect()` panic on the first sampler forward.
+        #[cfg(feature = "cuda")]
+        let lt = if w_i8.device().is_cuda() {
+            let cublas = std::sync::Arc::new(candle_gen::quant::CublasLt::new(w_i8.device())?);
+            Some(std::sync::Arc::new(
+                candle_gen::quant::Int8Linear::from_per_channel_parts(
+                    w_i8.clone(),
+                    scale.clone(),
+                    bias.clone(),
+                    cublas,
+                )?,
+            ))
+        } else {
+            None
+        };
         Ok(Self::ConvRotInt8(ConvRotInt8 {
             w_i8,
             scale,
@@ -203,7 +213,7 @@ impl QLinear {
             bias,
             rot: std::sync::OnceLock::new(),
             #[cfg(feature = "cuda")]
-            lt: std::sync::OnceLock::new(),
+            lt,
         }))
     }
 
@@ -396,6 +406,44 @@ mod tests {
         assert_eq!(
             dev_max, 0.0,
             "group-64 packed embedding deviates from the grid"
+        );
+        Ok(())
+    }
+
+    /// F-121 (sc-11208): `convrot_int8` now builds the cuBLASLt IGEMM leg eagerly (where `?` is
+    /// available) rather than in a lazy `get_or_init(|| … .expect())` on the sampler thread. On CPU
+    /// that eager leg is skipped, so a valid build must construct + forward without panicking, and
+    /// malformed parts must be typed errors from the constructor (never a `.expect()`/panic).
+    #[test]
+    fn convrot_int8_constructor_is_typed_error_not_panic() -> Result<()> {
+        let dev = Device::Cpu;
+        let (out_dim, in_dim) = (64usize, 128usize);
+        let mut wv = vec![0f32; out_dim * in_dim];
+        for o in 0..out_dim {
+            for j in 0..in_dim {
+                wv[o * in_dim + j] = ((o * 7 + j * 3) % 51) as f32 / 25.0 - 1.0;
+            }
+        }
+        // Canonical weight → rotate → per-row int8: the on-disk ConvRot granularity.
+        let w = Tensor::from_vec(wv, (out_dim, in_dim), &dev)?;
+        let r = candle_gen::quant::regular_hadamard(G, &dev)?;
+        let rw = candle_gen::quant::convrot_rotate(&w, &r)?;
+        let pc = candle_gen::quant::quantize_weight_int8_per_channel(&rw)?;
+
+        // Valid build + forward (CPU dequant-dense leg): must not panic.
+        let lin = QLinear::convrot_int8(pc.q.clone(), pc.scale.clone(), G, None)?;
+        assert!(lin.is_convrot_int8());
+        let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
+        assert_eq!(lin.forward(&x)?.dims(), &[4, out_dim]);
+
+        // Malformed parts ⇒ typed errors from the constructor, not panics.
+        assert!(
+            QLinear::convrot_int8(pc.q.clone(), vec![1.0; out_dim + 1], G, None).is_err(),
+            "scale-len mismatch must be a typed error"
+        );
+        assert!(
+            QLinear::convrot_int8(pc.q.clone(), pc.scale.clone(), G + 1, None).is_err(),
+            "non-power-of-four group_size must be a typed error"
         );
         Ok(())
     }

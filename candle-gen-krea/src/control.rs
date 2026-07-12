@@ -321,7 +321,10 @@ impl ControlBranch {
                 ))
             })?;
         let inject_offset = match tensors.get(META_INJECT_OFFSET) {
-            Some(t) => t.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?[0] as usize,
+            // A malformed/truncated overlay can ship a size-0 `meta.inject_offset`; route the read
+            // through the hardened scalar reader (F-119 / sc-11208, F-009 class) so a corrupt
+            // studio-trained checkpoint is a typed error at `Krea2Control::load`, not a worker panic.
+            Some(t) => candle_gen::train::merge::read_scalar(META_INJECT_OFFSET, t)? as usize,
             None => 0,
         };
         let get = |key: &str| -> Result<Tensor> {
@@ -1122,6 +1125,40 @@ mod tests {
             .to_vec1::<f32>()
             .unwrap();
         assert_eq!(a, b, "checkpoint roundtrip must reproduce the forward");
+        let _ = std::fs::remove_file(ckpt);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// F-119 (sc-11208): a malformed/truncated overlay can ship a degenerate size-0
+    /// `meta.inject_offset`. `from_checkpoint` must turn that into a typed error (via the hardened
+    /// `read_scalar`), not panic on a `[0]` index of an empty tensor on the worker thread. The
+    /// well-formed roundtrip above proves the success path is preserved.
+    #[test]
+    fn checkpoint_empty_inject_offset_is_typed_error() {
+        let dev = Device::Cpu;
+        let (_dit, c, path) = tiny_dit();
+        let w = Weights::from_file(&path, &dev, DType::F32).unwrap();
+        let branch = ControlBranch::from_base(&w, &c, 1, DType::F32, 0).unwrap();
+
+        let ckpt = std::env::temp_dir().join(format!(
+            "krea_ctrl_ckpt_empty_{}.safetensors",
+            std::process::id()
+        ));
+        branch.save(&ckpt).unwrap();
+
+        // Corrupt just the scalar meta tensor to size-0, re-save, and reload.
+        let mut tensors = candle_gen::candle_core::safetensors::load(&ckpt, &dev).unwrap();
+        tensors.insert(
+            META_INJECT_OFFSET.to_string(),
+            Tensor::from_vec(Vec::<f32>::new(), (0,), &dev).unwrap(),
+        );
+        candle_gen::candle_core::safetensors::save(&tensors, &ckpt).unwrap();
+
+        let loaded = ControlBranch::from_checkpoint(&ckpt, &c, &dev);
+        assert!(
+            loaded.is_err(),
+            "size-0 inject_offset must be a typed error, not a panic"
+        );
         let _ = std::fs::remove_file(ckpt);
         let _ = std::fs::remove_file(path);
     }
