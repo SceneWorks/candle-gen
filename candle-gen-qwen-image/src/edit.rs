@@ -736,10 +736,18 @@ mod tests {
     /// cudarc's caching allocator never returns pages, so a second in-process run reads the first's peak.
     /// Ignored by default; needs a real-file (hardlink-staged) Qwen-Image-Edit snapshot in
     /// `QWEN_EDIT_SNAPSHOT`, a reference PPM in `QWEN_EDIT_REF`, and a CUDA device.
+    ///
+    /// Setting `QWEN_EDIT_LIGHTNING=1` re-points the same probe at the **Qwen-Image-Edit-2511-Lightning**
+    /// few-step distill (sc-11066): the lightx2v 4-step LoRA at `QWEN_EDIT_LIGHTNING_LORA` folds into the
+    /// MMDiT at load ([`QwenEditPaths::adapters`]) and the request runs 4-step **CFG-OFF** (`lightning:true`,
+    /// `guidance:1.0` → a single MMDiT forward per step, no cond/uncond doubling). Same device-level peak
+    /// protocol, so the resident/sequential peaks the runner prints are the true Lightning CFG-off numbers
+    /// that replace the conservative base-CFG estimate carried in the manifest.
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore = "needs QWEN_EDIT_SNAPSHOT + QWEN_EDIT_REF (a reference PPM) + a CUDA GPU"]
     fn qwen_edit_probed_generate_for_offload_ab() {
+        use candle_gen::gen_core::AdapterKind;
         use candle_gen::testkit::{env_path, read_ppm, PeakSampler};
 
         let root = env_path("QWEN_EDIT_SNAPSHOT");
@@ -754,21 +762,38 @@ mod tests {
         } else {
             OffloadPolicy::Resident
         };
+
+        // `QWEN_EDIT_LIGHTNING=1` → the CFG-off 4-step distill path (sc-11066): fold the lightx2v LoRA and
+        // run `lightning:true` at guidance 1.0. Otherwise the base true-CFG 8-step path (the sc-11019
+        // conservative upper bound). The base runs guidance 4.0 (a cond+uncond MMDiT batch); Lightning is a
+        // single forward, which is exactly the peak delta this measure captures.
+        let lightning = std::env::var("QWEN_EDIT_LIGHTNING")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let adapters = if lightning {
+            vec![AdapterSpec::new(
+                env_path("QWEN_EDIT_LIGHTNING_LORA"),
+                1.0,
+                AdapterKind::Lora,
+            )]
+        } else {
+            vec![]
+        };
         let req = QwenEditRequest {
             prompt: "make the background a snowy mountain at sunset".into(),
             width: 1024,
             height: 1024,
-            steps: 8,
-            guidance: 4.0,
+            steps: if lightning { 4 } else { 8 },
+            guidance: if lightning { 1.0 } else { 4.0 },
             seed: 42,
-            lightning: false,
+            lightning,
             ..Default::default()
         };
 
         let sampler = PeakSampler::start(0);
         let model = QwenEdit::load(&QwenEditPaths {
             root,
-            adapters: vec![],
+            adapters,
             offload_policy,
         })
         .expect("load QwenEdit");
@@ -786,8 +811,9 @@ mod tests {
         } else {
             "resident"
         };
+        let path = if lightning { "lightning" } else { "base" };
         eprintln!(
-            "SEQ_AB mode={mode} peak_mib={peak_mib} bytes={} {}x{} out={out}",
+            "SEQ_AB path={path} mode={mode} peak_mib={peak_mib} bytes={} {}x{} out={out}",
             img.pixels.len(),
             img.width,
             img.height
