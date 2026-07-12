@@ -277,6 +277,20 @@ impl Encoder {
     }
 }
 
+/// Reject a conditioning-video temporal length the chunked causal encode cannot consume without
+/// dropping frames (F-126, sc-11220). The encode reads frame 0 alone then 4-frame chunks, i.e.
+/// exactly `1 + 4·k` frames; any other `t` leaves the trailing `(t - 1) % 4` frames unencoded.
+fn require_aligned_encode_frames(t: usize) -> Result<()> {
+    if t == 0 || !(t - 1).is_multiple_of(4) {
+        return Err(candle_gen::candle_core::Error::Msg(format!(
+            "WanVae16::encode: frame count must be 1 + 4·k (got {t}); the causal encode would \
+             silently drop the trailing {} frame(s)",
+            t.saturating_sub(1) % 4
+        )));
+    }
+    Ok(())
+}
+
 /// The Wan 2.1 z16 VAE: a decoder (always) plus an optional encoder (I2V conditioning), with
 /// per-channel latent normalization.
 pub struct WanVae16 {
@@ -436,6 +450,11 @@ impl WanVae16 {
             candle_gen::candle_core::Error::Msg("WanVae16: encode needs encoder weights".into())
         })?;
         let t = video.dim(2)?;
+        // The chunked causal encode consumes exactly `1 + 4·(num_chunks-1)` frames (frame 0 alone,
+        // then 4-frame chunks). For `t % 4 != 1` the trailing `(t - 1) % 4` frames would silently
+        // vanish from the latent. All in-repo callers pre-align, but this method (and `Scail2Job`)
+        // is `pub`, so reject the unaligned length with a typed error rather than dropping frames.
+        require_aligned_encode_frames(t)?;
         let num_chunks = 1 + (t - 1) / 4;
         encoder.reset_cache();
         // Collect the per-chunk encoded features and `cat` once (sc-9037): cat-ing onto a growing
@@ -560,5 +579,29 @@ mod tests {
         let single = Tensor::cat(&chunks, 2).unwrap();
         let t_lat = chunks.len();
         assert_eq!(single.dim(2).unwrap(), 1 + (t_lat - 1) * 4);
+    }
+
+    /// F-126 (sc-11220): `encode` must reject a temporal length it cannot consume without dropping
+    /// trailing frames. Aligned `1 + 4·k` lengths pass; any other (including 0) errors, and the
+    /// message reports how many frames would have been dropped.
+    #[test]
+    fn require_aligned_encode_frames_gates_unaligned_lengths() {
+        for t in [1usize, 5, 9, 17, 33] {
+            assert!(
+                super::require_aligned_encode_frames(t).is_ok(),
+                "t={t} is 1+4k and must be accepted"
+            );
+        }
+        // t=0 and every t with (t-1)%4 != 0 are rejected.
+        assert!(super::require_aligned_encode_frames(0).is_err());
+        for (t, dropped) in [(2usize, 1usize), (3, 2), (4, 3), (18, 1), (20, 3)] {
+            let err = super::require_aligned_encode_frames(t)
+                .expect_err("unaligned length must be rejected");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("{dropped}")) && msg.contains(&format!("got {t}")),
+                "message reports dropped count and t: {msg}"
+            );
+        }
     }
 }

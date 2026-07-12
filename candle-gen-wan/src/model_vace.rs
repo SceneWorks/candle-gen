@@ -323,6 +323,21 @@ impl Generator for WanVaceGenerator {
                 clip.frames.len()
             )));
         }
+        // The VACE output frame count is driven solely by the ControlClip (`render` derives the
+        // temporal length from `clip.frames`, never `req.frames`). A request carrying a `frames`
+        // that disagrees with the clip would silently render the clip's length instead — the F-043
+        // silently-ignored-input class (sc-9027). Reject the disagreement with an actionable error.
+        if let Some(f) = req.frames {
+            if f as usize != clip.frames.len() {
+                return Err(gen_core::Error::Msg(format!(
+                    "wan-vace: req.frames ({f}) disagrees with the ControlClip frame count ({}); \
+                     the VACE output length is driven by the control clip — omit `frames` or set it \
+                     to {}",
+                    clip.frames.len(),
+                    clip.frames.len()
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -502,6 +517,32 @@ mod tests {
         let mut bad_size = control_req();
         bad_size.width = 70;
         assert!(g.validate(&bad_size).is_err());
+    }
+
+    /// F-124 (sc-11220): the VACE output length is driven solely by the ControlClip. A `req.frames`
+    /// that agrees with the 5-frame clip passes; one that disagrees is rejected (rather than silently
+    /// rendering the clip's length — the F-043 silently-ignored-input class).
+    #[test]
+    fn validate_rejects_frames_disagreeing_with_clip() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(MODEL_ID_VACE, &spec).unwrap();
+
+        // Agrees with the 5-frame control clip → accepted.
+        let mut ok = control_req();
+        ok.frames = Some(5);
+        assert!(g.validate(&ok).is_ok());
+
+        // Disagrees → rejected with a message that names both counts.
+        let mut bad = control_req();
+        bad.frames = Some(33);
+        let err = g
+            .validate(&bad)
+            .expect_err("frames disagreeing with the clip must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("33") && msg.contains('5'),
+            "names counts: {msg}"
+        );
     }
 
     /// The shared A14B area cap is enforced on the VACE lane too (F-090 / sc-11215): an at-cap request

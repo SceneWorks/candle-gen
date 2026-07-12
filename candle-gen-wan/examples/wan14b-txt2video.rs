@@ -91,6 +91,16 @@ fn main() -> Result<()> {
     // the whole snapshot.
     let gen = match (arg(&args, "--comfyui-high"), arg(&args, "--comfyui-low")) {
         (Some(high), Some(low)) => {
+            // `load_from_comfyui_experts` takes no adapters, so `--lora-high/--lora-low` would be
+            // silently dropped in ComfyUI mode — invalidating any sc-10671-in-place + Lightning-distill
+            // A/B (F-127). Reject the combination rather than rendering unadapted.
+            if !adapters.is_empty() {
+                return Err(
+                    "--lora-high/--lora-low are not supported alongside --comfyui-high/--comfyui-low \
+                     (the ComfyUI in-place loader takes no adapters); drop one flag set"
+                        .into(),
+                );
+            }
             // sc-10909: optional in-place UMT5 TE / Wan VAE; whichever is omitted falls back to snapshot.
             let te_file = arg(&args, "--comfyui-te").map(PathBuf::from);
             let vae_file = arg(&args, "--comfyui-vae").map(PathBuf::from);
