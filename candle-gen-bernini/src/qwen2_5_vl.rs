@@ -14,7 +14,7 @@
 //! two-layer golden the MLX lane asserts): the MRoPE table (trig only, ~1e-4 f32 floor) and the
 //! penultimate hidden state through the residual stack (~5e-3 f32 matmul floor).
 
-use candle_gen::candle_core::{DType, Tensor, D};
+use candle_gen::candle_core::{DType, Device, Tensor, D};
 use candle_gen::candle_nn::{ops::softmax_last_dim, Linear, Module, VarBuilder};
 use candle_gen::{CandleError, Result as CResult};
 
@@ -188,6 +188,14 @@ impl Qwen25VlText {
 
     pub fn config(&self) -> &QwenVlTextConfig {
         &self.cfg
+    }
+
+    /// The device the backbone weights live on. Planner-side host tensors (token ids, MRoPE position
+    /// ids, the additive attention mask) must be moved onto this device before the forward, otherwise
+    /// `embed_tokens.index_select`, `mrope_cos_sin`, and `scores.broadcast_add(mask)` hard-error with
+    /// `DeviceMismatchBinaryOp` on CUDA (sc-11148 / F-079).
+    pub fn device(&self) -> &Device {
+        self.embed_tokens.device()
     }
 
     /// Token embedding: `input_ids` `[B,L]` (int) → `[B,L,hidden]` (the reference's

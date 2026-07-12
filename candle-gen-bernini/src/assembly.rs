@@ -34,11 +34,9 @@ pub fn format_mllm_inputs_embeds(
     visual_output_mask: &[bool],
 ) -> CResult<Tensor> {
     let l = input_ids.len();
-    let ids = Tensor::from_vec(
-        input_ids.to_vec(),
-        (1, l),
-        &candle_gen::candle_core::Device::Cpu,
-    )?;
+    // Build the id tensor on the backbone's device — `embed_tokens.index_select` requires the ids to
+    // live where the weights do, else CUDA hard-errors with `DeviceMismatchBinaryOp` (sc-11148 / F-079).
+    let ids = Tensor::from_vec(input_ids.to_vec(), (1, l), backbone.device())?;
     let embeds = backbone.embed(&ids)?; // [1, L, H]
 
     let ve = match visual_embeds {

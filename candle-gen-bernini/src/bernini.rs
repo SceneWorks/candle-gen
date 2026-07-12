@@ -425,13 +425,19 @@ fn build_stream(
             .map(|&[a, b, c]| [a as i64, b as i64, c as i64])
             .collect()
     };
+    // `mrope_position_ids` / `build_attention_mask_4d` build on CPU (pure host computation). Move them
+    // onto the backbone's device so the planner forward (`mrope_cos_sin`, `scores.broadcast_add(mask)`)
+    // stays device-consistent on CUDA (sc-11148 / F-079).
+    let bb_dev = planner.backbone.device();
     let pos = mrope_position_ids(
         &tout.input_ids,
         &to_i64(&image_grids),
         &to_i64(&video_grids),
         &planner.mrope,
-    )?;
-    let mask = build_attention_mask_4d(&tout.token_type, &tout.token_segment_ids)?;
+    )?
+    .to_device(bb_dev)?;
+    let mask =
+        build_attention_mask_4d(&tout.token_type, &tout.token_segment_ids)?.to_device(bb_dev)?;
 
     let vin: Vec<bool> = tout.token_type.iter().map(|&t| t == 2).collect();
     let vout: Vec<bool> = tout.token_type.iter().map(|&t| t == 3).collect();
