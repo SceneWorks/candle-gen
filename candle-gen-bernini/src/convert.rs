@@ -271,6 +271,38 @@ fn validate_planner_counts<V>(planner: &HashMap<&'static str, Vec<V>>) -> Result
     Ok(())
 }
 
+/// The base Wan2.2 snapshot components the candle renderer loader **must** read — copying any of
+/// these is not optional: [`crate::bernini::BerniniRenderer`] / [`crate::pipeline`] load the UMT5
+/// `text_encoder/`, the z16 `vae/`, and the UMT5 `tokenizer/` (`tokenizer/tokenizer.json`) at
+/// component-load time, so a base snapshot missing any of them yields a broken, unloadable tier.
+const REQUIRED_BASE_WAN_COMPONENTS: [&str; 3] = ["text_encoder", "vae", "tokenizer"];
+
+/// The base Wan2.2 snapshot components copied for diffusers-layout completeness but **not** read by the
+/// candle loader (the sampler is a `FlowScheduler` built in-code from the Bernini knobs, and
+/// `model_index.json` is diffusers metadata). Copied best-effort — a missing one is not fatal.
+const OPTIONAL_BASE_WAN_COMPONENTS: [&str; 2] = ["scheduler", "model_index.json"];
+
+/// Assert every [`REQUIRED_BASE_WAN_COMPONENTS`] entry exists under the base Wan snapshot, returning a
+/// clear `Err` naming the first missing component + its expected source path. Mirrors
+/// [`require_planner_sources`] (and the mlx-gen-bernini converter's unconditional `place()`): a
+/// base-Wan snapshot lacking the UMT5 `text_encoder/` / z16 `vae/` / `tokenizer/` the renderer loads
+/// must fail LOUD at build time rather than silently ship a VAE-/encoder-less tier that only surfaces
+/// as a broken load later (sc-11631; found in sc-11003 where a base snapshot lacked `vae/`).
+fn require_base_wan_sources(base_wan_snapshot: &Path) -> Result<()> {
+    for name in REQUIRED_BASE_WAN_COMPONENTS {
+        let src = base_wan_snapshot.join(name);
+        if !src.exists() {
+            return Err(candle_gen::candle_core::Error::Msg(format!(
+                "build_bernini_candle_tier: missing required base-Wan renderer component {} (the \
+                 base Wan2.2-T2V-A14B snapshot must contain `{name}/` — the candle Bernini renderer \
+                 loads the UMT5 text_encoder, z16 vae, and tokenizer from it)",
+                src.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Assert both planner source files the loader requires exist in the package `mllm/` dir, returning
 /// their paths. The mlx-gen-bernini converter `place()`s `config.json` + `tokenizer.json`
 /// unconditionally (erroring if absent); this mirrors that — a missing source is a loud build-time
@@ -502,14 +534,16 @@ pub fn build_bernini_candle_tier(
     let mask_tokens = plan.st.load(mask_key, &Device::Cpu)?;
     write_mask_tokens(mask_tokens, out_dir)?;
 
-    // 2. Stock Wan2.2 components copied verbatim from the base snapshot.
-    for name in [
-        "text_encoder",
-        "vae",
-        "tokenizer",
-        "scheduler",
-        "model_index.json",
-    ] {
+    // 2. Stock Wan2.2 components copied verbatim from the base snapshot. The renderer loader REQUIRES
+    // the UMT5 `text_encoder/`, z16 `vae/`, and `tokenizer/`; a base snapshot missing any of them is a
+    // loud build-time `Err` (sc-11631) — never a silently-emitted, unloadable tier. `scheduler/` +
+    // `model_index.json` are diffusers-layout completeness only (the sampler is built in-code), so they
+    // stay best-effort copies.
+    require_base_wan_sources(base_wan_snapshot)?;
+    for name in REQUIRED_BASE_WAN_COMPONENTS {
+        copy_recursive(&base_wan_snapshot.join(name), &out_dir.join(name))?;
+    }
+    for name in OPTIONAL_BASE_WAN_COMPONENTS {
         let src = base_wan_snapshot.join(name);
         if src.exists() {
             copy_recursive(&src, &out_dir.join(name))?;
@@ -845,6 +879,52 @@ mod tests {
         let (cfg, tok) = require_planner_sources(&mllm).unwrap();
         assert!(cfg.ends_with("config.json"));
         assert!(tok.ends_with(PLANNER_TOKENIZER_FILE));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// sc-11631 required base-Wan-sources guard: a base snapshot missing any REQUIRED renderer
+    /// component (`text_encoder/` / `vae/` / `tokenizer/`) yields a clear `Err` naming it; a complete
+    /// layout passes. Optional diffusers artifacts (`scheduler/` / `model_index.json`) are NOT required.
+    #[test]
+    fn require_base_wan_sources_errs_on_missing_vae() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bernini_base_wan_src_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let base = tmp.join("base_wan");
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Empty base → missing `text_encoder/` (the first required component).
+        let err = require_base_wan_sources(&base).unwrap_err().to_string();
+        assert!(
+            err.contains("text_encoder"),
+            "names the first missing required component: {err}"
+        );
+
+        // text_encoder present, `vae/` still missing → Err naming `vae` (the sc-11003 case).
+        std::fs::create_dir_all(base.join("text_encoder")).unwrap();
+        let err = require_base_wan_sources(&base).unwrap_err().to_string();
+        assert!(err.contains("vae"), "names the missing vae: {err}");
+
+        // vae present, `tokenizer/` still missing → Err naming `tokenizer`.
+        std::fs::create_dir_all(base.join("vae")).unwrap();
+        let err = require_base_wan_sources(&base).unwrap_err().to_string();
+        assert!(
+            err.contains("tokenizer"),
+            "names the missing tokenizer: {err}"
+        );
+
+        // All three required components present → Ok, even without the optional diffusers artifacts.
+        std::fs::create_dir_all(base.join("tokenizer")).unwrap();
+        assert!(
+            require_base_wan_sources(&base).is_ok(),
+            "complete required layout must pass without scheduler/model_index.json"
+        );
 
         std::fs::remove_dir_all(&tmp).ok();
     }
