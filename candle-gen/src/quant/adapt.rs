@@ -250,6 +250,20 @@ impl AdaptLinear {
         }
     }
 
+    /// Wrap an already-built **packed** base [`super::QLinear`] with its logical `[out, in]` dims — the
+    /// raw-tensor twin of [`Self::from_dense`], for a caller that builds the packed base directly from
+    /// the MLX triple tensors rather than through a [`VarBuilder`] (e.g. the ideogram DiT loader's
+    /// `Weights`-based `linear_detect`, sc-11104). The base stays quantized (dequant-on-forward); pushed
+    /// residuals ride unmerged, so a q4/q8 tier keeps its footprint.
+    pub fn from_packed(base: QLinear, in_dim: usize, out_dim: usize) -> Self {
+        Self {
+            base: Base::Packed(base),
+            out_features: out_dim,
+            in_features: in_dim,
+            adapters: Vec::new(),
+        }
+    }
+
     /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`), shape-
     /// checked exactly like `candle_nn::linear` — so it loads unchanged on `VarMap`-backed test
     /// fixtures.

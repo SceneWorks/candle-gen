@@ -197,8 +197,9 @@ fn build(
         )));
     }
     // sc-9607: `spec.quantize` (Q4/Q8) is ACCEPTED and is a no-op. The per-tier turnkey is already
-    // MLX-packed; `loader::linear_detect` builds each `QLinear::Quantized` straight from the packed
-    // parts (sc-9412), so the resolved q4/q8 subdir self-describes its tier and no on-the-fly quant
+    // MLX-packed; `loader::linear_detect` builds each `QLinear` (shared `AdaptLinear`) with a packed
+    // base straight from the packed parts (sc-9412), so the resolved q4/q8 subdir self-describes its
+    // tier and no on-the-fly quant
     // pass runs (there is no post-load `.quantize()` to double-quantize). Advertising `supported_quants`
     // lets the worker's A-B tier toggle engage; the requested quant is carried for the recipe only.
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {

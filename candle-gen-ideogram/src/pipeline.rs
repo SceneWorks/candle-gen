@@ -168,13 +168,23 @@ pub fn load_components_turbo(
 
     let mut cond_w =
         crate::loader::Weights::from_dir(&root.join("transformer"), device, DIT_DTYPE)?;
-    let n = crate::adapters::merge_turbo_lora(
-        &mut cond_w,
-        &root.join(TURBO_LORA_FILE),
-        TURBO_LORA_SCALE,
-    )?;
-    eprintln!("ideogram turbo: merged {n} TurboTime LoRA target module(s)");
-    let cond = Ideogram4Transformer::load(&cond_w, &dit)?;
+    let lora_path = root.join(TURBO_LORA_FILE);
+    // Two routes by tier (sc-11104): a packed q4/q8 tier keeps its base quantized and attaches the
+    // TurboTime LoRA as forward-time additive residuals (built after load); a dense bf16 tier folds the
+    // delta bit-exactly into the weights before load (the flow-matching goldens expect `(W+δ)·x`).
+    let cond = if cond_w.is_packed() {
+        let mut cond = Ideogram4Transformer::load(&cond_w, &dit)?;
+        let n =
+            crate::adapters::install_turbo_lora_additive(&mut cond, &lora_path, TURBO_LORA_SCALE)?;
+        eprintln!(
+            "ideogram turbo: applied {n} TurboTime LoRA residual(s) additively (packed base kept quantized)"
+        );
+        cond
+    } else {
+        let n = crate::adapters::merge_turbo_lora(&mut cond_w, &lora_path, TURBO_LORA_SCALE)?;
+        eprintln!("ideogram turbo: merged {n} TurboTime LoRA target module(s) (dense fold)");
+        Ideogram4Transformer::load(&cond_w, &dit)?
+    };
 
     let te = Ideogram4TextEncoder::new(
         &te_cfg,

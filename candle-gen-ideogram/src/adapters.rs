@@ -1,28 +1,33 @@
-//! TurboTime LoRA merge for the Ideogram 4 **Turbo** path. The few-step ostris "continuous turbo"
-//! LoRA is bundled in a turbo snapshot ([`crate::config::TURBO_LORA_FILE`]); this folds its delta
-//! into the conditional DiT's weights at load (`W += eff·(up @ down)`, in f32, Linear-only), via the
-//! loader's override layer — the candle analogue of `mlx-gen-ideogram`'s `apply_ideogram_adapters`.
+//! TurboTime LoRA application for the Ideogram 4 **Turbo** path. The few-step ostris "continuous turbo"
+//! LoRA is bundled in a turbo snapshot ([`crate::config::TURBO_LORA_FILE`]); it is applied at load —
+//! the candle analogue of `mlx-gen-ideogram`'s `apply_ideogram_adapters`. **Two routes by tier**
+//! (sc-11104):
 //!
-//! Key forms handled: `{ns}{module}.lora_{down,up}.weight` / `.lora_{A,B}.weight` (and the
+//!  - **Dense** bf16 tier — [`merge_turbo_lora`] folds the delta into the DiT weights
+//!    (`W += eff·(up @ down)`, in f32, Linear-only) via the loader's CPU-side override layer. A fold is
+//!    byte-for-byte what the flow-matching sampler's goldens expect, so the dense tier keeps folding.
+//!  - **Packed** q4/q8 tier (`SceneWorks/ideogram-4-mlx`) — there is no dense `W` to fold into (the
+//!    weight is MLX-packed u32 codes), so [`install_turbo_lora_additive`] attaches each LoRA as a
+//!    **forward-time additive residual** on the shared [`crate::quant::QLinear`]
+//!    (`y = base(x) + Σ scale·((x·A)·B)`, the base kept quantized). No dequant, no dense reload — the
+//!    q4/q8 tier keeps its footprint. This retired the prior packed **dequant-fold** (reconstruct the
+//!    dense grid from the packed triple, fold, install a dense override).
+//!
+//! Key forms handled (both routes): `{ns}{module}.lora_{down,up}.weight` / `.lora_{A,B}.weight` (and the
 //! `.weight`-less variants), namespace `ns` ∈ {`diffusion_model.`, `transformer.`, `model.`, none}
 //! (sd-scripts / ai-toolkit exports). The `module` path (e.g. `layers.0.attention.qkv`) matches the
-//! DiT's safetensors keys directly. An optional `{module}.alpha` applies `alpha/rank` scaling.
-//!
-//! **Packed-base compose (sc-9412).** On the `SceneWorks/ideogram-4-mlx` (q4/q8) tier the targeted
-//! DiT weights are MLX-packed u32 codes, not a dense grid. The merge reconstructs the dense f32 base
-//! from the packed triple ([`Weights::get_cpu_merge_base`]) before folding the delta, then installs the
-//! merged **dense** weight in the override — so [`crate::loader::linear_detect`] loads that projection
-//! dense while every untargeted projection stays packed (the packed base and the adapter compose). The
-//! whole merge runs on the CPU (matching the CPU-loaded LoRA factors); the override's `get` moves the
-//! result to the compute device on read.
+//! DiT's safetensors keys directly. An optional `{module}.alpha` applies `alpha/rank` scaling. The
+//! additive route resolves the *same* `(down, up, alpha)` into unmerged factors (`a = downᵀ`, `b = upᵀ`,
+//! `scale = eff`), so the residual equals the folded delta to f32 tolerance.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Error, Result};
 
 use crate::loader::Weights;
+use crate::transformer::Ideogram4Transformer;
 
 /// Recognized `(down, up)` suffix pairs, most-specific first.
 const PAIRS: &[(&str, &str)] = &[
@@ -35,13 +40,22 @@ const PAIRS: &[(&str, &str)] = &[
 /// Namespace prefixes stripped to recover the DiT module path.
 const PREFIXES: &[&str] = &["diffusion_model.", "transformer.", "model."];
 
-/// Merge the TurboTime LoRA at `lora_path` into `w`'s DiT weights (override layer). Returns the
-/// number of merged target modules. Errors if the file is missing or **no** target matched (a wrong
-/// key format / prefix), mirroring the MLX strict apply's no-silent-drop intent.
+/// Fold the TurboTime LoRA at `lora_path` into `w`'s **dense** DiT weights (override layer). Returns the
+/// number of merged target modules. Errors if the file is missing, `w` is a **packed** tier (that must
+/// route through [`install_turbo_lora_additive`] — there is no dense weight to fold, sc-11104), or **no**
+/// target matched (a wrong key format / prefix), mirroring the MLX strict apply's no-silent-drop intent.
 pub fn merge_turbo_lora(w: &mut Weights, lora_path: &Path, scale: f32) -> Result<usize> {
     if !lora_path.exists() {
         return Err(Error::Msg(format!(
             "ideogram turbo: TurboTime LoRA not found at {} (a turbo snapshot must ship it alongside transformer/)",
+            lora_path.display()
+        )));
+    }
+    if w.is_packed() {
+        return Err(Error::Msg(format!(
+            "ideogram turbo: merge_turbo_lora is the dense-tier fold, but {} is a packed (q4/q8) tier — \
+             route it through install_turbo_lora_additive (forward-time residual, base kept quantized). \
+             sc-11104",
             lora_path.display()
         )));
     }
@@ -62,9 +76,9 @@ pub fn merge_turbo_lora(w: &mut Weights, lora_path: &Path, scale: f32) -> Result
             skipped += 1;
             continue;
         }
-        // Reconstruct the delta + base on the CPU: on a packed tier `get_cpu_merge_base` dequantizes
-        // the MLX-packed triple to its dense f32 grid (the mergeable base); on a dense tier it returns
-        // the on-disk weight. Both the base and the LoRA factors live on the CPU so the fold matches.
+        // Reconstruct the delta + base on the CPU: `get_cpu_merge_base` returns the on-disk (dense)
+        // weight (this is the dense tier — a packed tier was rejected up front, sc-11104). Both the base
+        // and the LoRA factors live on the CPU so the fold matches.
         let down = lora.load(name, &Device::Cpu)?.to_dtype(DType::F32)?; // [r, in]
         let up = lora.load(&up_name, &Device::Cpu)?.to_dtype(DType::F32)?; // [out, r]
         if down.rank() != 2 || up.rank() != 2 {
@@ -81,10 +95,9 @@ pub fn merge_turbo_lora(w: &mut Weights, lora_path: &Path, scale: f32) -> Result
                 .unwrap_or(1.0);
         let delta = up.contiguous()?.matmul(&down.contiguous()?)?; // [out, in]
         let base = w.get_cpu_merge_base(&weight_key)?;
-        // Fold in f32: `base` is f32 on a PACKED tier (dequantized) but the on-disk dtype (bf16) on the
-        // DENSE `SceneWorks/ideogram-4` tier, while `delta` is f32 — so a bare add raised `dtype mismatch
-        // in add, lhs: BF16, rhs: F32` there (sc-9654). `.to_dtype(F32)` is a no-op on the packed path;
-        // the result folds back to `w.dtype()`.
+        // Fold in f32: `base` is the on-disk dtype (bf16) on the dense `SceneWorks/ideogram-4` tier while
+        // `delta` is f32 — a bare add raised `dtype mismatch in add, lhs: BF16, rhs: F32` (sc-9654), so
+        // lift the base to f32; the result folds back to `w.dtype()`.
         let merged_w = (base.to_dtype(DType::F32)? + (delta * eff)?)?.to_dtype(w.dtype())?;
         w.insert_override(weight_key, merged_w);
         merged += 1;
@@ -102,6 +115,108 @@ pub fn merge_turbo_lora(w: &mut Weights, lora_path: &Path, scale: f32) -> Result
         );
     }
     Ok(merged)
+}
+
+/// A resolved LoRA residual pending attachment to a projection: `a = downᵀ` `[in, rank]`,
+/// `b = upᵀ` `[rank, out]`, `scale = eff` (`= user_scale · (alpha/rank)` — the same effective factor the
+/// dense fold bakes into its delta). Read on the CPU; moved to the DiT device at push.
+struct PendingLora {
+    a: candle_gen::candle_core::Tensor,
+    b: candle_gen::candle_core::Tensor,
+    scale: f64,
+}
+
+/// Install the TurboTime LoRA at `lora_path` onto `dit` as **forward-time additive residuals** — the
+/// packed-tier route (sc-11104). Resolves every `(down, up[, alpha])` pair into unmerged factors with
+/// the *same* effective scale [`merge_turbo_lora`] folds (`eff = scale·(alpha/rank)`), then walks the
+/// DiT once ([`Ideogram4Transformer::visit_adaptable_mut`]) pushing a residual onto each matched
+/// projection. The base is never dequantized or folded, so a q4/q8 tier keeps its footprint while the
+/// distill applies; the residual equals the fold to f32 tolerance. Returns the number of adapted
+/// projections. Errors if the file is missing, a factor is not a 2-D Linear adapter, or — mirroring the
+/// fold's no-silent-drop guard — **no** target matched the DiT (a wrong key format / prefix). A resolved
+/// target absent from the DiT surface, or a factor whose shape mismatches its projection, is surfaced
+/// (never a crashing forward), not merged.
+pub fn install_turbo_lora_additive(
+    dit: &mut Ideogram4Transformer,
+    lora_path: &Path,
+    scale: f32,
+) -> Result<usize> {
+    if !lora_path.exists() {
+        return Err(Error::Msg(format!(
+            "ideogram turbo: TurboTime LoRA not found at {} (a turbo snapshot must ship it alongside transformer/)",
+            lora_path.display()
+        )));
+    }
+    // SAFETY: read-only mmap of the adapter file.
+    let lora = unsafe { MmapedSafetensors::new(lora_path)? };
+    let names: Vec<String> = lora.tensors().into_iter().map(|(n, _)| n).collect();
+    let present: HashSet<&str> = names.iter().map(String::as_str).collect();
+
+    // Resolve every down/up pair into a pending residual keyed by the DiT module path (mirrors the
+    // fold's per-key math, unmerged: `a = downᵀ`, `b = upᵀ`, scale = eff).
+    let mut pending: BTreeMap<String, PendingLora> = BTreeMap::new();
+    for name in &names {
+        let Some((base_full, up_name)) = down_pair(name, &present) else {
+            continue;
+        };
+        let module = strip_prefix(&base_full).to_string();
+        let down = lora.load(name, &Device::Cpu)?.to_dtype(DType::F32)?; // [r, in]
+        let up = lora.load(&up_name, &Device::Cpu)?.to_dtype(DType::F32)?; // [out, r]
+        if down.rank() != 2 || up.rank() != 2 {
+            return Err(Error::Msg(format!(
+                "ideogram turbo: LoRA {name} is not a 2D Linear adapter (rank {}/{})",
+                up.rank(),
+                down.rank()
+            )));
+        }
+        let rank = down.dim(0)?;
+        let eff = scale as f64
+            * alpha_for(&lora, &base_full)
+                .map(|a| a as f64 / rank as f64)
+                .unwrap_or(1.0);
+        // a = downᵀ [in, rank]; b = upᵀ [rank, out]. Contiguous for the residual matmuls.
+        let a = down.t()?.contiguous()?;
+        let b = up.t()?.contiguous()?;
+        pending.insert(module, PendingLora { a, b, scale: eff });
+    }
+
+    // Attach: walk the DiT once, pushing a resolved residual onto each matched projection. The factors
+    // are read on the CPU but the base lives on the DiT device (CUDA on a packed tier), so move them at
+    // push. A factor whose dims don't match the projection is surfaced as skipped, never a crashing
+    // forward (the additive twin of the fold path's shape guard).
+    let device = dit.device();
+    let mut matched: HashSet<String> = HashSet::new();
+    let mut applied = 0usize;
+    let mut skipped = 0usize;
+    dit.visit_adaptable_mut(&mut |path, lin| {
+        if let Some(p) = pending.get(path) {
+            matched.insert(path.to_string());
+            let (out_f, in_f) = lin.base_shape();
+            if p.a.dims()[0] != in_f || p.b.dims()[1] != out_f {
+                skipped += 1;
+                return Ok(());
+            }
+            lin.push_lora(p.a.to_device(&device)?, p.b.to_device(&device)?, p.scale);
+            applied += 1;
+        }
+        Ok(())
+    })?;
+
+    if applied == 0 {
+        return Err(Error::Msg(format!(
+            "ideogram turbo: no TurboTime LoRA targets matched the DiT additively (checked {} adapter \
+             tensors — wrong key format/prefix?)",
+            names.len()
+        )));
+    }
+    let absent = pending.len() - matched.len();
+    if absent > 0 || skipped > 0 {
+        eprintln!(
+            "ideogram turbo: applied {applied} additive residual(s); {absent} resolved target(s) absent \
+             from the DiT, {skipped} shape-mismatched"
+        );
+    }
+    Ok(applied)
 }
 
 /// If `name` is a recognized "down"/"A" key whose paired "up"/"B" is also present, return
@@ -173,5 +288,98 @@ mod tests {
         );
         // The up half alone is not a "down" key.
         assert_eq!(down_pair("m.lora_up.weight", &present), None);
+    }
+
+    /// **The packed additive residual equals the dense fold to f32 tolerance (sc-11104 guardrail).**
+    /// This is the parity that lets the packed tier drop the dequant-fold: build a q4 packed base
+    /// (`AdaptLinear::from_packed`) and push the LoRA as an unmerged residual with the exact resolution
+    /// [`install_turbo_lora_additive`] uses (`a = downᵀ`, `b = upᵀ`, `scale = eff = user·alpha/rank`);
+    /// fold the *same* delta into the dense affine grid the pack represents and forward it densely. The
+    /// two forwards must agree — proving the residual reproduces the fold on a kept-quantized base.
+    #[test]
+    fn additive_residual_matches_dense_fold_on_packed_base() -> Result<()> {
+        use candle_gen::candle_core::{Device, Tensor};
+        use candle_gen::candle_nn::{Linear, Module};
+        use candle_gen::quant::{AdaptLinear, QLinear as SharedQLinear, MLX_GROUP_SIZE};
+
+        let dev = Device::Cpu;
+        let g = MLX_GROUP_SIZE;
+        let (out_dim, in_dim, rank) = (64usize, 128usize, 4usize);
+
+        // A group-64 Q4 pack + the exact affine grid it represents (the dense base for the fold ref).
+        let codes: Vec<u8> = (0..out_dim * in_dim)
+            .map(|i| ((i * 5 + i / 11) % 16) as u8)
+            .collect();
+        let gpr = in_dim / g;
+        let groups = out_dim * gpr;
+        let scales: Vec<f32> = (0..groups)
+            .map(|gi| 0.02 * ((gi % 5) as f32 + 1.0))
+            .collect();
+        let biases: Vec<f32> = (0..groups).map(|gi| -0.05 * (gi % 7) as f32).collect();
+        let grid: Vec<f32> = (0..out_dim * in_dim)
+            .map(|i| {
+                let (row, col) = (i / in_dim, i % in_dim);
+                let gi = row * gpr + col / g;
+                scales[gi] * codes[i] as f32 + biases[gi]
+            })
+            .collect();
+        let words: Vec<u32> = codes
+            .chunks_exact(8)
+            .map(|c| {
+                c.iter()
+                    .enumerate()
+                    .fold(0u32, |acc, (i, &q)| acc | ((q as u32 & 0xF) << (4 * i)))
+            })
+            .collect();
+        let wq = Tensor::from_vec(words, (out_dim, in_dim / 8), &dev)?;
+        let s = Tensor::from_vec(scales, (out_dim, gpr), &dev)?;
+        let b = Tensor::from_vec(biases, (out_dim, gpr), &dev)?;
+        let grid = Tensor::from_vec(grid, (out_dim, in_dim), &dev)?;
+
+        // A LoRA: down [rank, in], up [out, rank], alpha 8 (⇒ ratio alpha/rank = 2), user scale 1.0.
+        let down = Tensor::randn(0f32, 0.1f32, (rank, in_dim), &dev)?;
+        let up = Tensor::randn(0f32, 0.1f32, (out_dim, rank), &dev)?;
+        let (alpha, user_scale) = (8f64, 1.0f64);
+        let eff = user_scale * (alpha / rank as f64);
+
+        // The install-time resolved residual (a = downᵀ, b = upᵀ, scale = eff).
+        let (a, b_fac) = (down.t()?.contiguous()?, up.t()?.contiguous()?);
+        let x = Tensor::randn(0f32, 1f32, (3, in_dim), &dev)?;
+
+        // (A) Residual identity — on a DENSE grid base, the additive forward equals the folded forward to
+        // f32 tolerance (the only gap is op order: `eff·(x·downᵀ)·upᵀ` vs `x·(grid + eff·up@down)ᵀ`).
+        // This isolates the residual math from the quant error, so the bar is tight.
+        let delta = up.matmul(&down)?; // [out, in]
+        let mut dense_additive =
+            AdaptLinear::from_dense(Linear::new(grid.clone(), None), in_dim, out_dim);
+        dense_additive.push_lora(a.clone(), b_fac.clone(), eff);
+        let folded = Linear::new((grid.clone() + (delta * eff)?)?, None);
+        let resid_diff = (dense_additive.forward(&x)? - folded.forward(&x)?)?
+            .abs()?
+            .max_all()?
+            .to_scalar::<f32>()?;
+        assert!(resid_diff < 1e-3, "residual vs fold max diff {resid_diff}");
+
+        // (B) The packed base carries the same residual: the packed-additive forward tracks the
+        // dense-grid-additive forward within the Q4→Q4_1 repack tolerance (the same bar the packed-load
+        // parity test uses) — so `packed additive == dense fold` end to end.
+        let packed = SharedQLinear::from_packed_gs(&wq, &s, &b, None, g, &dev)?;
+        let mut packed_additive = AdaptLinear::from_packed(packed, in_dim, out_dim);
+        packed_additive.push_lora(a, b_fac, eff);
+        let (pa, da) = (packed_additive.forward(&x)?, dense_additive.forward(&x)?);
+        let pa = pa.flatten_all()?.to_vec1::<f32>()?;
+        let da = da.flatten_all()?.to_vec1::<f32>()?;
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for (p, d) in pa.iter().zip(&da) {
+            dot += (*p as f64) * (*d as f64);
+            na += (*p as f64) * (*p as f64);
+            nb += (*d as f64) * (*d as f64);
+        }
+        let cos = dot / (na.sqrt() * nb.sqrt() + 1e-12);
+        assert!(
+            cos > 0.99999,
+            "packed-additive vs dense-additive cosine {cos:.6}"
+        );
+        Ok(())
     }
 }

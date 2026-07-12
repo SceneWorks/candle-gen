@@ -85,6 +85,18 @@ impl Ideogram4Attention {
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
         self.o.forward(&o)
     }
+
+    /// Visit the two adaptable attention projections (`{prefix}.qkv`, `{prefix}.o`) with their canonical
+    /// DiT dotted paths — the surface the TurboTime LoRA's `qkv`/`o` targets resolve against (sc-11104).
+    pub fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        f(&format!("{prefix}.qkv"), &mut self.qkv)?;
+        f(&format!("{prefix}.o"), &mut self.o)?;
+        Ok(())
+    }
 }
 
 /// HF half-split RoPE in `[B, H, L, hd]` layout: `cos`/`sin` `[B, L, hd]` → broadcast over heads.
@@ -117,6 +129,19 @@ impl Ideogram4Mlp {
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gated = (self.w1.forward(x)?.silu()? * self.w3.forward(x)?)?;
         self.w2.forward(&gated)
+    }
+
+    /// Visit the three adaptable SwiGLU projections (`{prefix}.w1/w2/w3`) with their canonical DiT
+    /// dotted paths — the surface the TurboTime LoRA's feed-forward targets resolve against (sc-11104).
+    pub fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        f(&format!("{prefix}.w1"), &mut self.w1)?;
+        f(&format!("{prefix}.w2"), &mut self.w2)?;
+        f(&format!("{prefix}.w3"), &mut self.w3)?;
+        Ok(())
     }
 }
 
@@ -183,5 +208,93 @@ impl Ideogram4Block {
         let ff = self.feed_forward.forward(&normed2)?;
         let x = (&x + rmsnorm(&ff, &self.ffn_norm2, self.eps)?.broadcast_mul(&gate_mlp)?)?;
         Ok(x)
+    }
+
+    /// Visit every adaptable projection in this block with its canonical DiT dotted path (sc-11104):
+    /// `{prefix}.attention.{qkv,o}`, `{prefix}.feed_forward.{w1,w2,w3}`, `{prefix}.adaln_modulation`.
+    pub fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        self.attention
+            .visit_adaptable_mut(&format!("{prefix}.attention"), f)?;
+        self.feed_forward
+            .visit_adaptable_mut(&format!("{prefix}.feed_forward"), f)?;
+        f(
+            &format!("{prefix}.adaln_modulation"),
+            &mut self.adaln_modulation,
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_gen::candle_core::{safetensors, DType, Device};
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    /// Build a `Weights` over a written dense component from `(name → [out,in]-or-[dim])` shapes.
+    fn weights_from(dir: &Path, shapes: &[(&str, Vec<usize>)]) -> Weights {
+        let dev = Device::Cpu;
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        for (name, dims) in shapes {
+            map.insert(
+                (*name).to_string(),
+                Tensor::randn(0f32, 1f32, dims.clone(), &dev).unwrap(),
+            );
+        }
+        std::fs::create_dir_all(dir).unwrap();
+        safetensors::save(&map, dir.join("model.safetensors")).unwrap();
+        Weights::from_dir(dir, &dev, DType::F32).unwrap()
+    }
+
+    /// **The block visitor emits the canonical DiT dotted paths (sc-11104).** These are exactly the keys
+    /// the TurboTime LoRA's prefix-stripped modules resolve against, so a path typo here would silently
+    /// drop every residual (no-match). Locks the full per-block surface, in walk order.
+    #[test]
+    fn block_visitor_emits_canonical_paths() {
+        let (e, h, hd, hidden) = (8usize, 2usize, 4usize, 16usize);
+        let dir = std::env::temp_dir().join(format!("sc11104_blk_{}", std::process::id()));
+        let w = weights_from(
+            &dir,
+            &[
+                ("layers.0.attention.qkv.weight", vec![3 * h * hd, e]),
+                ("layers.0.attention.o.weight", vec![e, h * hd]),
+                ("layers.0.attention.norm_q.weight", vec![hd]),
+                ("layers.0.attention.norm_k.weight", vec![hd]),
+                ("layers.0.feed_forward.w1.weight", vec![hidden, e]),
+                ("layers.0.feed_forward.w2.weight", vec![e, hidden]),
+                ("layers.0.feed_forward.w3.weight", vec![hidden, e]),
+                ("layers.0.adaln_modulation.weight", vec![4 * e, e]),
+                ("layers.0.adaln_modulation.bias", vec![4 * e]),
+                ("layers.0.attention_norm1.weight", vec![e]),
+                ("layers.0.attention_norm2.weight", vec![e]),
+                ("layers.0.ffn_norm1.weight", vec![e]),
+                ("layers.0.ffn_norm2.weight", vec![e]),
+            ],
+        );
+        let mut block = Ideogram4Block::load(&w, "layers.0", h, hd, 1e-6).unwrap();
+        let mut paths = Vec::new();
+        block
+            .visit_adaptable_mut("layers.0", &mut |p, _| {
+                paths.push(p.to_string());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            paths,
+            vec![
+                "layers.0.attention.qkv",
+                "layers.0.attention.o",
+                "layers.0.feed_forward.w1",
+                "layers.0.feed_forward.w2",
+                "layers.0.feed_forward.w3",
+                "layers.0.adaln_modulation",
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -20,85 +20,33 @@
 //! **unchanged** (`candle_nn::Linear` / `Embedding` from `{base}.weight`), so one crate serves both a
 //! dense bf16 and a packed q4/q8 snapshot.
 //!
-//! The DiT loader is a thin `MmapedSafetensors` wrapper ([`crate::loader::Weights`]) with an
-//! adapter-merge **override** (`insert_override`, the turbo TurboTime LoRA), not a `VarBuilder` — so
-//! this seam builds the quantized module from **raw tensors** pulled through `Weights`
-//! (`from_packed_gs`) rather than the VarBuilder-detecting `candle_gen::quant::lin`. The Qwen3-VL text
-//! encoder loads via a `VarBuilder`, so it routes straight through the shared `lin`/`embedding`
-//! detectors instead ([`crate::text_encoder`]). Both compute paths are identical: the shared
-//! dequant-on-forward `QLinear`/`QEmbedding` (sc-7702 — *not* candle's int8 `QMatMul` fast path, whose
-//! q8_1 activation quant NaNs on outlier features).
-//!
-//! **Adapter compose (sc-9412).** The bundled TurboTime LoRA merge folds its delta into the DiT
-//! attention/FFN/adaln Linears — which is exactly the packed surface. On a packed tier the merge
-//! reconstructs the dense base from the packed parts on the CPU and installs the merged **dense**
-//! weight in the override ([`crate::adapters::merge_turbo_lora`]); the override then shadows the packed
-//! path for those keys ([`crate::loader::linear_detect`] reads the override first). So the packed base
-//! stays packed for untargeted projections, while an adapted projection resolves to its correct merged
-//! dense weight — there is no packed `quantize_onto` to no-op here (that is the VarBuilder crates'
-//! seam).
+//! **The projection type is the SHARED [`candle_gen::quant::AdaptLinear`] (sc-11104).** It wraps a
+//! frozen base — dense (`candle_nn::Linear`) or MLX-packed ([`candle_gen::quant::QLinear`],
+//! dequant-on-forward, sc-7702) — plus zero or more **forward-time additive LoRA residuals**. With no
+//! residual attached its forward is byte-identical to the bare base, so the plain T2I and the
+//! dense-tier fold paths are unchanged. On the **packed** q4/q8 tier the bundled TurboTime LoRA rides
+//! as an *unmerged* residual (`y = base(x) + Σ scale·((x·A)·B)`, the base kept quantized) instead of
+//! being dequant-folded into a materialized dense weight
+//! ([`crate::adapters::install_turbo_lora_additive`]). The DiT loader is a thin `MmapedSafetensors`
+//! wrapper ([`crate::loader::Weights`]), so this seam builds the base from **raw tensors** pulled
+//! through `Weights` (`from_packed_gs` / `Linear::new`) wrapped via
+//! [`candle_gen::quant::AdaptLinear::from_packed`] / `from_dense`, rather than the VarBuilder-detecting
+//! `candle_gen::quant::lin`. The Qwen3-VL text encoder loads via a `VarBuilder`, so it routes straight
+//! through the shared `lin`/`embedding` detectors instead ([`crate::text_encoder`]). Both compute
+//! paths are identical: the shared dequant-on-forward `QLinear` (sc-7702 — *not* candle's int8
+//! `QMatMul` fast path, whose q8_1 activation quant NaNs on outlier features).
 
 use candle_gen::candle_core::{Result, Tensor};
-use candle_gen::candle_nn::{Embedding, Linear, Module};
+use candle_gen::candle_nn::{Embedding, Module};
 use candle_gen::quant as shared;
 
-/// A Linear projection that is **dense** (the loaded bf16 weight, possibly adapter-merged via the
-/// override) or **packed** (loaded straight from the MLX-packed tier via the shared
-/// [`candle_gen::quant::QLinear`], sc-9412). Built dense ([`Self::dense`]) or packed ([`Self::packed`]);
-/// both forwards compute `x·Wᵀ + b`.
-pub enum QLinear {
-    Dense(Linear),
-    /// Loaded directly from the MLX-packed tier through the shared module — the resident `Q4_1`/`Q8_0`
-    /// weight **dequantizes-on-forward** into a dense matmul (sc-7702, *not* the int8 `QMatMul` fast
-    /// path).
-    Packed(shared::QLinear),
-}
-
-impl QLinear {
-    /// Wrap an already-loaded dense [`Linear`] (the loader built it from `{base}.weight` [+ `.bias`],
-    /// or from the adapter-merged override).
-    pub fn dense(linear: Linear) -> Self {
-        Self::Dense(linear)
-    }
-
-    /// Build a **packed** projection from the MLX packed triple (`wq` u32 codes + `scales` + `biases`,
-    /// optional dense `bias`) at the tier's `group_size`, on `wq`'s device, via the shared group-size
-    /// -aware loader. No dense weight is materialized.
-    pub fn packed(
-        wq: &Tensor,
-        scales: &Tensor,
-        biases: &Tensor,
-        bias: Option<Tensor>,
-        group_size: usize,
-    ) -> Result<Self> {
-        let device = wq.device().clone();
-        Ok(Self::Packed(shared::QLinear::from_packed_gs(
-            wq, scales, biases, bias, group_size, &device,
-        )?))
-    }
-
-    /// `x·Wᵀ + b`. Dense delegates to `candle_nn::Linear`; packed delegates to the shared
-    /// dequant-on-forward `QLinear` (sc-7702).
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Dense(l) => l.forward(x),
-            Self::Packed(l) => l.forward(x),
-        }
-    }
-
-    /// Whether this projection loaded directly from the MLX-packed tier (the packed path) — used by the
-    /// loaders + tests to assert a packed tier fired the packed path (not a silent dense fallback).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn is_packed(&self) -> bool {
-        matches!(self, Self::Packed(_))
-    }
-}
-
-impl Module for QLinear {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        QLinear::forward(self, x)
-    }
-}
+/// A Linear projection with a frozen base (**dense** or MLX-**packed**) plus optional **forward-time
+/// additive LoRA/LoKr residuals** — the shared [`candle_gen::quant::AdaptLinear`] (sc-11104). Built
+/// dense ([`QLinear::from_dense`]) or packed ([`QLinear::from_packed`], from the raw MLX triple via the
+/// shared [`candle_gen::quant::QLinear::from_packed_gs`]); the loader ([`crate::loader::linear_detect`])
+/// picks the arm. Residuals are pushed post-load by [`crate::adapters::install_turbo_lora_additive`] on
+/// the packed tier (the dense tier folds bit-exactly into an override instead).
+pub use candle_gen::quant::AdaptLinear as QLinear;
 
 /// A token embedding that is **dense** (`candle_nn::Embedding`) or **packed** (loaded straight from the
 /// MLX-packed tier's triple via the shared [`candle_gen::quant::QEmbedding`], sc-9412). The DiT's small
@@ -151,6 +99,7 @@ impl QEmbedding {
 mod tests {
     use super::*;
     use candle_gen::candle_core::{DType, Device};
+    use candle_gen::candle_nn::Linear;
 
     /// The Ideogram MLX tier's quant group size (64 — the MLX default; the ideogram converter emits no
     /// `quantization` block, so the loaders default to this via [`candle_gen::quant::MLX_GROUP_SIZE`]).
@@ -201,21 +150,23 @@ mod tests {
         (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
     }
 
-    /// A group-64 packed `QLinear` forward matches a dense linear built from the SAME affine grid the
-    /// pack represents — bit-exact (the Q4 → Q4_1 repack is lossless, both forwards dequant-to-dense
-    /// -matmul). Uses an `input_proj`-style biased projection shape.
+    /// A group-64 packed [`QLinear`] (shared `AdaptLinear`, packed base, no residual) forward matches a
+    /// dense linear built from the SAME affine grid the pack represents — bit-exact (the Q4 → Q4_1
+    /// repack is lossless, both forwards dequant-to-dense-matmul). Uses an `input_proj`-style shape.
     #[test]
     fn packed_qlinear_matches_dense_grid() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
         let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
 
-        let packed = QLinear::packed(&wq, &s, &b, None, G)?;
+        let base = shared::QLinear::from_packed_gs(&wq, &s, &b, None, G, &dev)?;
+        let packed = QLinear::from_packed(base, in_dim, out_dim);
         assert!(packed.is_packed(), "group-64 triple ⇒ packed load");
-        let dense = QLinear::dense(Linear::new(
-            Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
-            None,
-        ));
+        let dense = QLinear::from_dense(
+            Linear::new(Tensor::from_vec(grid, (out_dim, in_dim), &dev)?, None),
+            in_dim,
+            out_dim,
+        );
         assert!(!dense.is_packed());
 
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;

@@ -111,6 +111,35 @@ impl Ideogram4Transformer {
         })
     }
 
+    /// The DiT's compute device (every weight loaded onto it) — the device a resolved additive residual
+    /// factor is moved to before it is pushed onto a projection (sc-11104).
+    pub fn device(&self) -> candle_gen::candle_core::Device {
+        self.t_freqs.device().clone()
+    }
+
+    /// Walk **every** adaptable projection in the DiT with its canonical diffusers-style dotted path
+    /// (sc-11104): the top-level `input_proj` / `llm_cond_proj` / `t_embedding.mlp_{in,out}` /
+    /// `adaln_proj`, each block's `layers.{i}.*`, and the final layer's `final_layer.{adaln_modulation,
+    /// linear}`. These are the keys a prefix-stripped TurboTime-LoRA module resolves against, so the
+    /// additive installer ([`crate::adapters::install_turbo_lora_additive`]) can push a residual onto any
+    /// matched projection while leaving the base packed. Ordered by walk, top-level first.
+    pub fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> Result<()>,
+    ) -> Result<()> {
+        f("input_proj", &mut self.input_proj)?;
+        f("llm_cond_proj", &mut self.llm_cond_proj)?;
+        f("t_embedding.mlp_in", &mut self.t_mlp_in)?;
+        f("t_embedding.mlp_out", &mut self.t_mlp_out)?;
+        f("adaln_proj", &mut self.adaln_proj)?;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            layer.visit_adaptable_mut(&format!("layers.{i}"), f)?;
+        }
+        f("final_layer.adaln_modulation", &mut self.final_adaln)?;
+        f("final_layer.linear", &mut self.final_linear)?;
+        Ok(())
+    }
+
     /// Sinusoidal scalar-`t` embedding → MLP. `t`: `[B]` in `[0,1]` → `[B, emb_dim]`.
     fn t_embedding(&self, t: &Tensor) -> Result<Tensor> {
         let scaled = (t.to_dtype(DType::F32)? * 1e4)?; // [B]

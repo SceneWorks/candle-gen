@@ -15,13 +15,16 @@
 //! from the packed parts through the shared group-size-aware loaders (no dense staging — see
 //! [`crate::quant`]). Absent the `.scales` sibling, the dense path is unchanged.
 //!
-//! **Adapter compose (sc-9412).** The DiT's `insert_override` (the turbo TurboTime LoRA merge) installs
-//! dense CPU-side weights that take priority over the mmap. [`linear_detect`] checks the **override
-//! first**: a projection the adapter merge targeted resolves to its merged **dense** weight (the merge
-//! reconstructs the dense base from the packed parts before folding, [`crate::adapters`]), while an
-//! untargeted packed projection stays packed. So the packed base and the dense adapter override compose.
-//! [`dequant_packed_base`] is the reconstruction the merge uses to build a mergeable dense base off the
-//! packed triple.
+//! **Turbo TurboTime LoRA — two routes by tier (sc-11104).** On the **dense** bf16 tier the merge
+//! folds `W += eff·(up @ down)` bit-exactly into a CPU-side **override** the mmap yields to
+//! (`insert_override`, [`crate::adapters::merge_turbo_lora`]); [`linear_detect`] checks the override
+//! **first**, so an adapted projection resolves to its merged **dense** weight. On the **packed** q4/q8
+//! tier there is no dense `W` to fold into — the base is kept quantized and the LoRA rides as a
+//! **forward-time additive residual** on the shared [`crate::quant::QLinear`]
+//! ([`crate::adapters::install_turbo_lora_additive`]), pushed onto the loaded projection *after* build.
+//! So a packed projection stays packed (no dequant, no dense reload) while an untargeted one is
+//! untouched. The prior packed **dequant-fold** (a `get_cpu_merge_base` reconstruction of the dense
+//! grid) is retired.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,10 +32,7 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::safetensors::MmapedSafetensors;
 use candle_gen::candle_core::{DType, Device, Error, Result, Tensor};
 use candle_gen::candle_nn::{Embedding, Linear};
-use candle_gen::quant::{
-    dequant_mlx_q4_reference_gs, dequant_mlx_q8_gs, mlx_packed_bits_gs, PackedConfig,
-    MLX_GROUP_SIZE,
-};
+use candle_gen::quant::{PackedConfig, MLX_GROUP_SIZE};
 
 use crate::quant::{QEmbedding, QLinear};
 
@@ -134,30 +134,25 @@ impl Weights {
         self.overlay.contains_key(name)
     }
 
-    /// The **dense** CPU base weight for an adapter merge target `weight_key` (`{base}.weight`) — the
-    /// adapter-compose seam (sc-9412). On a dense tier this is the on-disk weight loaded onto the CPU.
-    /// On a **packed** tier whose `{base}.scales` sibling is present, the weight is u32 codes, so the
-    /// dense grid is reconstructed from the packed triple at the tier's group size
-    /// ([`dequant_packed_base`], f32) — the mergeable base the LoRA delta folds into. The resulting
-    /// merged weight is installed in the override, so [`linear_detect`] then loads it dense (the packed
-    /// base stays packed for untargeted projections).
+    /// The **dense** CPU base weight for a **dense-tier** turbo-LoRA fold target `weight_key`
+    /// (`{base}.weight`) — the on-disk weight loaded onto the CPU (where the LoRA factors live), which
+    /// [`crate::adapters::merge_turbo_lora`] folds `W += eff·δ` into and installs as an override. Only
+    /// the **dense** tier folds (sc-11104): a packed tier routes through the additive residual path
+    /// ([`crate::adapters::install_turbo_lora_additive`]) and never calls this, so there is no packed
+    /// dequant here anymore.
     pub(crate) fn get_cpu_merge_base(&self, weight_key: &str) -> Result<Tensor> {
-        if let Some(base) = weight_key.strip_suffix(".weight") {
-            let scales_key = format!("{base}.scales");
-            if self.st.get(&scales_key).is_ok() {
-                let wq = self.st.load(weight_key, &Device::Cpu)?;
-                let scales = self
-                    .st
-                    .load(&scales_key, &Device::Cpu)?
-                    .to_dtype(DType::F32)?;
-                let biases = self
-                    .st
-                    .load(&format!("{base}.biases"), &Device::Cpu)?
-                    .to_dtype(DType::F32)?;
-                return dequant_packed_base(&wq, &scales, &biases, self.group_size());
-            }
-        }
         self.st.load(weight_key, &Device::Cpu)
+    }
+
+    /// Whether this component is a **pre-quantized MLX tier** — some projection ships the `.scales`
+    /// sibling of the packed triple. Gates the turbo-LoRA route (sc-11104): packed ⇒ forward-time
+    /// additive residual on the kept-quantized base ([`crate::adapters::install_turbo_lora_additive`]);
+    /// dense ⇒ bit-exact fold into an override ([`crate::adapters::merge_turbo_lora`]).
+    pub fn is_packed(&self) -> bool {
+        self.st
+            .tensors()
+            .iter()
+            .any(|(n, _)| n.ends_with(".scales"))
     }
 }
 
@@ -169,30 +164,6 @@ fn read_packed_group_size(dir: &Path) -> Option<usize> {
     let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
     PackedConfig::from_config(&v).map(|c| c.group_size as usize)
-}
-
-/// Reconstruct the **dense** f32 grid a packed triple (`{base}.weight` u32 codes + `.scales` +
-/// `.biases`) represents, at the tier's `group_size` — the adapter-merge base (sc-9412). The TurboTime
-/// LoRA merge folds its delta into this reconstructed dense weight (CPU, f32) and installs the result in
-/// the override, so the merged projection loads dense while the untargeted bulk stays packed. Bit-width
-/// is inferred from the packed shapes (Q4 → the lossless affine grid; Q8 → its exact grid), mirroring
-/// the shared `repack_packed_weight` dispatch.
-pub fn dequant_packed_base(
-    wq: &Tensor,
-    scales: &Tensor,
-    biases: &Tensor,
-    group_size: usize,
-) -> Result<Tensor> {
-    let wq_cols = wq.dim(1)?;
-    let s_cols = scales.dim(1)?;
-    match mlx_packed_bits_gs(wq_cols, s_cols, group_size) {
-        4 => dequant_mlx_q4_reference_gs(wq, scales, biases, group_size),
-        8 => dequant_mlx_q8_gs(wq, scales, biases, group_size),
-        b => Err(Error::Msg(format!(
-            "ideogram: unsupported MLX packed bit-width {b} (wq cols {wq_cols}, scales cols {s_cols}, \
-             group {group_size})"
-        ))),
-    }
 }
 
 /// Build a [`Linear`] from `{base}.weight` (+ `{base}.bias` when `bias`), inferring in/out dims from
@@ -207,25 +178,36 @@ pub fn linear(w: &Weights, base: &str, bias: bool) -> Result<Linear> {
     Ok(Linear::new(weight, bias))
 }
 
-/// **Packed-detecting** [`QLinear`] loader (sc-9412) with adapter-override priority. In order:
+/// Wrap a loaded dense [`Linear`] as the shared [`QLinear`] (`AdaptLinear`), recovering the logical
+/// `[out, in]` from the weight shape so a residual installer can shape-check without re-reading it.
+fn dense_adapt(l: Linear) -> QLinear {
+    let dims = l.weight().dims();
+    let (out, in_) = (dims[0], dims[1]);
+    QLinear::from_dense(l, in_, out)
+}
+
+/// **Packed-detecting** [`QLinear`] loader (sc-9412, additive route sc-11104). In order:
 ///
-/// 1. **Override** (`{base}.weight` is adapter-merged): the merge already reconstructed a dense weight
-///    (from the packed parts if the tier is packed, [`crate::adapters`]) and installed it, so load that
-///    **dense** merged weight — a `Dense` `QLinear`. The packed base composes with the adapter.
-/// 2. **Packed** (`{base}.scales` present, no override): build a `Packed` projection straight from the
-///    MLX packed triple at the tier's group size — **no dense weight materialized**.
+/// 1. **Override** (`{base}.weight` is a **dense-tier** turbo-LoRA-merged weight): the fold already
+///    installed a dense weight, so load it dense ([`crate::adapters::merge_turbo_lora`]).
+/// 2. **Packed** (`{base}.scales` present, no override): build the base straight from the MLX packed
+///    triple at the tier's group size (**no dense weight materialized**) — the base stays quantized and
+///    the turbo LoRA rides as a forward-time additive residual pushed post-load
+///    ([`crate::adapters::install_turbo_lora_additive`]).
 /// 3. **Dense** (otherwise): the exact [`linear`] behavior (`{base}.weight` [+ `{base}.bias`]).
 ///
-/// `base` is the full dotted key prefix (e.g. `layers.0.attention.qkv`), so the `.scales`/`.biases`
-/// siblings survive any nesting — build the base string first, then detect.
+/// Every arm yields the shared [`QLinear`] with **no residual attached**, so before any install its
+/// forward is byte-identical to the bare base. `base` is the full dotted key prefix (e.g.
+/// `layers.0.attention.qkv`), so the `.scales`/`.biases` siblings survive any nesting — build the base
+/// string first, then detect.
 pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
     let weight_key = format!("{base}.weight");
     let scales_key = format!("{base}.scales");
-    // (1) An adapter-merged dense weight in the override wins — load it dense (adapter compose).
+    // (1) A dense-tier turbo-folded weight in the override wins — load it dense.
     if w.overlay_has(&weight_key) {
-        return Ok(QLinear::dense(linear(w, base, bias)?));
+        return Ok(dense_adapt(linear(w, base, bias)?));
     }
-    // (2) A `.scales` sibling → build straight from the packed parts.
+    // (2) A `.scales` sibling → build the packed base straight from the MLX triple (kept quantized).
     if w.contains(&scales_key) {
         let wq = w.get_native(&weight_key)?;
         let scales = w.get_f32(&scales_key)?;
@@ -235,10 +217,22 @@ pub fn linear_detect(w: &Weights, base: &str, bias: bool) -> Result<QLinear> {
         } else {
             None
         };
-        return QLinear::packed(&wq, &scales, &biases, dense_bias, w.group_size());
+        // Recover the logical `[out, in]` from the scales shape `[out, in/group]` — no dense
+        // materialization, and no dependence on the packed-code column count (Q4 vs Q8 differ).
+        let out = scales.dim(0)?;
+        let in_ = scales.dim(1)? * w.group_size();
+        let packed = candle_gen::quant::QLinear::from_packed_gs(
+            &wq,
+            &scales,
+            &biases,
+            dense_bias,
+            w.group_size(),
+            w.device(),
+        )?;
+        return Ok(QLinear::from_packed(packed, in_, out));
     }
     // (3) Dense path unchanged.
-    Ok(QLinear::dense(linear(w, base, bias)?))
+    Ok(dense_adapt(linear(w, base, bias)?))
 }
 
 /// **Packed-detecting** [`QEmbedding`] loader (sc-9412): packed straight from the MLX triple when
@@ -364,7 +358,7 @@ mod tests {
         assert!(!dense.is_packed(), "no `.scales` ⇒ dense path unchanged");
 
         // The packed forward reproduces the affine grid (group-64 default + dequant-on-forward).
-        let grid_lin = QLinear::dense(Linear::new(grid, None));
+        let grid_lin = dense_adapt(Linear::new(grid, None));
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "group-64 packed vs grid cosine {cos:.6}");
@@ -418,7 +412,7 @@ mod tests {
 
         let packed = linear_detect(&w, "input_proj", true)?;
         assert!(packed.is_packed());
-        let dense = QLinear::dense(Linear::new(grid, Some(dbias)));
+        let dense = dense_adapt(Linear::new(grid, Some(dbias)));
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let cos = cosine(&packed.forward(&x)?, &dense.forward(&x)?);
         assert!(
@@ -429,12 +423,12 @@ mod tests {
         Ok(())
     }
 
-    /// **Adapter override wins over the packed base (sc-9412 adapter compose).** With a packed
-    /// `layers.0.attention.qkv` triple in the component AND an override-installed dense
-    /// `...qkv.weight` (the TurboTime-merged weight), `linear_detect` must take the **dense** override
-    /// path — not the packed triple — and its forward must reproduce the override weight exactly. This
-    /// is the seam that lets the turbo LoRA merge into a packed tier: the adapted projection loads
-    /// dense, the rest stays packed.
+    /// **A turbo-fold override wins over any base (override-first precedence, sc-11104).**
+    /// `linear_detect` checks the override before the packed `.scales` sibling, so an installed dense
+    /// weight loads dense and reproduces the override exactly — even when a packed triple is present.
+    /// This is the dense-tier fold seam ([`crate::adapters::merge_turbo_lora`]); on the packed tier the
+    /// LoRA rides additively instead (no override is ever installed there), but the precedence must not
+    /// regress into letting a packed triple shadow an override.
     #[test]
     fn override_shadows_packed_base_for_adapter_compose() -> Result<()> {
         let dev = Device::Cpu;
@@ -475,45 +469,54 @@ mod tests {
         Ok(())
     }
 
-    /// **`get_cpu_merge_base` reconstructs the dense grid from the packed triple (sc-9412).** The
-    /// TurboTime LoRA merge folds its delta into this reconstructed base; on a packed tier the base must
-    /// be the exact affine grid the pack represents (f32), NOT the u32 codes. A dense tier returns the
-    /// on-disk weight unchanged.
+    /// **`get_cpu_merge_base` returns the on-disk weight for the dense-tier fold (sc-11104).** The
+    /// packed dequant-fold is retired: only the dense tier folds, and its base is the on-disk weight
+    /// loaded onto the CPU (identity round-trip) — the LoRA factors live on the CPU, so the fold matches.
+    /// (A packed tier never calls this; it routes through the additive residual path instead.)
     #[test]
-    fn get_cpu_merge_base_dequantizes_packed_and_passes_dense() -> Result<()> {
+    fn get_cpu_merge_base_returns_dense_weight() -> Result<()> {
         let dev = Device::Cpu;
         let (out_dim, in_dim) = (128usize, 256usize);
-        let (wq, s, b, grid) = q4_packed(out_dim, in_dim);
-
-        // Packed tier: base is the reconstructed dense grid.
-        let mut map: HashMap<String, Tensor> = HashMap::new();
-        map.insert("layers.0.attention.qkv.weight".into(), wq);
-        map.insert("layers.0.attention.qkv.scales".into(), s);
-        map.insert("layers.0.attention.qkv.biases".into(), b);
-        let dir = std::env::temp_dir().join(format!("sc9412_base_{}", std::process::id()));
-        write_component(&dir, map, None);
-        let w = Weights::from_dir(&dir, &dev, DType::F32)?;
-        let base = w.get_cpu_merge_base("layers.0.attention.qkv.weight")?;
-        assert_eq!(base.dims(), &[out_dim, in_dim], "reconstructed dense shape");
-        assert!(
-            cosine(&base, &grid) > 0.99999,
-            "reconstructed base must equal the affine grid"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-
-        // Dense tier: base is the on-disk weight (identity round-trip).
         let dense_w = Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?;
         let mut dmap: HashMap<String, Tensor> = HashMap::new();
         dmap.insert("layers.0.attention.qkv.weight".into(), dense_w.clone());
-        let ddir = std::env::temp_dir().join(format!("sc9412_base_dense_{}", std::process::id()));
+        let ddir = std::env::temp_dir().join(format!("sc11104_base_dense_{}", std::process::id()));
         write_component(&ddir, dmap, None);
         let dw = Weights::from_dir(&ddir, &dev, DType::F32)?;
+        assert!(!dw.is_packed(), "no `.scales` sibling ⇒ dense tier");
         let dbase = dw.get_cpu_merge_base("layers.0.attention.qkv.weight")?;
         let dev_max = (dbase.sub(&dense_w)?)
             .abs()?
             .max_all()?
             .to_scalar::<f32>()?;
         assert_eq!(dev_max, 0.0, "dense tier base is the on-disk weight");
+        std::fs::remove_dir_all(&ddir).ok();
+        Ok(())
+    }
+
+    /// **`is_packed` fires on the `.scales` sibling (sc-11104).** A packed triple ⇒ `is_packed()` true
+    /// (route to the additive residual path); a purely dense component ⇒ false (route to the fold).
+    #[test]
+    fn is_packed_detects_scales_sibling() -> Result<()> {
+        let dev = Device::Cpu;
+        let (wq, s, b, _grid) = q4_packed(64, 128);
+        let mut pmap: HashMap<String, Tensor> = HashMap::new();
+        pmap.insert("input_proj.weight".into(), wq);
+        pmap.insert("input_proj.scales".into(), s);
+        pmap.insert("input_proj.biases".into(), b);
+        let pdir = std::env::temp_dir().join(format!("sc11104_ispacked_p_{}", std::process::id()));
+        write_component(&pdir, pmap, None);
+        assert!(Weights::from_dir(&pdir, &dev, DType::F32)?.is_packed());
+        std::fs::remove_dir_all(&pdir).ok();
+
+        let mut dmap: HashMap<String, Tensor> = HashMap::new();
+        dmap.insert(
+            "input_proj.weight".into(),
+            Tensor::randn(0f32, 1f32, (64usize, 128usize), &dev)?,
+        );
+        let ddir = std::env::temp_dir().join(format!("sc11104_ispacked_d_{}", std::process::id()));
+        write_component(&ddir, dmap, None);
+        assert!(!Weights::from_dir(&ddir, &dev, DType::F32)?.is_packed());
         std::fs::remove_dir_all(&ddir).ok();
         Ok(())
     }
