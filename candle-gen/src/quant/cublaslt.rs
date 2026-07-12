@@ -270,12 +270,23 @@ mod cuda_impl {
                 }
             }
             // sc-11260 (F-100): no per-call `stream.synchronize()` here. The GEMM enqueues on the
-            // device stream and stream ordering already sequences every downstream consumer: the
-            // host-fold paths (`matmul_int8[_per_channel[_staged]]`) read the accumulate back via
-            // `clone_dtoh`, which synchronizes itself, and the on-device fold
-            // (`matmul_int8_per_channel_staged_ondevice`) chains stream-ordered candle ops. The fp8
-            // twin (`matmul_fp8_staged`) is sync-free for the same reason. Draining the pipeline once
-            // per int8 projection defeated async enqueue-ahead on the ConvRot resident forward.
+            // device stream and stream ordering already sequences every downstream consumer.
+            // Correctness rests on two LOAD-BEARING invariants:
+            //   (1) Same-stream ordering — the GEMM, the `out` allocation, and the host read-back
+            //       copy all run on `self.stream` (= `device.cuda_stream()`), so the GEMM is
+            //       ordered strictly before the read.
+            //   (2) Blocking read-back — the host-fold paths
+            //       (`matmul_int8[_per_channel[_staged]]`) read the accumulate back via `clone_dtoh`
+            //       into a PAGEABLE (non-pinned) `Vec`. A device→pageable-host `cudaMemcpyAsync`
+            //       blocks the host until the copy — hence the GEMM — completes, so no explicit sync
+            //       is needed. The on-device fold (`matmul_int8_per_channel_staged_ondevice`) chains
+            //       stream-ordered candle ops, and the fp8 twin (`matmul_fp8_staged`) is sync-free
+            //       for the same reasons.
+            // CAVEAT: this holds ONLY while read-backs land in pageable host memory. If a caller
+            // ever switches the read-back to a PINNED host buffer, the blocking guarantee is lost
+            // and an explicit stream sync (or event) would be required again — do not reintroduce a
+            // race by that route. Draining the pipeline once per int8 projection defeated async
+            // enqueue-ahead on the ConvRot resident forward.
             let storage = CudaStorage {
                 slice: CudaStorageSlice::I32(out),
                 device: self.device.clone(),
