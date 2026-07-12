@@ -28,12 +28,9 @@ fn tiny_cfg() -> PidConfig {
         patch_size: 2,
         txt_embed_dim: 6,
         txt_max_length: 5,
-        use_text_rope: true,
         text_rope_theta: 10000.0,
-        rope_mode: candle_gen_pid::config::RopeMode::NtkAware,
         rope_ref_h: 4,
         rope_ref_w: 4,
-        lq_in_channels: 0,
         lq_latent_channels: 4,
         lq_hidden_dim: 8, // divisible by the ResBlock GroupNorm's 4 groups
         lq_num_res_blocks: 1,

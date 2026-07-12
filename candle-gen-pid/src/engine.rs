@@ -21,7 +21,7 @@ use crate::config::{PidConfig, SamplerConfig};
 use crate::decoder::PidDecoder;
 use crate::gemma2::{Gemma2, Gemma2Config};
 use crate::lq::PidNet;
-use crate::registry::lookup;
+use crate::registry::{lookup, BackboneSpec};
 use crate::sampler::Sampler;
 
 /// Filename of the merged Gemma-2-2b-it checkpoint inside the gemma snapshot dir; falls back to
@@ -62,12 +62,7 @@ impl PidEngine {
                 "pid: unknown/out-of-scope backbone {backbone:?} (no PiD latent-space mapping)"
             ))
         })?;
-        // The released students share the sr4x PixDiT topology; only the LQ latent-channel count and
-        // the latent grid's spatial compression differ per latent space (16-ch/8× for qwen/flux/sd3,
-        // 4-ch/8× for sdxl, 128-ch/16× for flux2 — see the registry `FLUX2` note, sc-7847).
-        let mut cfg = PidConfig::sr4x();
-        cfg.lq_latent_channels = spec.latent_channels;
-        cfg.latent_spatial_down_factor = spec.latent_spatial_down_factor;
+        let cfg = config_for_spec(&spec);
 
         // The PiD net runs f32 (the parity target + the dense-GEMM-safe path).
         let weights = Weights::from_file(checkpoint, device, DType::F32)?;
@@ -292,6 +287,25 @@ pub fn flow_capture_for_request(
     }
 }
 
+/// Assemble the per-latent-space [`PidConfig`] for a resolved backbone spec. The released students
+/// share the `sr4x` PixDiT topology; only the LQ latent-channel count, the latent grid's spatial
+/// compression, and the SR scale differ per latent space (16-ch/8× for qwen/flux/sd3, 4-ch/8× for
+/// sdxl, 128-ch/16× for flux2 — see the registry `FLUX2` note, sc-7847).
+///
+/// `sr_scale` is threaded from [`BackboneSpec::pid_scale`] (F-141, sc-11246) rather than left at the
+/// hard-coded `sr4x()` `4`. Every released student is 4× — the value `sr4x()` already defaults to — so
+/// this is a byte-for-byte no-op today; but the registry deliberately carries `pid_scale` per space, and
+/// an 8× student would otherwise silently size its noise, output geometry, and the budget guard for 4×
+/// (a wrong-resolution decode, not a load error). `sr_scale` flows into the decoder's output resolution
+/// (`zH·vae_compression·scale`) and the LQ upsample ratio (`(sr_scale·lsdf)/patch`).
+fn config_for_spec(spec: &BackboneSpec) -> PidConfig {
+    let mut cfg = PidConfig::sr4x();
+    cfg.lq_latent_channels = spec.latent_channels;
+    cfg.latent_spatial_down_factor = spec.latent_spatial_down_factor;
+    cfg.sr_scale = spec.pid_scale;
+    cfg
+}
+
 /// Extract the single-file path from a [`WeightsSource`], rejecting a directory.
 fn file_path(src: &WeightsSource, what: &str) -> Result<PathBuf> {
     match src {
@@ -321,6 +335,60 @@ mod tests {
             Ok(_) => panic!("expected an error"),
             Err(e) => e.to_string(),
         }
+    }
+
+    // --- F-141 (sc-11246): sr_scale is threaded from BackboneSpec.pid_scale --------------------------
+
+    #[test]
+    fn config_threads_pid_scale_and_default_is_identity() {
+        // Every released student ships pid_scale=4, the same value sr4x() hard-codes — so threading is a
+        // byte-for-byte no-op today: the assembled config must equal PidConfig::sr4x() with only the two
+        // pre-existing per-space fields (latent channels / grid compression) diverging, never sr_scale.
+        let baseline = PidConfig::sr4x();
+        for backbone in ["qwenimage", "flux", "sd3", "sdxl", "flux2"] {
+            let spec = lookup(backbone).unwrap();
+            let cfg = config_for_spec(&spec);
+            assert_eq!(
+                cfg.sr_scale, spec.pid_scale,
+                "{backbone}: sr_scale must come from the spec, not the hard-coded 4"
+            );
+            assert_eq!(
+                cfg.sr_scale, baseline.sr_scale,
+                "{backbone}: released students are all 4× — threading reproduces current behavior"
+            );
+            assert_eq!(cfg.lq_latent_channels, spec.latent_channels);
+            assert_eq!(
+                cfg.latent_spatial_down_factor,
+                spec.latent_spatial_down_factor
+            );
+        }
+    }
+
+    #[test]
+    fn nondefault_pid_scale_changes_decode_geometry() {
+        // A hypothetical 8× student: threading pid_scale sizes the decode for 8×, not the hard-coded 4×.
+        // sr_scale drives the decoder's output resolution (target_hw = zH·vae_compression·scale) and the
+        // LQ upsample ratio ((sr_scale·lsdf)/patch), so a different pid_scale is a materially different
+        // decode — proven here on the geometry those consumers compute from sr_scale.
+        let mut spec = lookup("flux").unwrap();
+        spec.pid_scale = 8;
+        let cfg8 = config_for_spec(&spec);
+        assert_eq!(
+            cfg8.sr_scale, 8,
+            "non-default pid_scale must be threaded through"
+        );
+
+        spec.pid_scale = 4;
+        let cfg4 = config_for_spec(&spec);
+        assert_ne!(
+            cfg8.sr_scale, cfg4.sr_scale,
+            "a non-default pid_scale yields a different sr_scale"
+        );
+        // Output pixel side for a fixed latent grid side `zside` differs between the two scales.
+        let zside = 32;
+        let out8 = zside * cfg8.latent_spatial_down_factor * cfg8.sr_scale;
+        let out4 = zside * cfg4.latent_spatial_down_factor * cfg4.sr_scale;
+        assert_ne!(out8, out4, "output geometry tracks sr_scale");
     }
 
     #[test]

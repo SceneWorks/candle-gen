@@ -14,6 +14,12 @@
 
 /// Backbone (`PixDiT_T2I` + `PidNet` LQ extension) hyperparameters. Dimension-parametric so the same
 /// code runs the real 1.36 B model and tiny parity fixtures.
+///
+/// Fixed policy for the ported catalog students (sc-11246, F-142): the port covers only the
+/// **latent-only** LQ path (no `lq_in_channels` image branch — see [`crate::lq`]), always applies 1-D
+/// text RoPE, and uses NTK-aware 2-D image RoPE unconditionally. The reference's `use_text_rope` /
+/// `rope_mode` / `lq_in_channels` toggles are therefore *not* modeled as fields — a variant port that
+/// needs a different path must add the branch (and honor it) rather than flip a silently-ignored flag.
 #[derive(Debug, Clone)]
 pub struct PidConfig {
     // ---- PixDiT_T2I backbone (model_pixeldit.py::PIXELDIT_FINETUNE_2048PX) ----
@@ -39,20 +45,14 @@ pub struct PidConfig {
     pub txt_embed_dim: i32,
     /// Caption token budget (`model_max_length`).
     pub txt_max_length: i32,
-    /// Apply 1-D RoPE to the text stream.
-    pub use_text_rope: bool,
-    /// Text RoPE base.
+    /// Text RoPE base (1-D text RoPE is always applied — see the struct's fixed-policy note).
     pub text_rope_theta: f32,
-    /// 2-D image RoPE mode (`"ntk_aware"`).
-    pub rope_mode: RopeMode,
     /// NTK reference pixel height (grid = `rope_ref_h / patch_size`).
     pub rope_ref_h: i32,
     /// NTK reference pixel width.
     pub rope_ref_w: i32,
 
     // ---- LQ adapter (model_pid.py::PID_SR4X + experiment override) ----
-    /// LQ image-branch input channels (0 = latent-only, the SR default).
-    pub lq_in_channels: i32,
     /// LQ latent-branch channels (16 for the Qwen/Flux/SD3 latent spaces).
     pub lq_latent_channels: i32,
     /// LQ projection internal width.
@@ -65,13 +65,6 @@ pub struct PidConfig {
     pub sr_scale: i32,
     /// VAE spatial compression (latent grid → pixel grid factor).
     pub latent_spatial_down_factor: i32,
-}
-
-/// 2-D image RoPE mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RopeMode {
-    /// NTK-aware per-axis θ scaling (identity when the sampled grid == the reference grid).
-    NtkAware,
 }
 
 impl PidConfig {
@@ -118,12 +111,9 @@ impl PidConfig {
             patch_size: 16,
             txt_embed_dim: 2304,
             txt_max_length: 300,
-            use_text_rope: true,
             text_rope_theta: 10000.0,
-            rope_mode: RopeMode::NtkAware,
             rope_ref_h: 1024,
             rope_ref_w: 1024,
-            lq_in_channels: 0,
             lq_latent_channels: 16,
             lq_hidden_dim: 512,
             lq_num_res_blocks: 4,
@@ -162,37 +152,6 @@ impl SamplerConfig {
             fm_timescale: 1000.0,
             student_t_list: vec![0.999, 0.866, 0.634, 0.342, 0.0],
             sample_type: SampleType::Sde,
-        }
-    }
-}
-
-/// Caption-conditioning configuration (`_common_model_overrides`). PiD conditions on a `gemma-2-2b-it`
-/// embedding of the prompt, prefixed by a fixed "Chi-prompt", then a learned `y_norm` scale.
-#[derive(Debug, Clone)]
-pub struct CaptionConfig {
-    /// HF id of the caption text encoder.
-    pub text_encoder_name: &'static str,
-    /// Caption embedding width (must equal [`PidConfig::txt_embed_dim`]).
-    pub caption_channels: i32,
-    /// Caption token budget.
-    pub model_max_length: i32,
-    /// Apply the learned `y_norm` scaling to the projected caption tokens.
-    pub y_norm: bool,
-    /// `y_norm` scale factor.
-    pub y_norm_scale_factor: f32,
-    /// Whether the fixed "Chi-prompt" enhancement prefix is prepended before tokenizing.
-    pub use_chi_prompt: bool,
-}
-
-impl Default for CaptionConfig {
-    fn default() -> Self {
-        Self {
-            text_encoder_name: "gemma-2-2b-it",
-            caption_channels: 2304,
-            model_max_length: 300,
-            y_norm: true,
-            y_norm_scale_factor: 0.01,
-            use_chi_prompt: true,
         }
     }
 }
