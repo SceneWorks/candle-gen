@@ -59,6 +59,21 @@ pub const DEFAULT_INPAINT_STRENGTH: f32 = 0.85;
 /// SDXL works in latent space at /8: both render dims must be multiples of 8.
 const SIZE_MULTIPLE: u32 = 8;
 
+/// Reject `steps == 0` loudly instead of building an empty schedule: with `steps: 0` the
+/// `round(steps·strength)` effective count is 0, so the strength-noised source is decoded and returned
+/// as the "edit" (at the default 0.8 strength, an 80%-noised source — garbage labeled success). A fast
+/// typed error mirrors the sibling bespoke lanes (`reject_zero_steps` in the SDXL IP-Adapter provider,
+/// sc-9016, F-032); this worker-driven edit path has no gen-core capability floor upstream of it
+/// (sc-11182, F-102).
+fn reject_zero_steps(steps: usize) -> Result<()> {
+    if steps == 0 {
+        return Err(CandleError::Msg(
+            "sdxl edit: steps must be >= 1 (an explicit 0 decodes the noised source)".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Paths to the SDXL edit checkpoints — just the SDXL base snapshot (the f16-fix VAE is resolved via
 /// `hf-hub`, exactly as the txt2img / IP-Adapter paths). No IP-Adapter / ControlNet / face checkpoints.
 pub struct SdxlEditPaths {
@@ -214,6 +229,7 @@ impl SdxlEdit {
                 req.width, req.height
             )));
         }
+        reject_zero_steps(req.steps)?;
         let cfg_on = req.guidance > 1.0;
 
         // Text conditioning (uncond-first under CFG) + the SDXL micro-conditioning time_ids.
@@ -408,6 +424,16 @@ mod tests {
     use super::*;
     use crate::unet::{BlockConfig, UNet2DConditionModelConfig};
     use candle_nn::{VarBuilder, VarMap};
+
+    /// `steps == 0` is rejected with a fast, actionable error (never decoded as the noised source);
+    /// a valid step count passes (sc-11182, F-102).
+    #[test]
+    fn reject_zero_steps_floors_edit_lane() {
+        let err = reject_zero_steps(0).expect_err("steps==0 must be rejected");
+        assert!(err.to_string().contains("steps must be >= 1"), "{err}");
+        assert!(reject_zero_steps(1).is_ok());
+        assert!(reject_zero_steps(30).is_ok());
+    }
 
     /// The request defaults match the SDXL edit production knobs (1024², 30 steps, strength 0.8).
     #[test]

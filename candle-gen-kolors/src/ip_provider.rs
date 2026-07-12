@@ -235,6 +235,7 @@ impl IpAdapterKolors {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        common::reject_zero_steps("kolors ip-adapter", req.steps)?;
         let use_guide = req.guidance > 1.0;
 
         // Everything that borrows `&self`, computed into owned values BEFORE the `&mut self.unet`

@@ -50,6 +50,10 @@ const MAX_SHIFT: f64 = 1.15;
 /// Default `ip_adapter_scale` for the XLabs FLUX IP-Adapter (mlx-gen-flux `DEFAULT_IP_SCALE`).
 pub const DEFAULT_IP_SCALE: f32 = 0.7;
 
+/// FLUX packs the /8 VAE latent 2×2, so both render dims must be multiples of 16 (matching the flux1
+/// txt2img `validate` and the control/edit siblings).
+const SIZE_MULTIPLE: u32 = 16;
+
 /// Paths to the FLUX IP-Adapter checkpoints.
 pub struct IpAdapterFluxPaths {
     /// The black-forest-labs FLUX.1 snapshot dir (`flux1-{dev,schnell}.safetensors`, `ae.safetensors`,
@@ -359,6 +363,22 @@ fn validate_request(req: &IpAdapterFluxRequest) -> Result<()> {
             "flux ip-adapter: prompt is required".into(),
         ));
     }
+    // Bring this lane up to parity with its three siblings (flux1 txt2img/control/edit): a
+    // multiple-of-16 size floor and a `steps == 0` reject. Without them `get_schedule(0, …)` builds an
+    // empty flow-match trajectory (zero sampler steps ⇒ pure seeded noise decoded and returned as
+    // success), burning GPU time for garbage rather than the fast typed error the siblings give
+    // (sc-9016/F-032 established the guard; sc-11182/F-102 sweeps it here).
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(CandleError::Msg(format!(
+            "flux ip-adapter: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    if req.steps == 0 {
+        return Err(CandleError::Msg(
+            "flux ip-adapter: steps must be >= 1 (an explicit 0 renders undenoised noise)".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -389,6 +409,32 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_request(&ok).is_ok());
+    }
+
+    /// Parity with the three flux1 siblings (sc-11182, F-102): `steps == 0` and a non-multiple-of-16
+    /// size are fast typed errors (never a decoded pure-noise "success"); the defaults pass.
+    #[test]
+    fn validate_request_floors_steps_and_size() {
+        let base = IpAdapterFluxRequest {
+            prompt: "a portrait".into(),
+            ..Default::default()
+        };
+
+        let zero_steps = IpAdapterFluxRequest {
+            steps: 0,
+            ..base.clone()
+        };
+        let err = validate_request(&zero_steps).unwrap_err();
+        assert!(err.to_string().contains("steps must be >= 1"), "{err}");
+
+        let bad_size = IpAdapterFluxRequest {
+            width: 1000, // not a multiple of 16
+            ..base.clone()
+        };
+        let err = validate_request(&bad_size).unwrap_err();
+        assert!(err.to_string().contains("multiples of 16"), "{err}");
+
+        assert!(validate_request(&base).is_ok());
     }
 
     /// The request defaults match the FLUX dev IP-Adapter knobs (1024², 25 steps, guidance 3.5, ip 0.7).

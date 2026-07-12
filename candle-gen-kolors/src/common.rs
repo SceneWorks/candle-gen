@@ -24,6 +24,22 @@ use rand::{rngs::StdRng, SeedableRng};
 
 use crate::pipeline::{kolors_alpha_schedule, VAE_SCALE};
 
+/// Reject `steps == 0` loudly instead of the silent 1-step render it would otherwise produce: the
+/// curated unified-sampler path feeds `req.steps` into gen-core `schedule_sigmas`, which clamps
+/// `steps.max(1)` — so an explicit 0 silently becomes a single-step decode of near-pure noise (the
+/// native `KolorsEulerSampler` already errors, but the curated branch does not). A fast typed error
+/// mirrors the sibling bespoke lanes (`reject_zero_steps` in sdxl-IP / scail2 / instantid, sc-9016,
+/// F-032); these worker-driven Kolors paths have no gen-core capability floor upstream. Shared by
+/// both the ControlNet and IP-Adapter entry points so they can't drift (sc-11182, F-102).
+pub(crate) fn reject_zero_steps(id: &str, steps: usize) -> Result<()> {
+    if steps == 0 {
+        return Err(CandleError::Msg(format!(
+            "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
+        )));
+    }
+    Ok(())
+}
+
 /// The SDXL micro-conditioning `time_ids` = `(H, W, 0, 0, H, W)` per row, f32 `[batch, 6]` (the Kolors
 /// txt2img value — original == target, no crop). Shared verbatim by all three entry points.
 pub(crate) fn build_time_ids(
@@ -168,6 +184,18 @@ mod tests {
 
     fn cpu() -> Device {
         Device::Cpu
+    }
+
+    /// `steps == 0` is a fast typed error on BOTH Kolors bespoke lanes (it would otherwise clamp to a
+    /// silent 1-step render on the curated path); a valid step count passes (sc-11182, F-102).
+    #[test]
+    fn reject_zero_steps_floors_both_lanes() {
+        let err = reject_zero_steps("kolors control", 0).expect_err("steps==0 must be rejected");
+        assert!(err.to_string().contains("steps must be >= 1"), "{err}");
+        let err = reject_zero_steps("kolors ip-adapter", 0).expect_err("steps==0 must be rejected");
+        assert!(err.to_string().contains("kolors ip-adapter"), "{err}");
+        assert!(reject_zero_steps("kolors control", 1).is_ok());
+        assert!(reject_zero_steps("kolors ip-adapter", 30).is_ok());
     }
 
     #[test]

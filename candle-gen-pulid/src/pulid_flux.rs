@@ -50,6 +50,31 @@ const LATENT_CHANNELS: usize = 16;
 const BASE_SHIFT: f64 = 0.5;
 const MAX_SHIFT: f64 = 1.15;
 
+/// FLUX packs the /8 VAE latent 2×2, so both render dims must be multiples of 16 (the flux1 txt2img /
+/// IP-Adapter / control size floor).
+const SIZE_MULTIPLE: u32 = 16;
+
+/// Reject a below-floor request loudly before any tensor work. Without it `get_schedule(0, …)` returns
+/// `[NaN]` — zero sampler steps, so the pure seeded noise is decoded and returned as a "success",
+/// burning GPU time for garbage. A fast typed error mirrors the sibling bespoke lanes (`reject_zero_steps`
+/// in sdxl-IP / scail2 / instantid, sc-9016, F-032); this worker-driven PuLID path has no gen-core
+/// capability floor upstream of it, and (like flux1-IP) previously had no size floor either
+/// (sc-11182, F-102).
+fn reject_below_floor(req: &PulidFluxRequest) -> Result<()> {
+    if !req.width.is_multiple_of(SIZE_MULTIPLE) || !req.height.is_multiple_of(SIZE_MULTIPLE) {
+        return Err(CandleError::Msg(format!(
+            "pulid_flux: width/height must be multiples of {SIZE_MULTIPLE} (got {}x{})",
+            req.width, req.height
+        )));
+    }
+    if req.steps == 0 {
+        return Err(CandleError::Msg(
+            "pulid_flux: steps must be >= 1 (an explicit 0 renders undenoised noise)".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Default PuLID `id_weight` (the reference-face strength; 0–3, upstream default 1.0).
 pub const DEFAULT_ID_WEIGHT: f32 = 1.0;
 /// Default dev guidance for the PuLID photoreal recipe.
@@ -275,6 +300,7 @@ impl PulidFlux {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        reject_below_floor(req)?;
 
         // Identity conditioning (computed once; constant across the denoise).
         let id_embedding = self.compute_id_embedding(reference)?;
@@ -393,6 +419,29 @@ impl PulidFlux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `steps == 0` and a non-multiple-of-16 size are fast typed errors (never a decoded pure-noise
+    /// "success"); the defaults pass (sc-11182, F-102).
+    #[test]
+    fn reject_below_floor_floors_steps_and_size() {
+        let base = PulidFluxRequest::default();
+
+        let zero_steps = PulidFluxRequest {
+            steps: 0,
+            ..base.clone()
+        };
+        let err = reject_below_floor(&zero_steps).unwrap_err();
+        assert!(err.to_string().contains("steps must be >= 1"), "{err}");
+
+        let bad_size = PulidFluxRequest {
+            height: 1000, // not a multiple of 16
+            ..base.clone()
+        };
+        let err = reject_below_floor(&bad_size).unwrap_err();
+        assert!(err.to_string().contains("multiples of 16"), "{err}");
+
+        assert!(reject_below_floor(&base).is_ok());
+    }
 
     /// The request defaults match the PuLID-FLUX dev knobs (1024², 25 steps, guidance 4.0, id 1.0).
     #[test]

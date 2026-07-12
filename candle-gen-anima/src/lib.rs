@@ -296,6 +296,15 @@ pub(crate) fn validate_request(
             "{id}: prompt must not be empty"
         )));
     }
+    // Reject an explicit `steps: Some(0)` loudly: `anima_sigmas` clamps `steps.max(1)`, so a 0 silently
+    // becomes a single-step render rather than the fast typed error its sibling bespoke lanes give
+    // (`reject_zero_steps`, sc-9016, F-032; swept here by sc-11182, F-102). A `None` legitimately falls
+    // through to `variant.default_steps()`.
+    if req.steps == Some(0) {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: steps must be >= 1 (an explicit 0 renders a single step of undenoised noise)"
+        )));
+    }
     desc.capabilities.validate_request(id, req)?;
     if !req.width.is_multiple_of(RES_MULTIPLE) || !req.height.is_multiple_of(RES_MULTIPLE) {
         return Err(gen_core::Error::Msg(format!(
@@ -378,6 +387,14 @@ mod tests {
         assert!(validate_request(&descriptor_base(), &req(1000, 1024)).is_err()); // not mult of 16
         assert!(validate_request(&descriptor_base(), &req(256, 256)).is_err()); // below min
         assert!(validate_request(&descriptor_base(), &req(2048, 2048)).is_err()); // above max
+                                                                                  // Explicit `steps: Some(0)` is rejected (sc-11182, F-102) — it would otherwise clamp to a
+                                                                                  // silent 1-step render in `anima_sigmas`; `None` (the default) is fine.
+        let zero_steps = GenerationRequest {
+            steps: Some(0),
+            ..req(1024, 1024)
+        };
+        let err = validate_request(&descriptor_base(), &zero_steps).unwrap_err();
+        assert!(err.to_string().contains("steps must be >= 1"), "{err}");
         assert!(validate_request(&descriptor_base(), &req(1024, 1024)).is_ok());
         assert!(validate_request(&descriptor_base(), &req(1536, 1536)).is_ok());
     }

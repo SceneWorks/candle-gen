@@ -268,6 +268,7 @@ impl KolorsControl {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        common::reject_zero_steps("kolors control", req.steps)?;
         let use_guide = req.guidance > 1.0;
 
         // CFG batch is [neg, pos] = uncond-first (the Kolors txt2img convention); without guidance only
