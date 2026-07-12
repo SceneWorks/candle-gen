@@ -90,6 +90,31 @@ fn sample_band_timestep(
     (lo + t_unit * (hi - lo)).clamp(1e-3, 1.0 - 1e-3)
 }
 
+/// Which expert trains at `step` (1-based): odd steps → high-noise (`experts[0]`), even → low-noise
+/// (`experts[1]`). The two experts alternate so both accumulate roughly `steps/2` micro-steps.
+#[inline]
+fn expert_index(step: u32) -> usize {
+    if step % 2 == 1 {
+        0
+    } else {
+        1
+    }
+}
+
+/// Dataset item consumed at `step` (1-based), indexing into a cache of `cache_len` items.
+///
+/// The index is the expert's own visit count `(step - 1) / 2`, **not** the raw step. Because the
+/// experts alternate by step parity ([`expert_index`]), indexing by `step` couples the item parity
+/// to the expert parity: for an even-sized dataset `(step - 1) % N` keeps the same parity forever, so
+/// the high-noise expert would only ever see even-indexed items and the low-noise expert only
+/// odd-indexed ones — each adapter silently training on a disjoint half of the user's images
+/// (sc-11157 / F-082). Advancing by the per-expert visit count instead makes each expert walk the
+/// full dataset in order (`0, 1, 2, …` cycling at `N`), independent of its parity.
+#[inline]
+fn expert_item_index(step: u32, cache_len: usize) -> usize {
+    (((step - 1) / 2) as usize) % cache_len
+}
+
 /// One micro-step's forward+backward over one expert's installed adapter `Var`s: build the noised
 /// latent at `t`, predict the **raw** velocity through the (LoRA-adapted) DiT, regress it toward
 /// `noise − x0`, return `(loss, grads)` keyed by `lora_vars`. `cos`/`sin` are the (constant,
@@ -532,8 +557,10 @@ impl WanMoeTrainer {
             if req.cancel.is_cancelled() {
                 break;
             }
-            let ei = if step % 2 == 1 { 0 } else { 1 }; // odd → high (experts[0]), even → low
-            let (x0, cap) = &cache[((step - 1) as usize) % cache.len()];
+            let ei = expert_index(step); // odd → high (experts[0]), even → low
+                                         // Index by the expert's own visit count, not the raw step — else on an even-sized
+                                         // dataset each expert stays parity-locked to a disjoint half (sc-11157 / F-082).
+            let (x0, cap) = &cache[expert_item_index(step, cache.len())];
             let band = experts[ei].band;
             let t = sample_band_timestep(
                 &cfg.timestep_type,
@@ -801,6 +828,58 @@ mod tests {
                 "low band t out of range: {l}"
             );
         }
+    }
+
+    /// Regression for sc-11157 / F-082: the dataset item must NOT stay parity-locked to the
+    /// alternating expert. Over a full pass, each expert must see EVERY item — most critically for
+    /// the even-sized datasets (2, 10, 20 items) that are the common LoRA case — so neither adapter
+    /// silently trains on a disjoint half. The pre-fix `(step - 1) % N` selector fails this: it kept
+    /// the high-noise expert on even indices and the low-noise on odd indices forever.
+    #[test]
+    fn experts_each_cover_the_whole_dataset() {
+        for &n in &[2usize, 4, 10, 20, 3, 7] {
+            // Run enough steps for every expert to complete at least one full cycle of the dataset.
+            let steps = (2 * n * 3) as u32;
+            let mut hi_seen = std::collections::BTreeSet::new();
+            let mut lo_seen = std::collections::BTreeSet::new();
+            for step in 1..=steps {
+                let idx = expert_item_index(step, n);
+                match expert_index(step) {
+                    0 => hi_seen.insert(idx),
+                    _ => lo_seen.insert(idx),
+                };
+            }
+            let full: std::collections::BTreeSet<usize> = (0..n).collect();
+            assert_eq!(
+                hi_seen, full,
+                "high-noise expert must cover all {n} items, saw {hi_seen:?}"
+            );
+            assert_eq!(
+                lo_seen, full,
+                "low-noise expert must cover all {n} items, saw {lo_seen:?}"
+            );
+        }
+    }
+
+    /// Guards the exact even-size parity trap from the finding: with N even, the OLD selector
+    /// `(step - 1) % N` collapses each expert onto one parity class. Assert the NEW selector breaks
+    /// that lock by having the high-noise expert reach at least one ODD index (impossible under the
+    /// old scheme) within N steps of its own progression.
+    #[test]
+    fn even_dataset_expert_is_not_parity_locked() {
+        let n = 10usize;
+        let mut hi_indices = Vec::new();
+        for step in (1..=(4 * n as u32)).filter(|s| expert_index(*s) == 0) {
+            hi_indices.push(expert_item_index(step, n));
+        }
+        assert!(
+            hi_indices.iter().any(|i| i % 2 == 1),
+            "high-noise expert never reached an odd index on N={n}: {hi_indices:?} — parity lock persists"
+        );
+        assert!(
+            hi_indices.iter().any(|i| i % 2 == 0),
+            "high-noise expert never reached an even index: {hi_indices:?}"
+        );
     }
 
     /// The keystone training gate: a real flow-match forward+backward over the tiny DiT with nonzero
