@@ -80,7 +80,7 @@ impl<K: PartialEq, V: Clone> RopeCache<K, V> {
 
     /// Return the cached value for `key`, building + inserting it on a miss.
     fn get_or_build(&self, key: K, build: impl FnOnce() -> Result<V>) -> Result<V> {
-        let mut guard = self.entries.lock().unwrap();
+        let mut guard = candle_gen::lock_recover(&self.entries);
         if let Some((_, v)) = guard.iter().find(|(k, _)| *k == key) {
             return Ok(v.clone());
         }

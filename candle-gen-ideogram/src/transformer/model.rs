@@ -224,7 +224,7 @@ impl Ideogram4Transformer {
             .flatten_all()?
             .to_vec1::<f32>()?;
 
-        let mut guard = self.cond_cache.lock().unwrap();
+        let mut guard = candle_gen::lock_recover(&self.cond_cache);
         if let Some(c) = guard.as_ref() {
             if c.b == b
                 && c.l == l

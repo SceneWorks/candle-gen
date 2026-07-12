@@ -74,10 +74,7 @@ impl ZImageBaseGenerator {
         // sc-9032: no-op `flash-attn` feature removed; flash path is never wired, so `false` is
         // byte-identical to the old `cfg!(feature = "flash-attn") && accel_attn_enabled()`.
         let accel = false;
-        let mut guard = self
-            .components
-            .lock()
-            .expect("z-image base components cache mutex poisoned");
+        let mut guard = candle_gen::lock_recover(&self.components);
         if let Some((cached_accel, comps)) = guard.as_ref() {
             if *cached_accel == accel {
                 return Ok(comps.clone());

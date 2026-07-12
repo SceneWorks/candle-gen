@@ -1063,7 +1063,7 @@ pub fn encode_text(
     t5_ids.resize(variant.t5_max_len(), T5_PAD_TOKEN_ID);
     let t5_input = Tensor::new(t5_ids.as_slice(), device)?.unsqueeze(0)?;
     let t5_emb = {
-        let mut t5 = t5.lock().expect("flux T5 mutex poisoned");
+        let mut t5 = candle_gen::lock_recover(t5);
         t5.forward(&t5_input)?
     }
     .to_dtype(dtype)?;

@@ -233,7 +233,7 @@ impl Pipeline {
 
     /// Encode a prompt to its T5 sequence embedding `[1, L, 4096]` (natural length).
     fn encode(&self, components: &Components, prompt: &str) -> Result<Tensor> {
-        let mut t5 = components.t5.lock().expect("chroma T5 mutex poisoned");
+        let mut t5 = candle_gen::lock_recover(&components.t5);
         text::encode_prompt(&components.tokenizer, &mut t5, prompt, &self.device)
     }
 

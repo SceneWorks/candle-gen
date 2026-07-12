@@ -354,7 +354,7 @@ impl Scail2Dit {
         addref_count: usize,
         h_shift: usize,
     ) -> Result<(Tensor, Tensor)> {
-        let mut guard = self.rope_cache.lock().unwrap();
+        let mut guard = candle_gen::lock_recover(&self.rope_cache);
         if let Some(c) = guard.as_ref() {
             if c.rope_t == rope_t
                 && c.rope_h == rope_h

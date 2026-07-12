@@ -316,21 +316,21 @@ struct GeometryCache {
 impl GeometryCache {
     /// Read-through the `dense_pe` cache, building (and storing) the table on the first miss.
     fn dense_pe(&self, g: usize, build: impl FnOnce() -> Result<Tensor>) -> Result<Tensor> {
-        if let Some(t) = self.dense_pe.lock().unwrap().get(&g) {
+        if let Some(t) = candle_gen::lock_recover(&self.dense_pe).get(&g) {
             return Ok(t.clone());
         }
         let t = build()?;
-        self.dense_pe.lock().unwrap().insert(g, t.clone());
+        candle_gen::lock_recover(&self.dense_pe).insert(g, t.clone());
         Ok(t)
     }
 
     /// Read-through the neck sine-PE cache.
     fn frame_pos(&self, g: usize, build: impl FnOnce() -> Result<Tensor>) -> Result<Tensor> {
-        if let Some(t) = self.frame_pos.lock().unwrap().get(&g) {
+        if let Some(t) = candle_gen::lock_recover(&self.frame_pos).get(&g) {
             return Ok(t.clone());
         }
         let t = build()?;
-        self.frame_pos.lock().unwrap().insert(g, t.clone());
+        candle_gen::lock_recover(&self.frame_pos).insert(g, t.clone());
         Ok(t)
     }
 
@@ -342,11 +342,11 @@ impl GeometryCache {
         build: impl FnOnce() -> Result<Tensor>,
     ) -> Result<Tensor> {
         let key = (in_size, out_size);
-        if let Some(t) = self.resize.lock().unwrap().get(&key) {
+        if let Some(t) = candle_gen::lock_recover(&self.resize).get(&key) {
             return Ok(t.clone());
         }
         let t = build()?;
-        self.resize.lock().unwrap().insert(key, t.clone());
+        candle_gen::lock_recover(&self.resize).insert(key, t.clone());
         Ok(t)
     }
 }

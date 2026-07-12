@@ -997,7 +997,7 @@ mod tests {
             dev: &Device,
         ) -> candle_gen::candle_core::Result<Tensor> {
             let n: usize = s.elem_count();
-            let mut rng = self.rng.lock().unwrap();
+            let mut rng = candle_gen::lock_recover(&self.rng);
             // Small magnitude keeps the tiny DiT numerically sane (and norm-out + RMSNorm stable).
             let data: Vec<f32> = candle_gen::seeded_normal_vec(&mut rng, n)
                 .into_iter()

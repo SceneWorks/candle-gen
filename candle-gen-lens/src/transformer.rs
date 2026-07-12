@@ -582,7 +582,7 @@ impl LensTransformer {
         w: usize,
         txt_len: usize,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
-        let mut guard = self.rope_cache.lock().unwrap();
+        let mut guard = candle_gen::lock_recover(&self.rope_cache);
         if let Some(c) = guard.as_ref() {
             if c.frame == frame && c.h == h && c.w == w && c.txt_len == txt_len {
                 return Ok((

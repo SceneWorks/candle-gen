@@ -586,7 +586,7 @@ impl AvDiT {
     ) -> Result<[(Tensor, Tensor); 4]> {
         let vkey = video_grid.flatten_all()?.to_vec1::<f32>()?;
         let akey = audio_grid.flatten_all()?.to_vec1::<f32>()?;
-        let mut guard = self.rope_cache.lock().unwrap();
+        let mut guard = candle_gen::lock_recover(&self.rope_cache);
         if let Some(c) = guard.as_ref() {
             if c.video_grid == vkey && c.audio_grid == akey {
                 return Ok([

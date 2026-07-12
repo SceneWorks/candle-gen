@@ -97,16 +97,13 @@ impl PackedForward {
         latent: &Tensor,
     ) -> CResult<(Tensor, Tensor)> {
         let key: RopeKey = (grid.0, grid.1, grid.2, source_id.to_bits());
-        if let Some((cos, sin)) = self.rope_cache.lock().unwrap().get(&key) {
+        if let Some((cos, sin)) = candle_gen::lock_recover(&self.rope_cache).get(&key) {
             return Ok((cos.clone(), sin.clone()));
         }
         let (cos, sin) =
             WanRope::new(&self.cfg).cos_sin(grid.0, grid.1, grid.2, latent.device())?;
         let (cos, sin) = apply_source_id(&cos, &sin, source_id, self.cfg.head_dim)?;
-        self.rope_cache
-            .lock()
-            .unwrap()
-            .insert(key, (cos.clone(), sin.clone()));
+        candle_gen::lock_recover(&self.rope_cache).insert(key, (cos.clone(), sin.clone()));
         Ok((cos, sin))
     }
 

@@ -180,7 +180,7 @@ impl RopeCache {
         txt_seq: usize,
         device: &Device,
     ) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
-        let mut guard = self.slot.lock().unwrap();
+        let mut guard = candle_gen::lock_recover(&self.slot);
         if let Some(c) = guard.as_ref() {
             if c.grids.as_slice() == grids && c.txt_seq == txt_seq {
                 return Ok((

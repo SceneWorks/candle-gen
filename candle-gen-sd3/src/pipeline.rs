@@ -338,7 +338,7 @@ impl Pipeline {
         req: &GenerationRequest,
         cfg_scale: f32,
     ) -> Result<(Sd3Conditioning, Option<Sd3Conditioning>)> {
-        let mut enc = encoders.lock().expect("sd3 encoders mutex poisoned");
+        let mut enc = candle_gen::lock_recover(encoders);
         let cond_out = enc.encode(&req.prompt)?;
         let cond = aggregate(&self.cfg, &cond_out)?;
         let uncond = if self.variant.cfg_enabled() && cfg_scale != 1.0 {

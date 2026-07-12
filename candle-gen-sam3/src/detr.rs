@@ -523,7 +523,7 @@ impl Sam3Detector {
         // The sine position embedding is a pure function of (h, w, d); cache it so a video's per-frame
         // detector passes reuse one build instead of rebuilding it every frame (F-016).
         let vis_pos = {
-            let mut cache = self.vis_pos_cache.lock().unwrap();
+            let mut cache = candle_gen::lock_recover(&self.vis_pos_cache);
             match cache.get(&(h, w)) {
                 Some(t) => t.clone(),
                 None => {

@@ -52,6 +52,9 @@ jobs:
       - name: Test (default / CPU)
         run: cargo test --workspace
 
+      - name: lock-poison guard (no panicking cache/component locks)
+        run: bash scripts/check-lock-poison.sh
+
       - name: gen-core skew gate (self-test)
         run: bash scripts/check-gen-core-skew.sh --self-test
 

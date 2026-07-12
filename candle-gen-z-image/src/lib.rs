@@ -163,10 +163,7 @@ impl ZImageGenerator {
         // byte-identical to the old `cfg!(feature = "flash-attn") && accel_attn_enabled()` (which
         // always resolved false in every buildable config). `set_accel_attn` stays as worker API.
         let accel = false;
-        let mut guard = self
-            .components
-            .lock()
-            .expect("z-image components cache mutex poisoned");
+        let mut guard = candle_gen::lock_recover(&self.components);
         if let Some((cached_accel, comps)) = guard.as_ref() {
             if *cached_accel == accel {
                 return Ok(comps.clone());

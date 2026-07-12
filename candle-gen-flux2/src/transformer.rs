@@ -567,7 +567,7 @@ impl Flux2Transformer {
     /// Arc-backed handles are cloned. The construction is identical to computing it inline, so every
     /// step remains byte-identical.
     fn rope_tables(&self, img_ids: &[[i64; 4]], txt_ids: &[[i64; 4]]) -> Result<(Tensor, Tensor)> {
-        let mut guard = self.rope_cache.lock().unwrap();
+        let mut guard = candle_gen::lock_recover(&self.rope_cache);
         if let Some(c) = guard.as_ref() {
             if c.img_ids.as_slice() == img_ids && c.txt_ids.as_slice() == txt_ids {
                 return Ok((c.cos.clone(), c.sin.clone()));
@@ -610,7 +610,7 @@ impl Flux2Transformer {
         // The RoPE cache pins tables on the old device; drop it so the next forward rebuilds on
         // `device` (sc-8992). Empty at load anyway, but keep this correct if quantize ever runs after
         // a warmup forward.
-        *self.rope_cache.lock().unwrap() = None;
+        *candle_gen::lock_recover(&self.rope_cache) = None;
         Ok(())
     }
 
