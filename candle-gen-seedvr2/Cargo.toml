@@ -15,6 +15,10 @@ inventory = { workspace = true }
 # convention) — NOT candle's CUDA set_seed. `StdRng` (ChaCha) is reproducible across launches.
 rand = { workspace = true }
 rand_distr = { workspace = true }
+# Data-parallel post-decode color correction (sc-11232 / F-094): the wavelet blurs, LAB transfer and
+# histogram matches were a single-threaded host hot loop serialized against the GPU pipeline. Rayon
+# spreads the per-row / per-pixel / per-channel work across cores with per-element numerics unchanged.
+rayon = "1"
 
 [features]
 default = []

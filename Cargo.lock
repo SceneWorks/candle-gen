@@ -550,6 +550,7 @@ dependencies = [
  "inventory",
  "rand",
  "rand_distr",
+ "rayon",
  "sceneworks-gen-core-testkit",
 ]
 
