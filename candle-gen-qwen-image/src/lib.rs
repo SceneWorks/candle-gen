@@ -278,6 +278,19 @@ impl Pipeline {
         Ok(te.prompt_embeds(&input_ids)?.to_dtype(DIT_DTYPE)?)
     }
 
+    /// Resolve the CFG negative prompt. An absent, empty, or whitespace-only negative falls back to
+    /// [`NEGATIVE_FALLBACK`] (a single space) rather than reaching `tokenize("")`, whose pre-chat-
+    /// template short-circuit to zero-length ids underflows `QwenTextEncoder::prompt_embeds`'
+    /// `hidden.narrow(1, 34, s - 34)` (the sc-8646 class; sc-11187 / F-085). `Some("")` from a cleared
+    /// UI field would otherwise slip past `unwrap_or`. Shared by the resident + sequential paths so both
+    /// build a byte-identical negative branch.
+    fn resolve_negative(negative: Option<&str>) -> &str {
+        match negative {
+            Some(n) if !n.trim().is_empty() => n,
+            _ => NEGATIVE_FALLBACK,
+        }
+    }
+
     fn render(
         &self,
         req: &GenerationRequest,
@@ -289,7 +302,7 @@ impl Pipeline {
         let pos_embeds = self.encode(&comps.te, &comps.tokenizer, &req.prompt)?;
         // True CFG: build the negative branch unless guidance is a no-op (≤ 1.0).
         let neg_embeds = if guidance > 1.0 {
-            let neg = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
+            let neg = Self::resolve_negative(req.negative_prompt.as_deref());
             Some(self.encode(&comps.te, &comps.tokenizer, neg)?)
         } else {
             None
@@ -467,7 +480,7 @@ impl Pipeline {
             let pos = self.encode(&te, &tok, &req.prompt)?;
             // True CFG: build the negative branch unless guidance is a no-op (≤ 1.0).
             let neg = if guidance > 1.0 {
-                let neg = req.negative_prompt.as_deref().unwrap_or(NEGATIVE_FALLBACK);
+                let neg = Self::resolve_negative(req.negative_prompt.as_deref());
                 Some(self.encode(&te, &tok, neg)?)
             } else {
                 None
@@ -779,6 +792,24 @@ mod tests {
     use super::*;
     use candle_gen::gen_core::registry;
     use candle_gen::gen_core::ConditioningKind;
+
+    /// sc-11187 / F-085: the CFG negative must never reach `tokenize("")`. An absent, empty, or
+    /// whitespace-only negative — including the `Some("")` a cleared UI field serializes to, which used
+    /// to slip past `unwrap_or` — resolves to the non-empty [`NEGATIVE_FALLBACK`], so the chat template
+    /// runs and `prompt_embeds`' `narrow(1, 34, s - 34)` never underflows. A real negative passes through.
+    #[test]
+    fn resolve_negative_guards_empty_to_fallback() {
+        // The fallback must be a non-empty string, or `tokenize` would short-circuit to (1, 0) again.
+        assert!(!NEGATIVE_FALLBACK.is_empty());
+        assert_eq!(Pipeline::resolve_negative(None), NEGATIVE_FALLBACK);
+        assert_eq!(Pipeline::resolve_negative(Some("")), NEGATIVE_FALLBACK);
+        assert_eq!(Pipeline::resolve_negative(Some("   ")), NEGATIVE_FALLBACK);
+        assert_eq!(Pipeline::resolve_negative(Some("\t\n")), NEGATIVE_FALLBACK);
+        assert_eq!(
+            Pipeline::resolve_negative(Some("blurry, low quality")),
+            "blurry, low quality"
+        );
+    }
 
     #[test]
     fn registers_and_resolves_as_candle() {

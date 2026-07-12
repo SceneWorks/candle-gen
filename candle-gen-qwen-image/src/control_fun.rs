@@ -188,6 +188,7 @@ impl QwenFunControl {
         if req.cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
+        require_prompt(&req.prompt)?;
         let (lat_h, lat_w) = pipeline::latent_dims(req.width, req.height);
 
         let pos = self.encode(&req.prompt)?;
@@ -274,10 +275,40 @@ impl QwenFunControl {
     }
 }
 
+/// The positive prompt is required on the control lane — unlike the negative (which falls back to
+/// [`NEGATIVE_FALLBACK`]), there is no sensible positive fallback. An empty or whitespace-only positive
+/// would reach gen-core's `tokenize("")`, whose pre-chat-template short-circuit to zero-length ids
+/// underflows `QwenTextEncoder::prompt_embeds`' `hidden.narrow(1, 34, s - 34)` (the sc-8646 class) —
+/// a usize-underflow panic in debug, an opaque `narrow` error in release. Fail fast with a diagnosable
+/// message instead (sc-11187 / F-085; the descriptor-registered txt2img lane guards this in `validate`,
+/// but this bespoke control stream never runs it).
+fn require_prompt(prompt: &str) -> Result<()> {
+    if prompt.trim().is_empty() {
+        return Err(CandleError::Msg(format!(
+            "{LABEL}: prompt must not be empty"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use candle_gen::gen_core::Image;
+
+    /// sc-11187 / F-085: the control lane's positive prompt is required. An empty or whitespace-only
+    /// prompt is rejected up front (before it can reach `tokenize("")` and underflow `prompt_embeds`);
+    /// a real prompt passes. This bespoke stream never runs the txt2img descriptor's `validate`, so it
+    /// carries its own guard.
+    #[test]
+    fn require_prompt_rejects_empty() {
+        assert!(require_prompt("").is_err());
+        assert!(require_prompt("   ").is_err());
+        assert!(require_prompt("\t\n").is_err());
+        let msg = require_prompt("").unwrap_err().to_string();
+        assert!(msg.contains("must not be empty"), "got: {msg}");
+        assert!(require_prompt("a cat, canny control").is_ok());
+    }
 
     #[test]
     fn request_defaults() {
