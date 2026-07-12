@@ -162,6 +162,24 @@ impl TimeEmbed {
         let h = self.linear_1.forward(&emb)?.silu()?;
         self.linear_2.forward(&h)
     }
+
+    /// Visit the two timestep-embedder projections (`{prefix}.timestep_embedder.linear_{1,2}`) — not
+    /// adapted by the Lightning distill, but part of the general adaptable surface (sc-11091).
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(
+            &format!("{prefix}.timestep_embedder.linear_1"),
+            &mut self.linear_1,
+        )?;
+        f(
+            &format!("{prefix}.timestep_embedder.linear_2"),
+            &mut self.linear_2,
+        )?;
+        Ok(())
+    }
 }
 
 /// GELU-tanh feed-forward (`net.0.proj → gelu → net.2`).
@@ -182,6 +200,18 @@ impl FeedForward {
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         self.proj_out.forward(&self.proj_in.forward(x)?.gelu()?)
+    }
+
+    /// Visit the two feed-forward projections (`{prefix}.net.0.proj`, `{prefix}.net.2`) — the diffusers
+    /// keys the Lightning distill's stream-MLP LoRA targets (sc-11091).
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.net.0.proj"), &mut self.proj_in)?;
+        f(&format!("{prefix}.net.2"), &mut self.proj_out)?;
+        Ok(())
     }
 }
 
@@ -278,6 +308,25 @@ impl JointAttention {
             self.to_add_out.forward(&txt_o)?,
         ))
     }
+
+    /// Visit every adaptable joint-attention projection (`{prefix}.{to_q,to_k,to_v,to_out.0,
+    /// add_q_proj,add_k_proj,add_v_proj,to_add_out}`) — the diffusers key each maps to, so a resolved
+    /// LoRA factor routes 1:1 (sc-11091). The RMSNorms are not `Linear` and are never adapted.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.to_q"), &mut self.to_q)?;
+        f(&format!("{prefix}.to_k"), &mut self.to_k)?;
+        f(&format!("{prefix}.to_v"), &mut self.to_v)?;
+        f(&format!("{prefix}.to_out.0"), &mut self.to_out)?;
+        f(&format!("{prefix}.add_q_proj"), &mut self.add_q)?;
+        f(&format!("{prefix}.add_k_proj"), &mut self.add_k)?;
+        f(&format!("{prefix}.add_v_proj"), &mut self.add_v)?;
+        f(&format!("{prefix}.to_add_out"), &mut self.to_add_out)?;
+        Ok(())
+    }
 }
 
 struct Block {
@@ -351,6 +400,26 @@ impl Block {
 
         Ok((encoder, hidden))
     }
+
+    /// Visit every adaptable projection in this block under `{prefix}` (`transformer_blocks.{i}`): the
+    /// two AdaLN modulation projections (`img_mod.1` / `txt_mod.1`), the joint attention, and the two
+    /// stream MLPs — the full per-block adaptable surface (sc-11091). The Lightning distill adapts the
+    /// attention + MLP set (12/block); user LoRAs may also target the mod projections.
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.img_mod.1"), &mut self.img_mod)?;
+        f(&format!("{prefix}.txt_mod.1"), &mut self.txt_mod)?;
+        self.attn
+            .visit_adaptable_mut(&format!("{prefix}.attn"), f)?;
+        self.img_ff
+            .visit_adaptable_mut(&format!("{prefix}.img_mlp"), f)?;
+        self.txt_ff
+            .visit_adaptable_mut(&format!("{prefix}.txt_mlp"), f)?;
+        Ok(())
+    }
 }
 
 /// AdaLayerNorm-Continuous output head: `silu(temb) → linear (bias-less) → (scale, shift)`, then
@@ -376,6 +445,15 @@ impl NormOut {
         layer_norm(x)?
             .broadcast_mul(&(scale + 1.0)?)?
             .broadcast_add(&shift)
+    }
+
+    /// Visit the output-head projection (`{prefix}.linear`) (sc-11091).
+    fn visit_adaptable_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f(&format!("{prefix}.linear"), &mut self.linear)
     }
 }
 
@@ -436,6 +514,39 @@ impl QwenTransformer {
             device: vb.device().clone(),
             dtype: vb.dtype(),
         })
+    }
+
+    /// Whether the DiT loaded from an MLX-packed tier (probed on `proj_out`, which packs together with
+    /// every other DiT projection in a q4/q8 tier). Gates the edit lane's additive-vs-fold adapter route
+    /// (sc-11091): a packed base attaches LoRA residuals unmerged; a dense base folds `W += δ`.
+    pub fn is_packed(&self) -> bool {
+        self.proj_out.is_packed()
+    }
+
+    /// The device the DiT weights live on — the forward-time residual factors are read on the CPU and
+    /// moved here at install (else the residual matmul is a device mismatch).
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Walk every adaptable projection, invoking `f(path, &mut QLinear)` once each with the projection's
+    /// canonical diffusers dotted path (`img_in`, `txt_in`, `time_text_embed.timestep_embedder.linear_*`,
+    /// per-block `transformer_blocks.{i}.*`, `norm_out.linear`, `proj_out`). The additive installer
+    /// ([`crate::adapters::install_additive`]) pushes a resolved LoRA/LoKr residual onto each matched
+    /// projection (sc-11091).
+    pub fn visit_adaptable_mut(
+        &mut self,
+        f: &mut dyn FnMut(&str, &mut QLinear) -> candle_gen::Result<()>,
+    ) -> candle_gen::Result<()> {
+        f("img_in", &mut self.img_in)?;
+        f("txt_in", &mut self.txt_in)?;
+        self.time_embed.visit_adaptable_mut("time_text_embed", f)?;
+        for (i, blk) in self.blocks.iter_mut().enumerate() {
+            blk.visit_adaptable_mut(&format!("transformer_blocks.{i}"), f)?;
+        }
+        self.norm_out.visit_adaptable_mut("norm_out", f)?;
+        f("proj_out", &mut self.proj_out)?;
+        Ok(())
     }
 
     /// Predict velocity. `hidden_states` `[1, img_seq, 64]`, `encoder_hidden_states`
@@ -1002,6 +1113,126 @@ mod tests {
             b.iter().zip(&s1).any(|(x, y)| (x - y).abs() > 1e-6),
             "control_scale=1 must change the output (branch must be wired)"
         );
+    }
+
+    /// **Forward-time additive install wiring (sc-11091).** A LoRA over two real Lightning projections
+    /// (`transformer_blocks.0.attn.to_q` + `…img_mlp.net.0.proj`) installs as forward-time residuals via
+    /// [`crate::adapters::install_additive`], applies (`report.applied == 2`), and **shifts** the DiT
+    /// forward vs the un-adapted base (identical weights); a scale-0 install is a byte-exact no-op, and
+    /// an adapter surface that matches nothing errors (never renders unadapted). The base here is the
+    /// tiny **dense** DiT — install_additive is base-agnostic (it pushes residuals, never folds), so the
+    /// packed-footprint / stays-packed property is proven at the `AdaptLinear` unit level
+    /// (`candle-gen/src/quant/adapt.rs`); the real q4/q8 GPU render is the offload re-measure follow-up.
+    #[test]
+    fn install_additive_applies_shifts_and_zero_is_noop() {
+        use candle_gen::candle_core::safetensors::save;
+        use candle_gen::gen_core::{AdapterKind, AdapterSpec};
+        use std::collections::HashMap as Map;
+
+        let cfg = tiny_cfg();
+        let dev = Device::Cpu;
+        let inner = cfg.inner_dim(); // 16
+        let ff_hidden = inner * 4; // 64
+        let rank = 4usize;
+
+        // A LoRA over two real projections; small factors so the residual is a clean, finite shift.
+        let mk =
+            |r: usize, c: usize| (Tensor::randn(0f32, 1f32, (r, c), &dev).unwrap() * 0.1).unwrap();
+        let mut lora: Map<String, Tensor> = Map::new();
+        for (path, out) in [
+            ("transformer_blocks.0.attn.to_q", inner),
+            ("transformer_blocks.0.img_mlp.net.0.proj", ff_hidden),
+        ] {
+            lora.insert(format!("{path}.lora_down.weight"), mk(rank, inner)); // A [rank, in]
+            lora.insert(format!("{path}.lora_up.weight"), mk(out, rank)); // B [out, rank]
+        }
+        let tmp = std::env::temp_dir().join(format!(
+            "sc11091_lora_{}_{}.safetensors",
+            std::process::id(),
+            cfg.num_layers
+        ));
+        save(&lora, &tmp).unwrap();
+
+        // Base (un-adapted) and adapted DiTs share identical weights (same random seed).
+        let base_dit = QwenTransformer::new(&cfg, random_vb(7)).unwrap();
+        let mut adapted = QwenTransformer::new(&cfg, random_vb(7)).unwrap();
+        let spec = AdapterSpec::new(tmp.clone(), 1.0, AdapterKind::Lora);
+        let report = crate::adapters::install_additive(&mut adapted, &[spec]).unwrap();
+        assert_eq!(
+            report.applied, 2,
+            "both projections must receive a residual"
+        );
+        assert!(
+            report.skipped_targets.is_empty(),
+            "no target should be unrouted"
+        );
+
+        // Same inputs through both: the adapter must SHIFT the forward, and stay finite.
+        let (lat_h, lat_w) = (2usize, 3usize);
+        let seq = lat_h * lat_w;
+        let hidden = Tensor::randn(0f32, 1f32, (1, seq, cfg.in_channels), &dev).unwrap();
+        let encoder = Tensor::randn(0f32, 1f32, (1, 5, cfg.joint_attention_dim), &dev).unwrap();
+        let b = base_dit
+            .forward(&hidden, &encoder, 0.7, lat_h, lat_w)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let a = adapted
+            .forward(&hidden, &encoder, 0.7, lat_h, lat_w)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert!(
+            a.iter().all(|v| v.is_finite()),
+            "additive DiT forward must stay finite"
+        );
+        assert!(
+            b.iter().zip(&a).any(|(x, y)| (x - y).abs() > 1e-5),
+            "the additive LoRA must shift the DiT forward"
+        );
+
+        // scale 0 ⇒ byte-exact base (the mutation anchor: break the scale bake and this breaks).
+        let mut zero = QwenTransformer::new(&cfg, random_vb(7)).unwrap();
+        let spec0 = AdapterSpec::new(tmp.clone(), 0.0, AdapterKind::Lora);
+        crate::adapters::install_additive(&mut zero, &[spec0]).unwrap();
+        let z = zero
+            .forward(&hidden, &encoder, 0.7, lat_h, lat_w)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(b, z, "scale-0 additive install must be a byte-exact no-op");
+
+        std::fs::remove_file(&tmp).ok();
+
+        // An adapter surface that matches NO DiT module errors (never renders unadapted silently).
+        let mut miss_map: Map<String, Tensor> = Map::new();
+        miss_map.insert(
+            "transformer_blocks.0.attn.no_such_proj.lora_down.weight".into(),
+            mk(rank, inner),
+        );
+        miss_map.insert(
+            "transformer_blocks.0.attn.no_such_proj.lora_up.weight".into(),
+            mk(inner, rank),
+        );
+        let miss = std::env::temp_dir().join(format!(
+            "sc11091_miss_{}_{}.safetensors",
+            std::process::id(),
+            cfg.num_heads
+        ));
+        save(&miss_map, &miss).unwrap();
+        let mut dit2 = QwenTransformer::new(&cfg, random_vb(7)).unwrap();
+        let miss_spec = AdapterSpec::new(miss.clone(), 1.0, AdapterKind::Lora);
+        assert!(
+            crate::adapters::install_additive(&mut dit2, &[miss_spec]).is_err(),
+            "an all-miss adapter surface must error, not render unadapted"
+        );
+        std::fs::remove_file(&miss).ok();
     }
 
     /// The branch wiring: 2 control layers → 2 hints, injected at base blocks `[0, 2]` (and only there).

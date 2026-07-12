@@ -35,6 +35,12 @@
 
 pub mod repack;
 
+// The shared forward-time additive (unmerged) LoRA/LoKr seam (sc-11091, epic 10765): [`AdaptLinear`]
+// — a frozen dense/packed base plus stacked residuals `y = base(x) + Σ scale·((x·A)·B)`, memory-free
+// on a packed q4/q8 tier. The one core that candle-gen-wan (sc-10094) + candle-gen-anima (sc-10640)
+// collapse into and that qwen-image-edit Lightning adopts. Pure candle ops → builds everywhere.
+pub mod adapt;
+
 // The ConvRot online rotation leg (sc-9601): the regular-Hadamard activation rotation `RHT(x) = x·R`
 // a community INT8-ConvRot checkpoint needs before the int8 IGEMM (its stored weight is `W·R`). Pure
 // candle ops — builds everywhere (CPU tests + CUDA).
@@ -49,6 +55,7 @@ pub mod cublaslt;
 #[cfg(feature = "cuda")]
 pub mod eight_bit_linear;
 
+pub use adapt::{AdaptLinear, LokrFactors};
 pub use convrot::{convrot_rotate, is_power_of_four, regular_hadamard};
 pub use repack::{
     dequant_mlx_q4_reference, dequant_mlx_q4_reference_gs, dequant_mlx_q8, dequant_mlx_q8_gs,

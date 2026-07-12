@@ -509,6 +509,21 @@ pub(crate) fn transformer_group_size(dit_dir: &Path) -> usize {
         .unwrap_or(candle_gen::quant::MLX_GROUP_SIZE)
 }
 
+/// Whether the DiT tier is MLX-**packed** (q4/q8), read from `transformer/config.json`'s `quantization`
+/// block — the MLX convert job stamps it on every quantized tier (`SceneWorks/qwen-image-*-mlx`), and a
+/// dense diffusers snapshot has none. Gates the edit lane's adapter route (sc-11091): a packed base
+/// attaches LoRA/LoKr as forward-time additive residuals (base kept packed, no dense reload), while a
+/// dense base folds `W += δ` bit-exactly. A misread is safe by construction — the additive path is
+/// correct on a dense base too (it just isn't bit-identical to the fold there), and per-projection
+/// packed-detect (`.scales`) still governs the actual weight load.
+pub(crate) fn transformer_is_packed(dit_dir: &Path) -> bool {
+    std::fs::read_to_string(dit_dir.join("config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| candle_gen::quant::PackedConfig::from_config(&v))
+        .is_some()
+}
+
 fn to_image(decoded: &Tensor) -> CResult<Image> {
     let img = ((decoded.clamp(-1f32, 1f32)? + 1.0)? * 127.5)?.to_dtype(DType::U8)?;
     let img = img.i(0)?.to_device(&Device::Cpu)?;

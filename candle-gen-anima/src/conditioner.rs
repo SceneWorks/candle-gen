@@ -90,7 +90,7 @@ impl Attention {
         let o = o
             .transpose(1, 2)?
             .reshape((b, sq, self.heads * self.head_dim))?;
-        self.o_proj.forward(&o)
+        Ok(self.o_proj.forward(&o)?)
     }
 
     /// Visit this attention's four adaptable projections (`{prefix}.{q,k,v,o}_proj`) for the

@@ -134,13 +134,20 @@ fn load_transformer_tensors(root: &Path) -> Result<HashMap<String, Tensor>> {
     Ok(map)
 }
 
-/// Build the MMDiT, optionally folding LoRA/LoKr `adapters` into the dense weights at load (sc-6220).
-/// With **no** adapters this is the mmap fast path (byte-identical to before). With adapters: load the
-/// `transformer/` tensors onto CPU at native dtype, fold the deltas in f32
-/// ([`crate::adapters::merge_adapters`]), then build the MMDiT from the merged map — each tensor cast to
-/// `dtype` + moved to `device` as the VarBuilder serves it, so peak GPU is unchanged vs the mmap path
-/// (mirrors `candle-gen-sdxl`'s `load_instantid_unet_with_adapters`). A non-empty `adapters` slice that
-/// matches no MMDiT module errors (it never renders an unadapted image silently).
+/// Build the MMDiT, applying LoRA/LoKr `adapters` by the route the base tier allows (sc-6220, sc-11091):
+///
+/// * **No adapters** — the mmap fast path (byte-identical to before), serving a dense *or* packed base.
+/// * **Adapters + packed q4/q8 base** — build the DiT packed (the base kept in q4/q8 codes via the mmap
+///   fast path), then attach each adapter as a **forward-time additive residual**
+///   ([`crate::adapters::install_additive`]): `y = base(x) + Σ scale·((x·A)·B)`, the base never
+///   dequantized/folded. So the Qwen-Image-Edit-2511-Lightning distill (all 720 attn+MLP Linears)
+///   applies on the packed tier at the base's footprint rather than forcing the ~41 GB dense DiT load.
+/// * **Adapters + dense bf16 base** — the eager-load + **fold** path (`W += δ` in f32,
+///   [`crate::adapters::merge_adapters`]), bit-exact as before (the chaos-sensitive sampler wants the
+///   merged forward, not a residual, on the dense tier).
+///
+/// A non-empty `adapters` slice that matches no MMDiT module errors on either route (it never renders an
+/// unadapted image silently).
 fn load_transformer(
     root: &Path,
     adapters: &[AdapterSpec],
@@ -148,11 +155,12 @@ fn load_transformer(
     device: &Device,
 ) -> Result<QwenTransformer> {
     let cfg = TransformerConfig::qwen_image();
+    let dit_dir = root.join("transformer");
     // The DiT packed-detects each `Linear`: an MLX-packed edit tier (`SceneWorks/qwen-image-edit-2511
     // -mlx` q4/q8) loads straight from the packed parts at the `group_size` read from
     // `transformer/config.json` (64); a dense Edit snapshot loads unchanged (the group size is inert on
     // the dense path). See `crate::transformer_group_size`.
-    let gs = crate::transformer_group_size(&root.join("transformer"));
+    let gs = crate::transformer_group_size(&dit_dir);
     if adapters.is_empty() {
         return Ok(QwenTransformer::new_gs(
             &cfg,
@@ -160,13 +168,20 @@ fn load_transformer(
             gs,
         )?);
     }
-    // Adapter-merge path: a LoRA/LoKr overlay implies a **dense** base checkpoint (the deltas are f32
-    // and can't fold into u32 packed codes), so the merged VarBuilder is dense and packed-detect takes
-    // the dense path for every projection. Group size stays the default (inert here).
+    if crate::transformer_is_packed(&dit_dir) {
+        // Packed additive path (sc-11091): build the DiT with the base kept packed (mmap fast path), then
+        // push the LoRA/LoKr as forward-time residuals — never folding an f32 delta into u32 codes.
+        let mut dit =
+            QwenTransformer::new_gs(&cfg, component_vb(root, "transformer", dtype, device)?, gs)?;
+        // Discard the report — like the fold path below, library code stays quiet on stderr; a
+        // non-matching adapter surface already errors inside `install_additive` (sc-9035 / F-051).
+        let _ = crate::adapters::install_additive(&mut dit, adapters)?;
+        return Ok(dit);
+    }
+    // Dense fold path: a LoRA/LoKr overlay on a dense base folds into the weight before the MMDiT is
+    // built (each merged tensor cast to `dtype` + moved to `device` as the VarBuilder serves it, so peak
+    // GPU is unchanged vs the mmap path — mirrors `candle-gen-sdxl`'s `load_instantid_unet_with_adapters`).
     let mut tensors = load_transformer_tensors(root)?;
-    // Discard the merge report — the silent twin (`candle-gen-z-image`'s
-    // `transformer_vb_with_adapters`) does the same; a non-matching adapter surface already errors
-    // inside `merge_adapters`, so library code stays quiet on stderr (sc-9035 / F-051).
     crate::adapters::merge_adapters(&mut tensors, adapters)?;
     let vb = VarBuilder::from_tensors(tensors, dtype, device);
     Ok(QwenTransformer::new_gs(&cfg, vb, gs)?)

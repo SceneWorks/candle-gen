@@ -242,7 +242,7 @@ impl Attention {
         let o = o
             .transpose(1, 2)?
             .reshape((b, sq, self.heads * self.head_dim))?;
-        self.to_out.forward(&o)
+        Ok(self.to_out.forward(&o)?)
     }
 
     /// Visit this attention's four adaptable projections (`{prefix}.{q,k,v,output}_proj`) for the
@@ -277,7 +277,7 @@ impl FeedForward {
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // gelu_exact = erf GELU (candle `gelu_erf`), matching `mlx_gen::nn::gelu_exact`.
         let h = self.proj_in.forward(x)?.gelu_erf()?;
-        self.proj_out.forward(&h)
+        Ok(self.proj_out.forward(&h)?)
     }
 
     /// Visit the FFN's two adaptable projections (`{prefix}.layer1`, `{prefix}.layer2`) for the

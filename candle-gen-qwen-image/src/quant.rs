@@ -11,136 +11,38 @@
 //! bf16 weight is ever materialized** on the packed path — the q4 DiT lands ~5 GB directly rather than
 //! staging the ~41 GB dense DiT first.
 //!
+//! **The projection type is now the SHARED [`candle_gen::quant::AdaptLinear`] (sc-11091).** It used to
+//! be a per-crate dense-or-packed enum here; it is now re-exported as [`QLinear`] so the DiT
+//! ([`crate::transformer`]) keeps its call sites unchanged, and — new for the edit lane — it carries an
+//! optional **forward-time additive LoRA/LoKr residual**, so the **Qwen-Image-Edit-2511-Lightning**
+//! distill (and user LoRAs) can apply on a **packed q4/q8** edit tier with the base kept packed (the
+//! deltas ride unmerged, never folded into u32 codes — [`crate::adapters::install_additive`]). A dense
+//! Edit snapshot still **folds** the delta (bit-exact) via [`crate::adapters::merge_adapters`]; with no
+//! adapter the forward is byte-identical to before.
+//!
 //! **Which sub-models pack (audited against the real tier headers, sc-9415):** only the
 //! `transformer/` is packed — 846 packed `Linear` triples at group size 64 (every attn/ff/embedder/
 //! `proj_out` projection; the RMSNorm weights `norm_q`/`norm_k`/`txt_norm` stay dense, they are not
 //! `Linear`). The `text_encoder/` (the fused Qwen2.5-VL **language model `model.*` AND the vision
-//! tower `visual.*`**) and the `vae/` ship **dense bf16 in every tier** — the MLX convert job
-//! quantizes only the transformer, so those safetensors carry **zero `.scales`** (verified: the q4/q8
-//! TE index lists 0 scales across all 729 keys, incl. the 390 `visual.*` keys). The multi-modal
-//! "vision tower stays bf16" rule (this epic) therefore holds here in the strongest form: the whole
-//! TE stays dense, and [`crate::text_encoder`] / [`crate::vision`] keep their stock `candle_nn` loaders
-//! unchanged. [`crate::text_encoder::QwenTextEncoder::new`] additionally **guards** (errors loudly) if a
-//! TE weight ever unexpectedly grows a `.scales` sibling, rather than silently reading u32 codes as
-//! bf16 (the boogu `linear_guard_dense` precedent) — a future TE-packing tier must add a real packed
-//! path, not fall through.
-//!
-//! Absent `.scales` (a dense bf16 tier — the stock diffusers `Qwen/Qwen-Image` snapshot, *and* the
-//! separate alibaba-pai `QwenFunControlBranch` control checkpoint, which is
-//! **not** part of the MLX tiers and is genuinely-deferred to sc-9517 for its own packed tier)
-//! the loader falls back to the **stock** `candle_nn::linear` path unchanged, so the same
-//! [`crate::transformer`] serves both a dense snapshot and a packed one, and the mixed dense/packed DiT
-//! loads with one call site per projection.
+//! tower `visual.*`**) and the `vae/` ship **dense bf16 in every tier**, so [`crate::text_encoder`] /
+//! [`crate::vision`] keep their stock `candle_nn` loaders and [`guard_dense`] trips loudly if a TE
+//! weight ever unexpectedly grows a `.scales` sibling.
 //!
 //! **The packed forward dequantizes the weight into a dense matmul (sc-7702)** — it does *not* take
-//! candle's int8 `QMatMul` fast path (`fast_mmq`), so a Q4 denoise stays coherent. The compute path is
-//! the shared [`candle_gen::quant::QLinear`], which already owns that behavior; this module is only the
-//! thin dense-or-packed **enum + detect** wrapper the vendored Qwen-Image DiT builds its projections
-//! from (mirroring `candle-gen-chroma/src/quant.rs`). Qwen-Image has no *dense-tier on-the-fly* quant
-//! path (the only quantized tier is the pre-packed MLX one), so — like the chroma seam — there is no
-//! `quantize_onto`/load-time fold arm here.
+//! candle's int8 `QMatMul` fast path (`fast_mmq`), so a Q4 denoise stays coherent. That behavior lives
+//! in the shared [`candle_gen::quant::QLinear`] that [`AdaptLinear`]'s packed arm wraps.
 
-use candle_gen::candle_core::{Result, Tensor};
-use candle_gen::candle_nn::{Linear, Module, VarBuilder};
-use candle_gen::quant as shared;
+use candle_gen::candle_core::Result;
+use candle_gen::candle_nn::VarBuilder;
 
-/// A Linear projection that is **dense** (the loaded bf16/f32 weight) or **packed** (loaded straight
-/// from an MLX-packed tier via the shared [`candle_gen::quant::QLinear`], sc-9415). Built dense
-/// ([`Self::linear`] / [`Self::linear_no_bias`]) or packed-detected ([`Self::linear_detect_gs`]); both
-/// forwards compute `x·Wᵀ + b`.
-pub enum QLinear {
-    Dense(Linear),
-    /// Loaded directly from an MLX-packed tier through the shared module — the resident `Q4_1`/`Q8_0`
-    /// weight **dequantizes-on-forward** into a dense matmul (sc-7702, *not* the int8 `QMatMul` fast
-    /// path).
-    Packed(shared::QLinear),
-}
-
-impl QLinear {
-    /// A biased dense `[out, in]` projection from `vb` (`{prefix}.weight` + `{prefix}.bias`).
-    pub fn linear(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        Ok(Self::Dense(candle_gen::candle_nn::linear(
-            in_dim, out_dim, vb,
-        )?))
-    }
-
-    /// A bias-less dense `[out, in]` projection from `vb` (`{prefix}.weight`) — the DiT `norm_out.linear`
-    /// loads bias-less (the checkpoint bias is ignored).
-    pub fn linear_no_bias(in_dim: usize, out_dim: usize, vb: VarBuilder) -> Result<Self> {
-        Ok(Self::Dense(candle_gen::candle_nn::linear_no_bias(
-            in_dim, out_dim, vb,
-        )?))
-    }
-
-    /// **Packed-detecting** `[out, in]` loader at an explicit MLX `group_size` (sc-9415): if
-    /// `{base}.scales` is present in `vb` (a pre-quantized MLX tier), build a [`Self::Packed`] straight
-    /// from the packed parts on `vb`'s device via the shared [`candle_gen::quant::lin_gs`] — **no dense
-    /// weight is materialized**. Otherwise the **dense** path is taken unchanged (`{base}.weight`
-    /// [+ `{base}.bias`]).
-    ///
-    /// `base` is the full dotted key prefix relative to `vb` (e.g. `attn.to_out.0`), so the
-    /// `.scales`/`.biases`/`.bias` siblings survive any `to_out.0`-style key nesting: build the base
-    /// string first, then detect — never `.pp()` past the scales sibling (the key-remap trap the shared
-    /// loader guards). The `linear_detect_fires_on_to_out_remap*` test pins this on the real Qwen-Image
-    /// `attn.to_out.0` layout.
-    pub fn linear_detect_gs(
-        in_dim: usize,
-        out_dim: usize,
-        vb: &VarBuilder,
-        base: &str,
-        bias: bool,
-        group_size: usize,
-    ) -> Result<Self> {
-        if vb.contains_tensor(&format!("{base}.scales")) {
-            return Ok(Self::Packed(shared::lin_gs(
-                vb, base, in_dim, out_dim, bias, group_size,
-            )?));
-        }
-        let sub = vb.pp(base);
-        if bias {
-            Self::linear(in_dim, out_dim, sub)
-        } else {
-            Self::linear_no_bias(in_dim, out_dim, sub)
-        }
-    }
-
-    /// **Packed-detecting** `[out, in]` loader at the default MLX group size 64 (a thin
-    /// [`Self::linear_detect_gs`]) — used by the tests and any caller that doesn't thread a config
-    /// group size. Every Qwen-Image packed tier ships `quantization.group_size = 64`.
-    #[cfg(test)]
-    pub fn linear_detect(
-        in_dim: usize,
-        out_dim: usize,
-        vb: &VarBuilder,
-        base: &str,
-        bias: bool,
-    ) -> Result<Self> {
-        Self::linear_detect_gs(in_dim, out_dim, vb, base, bias, shared::MLX_GROUP_SIZE)
-    }
-
-    /// `x·Wᵀ + b`. Dense delegates to `candle_nn::Linear`; packed delegates to the shared
-    /// dequant-on-forward `QLinear` (sc-7702).
-    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        match self {
-            Self::Dense(l) => l.forward(x),
-            Self::Packed(l) => l.forward(x),
-        }
-    }
-
-    /// Whether this projection loaded directly from an MLX-packed tier (the packed path). Distinguishes
-    /// a packed load from the dense path — used by the loader tests to assert a packed tier fired the
-    /// packed path (and did not silently fall back to dense).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn is_packed(&self) -> bool {
-        matches!(self, Self::Packed(_))
-    }
-}
-
-impl Module for QLinear {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        QLinear::forward(self, x)
-    }
-}
+/// The residual-capable Qwen-Image DiT projection — a frozen dense/packed base plus optional
+/// forward-time additive LoRA/LoKr residuals. **Now the shared [`candle_gen::quant::AdaptLinear`]**
+/// (sc-11091), re-exported so `crate::quant::QLinear` keeps resolving for the DiT loader / transformer
+/// / additive installer. Built dense ([`QLinear::linear`] / [`QLinear::linear_no_bias`]) or packed-
+/// detecting ([`QLinear::linear_detect_gs`]); the base forward computes `x·Wᵀ (+ b)` and each attached
+/// adapter adds `scale·((x·A)·B)` AS-IS — no dense weight materialized, so a packed q4/q8 base keeps
+/// its footprint while the Lightning distill (or a user LoRA) applies *unmerged*.
+pub use candle_gen::quant::AdaptLinear as QLinear;
 
 /// Guard a **dense** VarBuilder sub-tree against an unexpected MLX-packed weight: error loudly if
 /// `{base}.scales` is present under `vb` (sc-9415, the boogu `linear_guard_dense` precedent). The
@@ -165,7 +67,8 @@ pub fn guard_dense(vb: &VarBuilder, base: &str) -> Result<()> {
 mod tests {
     use super::*;
     use candle_gen::candle_core::safetensors::MmapedSafetensors;
-    use candle_gen::candle_core::{DType, Device};
+    use candle_gen::candle_core::{DType, Device, Tensor};
+    use candle_gen::candle_nn::Linear;
     use std::collections::HashMap;
 
     /// Test-side MLX Q4 packer: per-element 4-bit codes → MLX u32 words (LSB-first nibbles), group `G`.
@@ -214,12 +117,9 @@ mod tests {
     }
 
     /// **Packed-detect fires on the real Qwen-Image DiT key layout (the `attn.to_out.0` nesting + a
-    /// biased projection) and leaves a dense sibling unchanged.** Writes a safetensors mimicking the
-    /// real Qwen-Image packed layout — a `to_out.0` triple *with* a dense `.bias` (the key remap that
-    /// would silently fall back to dense if the loader `.pp()`'d past the `.scales` sibling) and a dense
-    /// `to_q` sibling — and loads both through `linear_detect`. The `.scales`/`.biases`/`.bias` siblings
-    /// must survive the `to_out.0` base string, `to_out.0` must load `Packed`, the dense sibling stays
-    /// `Dense`, and the packed biased forward must reproduce the affine grid (+ bias) bit-exactly.
+    /// biased projection) and leaves a dense sibling unchanged.** `to_out.0` must load packed, the dense
+    /// `to_q` sibling stays dense, and the packed biased forward reproduces the affine grid (+ bias)
+    /// bit-exactly. The shared `AdaptLinear` load path (sc-11091).
     #[test]
     fn linear_detect_fires_on_to_out_remap_and_leaves_dense_unchanged() -> Result<()> {
         let dev = Device::Cpu;
@@ -228,8 +128,6 @@ mod tests {
         let bias_vec: Vec<f32> = (0..out_dim).map(|i| 0.01 * i as f32).collect();
 
         let mut map: HashMap<String, Tensor> = HashMap::new();
-        // The `attn.to_out.0` packed triple + dense `.bias` (the nested key the Qwen DiT threads as one
-        // base — the joint-attention `to_out` projection is biased).
         map.insert("attn.to_out.0.weight".into(), wq);
         map.insert("attn.to_out.0.scales".into(), s);
         map.insert("attn.to_out.0.biases".into(), b);
@@ -237,7 +135,6 @@ mod tests {
             "attn.to_out.0.bias".into(),
             Tensor::from_vec(bias_vec.clone(), (out_dim,), &dev)?,
         );
-        // A dense sibling (`to_q`) with no `.scales` → the dense path must stay unchanged.
         map.insert(
             "attn.to_q.weight".into(),
             Tensor::randn(0f32, 1f32, (out_dim, in_dim), &dev)?,
@@ -255,20 +152,20 @@ mod tests {
         let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev.clone());
         let attn = vb.pp("attn");
 
-        // `to_out.0` — packed-detected through the remapped base (never `.pp("0")` past the sibling).
         let packed = QLinear::linear_detect(in_dim, out_dim, &attn, "to_out.0", true)?;
         assert!(packed.is_packed(), "`.scales` under to_out.0 ⇒ packed load");
 
-        // `to_q` — dense (no `.scales`), path unchanged.
         let dense = QLinear::linear_detect(in_dim, out_dim, &attn, "to_q", true)?;
         assert!(!dense.is_packed(), "no `.scales` ⇒ dense path unchanged");
-        assert!(matches!(dense, QLinear::Dense(_)));
 
-        // The packed forward reproduces the affine grid + bias (bit-exact repack + dequant-on-forward).
-        let grid_lin = QLinear::Dense(Linear::new(
-            Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
-            Some(Tensor::from_vec(bias_vec, (out_dim,), &dev)?),
-        ));
+        let grid_lin = QLinear::from_dense(
+            Linear::new(
+                Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
+                Some(Tensor::from_vec(bias_vec, (out_dim,), &dev)?),
+            ),
+            in_dim,
+            out_dim,
+        );
         let x = Tensor::randn(0f32, 1f32, (4, in_dim), &dev)?;
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "packed vs affine-grid cosine {cos:.6}");
@@ -299,10 +196,11 @@ mod tests {
 
         let packed = QLinear::linear_detect_gs(in_dim, out_dim, &vb, "p", false, 32)?;
         assert!(packed.is_packed());
-        let grid_lin = QLinear::Dense(Linear::new(
-            Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
-            None,
-        ));
+        let grid_lin = QLinear::from_dense(
+            Linear::new(Tensor::from_vec(grid, (out_dim, in_dim), &dev)?, None),
+            in_dim,
+            out_dim,
+        );
         let x = Tensor::randn(0f32, 1f32, (3, in_dim), &dev)?;
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "group-32 packed vs grid cosine {cos:.6}");
@@ -332,10 +230,11 @@ mod tests {
 
         let packed = QLinear::linear_detect(in_dim, out_dim, &vb, "linear", false)?;
         assert!(packed.is_packed(), "bias-less packed triple ⇒ packed load");
-        let grid_lin = QLinear::Dense(Linear::new(
-            Tensor::from_vec(grid, (out_dim, in_dim), &dev)?,
-            None,
-        ));
+        let grid_lin = QLinear::from_dense(
+            Linear::new(Tensor::from_vec(grid, (out_dim, in_dim), &dev)?, None),
+            in_dim,
+            out_dim,
+        );
         let x = Tensor::randn(0f32, 1f32, (2, in_dim), &dev)?;
         let cos = cosine(&packed.forward(&x)?, &grid_lin.forward(&x)?);
         assert!(cos > 0.99999, "bias-less packed vs grid cosine {cos:.6}");
@@ -346,13 +245,11 @@ mod tests {
 
     /// The **vision-tower / text-encoder dense guard** (sc-9415): [`guard_dense`] errors loudly when a
     /// weight it expects dense unexpectedly grows a `.scales` sibling (a packed weight on a path that
-    /// reads bf16), and is a no-op on a genuinely-dense weight. The Qwen-Image MLX tiers keep the whole
-    /// Qwen2.5-VL encoder dense, so the guard is a defensive tripwire, not a live branch.
+    /// reads bf16), and is a no-op on a genuinely-dense weight.
     #[test]
     fn guard_dense_errors_on_unexpected_scales() -> Result<()> {
         let dev = Device::Cpu;
         let mut map: HashMap<String, Tensor> = HashMap::new();
-        // A packed weight where only a dense one is expected (a "vision tower packed" tier).
         map.insert(
             "visual.blocks.0.attn.qkv.weight".into(),
             Tensor::zeros((8, 4), DType::U32, &dev)?,
@@ -361,7 +258,6 @@ mod tests {
             "visual.blocks.0.attn.qkv.scales".into(),
             Tensor::zeros((8, 1), DType::F32, &dev)?,
         );
-        // A genuinely-dense sibling.
         map.insert(
             "visual.blocks.0.attn.proj.weight".into(),
             Tensor::randn(0f32, 1f32, (8, 8), &dev)?,
@@ -374,12 +270,10 @@ mod tests {
         let st = unsafe { MmapedSafetensors::new(&tmp)? };
         let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev.clone());
 
-        // The packed weight trips the guard (loud error, not a silent u32-as-bf16 read).
         assert!(
             guard_dense(&vb, "visual.blocks.0.attn.qkv").is_err(),
             "a `.scales` sibling on a dense-path weight must error"
         );
-        // The dense weight passes.
         assert!(guard_dense(&vb, "visual.blocks.0.attn.proj").is_ok());
 
         std::fs::remove_file(&tmp).ok();
