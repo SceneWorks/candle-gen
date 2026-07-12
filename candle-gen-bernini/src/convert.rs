@@ -104,7 +104,7 @@ const PLANNER_PREFIXES: [(&str, &str); 3] = [
 ///   - `vit_decoder` **140**: `DiffLoss_FM` net (time/cond embed + input proj + 16 res blocks + final layer).
 ///
 /// The single `mask_tokens` parameter (mlx `expect: 1`) is guarded separately by its `Option` presence
-/// check ([`extract_components`]). Do NOT loosen these — a mismatch means the package layout changed.
+/// check ([`plan_components`]). Do NOT loosen these — a mismatch means the package layout changed.
 const PLANNER_EXPECTED_COUNTS: [(&str, usize); 3] = [
     (PLANNER_MLLM_DIR, 728),
     (PLANNER_CONNECTOR_DIR, 12),
@@ -149,23 +149,35 @@ pub fn route_bernini_planner_key(k: &str) -> Option<(&'static str, String)> {
     None
 }
 
-/// Everything extracted from the combined `bernini/` index in one shard sweep: the two renderer experts,
-/// the three prefix-routed planner component groups, and the single MAR mask-token tensor.
-struct Extracted {
-    /// `{"transformer" -> map, "transformer_2" -> map}` (diffusers keys).
-    experts: HashMap<&'static str, HashMap<String, Tensor>>,
-    /// `{"mllm" -> map, "connector" -> map, "vit_decoder" -> map}` (stripped planner keys).
-    planner: HashMap<&'static str, HashMap<String, Tensor>>,
-    /// The bare `mask_tokens` parameter.
-    mask_tokens: Option<Tensor>,
+/// The full routing plan over the combined `bernini/` index, built from a **header-only** scan of the
+/// mmap'd shards — no tensor data is materialized here. Each output component maps to the list of
+/// `(source key, stripped destination key)` pairs that feed it, plus the source key of the bare
+/// `mask_tokens` parameter. The [`cst::MmapedSafetensors`] keeps every shard memory-mapped so the builder
+/// can then load, convert, and write **one component at a time** (`st.load(src_key)` → write → drop),
+/// bounding peak RSS to a single component rather than materializing the whole ~150 GB index at once
+/// (sc-11169 / F-099). The old one-shot extractor accumulated both F32 experts (~114 GB) plus the planner
+/// (~33 GB) in host RAM simultaneously; this streams instead.
+struct RoutingPlan {
+    /// All `bernini/` shards, memory-mapped (headers parsed; tensor data lazily loaded on demand).
+    st: cst::MmapedSafetensors,
+    /// `{"transformer" -> [(src, stripped)], "transformer_2" -> ...}` (diffusers keys).
+    experts: HashMap<&'static str, Vec<(String, String)>>,
+    /// `{"mllm" -> [(src, stripped)], "connector" -> ..., "vit_decoder" -> ...}` (stripped planner keys).
+    planner: HashMap<&'static str, Vec<(String, String)>>,
+    /// Source key of the bare `mask_tokens` parameter (always `"mask_tokens"` when present).
+    mask_tokens_key: Option<String>,
 }
 
-/// One sweep over the `bernini/` shards, routing each tensor to its renderer-expert **or** planner group
-/// with the prefix stripped. Every non-Bernini tensor (the redundant T5 copy, the dropped `mllm.lm_head`)
-/// is skipped. Reading the ~168 GB index once and routing both families together avoids a second full
-/// pass. Returns the experts (`transformer`/`transformer_2`), planner groups (`mllm`/`connector`/
-/// `vit_decoder`), and the mask token.
-fn extract_components(bernini_dir: &Path) -> Result<Extracted> {
+/// Header-only scan of the `bernini/` shards: memory-map every shard via [`cst::MmapedSafetensors::multi`]
+/// (headers parsed, no tensor data read) and route each tensor **key** to its renderer-expert **or**
+/// planner group with the destination prefix stripped. Every non-Bernini key (the redundant T5 copy, the
+/// dropped `mllm.lm_head`) is skipped. Because only keys are inspected, this holds no weight data — the
+/// returned [`RoutingPlan`] lets the builder load and write one component at a time. The same invariants
+/// the old one-shot extractor enforced (experts non-empty, exact planner counts, `mask_tokens` present)
+/// are validated here up front, from the headers, so the expensive on-device build still fails loud and
+/// early. Keys are deduplicated (shards are disjoint in practice; a key present in two shards resolves to
+/// the last-mapped shard, matching [`cst::MmapedSafetensors`]'s own last-wins `load`).
+fn plan_components(bernini_dir: &Path) -> Result<RoutingPlan> {
     let mut shards: Vec<std::path::PathBuf> = std::fs::read_dir(bernini_dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
@@ -178,40 +190,46 @@ fn extract_components(bernini_dir: &Path) -> Result<Extracted> {
             bernini_dir.display()
         )));
     }
-    let mut experts: HashMap<&'static str, HashMap<String, Tensor>> = HashMap::new();
-    experts.insert("transformer", HashMap::new());
-    experts.insert("transformer_2", HashMap::new());
-    let mut planner: HashMap<&'static str, HashMap<String, Tensor>> = HashMap::new();
-    planner.insert(PLANNER_MLLM_DIR, HashMap::new());
-    planner.insert(PLANNER_CONNECTOR_DIR, HashMap::new());
-    planner.insert(PLANNER_VIT_DECODER_DIR, HashMap::new());
-    let mut mask_tokens: Option<Tensor> = None;
+    // SAFETY: inherited from memmap2 — the shard files are only read (never mutated) for the lifetime of
+    // the returned plan, and we never expose the mapped bytes outside `st.load`.
+    let st = unsafe { cst::MmapedSafetensors::multi(&shards)? };
 
-    for shard in &shards {
-        let map = cst::load(shard, &Device::Cpu)?;
-        for (k, v) in map {
-            if let Some((out, key)) = route_bernini_expert_key(&k) {
-                experts
+    let mut experts: HashMap<&'static str, Vec<(String, String)>> = HashMap::new();
+    experts.insert("transformer", Vec::new());
+    experts.insert("transformer_2", Vec::new());
+    let mut planner: HashMap<&'static str, Vec<(String, String)>> = HashMap::new();
+    planner.insert(PLANNER_MLLM_DIR, Vec::new());
+    planner.insert(PLANNER_CONNECTOR_DIR, Vec::new());
+    planner.insert(PLANNER_VIT_DECODER_DIR, Vec::new());
+    let mut mask_tokens_key: Option<String> = None;
+
+    // Dedup keys defensively (disjoint shards in practice) so a duplicate is routed once.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (name, _view) in st.tensors() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        if let Some((out, key)) = route_bernini_expert_key(&name) {
+            experts
+                .get_mut(out)
+                .expect("expert group present")
+                .push((name, key));
+        } else if let Some((out, key)) = route_bernini_planner_key(&name) {
+            if out == PLANNER_MASK_TOKENS_KEY {
+                mask_tokens_key = Some(name);
+            } else {
+                planner
                     .get_mut(out)
-                    .expect("expert group present")
-                    .insert(key, v);
-            } else if let Some((out, key)) = route_bernini_planner_key(&k) {
-                if out == PLANNER_MASK_TOKENS_KEY {
-                    mask_tokens = Some(v);
-                } else {
-                    planner
-                        .get_mut(out)
-                        .expect("planner group present")
-                        .insert(key, v);
-                }
+                    .expect("planner group present")
+                    .push((name, key));
             }
         }
     }
 
     // Renderer experts have no fixed count guard here (the diffusers-key strip is a pass-through; the
     // packer/loader validate their schema) — only assert they are non-empty.
-    for (name, g) in experts.iter() {
-        if g.is_empty() {
+    for (name, keys) in experts.iter() {
+        if keys.is_empty() {
             return Err(candle_gen::candle_core::Error::Msg(format!(
                 "build_bernini_candle_tier: no tensors routed to {name}/ (expected the \
                  diff_dec/diff_dec_low prefixes of a ByteDance/Bernini-Diffusers `bernini/` index)"
@@ -221,16 +239,17 @@ fn extract_components(bernini_dir: &Path) -> Result<Extracted> {
     // Planner components: HARD exact per-component tensor-count guard, mirroring the mlx-gen-bernini
     // converter's `Component::expect` asserts.
     validate_planner_counts(&planner)?;
-    if mask_tokens.is_none() {
+    if mask_tokens_key.is_none() {
         return Err(candle_gen::candle_core::Error::Msg(
             "build_bernini_candle_tier: no `mask_tokens` parameter found in the `bernini/` index"
                 .into(),
         ));
     }
-    Ok(Extracted {
+    Ok(RoutingPlan {
+        st,
         experts,
         planner,
-        mask_tokens,
+        mask_tokens_key,
     })
 }
 
@@ -239,9 +258,9 @@ fn extract_components(bernini_dir: &Path) -> Result<Extracted> {
 /// clear `Err` naming the component + expected-vs-actual on any mismatch (a re-layout in a future
 /// package revision), so the expensive on-device build fails loud and early instead of at GPU-val load.
 /// Do NOT loosen these counts.
-fn validate_planner_counts(planner: &HashMap<&'static str, HashMap<String, Tensor>>) -> Result<()> {
+fn validate_planner_counts<V>(planner: &HashMap<&'static str, Vec<V>>) -> Result<()> {
     for (dir, expect) in PLANNER_EXPECTED_COUNTS {
-        let got = planner.get(dir).map(HashMap::len).unwrap_or(0);
+        let got = planner.get(dir).map(Vec::len).unwrap_or(0);
         if got != expect {
             return Err(candle_gen::candle_core::Error::Msg(format!(
                 "build_bernini_candle_tier: planner component {dir}/ expected {expect} tensors, got \
@@ -276,24 +295,46 @@ fn require_planner_sources(pkg_mllm: &Path) -> Result<(std::path::PathBuf, std::
     Ok((cfg_src, tok_src))
 }
 
-/// Write one expert component `map` (diffusers keys) to `dst` as a single `model.safetensors`. When
-/// `bits ∈ {4,8}` every rank-2 `.weight` is MLX-affine-packed via [`pack_transformer_component`]
-/// (u32 codes + `.scales`/`.biases`, group [`TIER_GROUP_SIZE`]) and a `quantize_config.json` is written;
-/// when `bits == 0` the whole component is cast to bf16 dense. Returns the number of Linears packed.
-fn write_expert(map: HashMap<String, Tensor>, dst: &Path, bits: usize) -> Result<usize> {
+/// Write one expert component to `dst` as a single `model.safetensors`, **streaming** the source tensors
+/// one at a time from the mmap'd shards (`keys` = the `(source key, stripped diffusers key)` pairs the
+/// [`RoutingPlan`] routed to this expert). When `bits ∈ {4,8}` every rank-2 `.weight` is MLX-affine-packed
+/// via [`pack_transformer_component`] (u32 codes + `.scales`/`.biases`, group [`TIER_GROUP_SIZE`]) and a
+/// `quantize_config.json` is written; when `bits == 0` the whole component is dense bf16. Returns the
+/// number of Linears packed.
+///
+/// Byte-identity with the pre-streaming (whole-map) path is preserved exactly: each source F32 tensor is
+/// cast to bf16 **first** — even the rank-2 weights the packer then re-casts bf16→f32 internally — because
+/// the old path cast the entire map to bf16 before packing, and that intermediate rounding is
+/// load-bearing. safetensors serializes in a canonical (dtype, name) order, so the streamed insertion
+/// order does not affect the output bytes. Each loaded F32 tensor is dropped at the end of its iteration,
+/// so peak RSS is one source tensor plus the (packed/bf16) output map — never the whole ~114 GB expert
+/// in F32.
+fn write_expert_streamed(
+    st: &cst::MmapedSafetensors,
+    keys: &[(String, String)],
+    dst: &Path,
+    bits: usize,
+) -> Result<usize> {
     std::fs::create_dir_all(dst)?;
-    // Cast the (F32 package) tensors to bf16 first: the dense passthrough leaves (norms,
-    // patch_embedding conv, scale_shift_table, biases) then land bf16 (the DiT dtype), and the packer
-    // re-casts the rank-2 weights it packs to f32 internally — so this only affects the dense leaves.
-    let bf16: HashMap<String, Tensor> = map
-        .into_iter()
-        .map(|(k, v)| Ok((k, v.to_dtype(DType::BF16)?)))
-        .collect::<Result<_>>()?;
-    let (out, packed) = if bits == 0 {
-        (bf16, 0)
-    } else {
-        pack_transformer_component(bf16, bits)?
-    };
+    let mut out: HashMap<String, Tensor> = HashMap::with_capacity(keys.len() * 3);
+    let mut packed = 0usize;
+    for (src, stripped) in keys {
+        // Load ONE tensor from the mmap (F32 package dtype) and cast to bf16, exactly as the old
+        // whole-map pass did before packing.
+        let value = st.load(src, &Device::Cpu)?.to_dtype(DType::BF16)?;
+        if bits == 0 {
+            out.insert(stripped.clone(), value);
+        } else {
+            // Feed a single-entry map through the shared packer so the per-tensor pack/dense decision is
+            // identical to the whole-map path (rank-2 `.weight` → u32+scales+biases; everything else
+            // dense bf16 passthrough).
+            let one: HashMap<String, Tensor> = std::iter::once((stripped.clone(), value)).collect();
+            let (packed_one, n) = pack_transformer_component(one, bits)?;
+            out.extend(packed_one);
+            packed += n;
+        }
+        // `value` (or the single-entry map) is dropped here, bounding peak RSS.
+    }
     cst::save(&out, dst.join("model.safetensors"))?;
     if bits != 0 {
         std::fs::write(
@@ -306,16 +347,25 @@ fn write_expert(map: HashMap<String, Tensor>, dst: &Path, bits: usize) -> Result
     Ok(packed)
 }
 
-/// Write one **dense bf16** planner component `map` (already-stripped keys) to `dst` as a single
-/// `model.safetensors`. Unlike the renderer experts, the planner is never packed here — packed planner
-/// quant is the separate sc-11062; the loader reads these dense (bf16, the Qwen2.5-VL native dtype).
-fn write_planner_component(map: HashMap<String, Tensor>, dst: &Path) -> Result<()> {
+/// Write one **dense bf16** planner component to `dst` as a single `model.safetensors`, **streaming** the
+/// source tensors one at a time from the mmap'd shards (`keys` = the `(source key, stripped key)` pairs
+/// routed to this component). Unlike the renderer experts, the planner is never packed here — packed
+/// planner quant is the separate sc-11062; the loader reads these dense (bf16, the Qwen2.5-VL native
+/// dtype). Byte-identical to the pre-streaming path (same per-tensor bf16 cast; canonical safetensors
+/// ordering), but peak RSS is one source tensor plus the bf16 output map instead of the whole component in
+/// F32.
+fn write_planner_component_streamed(
+    st: &cst::MmapedSafetensors,
+    keys: &[(String, String)],
+    dst: &Path,
+) -> Result<()> {
     std::fs::create_dir_all(dst)?;
-    let bf16: HashMap<String, Tensor> = map
-        .into_iter()
-        .map(|(k, v)| Ok((k, v.to_dtype(DType::BF16)?)))
-        .collect::<Result<_>>()?;
-    cst::save(&bf16, dst.join("model.safetensors"))?;
+    let mut out: HashMap<String, Tensor> = HashMap::with_capacity(keys.len());
+    for (src, stripped) in keys {
+        let value = st.load(src, &Device::Cpu)?.to_dtype(DType::BF16)?;
+        out.insert(stripped.clone(), value);
+    }
+    cst::save(&out, dst.join("model.safetensors"))?;
     Ok(())
 }
 
@@ -419,38 +469,38 @@ pub fn build_bernini_candle_tier(
     }
     std::fs::create_dir_all(out_dir)?;
 
-    // 1. One sweep over the combined index: the two renderer experts + the planner components.
-    let Extracted {
-        mut experts,
-        mut planner,
-        mask_tokens,
-    } = extract_components(&bernini_dir)?;
+    // 1. Header-only routing plan over the mmap'd combined index (no weight data materialized): the two
+    // renderer experts + the planner components. Each component is then loaded, converted, and written one
+    // at a time below, bounding peak RSS to a single component (sc-11169 / F-099).
+    let plan = plan_components(&bernini_dir)?;
 
-    // 1a. Renderer experts: strip prefix → diffusers keys → pack (or dense bf16).
-    for (name, dir) in [
-        ("transformer", "transformer"),
-        ("transformer_2", "transformer_2"),
-    ] {
-        let map = experts.remove(name).expect("expert group present");
-        let n = write_expert(map, &out_dir.join(dir), bits)?;
+    // 1a. Renderer experts: stream each source tensor → strip prefix → diffusers keys → pack (or dense
+    // bf16). `write_expert_streamed` loads one tensor at a time from the mmap and drops it after
+    // converting, so the whole F32 expert never lands in host RAM at once.
+    for name in ["transformer", "transformer_2"] {
+        let keys = plan.experts.get(name).expect("expert group present");
+        let n = write_expert_streamed(&plan.st, keys, &out_dir.join(name), bits)?;
         eprintln!("[[BERNINI-CANDLE-TIER]] {name}: packed {n} Linears (bits={bits})");
     }
 
-    // 1b. Planner components: dense bf16 (packed planner quant is sc-11062, deliberately not here).
+    // 1b. Planner components: dense bf16 (packed planner quant is sc-11062, deliberately not here),
+    // likewise streamed one source tensor at a time.
     for dir in [
         PLANNER_MLLM_DIR,
         PLANNER_CONNECTOR_DIR,
         PLANNER_VIT_DECODER_DIR,
     ] {
-        let map = planner.remove(dir).expect("planner group present");
-        let n = map.len();
-        write_planner_component(map, &out_dir.join(dir))?;
+        let keys = plan.planner.get(dir).expect("planner group present");
+        let n = keys.len();
+        write_planner_component_streamed(&plan.st, keys, &out_dir.join(dir))?;
         eprintln!("[[BERNINI-CANDLE-TIER]] {dir}: {n} dense bf16 tensors");
     }
-    write_mask_tokens(
-        mask_tokens.expect("mask_tokens present (extract_components guarantees it)"),
-        out_dir,
-    )?;
+    let mask_key = plan
+        .mask_tokens_key
+        .as_deref()
+        .expect("mask_tokens present (plan_components guarantees it)");
+    let mask_tokens = plan.st.load(mask_key, &Device::Cpu)?;
+    write_mask_tokens(mask_tokens, out_dir)?;
 
     // 2. Stock Wan2.2 components copied verbatim from the base snapshot.
     for name in [
@@ -720,17 +770,17 @@ mod tests {
         );
     }
 
-    /// Build a synthetic planner map with `count` dummy tensors under `dir`.
+    /// Build a synthetic planner routing group with `count` dummy `(src, stripped)` key pairs under `dir`
+    /// (matching the [`RoutingPlan`] shape the count guard now inspects — keys only, no tensor data).
     fn synth_group(
         dir: &'static str,
         count: usize,
-    ) -> HashMap<&'static str, HashMap<String, Tensor>> {
-        let dev = Device::Cpu;
-        let mut inner: HashMap<String, Tensor> = HashMap::new();
+    ) -> HashMap<&'static str, Vec<(String, String)>> {
+        let mut inner: Vec<(String, String)> = Vec::new();
         for i in 0..count {
-            inner.insert(format!("w{i}"), Tensor::zeros(1, DType::F32, &dev).unwrap());
+            inner.push((format!("w{i}"), format!("w{i}")));
         }
-        let mut m: HashMap<&'static str, HashMap<String, Tensor>> = HashMap::new();
+        let mut m: HashMap<&'static str, Vec<(String, String)>> = HashMap::new();
         m.insert(dir, inner);
         m
     }
@@ -740,7 +790,7 @@ mod tests {
     #[test]
     fn planner_count_guard_rejects_short_map() {
         // A full planner map (all three at their expected counts) passes.
-        let mut full: HashMap<&'static str, HashMap<String, Tensor>> = HashMap::new();
+        let mut full: HashMap<&'static str, Vec<(String, String)>> = HashMap::new();
         for (dir, expect) in PLANNER_EXPECTED_COUNTS {
             full.extend(synth_group(dir, expect));
         }
@@ -796,6 +846,166 @@ mod tests {
         assert!(cfg.ends_with("config.json"));
         assert!(tok.ends_with(PLANNER_TOKENIZER_FILE));
 
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // --- sc-11169 / F-099: streaming-converter byte-identity tests ---------------------------------
+    //
+    // These prove the streamed writers (`write_expert_streamed` / `write_planner_component_streamed`),
+    // which load one source tensor at a time from mmap'd shards, produce byte-for-byte the SAME
+    // `model.safetensors` as the pre-streaming path that materialized the whole component map first. The
+    // reference closures below replicate the OLD whole-map logic exactly (cast the entire map to bf16,
+    // then pack — or, for the planner, just bf16). Because safetensors serializes in a canonical
+    // (dtype, name) order, insertion order does not matter, so equal tensor sets ⇒ equal bytes.
+
+    /// Unique temp dir for a streaming test.
+    fn stream_tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "bernini_stream_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn f32_tensor(shape: &[usize], seed: f32) -> Tensor {
+        let n: usize = shape.iter().product();
+        let data: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 + seed) * 0.017).sin() * 1.7)
+            .collect();
+        Tensor::from_vec(data, shape, &Device::Cpu).unwrap()
+    }
+
+    /// Reference for the OLD `write_expert`: cast the whole map to bf16, then pack (or dense bf16), save.
+    fn ref_write_expert(map: HashMap<String, Tensor>, dst: &Path, bits: usize) -> Result<()> {
+        std::fs::create_dir_all(dst)?;
+        let bf16: HashMap<String, Tensor> = map
+            .into_iter()
+            .map(|(k, v)| Ok((k, v.to_dtype(DType::BF16)?)))
+            .collect::<Result<_>>()?;
+        let (out, _n) = if bits == 0 {
+            (bf16, 0)
+        } else {
+            pack_transformer_component(bf16, bits)?
+        };
+        cst::save(&out, dst.join("model.safetensors"))?;
+        Ok(())
+    }
+
+    /// The streamed expert writer is byte-identical to the old whole-map path across bits ∈ {0,4,8},
+    /// with the component's tensors split across two shards (proving cross-shard streaming).
+    #[test]
+    fn streamed_expert_write_is_byte_identical() {
+        // A representative mix: a packable rank-2 `.weight`, a rank-1 norm `.weight` (dense — rank ≠ 2),
+        // a `.bias`, a rank-2 non-`.weight` (`scale_shift_table`, dense), and a rank-4 conv `.weight`
+        // (dense — rank ≠ 2). in_dim 128 is a multiple of the group size so the packer accepts it.
+        let tensors: Vec<(&str, Tensor)> = vec![
+            ("blocks.0.attn1.to_q.weight", f32_tensor(&[8, 128], 1.0)),
+            ("blocks.0.norm1.weight", f32_tensor(&[8], 2.0)),
+            ("blocks.0.attn1.to_q.bias", f32_tensor(&[8], 3.0)),
+            ("scale_shift_table", f32_tensor(&[2, 128], 4.0)),
+            ("patch_embedding.weight", f32_tensor(&[2, 3, 2, 2], 5.0)),
+        ];
+        for bits in [0usize, 4, 8] {
+            let tmp = stream_tmp(&format!("expert_{bits}"));
+            // Split the tensors across two shards.
+            let mut s0: HashMap<String, Tensor> = HashMap::new();
+            let mut s1: HashMap<String, Tensor> = HashMap::new();
+            for (i, (k, v)) in tensors.iter().enumerate() {
+                if i % 2 == 0 {
+                    s0.insert(k.to_string(), v.clone());
+                } else {
+                    s1.insert(k.to_string(), v.clone());
+                }
+            }
+            let p0 = tmp.join("shard0.safetensors");
+            let p1 = tmp.join("shard1.safetensors");
+            cst::save(&s0, &p0).unwrap();
+            cst::save(&s1, &p1).unwrap();
+
+            // Streamed path: mmap both shards, stream one tensor at a time (src == stripped here).
+            let st = unsafe { cst::MmapedSafetensors::multi(&[&p0, &p1]).unwrap() };
+            let keys: Vec<(String, String)> = tensors
+                .iter()
+                .map(|(k, _)| (k.to_string(), k.to_string()))
+                .collect();
+            let dst_stream = tmp.join("stream");
+            write_expert_streamed(&st, &keys, &dst_stream, bits).unwrap();
+
+            // Reference path: load the whole component into one map, then old whole-map write.
+            let mut whole: HashMap<String, Tensor> = HashMap::new();
+            whole.extend(cst::load(&p0, &Device::Cpu).unwrap());
+            whole.extend(cst::load(&p1, &Device::Cpu).unwrap());
+            let dst_ref = tmp.join("ref");
+            ref_write_expert(whole, &dst_ref, bits).unwrap();
+
+            let a = std::fs::read(dst_stream.join("model.safetensors")).unwrap();
+            let b = std::fs::read(dst_ref.join("model.safetensors")).unwrap();
+            assert_eq!(
+                a, b,
+                "streamed expert output must be byte-identical to whole-map (bits={bits})"
+            );
+            std::fs::remove_dir_all(&tmp).ok();
+        }
+    }
+
+    /// The streamed planner writer is byte-identical to the old whole-map (dense bf16) path, with the
+    /// component split across two shards.
+    #[test]
+    fn streamed_planner_write_is_byte_identical() {
+        let tensors: Vec<(&str, Tensor)> = vec![
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                f32_tensor(&[4, 4], 1.0),
+            ),
+            ("model.norm.weight", f32_tensor(&[4], 2.0)),
+            ("visual.patch_embed.proj.weight", f32_tensor(&[6, 3], 3.0)),
+        ];
+        let tmp = stream_tmp("planner");
+        let mut s0: HashMap<String, Tensor> = HashMap::new();
+        let mut s1: HashMap<String, Tensor> = HashMap::new();
+        for (i, (k, v)) in tensors.iter().enumerate() {
+            if i % 2 == 0 {
+                s0.insert(k.to_string(), v.clone());
+            } else {
+                s1.insert(k.to_string(), v.clone());
+            }
+        }
+        let p0 = tmp.join("shard0.safetensors");
+        let p1 = tmp.join("shard1.safetensors");
+        cst::save(&s0, &p0).unwrap();
+        cst::save(&s1, &p1).unwrap();
+
+        let st = unsafe { cst::MmapedSafetensors::multi(&[&p0, &p1]).unwrap() };
+        let keys: Vec<(String, String)> = tensors
+            .iter()
+            .map(|(k, _)| (k.to_string(), k.to_string()))
+            .collect();
+        let dst_stream = tmp.join("stream");
+        write_planner_component_streamed(&st, &keys, &dst_stream).unwrap();
+
+        // Reference: whole map cast to bf16 then saved (the old `write_planner_component`).
+        let mut whole: HashMap<String, Tensor> = HashMap::new();
+        whole.extend(cst::load(&p0, &Device::Cpu).unwrap());
+        whole.extend(cst::load(&p1, &Device::Cpu).unwrap());
+        let bf16: HashMap<String, Tensor> = whole
+            .into_iter()
+            .map(|(k, v)| (k, v.to_dtype(DType::BF16).unwrap()))
+            .collect();
+        let dst_ref = tmp.join("ref");
+        std::fs::create_dir_all(&dst_ref).unwrap();
+        cst::save(&bf16, dst_ref.join("model.safetensors")).unwrap();
+
+        let a = std::fs::read(dst_stream.join("model.safetensors")).unwrap();
+        let b = std::fs::read(dst_ref.join("model.safetensors")).unwrap();
+        assert_eq!(
+            a, b,
+            "streamed planner output must be byte-identical to whole-map"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
