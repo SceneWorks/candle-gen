@@ -324,16 +324,20 @@ impl Generator for SdxlGenerator {
             )));
         }
         // F-116: `lightning` (sc-6128) runs its own fixed Euler-trailing schedule and never consults
-        // `req.scheduler` — so a caller-selected curated scheduler (karras / sgm_uniform / …) would be
-        // silently dropped (the F-004 shape). Reject the combination loudly instead of misleading. A
-        // recognized curated scheduler is rejected; `None` and the native-fallback `discrete` alias
-        // (both resolve to lightning's own schedule anyway) are left alone.
+        // `req.scheduler` — so a caller-selected NON-DEFAULT curated scheduler (karras / sgm_uniform /
+        // …) would be silently dropped (the F-004 shape). Reject that combination loudly instead of
+        // misleading. Only a recognized non-default scheduler is rejected; the default `normal`, `None`,
+        // and any unrecognized value (e.g. the native-fallback `discrete` alias) all pass — a worker
+        // that always populates `scheduler:"normal"` alongside `lightning` must not hard-error, and
+        // every one of these resolves to lightning's own trailing schedule anyway (nothing dropped).
         if req.sampler.as_deref() == Some(pipeline::LIGHTNING_SAMPLER) {
             if let Some(sched) = req.scheduler.as_deref() {
-                if gen_core::sampling::Scheduler::from_name(sched).is_some() {
+                let recognized = gen_core::sampling::Scheduler::from_name(sched);
+                if recognized.is_some_and(|s| s != gen_core::sampling::Scheduler::Normal) {
                     return Err(gen_core::Error::Msg(format!(
                         "sdxl: the `lightning` sampler uses its own fixed trailing schedule and \
-                         ignores the `scheduler` axis (got `{sched}`) — omit `scheduler` for lightning"
+                         ignores the `scheduler` axis (got `{sched}`) — omit `scheduler` (or use \
+                         `normal`) for lightning"
                     )));
                 }
             }
@@ -674,8 +678,9 @@ mod tests {
         };
         assert!(g.validate(&bogus).is_err());
 
-        // F-116: `lightning` + a curated scheduler is rejected — lightning ignores the scheduler axis,
-        // so honoring the selection is impossible and silently dropping it would mislead.
+        // F-116: `lightning` + a NON-DEFAULT curated scheduler (`karras`) is rejected — lightning
+        // ignores the scheduler axis, so honoring the selection is impossible and silently dropping it
+        // would mislead.
         let lightning_sched = GenerationRequest {
             prompt: "x".into(),
             sampler: Some("lightning".into()),
@@ -684,8 +689,26 @@ mod tests {
         };
         assert!(g.validate(&lightning_sched).is_err());
 
-        // …but `lightning` with no scheduler (or the native-fallback `discrete` alias) is fine — both
-        // resolve to lightning's own trailing schedule, so nothing is dropped.
+        // …but `lightning` with the DEFAULT `normal` scheduler PASSES — a worker that always populates
+        // `scheduler:"normal"` alongside lightning must not hard-error, and `normal` resolves to
+        // lightning's own trailing schedule anyway (nothing dropped).
+        let lightning_normal = GenerationRequest {
+            prompt: "x".into(),
+            sampler: Some("lightning".into()),
+            scheduler: Some("normal".into()),
+            ..Default::default()
+        };
+        assert!(g.validate(&lightning_normal).is_ok());
+
+        // …as does `lightning` with no scheduler at all, or the unrecognized native-fallback `discrete`
+        // alias — both likewise resolve to lightning's own trailing schedule.
+        let lightning_none = GenerationRequest {
+            prompt: "x".into(),
+            sampler: Some("lightning".into()),
+            scheduler: None,
+            ..Default::default()
+        };
+        assert!(g.validate(&lightning_none).is_ok());
         let lightning_discrete = GenerationRequest {
             prompt: "x".into(),
             sampler: Some("lightning".into()),
