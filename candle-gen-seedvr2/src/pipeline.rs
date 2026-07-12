@@ -468,7 +468,12 @@ impl Seedvr2Pipeline {
 
         let plan = video::plan_chunks(n, chunk, video::DEFAULT_OVERLAP);
         let total = plan.len();
-        let mut chunk_frames: Vec<Vec<Image>> = Vec::with_capacity(total);
+        // Assemble incrementally: cross-fade each chunk into `out` as it is produced and drop the
+        // chunk, so host RAM stays at one full video plus the one chunk in flight — the batch path
+        // held every chunk's (overlap-duplicated) frames AND cloned the whole clip at peak (~2–3×
+        // the video, ~15–17 GB for a 300-frame 4K clip; F-128, sc-11234). Output is byte-identical:
+        // chunks are processed in the same plan order with the same cross-fade schedule.
+        let mut out: Vec<Image> = Vec::with_capacity(n.max(0) as usize);
         for (i, Chunk { start, len }) in plan.iter().enumerate() {
             // Honor the engine cancellation contract before each (seconds-to-minutes) chunk.
             check_canceled(cancel)?;
@@ -480,17 +485,13 @@ impl Seedvr2Pipeline {
             let cond = Self::condition(&latent)?;
             let latents = self.denoise(&noise, &cond)?;
             let decoded = self.decode_crop_5d(&latents, height, width)?;
-            chunk_frames.push(self.frames_from_decoded(&decoded, &clip, *len as usize)?);
+            let chunk_imgs = self.frames_from_decoded(&decoded, &clip, *len as usize)?;
+            video::assemble_overlap_chunk(&mut out, *start, chunk_imgs, n, video::DEFAULT_OVERLAP);
             if let Some(cb) = progress.as_deref_mut() {
                 cb(i + 1, total); // real per-chunk progress (1-based done / total chunks)
             }
         }
-        Ok(video::assemble_overlap(
-            &plan,
-            &chunk_frames,
-            n,
-            video::DEFAULT_OVERLAP,
-        ))
+        Ok(out)
     }
 
     /// Per-frame (`T=1`) video fallback: each frame through the still path with a fixed (anchored)

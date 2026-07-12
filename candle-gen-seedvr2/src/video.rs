@@ -147,29 +147,53 @@ fn blend_frames(a: &Image, b: &Image, w: f32) -> Image {
     }
 }
 
+/// Cross-fade one chunk's decoded frames into the running assembly `out`, **consuming** `frames`
+/// (moved, never cloned — the F-128 host-RAM bound, sc-11234). `start` is `plan[k].start`; `out`
+/// holds the already-assembled prefix. In the leading `ov`-frame overlap with `out` the frames are
+/// linearly cross-faded (weight ramps `1/(ov+1) … ov/(ov+1)`, the spike `chunk_test.py` schedule);
+/// each remaining (new) frame is appended **by value** (no clone). Trailing padding past frame `n`
+/// is dropped. Byte-identical to feeding this chunk to [`assemble_overlap`] — the ordering, blend
+/// schedule, and truncation are unchanged; only the ownership (move vs clone) differs.
+///
+/// Assembling incrementally as each chunk is produced keeps host RAM at one full video (`out`) plus
+/// the one chunk in flight, instead of accumulating every chunk's frames (overlap-duplicated) and
+/// then cloning the whole video in a batch pass (~2–3× the clip at peak).
+pub fn assemble_overlap_chunk(
+    out: &mut Vec<Image>,
+    start: i32,
+    frames: Vec<Image>,
+    n: i32,
+    ov: i32,
+) {
+    for (j, f) in frames.into_iter().enumerate() {
+        let i = start + j as i32;
+        if i >= n {
+            break; // remaining padding frames drop as the iterator is discarded.
+        }
+        if (i as usize) < out.len() {
+            // overlap with the previous chunk — cross-fade toward this chunk.
+            let w = (i - start + 1) as f32 / (ov + 1) as f32;
+            out[i as usize] = blend_frames(&out[i as usize], &f, w);
+        } else {
+            // new, contiguous frame — moved in, not cloned.
+            out.push(f);
+        }
+    }
+}
+
 /// Cross-fade-assemble per-chunk frame lists into exactly `n` output frames. `chunks[k]` holds the
 /// decoded (and color-corrected) frames for `plan[k]`, covering pixel-frames
 /// `[plan[k].start, plan[k].start + len)`. In each chunk's leading `ov`-frame overlap with the
 /// already-assembled region the frames are linearly cross-faded (weight ramps `1/(ov+1) … ov/(ov+1)`,
 /// the spike `chunk_test.py` schedule); the rest pass through. Trailing padding past frame `n` is dropped.
+///
+/// The batch entry point (retained for the parity harness/tests). Production assembles incrementally
+/// via [`assemble_overlap_chunk`] to bound host RAM (F-128); this clones each borrowed chunk so it
+/// can delegate to the same core, keeping the two paths byte-identical by construction.
 pub fn assemble_overlap(plan: &[Chunk], chunks: &[Vec<Image>], n: i32, ov: i32) -> Vec<Image> {
     let mut out: Vec<Image> = Vec::with_capacity(n.max(0) as usize);
     for (k, frames) in chunks.iter().enumerate() {
-        let start = plan[k].start;
-        for (j, f) in frames.iter().enumerate() {
-            let i = start + j as i32;
-            if i >= n {
-                break;
-            }
-            if (i as usize) < out.len() {
-                // overlap with the previous chunk — cross-fade toward this chunk.
-                let w = (i - start + 1) as f32 / (ov + 1) as f32;
-                out[i as usize] = blend_frames(&out[i as usize], f, w);
-            } else {
-                // new, contiguous frame.
-                out.push(f.clone());
-            }
-        }
+        assemble_overlap_chunk(&mut out, plan[k].start, frames.clone(), n, ov);
     }
     out
 }
@@ -394,6 +418,36 @@ mod tests {
         let out = assemble_overlap(&plan, &[frames], 5, 4);
         assert_eq!(out.len(), 5);
         assert_eq!(out[4].pixels[0], 4);
+    }
+
+    #[test]
+    fn incremental_assembly_matches_batch_byte_for_byte() {
+        // F-128 / sc-11234: assembling chunk-by-chunk (move, no clone) must produce exactly the same
+        // output as the batch `assemble_overlap` — same ordering, cross-fade schedule, truncation.
+        // Cover a single-chunk (truncating) plan and a multi-chunk (overlap-blending) plan.
+        for (n, chunk, ov, vals) in [(5i32, 16i32, 4i32, vec![7u8]), (28, 16, 4, vec![0, 200])] {
+            let plan = plan_chunks(n, chunk, ov);
+            // Build per-chunk frame lists (distinct fills so blends are observable).
+            let chunks: Vec<Vec<Image>> = (0..plan.len())
+                .map(|k| {
+                    (0..chunk)
+                        .map(|_| img(2, 2, vals[k % vals.len()]))
+                        .collect()
+                })
+                .collect();
+            let batch = assemble_overlap(&plan, &chunks, n, ov);
+
+            // Incremental: move each chunk in, as the pipeline loop does.
+            let mut incr: Vec<Image> = Vec::with_capacity(n.max(0) as usize);
+            for (k, Chunk { start, .. }) in plan.iter().enumerate() {
+                assemble_overlap_chunk(&mut incr, *start, chunks[k].clone(), n, ov);
+            }
+
+            assert_eq!(incr.len(), batch.len(), "same frame count (n={n})");
+            for (a, b) in incr.iter().zip(batch.iter()) {
+                assert_eq!(a.pixels, b.pixels, "byte-identical frames (n={n})");
+            }
+        }
     }
 
     #[test]

@@ -443,6 +443,26 @@ impl Generator for LtxGenerator {
                 )));
             }
         }
+        // Bound the AvDiT denoise sequence length (F-131, sc-11234). The checks above bound only the
+        // frame *shape*, never its magnitude, so a huge frame count (e.g. `frames: 2001`, which
+        // satisfies `% 8 == 1`) at a large resolution produced ~400k latent tokens and OOM'd deep in
+        // the 22B denoise loop rather than failing catchably here. The video latent token count
+        // `t_lat · h_lat · w_lat` is the memory driver (self-attn working set + per-token q/k/v across
+        // 48 layers); cap it against the GPU envelope. Uses the effective frame count (the render
+        // default when `None`) and the already-validated (mult-of-32) width/height.
+        let eff_frames = req.frames.unwrap_or(DEFAULT_FRAMES);
+        let (t_lat, h_lat, w_lat) = pipeline::latent_dims(eff_frames, req.width, req.height);
+        let tokens = t_lat * h_lat * w_lat;
+        let max_tokens = config::max_latent_tokens();
+        if tokens > max_tokens {
+            return Err(gen_core::Error::Msg(format!(
+                "ltx: request too large — {eff_frames} frames at {}x{} is {tokens} latent tokens, \
+                 over the {max_tokens}-token cap (the 22B AvDiT denoise loop would exceed the GPU \
+                 memory envelope). Reduce the frame count or resolution, or raise \
+                 LTX_MAX_LATENT_TOKENS for a larger-VRAM device.",
+                req.width, req.height
+            )));
+        }
         // `req.steps` (sc-9027 / F-043): the distilled model bakes the fixed `STAGE1_SIGMAS` σ waypoints
         // into training, so the only supported step count is `NATIVE_STEPS`. Reject any other explicit
         // override with a clear diagnostic instead of silently running the baked schedule — a
@@ -731,5 +751,57 @@ mod tests {
                 "steps={s} must be rejected"
             );
         }
+    }
+
+    /// F-131 / sc-11234: `validate` bounds the video latent token count (`t_lat · h_lat · w_lat`),
+    /// so a huge frame count that passes the `% 8 == 1` shape check but would OOM the 22B AvDiT
+    /// denoise loop is rejected catchably up front instead of blowing up mid-render. An in-bounds
+    /// long clip still passes.
+    #[test]
+    fn validate_rejects_unbounded_frame_count() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(MODEL_ID, &spec).unwrap();
+        let base = GenerationRequest {
+            prompt: "a cat walking across a sunny garden".into(),
+            width: 1280,
+            height: 1280,
+            ..Default::default()
+        };
+        // The finding's pathological case: 2001 frames satisfies `% 8 == 1` (shape-valid) but is
+        // ~400k latent tokens at 1280² — far over the cap.
+        assert_eq!(
+            2001 % config::TEMPORAL_SCALE as u32,
+            1,
+            "shape-valid frame count"
+        );
+        let huge = GenerationRequest {
+            frames: Some(2001),
+            ..base.clone()
+        };
+        let err = g.validate(&huge).unwrap_err().to_string();
+        assert!(
+            err.contains("latent tokens") && err.contains("cap"),
+            "over-cap request rejected with a clear message: {err}"
+        );
+
+        // The token count is the actual driver: computing it here mirrors `validate`.
+        let (t, h, w) = pipeline::latent_dims(2001, 1280, 1280);
+        assert!(
+            t * h * w > config::max_latent_tokens(),
+            "2001@1280² exceeds the cap"
+        );
+
+        // A generous but in-bounds clip still validates: 129 frames at 704×480 → t_lat 17 ·
+        // (22·15) = 5610 latent tokens, comfortably under the 131072 cap.
+        let ok = GenerationRequest {
+            frames: Some(129),
+            width: 704,
+            height: 480,
+            ..base
+        };
+        assert!(
+            g.validate(&ok).is_ok(),
+            "an in-bounds long clip must pass: {ok:?}"
+        );
     }
 }

@@ -32,6 +32,31 @@ pub const DEFAULT_HEIGHT: u32 = 480;
 /// learnable registers, so this caps the real-token context fed to the DiT cross-attention.
 pub const TEXT_MAX_LENGTH: usize = 256;
 
+/// Upper bound on a render's video **latent token count** (`t_lat · h_lat · w_lat`). This is the
+/// AvDiT denoise-loop sequence length and the real memory driver — the video self-attn scores
+/// `[b, h, s, s]` working set plus the per-token q/k/v activations across the 48 video-DiT layers.
+/// `validate` bounded only `frames % TEMPORAL_SCALE == 1` with no upper limit, so a `frames: 2001`
+/// request at 1280² (≈400k latent tokens) passed every guard except the VAE's and OOM'd mid-denoise
+/// in the 22B loop instead of failing catchably up front (F-131, sc-11234). Sized against the target
+/// GPU envelope: at 131072 tokens the per-layer f32 q/k/v working set is ≈6.4 GB — comfortably
+/// generous for real clips (704×480 → ~400 latent frames; 1280² → ~80 latent frames ≈ 640 pixel
+/// frames) while rejecting pathological requests. Overridable per-GPU via [`max_latent_tokens`].
+pub const MAX_LATENT_TOKENS: usize = 131_072;
+
+/// Resolve the latent-token cap: the `LTX_MAX_LATENT_TOKENS` env override (a positive integer) when
+/// set, else [`MAX_LATENT_TOKENS`]. Mirrors the seedvr2 `SEEDVR2_BUDGET_GIB` per-GPU tuning knob so
+/// a larger-VRAM worker can lift the ceiling without a recompile.
+pub fn max_latent_tokens() -> usize {
+    if let Ok(raw) = std::env::var("LTX_MAX_LATENT_TOKENS") {
+        if let Ok(n) = raw.trim().parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    MAX_LATENT_TOKENS
+}
+
 /// Distilled single-stage rectified-flow sigma schedule (`DEFAULT_STAGE_1_SIGMAS`, 8 denoise steps:
 /// σ goes 1.0 → 0.0, a complete generation). The 2-stage refinement (upsample + re-noise + the
 /// `STAGE2` sigmas) is deferred to a follow-up; stage-1 alone at the target resolution is a full,
