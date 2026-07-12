@@ -164,8 +164,16 @@ fn edit_renders_coherent_with_dual_conditioning() {
     };
 
     let t_gen = Instant::now();
-    let imgs =
-        render_edit(&comps, &edit, &req, &references, &device, &mut |_| {}).expect("render_edit");
+    let imgs = render_edit(
+        &comps,
+        &edit,
+        &req,
+        &references,
+        false,
+        &device,
+        &mut |_| {},
+    )
+    .expect("render_edit");
     let gen_s = t_gen.elapsed().as_secs_f32();
 
     assert_eq!(imgs.len(), 1, "count=1 → one image");
