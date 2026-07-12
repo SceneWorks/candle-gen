@@ -188,10 +188,17 @@ impl Generator for Seedvr2Generator {
             if req.cancel.is_cancelled() {
                 return Err(gen_core::Error::Canceled);
             }
-            on_progress(Progress::Step {
-                current: 1,
-                total: 1,
-            });
+            // Real per-chunk/per-frame progress (sc-11227 / F-092): the upscale loops call this back
+            // once per completed unit with `(done, total)` (1-based), replacing the old fixed
+            // `Step { 1, 1 }` placeholder that jumped straight to "done". `&req.cancel` is threaded in
+            // so a mid-clip cancel is honored per unit (the sam3 `propagate` contract, sc-8972) rather
+            // than only after the whole (minutes-to-hours) clip finishes.
+            let mut on_step = |done: usize, total: usize| {
+                on_progress(Progress::Step {
+                    current: done as u32,
+                    total: total as u32,
+                });
+            };
             let frames = pipe.generate_video(
                 clip.frames,
                 req.width as usize,
@@ -199,6 +206,8 @@ impl Generator for Seedvr2Generator {
                 base_seed,
                 softness,
                 None,
+                Some(&req.cancel),
+                Some(&mut on_step),
             )?;
             on_progress(Progress::Decoding);
             return Ok(GenerationOutput::Video {

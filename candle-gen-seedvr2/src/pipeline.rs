@@ -15,7 +15,7 @@
 //! no runtime text encoder), loaded at construction.
 
 use candle_gen::candle_core::{DType, Device, Result, Tensor};
-use candle_gen::gen_core::{imageops, Image, Quant};
+use candle_gen::gen_core::{imageops, CancelFlag, Image, Quant};
 use candle_gen::{CandleError, Result as CResult};
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -91,6 +91,18 @@ fn decoded_to_image(decoded: &Tensor) -> Result<Image> {
         height: h as u32,
         pixels,
     })
+}
+
+/// Bail with the typed [`CandleError::Canceled`] when the caller's cooperative cancel flag has
+/// tripped — the video loops check it before each (seconds-to-minutes) chunk/frame (the gen-core
+/// video per-step cancel contract, sc-8972/sc-11227; mirrors `Sam3VideoModel::propagate`). An
+/// absent flag is a no-op. The typed variant (never a stringified `Msg`) bridges to
+/// `gen_core::Error::Canceled` so the worker keys off the variant to map a user cancel.
+fn check_canceled(cancel: Option<&CancelFlag>) -> CResult<()> {
+    if cancel.is_some_and(CancelFlag::is_cancelled) {
+        return Err(CandleError::Canceled);
+    }
+    Ok(())
 }
 
 impl Seedvr2Pipeline {
@@ -401,6 +413,15 @@ impl Seedvr2Pipeline {
     /// and cross-fades chunk overlaps to close the causal-VAE seam ([`crate::video`]). Falls back to
     /// the per-frame (`T=1`) path under tight memory, and to per-frame **spatial tiling** when even one
     /// full-resolution frame exceeds the budget (HD), so peak stays bounded at any resolution.
+    ///
+    /// `cancel` is the caller's cooperative cancel flag (the gen-core video per-step cancel contract,
+    /// sc-8972/sc-11227; mirrors `Sam3VideoModel::propagate`): checked before each (seconds-to-minutes)
+    /// chunk/frame so a mid-clip cancel is honored promptly instead of after the whole upscale, surfacing
+    /// the typed [`CandleError::Canceled`]. `progress` is invoked `(units_done, units_total)` after each
+    /// completed chunk/frame (real per-unit progress, 1-based `units_done`), replacing the old
+    /// fixed-placeholder single step; `units_total` is the number of chunks (chunked path) or frames
+    /// (per-frame / spatial-tiling paths).
+    #[allow(clippy::too_many_arguments)] // the video seam threads size/seed + cancel + progress
     pub fn generate_video(
         &self,
         frames: &[Image],
@@ -409,6 +430,8 @@ impl Seedvr2Pipeline {
         seed: u64,
         softness: f32,
         chunk_override: Option<i32>,
+        cancel: Option<&CancelFlag>,
+        mut progress: Option<&mut dyn FnMut(usize, usize)>,
     ) -> CResult<Vec<Image>> {
         let n = frames.len() as i32;
         if n == 0 {
@@ -418,7 +441,8 @@ impl Seedvr2Pipeline {
         // at the full `width×height` per frame, which corrupts above ~1536² regardless of memory. Above
         // the cap, force the per-frame spatial tiler (tiles capped at `VAE_SAFE_DECODE_EDGE_PX`).
         if width.max(height) as i32 > video::VAE_SAFE_DECODE_EDGE_PX {
-            return self.generate_video_tiled(frames, width, height, seed, softness);
+            return self
+                .generate_video_tiled(frames, width, height, seed, softness, cancel, progress);
         }
         let chunk = match (
             chunk_override,
@@ -430,18 +454,24 @@ impl Seedvr2Pipeline {
             (Some(c), ChunkPlan::Chunked(safe)) => video::pad_to_valid_chunk(c).min(safe),
             (_, ChunkPlan::Chunked(c)) => c,
             (_, ChunkPlan::PerFrame) => {
-                return self.generate_video_per_frame(frames, width, height, seed, softness)
+                return self.generate_video_per_frame(
+                    frames, width, height, seed, softness, cancel, progress,
+                )
             }
             // Even one full-resolution frame exceeds the budget → spatially tile each frame
             // (per-frame T=1 + overlap feather blend). Bounds peak at any resolution (sc-5201).
             (_, ChunkPlan::OverBudget { .. }) => {
-                return self.generate_video_tiled(frames, width, height, seed, softness)
+                return self
+                    .generate_video_tiled(frames, width, height, seed, softness, cancel, progress)
             }
         };
 
         let plan = video::plan_chunks(n, chunk, video::DEFAULT_OVERLAP);
-        let mut chunk_frames: Vec<Vec<Image>> = Vec::with_capacity(plan.len());
-        for Chunk { start, len } in &plan {
+        let total = plan.len();
+        let mut chunk_frames: Vec<Vec<Image>> = Vec::with_capacity(total);
+        for (i, Chunk { start, len }) in plan.iter().enumerate() {
+            // Honor the engine cancellation contract before each (seconds-to-minutes) chunk.
+            check_canceled(cancel)?;
             let clip = self.preprocess_chunk(frames, *start, *len, width, height, softness)?;
             let latent = self.vae.encode(&clip)?;
             let (_b, _c, lt, lh, lw) = latent.dims5()?;
@@ -451,6 +481,9 @@ impl Seedvr2Pipeline {
             let latents = self.denoise(&noise, &cond)?;
             let decoded = self.decode_crop_5d(&latents, height, width)?;
             chunk_frames.push(self.frames_from_decoded(&decoded, &clip, *len as usize)?);
+            if let Some(cb) = progress.as_deref_mut() {
+                cb(i + 1, total); // real per-chunk progress (1-based done / total chunks)
+            }
         }
         Ok(video::assemble_overlap(
             &plan,
@@ -462,7 +495,9 @@ impl Seedvr2Pipeline {
 
     /// Per-frame (`T=1`) video fallback: each frame through the still path with a fixed (anchored)
     /// seed — intrinsically temporally stable (spike sc-4812). Used when even an 8-frame chunk
-    /// exceeds the memory budget.
+    /// exceeds the memory budget. Honors `cancel` before each frame and reports `(frame+1, total)`
+    /// real progress (sc-11227).
+    #[allow(clippy::too_many_arguments)] // size/seed + cancel + progress threaded from generate_video
     fn generate_video_per_frame(
         &self,
         frames: &[Image],
@@ -470,17 +505,27 @@ impl Seedvr2Pipeline {
         height: usize,
         seed: u64,
         softness: f32,
+        cancel: Option<&CancelFlag>,
+        mut progress: Option<&mut dyn FnMut(usize, usize)>,
     ) -> CResult<Vec<Image>> {
-        frames
-            .iter()
-            .map(|f| self.generate(f, width, height, seed, softness))
-            .collect()
+        let total = frames.len();
+        let mut out = Vec::with_capacity(total);
+        for (i, f) in frames.iter().enumerate() {
+            check_canceled(cancel)?;
+            out.push(self.generate(f, width, height, seed, softness)?);
+            if let Some(cb) = progress.as_deref_mut() {
+                cb(i + 1, total);
+            }
+        }
+        Ok(out)
     }
 
     /// HD spatial-tiling video path (sc-5201): each frame is upscaled per-frame (`T=1`) but **spatially
     /// tiled** — the budget sizer picks the largest square tile that fits, and the decoded tiles are
     /// feather-blended. Used when even one full-resolution frame exceeds the memory budget; bounds peak
-    /// at any resolution.
+    /// at any resolution. Honors `cancel` before each frame and reports `(frame+1, total)` real
+    /// progress (sc-11227).
+    #[allow(clippy::too_many_arguments)] // size/seed + cancel + progress threaded from generate_video
     fn generate_video_tiled(
         &self,
         frames: &[Image],
@@ -488,15 +533,22 @@ impl Seedvr2Pipeline {
         height: usize,
         seed: u64,
         softness: f32,
+        cancel: Option<&CancelFlag>,
+        mut progress: Option<&mut dyn FnMut(usize, usize)>,
     ) -> CResult<Vec<Image>> {
         let tile = video::plan_spatial_tile_px(self.weights_bytes, video::safe_budget_gib());
         let overlap = video::SPATIAL_OVERLAP.min(tile / 2);
-        let mut out = Vec::with_capacity(frames.len());
-        for f in frames {
+        let total = frames.len();
+        let mut out = Vec::with_capacity(total);
+        for (i, f) in frames.iter().enumerate() {
+            check_canceled(cancel)?;
             let processed = self.preprocess(f, width, height, softness)?.unsqueeze(2)?; // (1,3,1,H,W)
             let decoded = self.run_frame_tiled(&processed, seed, tile, overlap)?;
             let imgs = self.frames_from_decoded(&decoded, &processed, 1)?;
             out.push(imgs.into_iter().next().expect("one frame"));
+            if let Some(cb) = progress.as_deref_mut() {
+                cb(i + 1, total);
+            }
         }
         Ok(out)
     }
@@ -563,5 +615,52 @@ impl Seedvr2Pipeline {
         Ok(acc
             .expect("≥1 tile")
             .broadcast_div(&wsum.expect("≥1 tile"))?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// sc-11227 / F-092: the video upscale loops check `check_canceled` before each
+    /// (seconds-to-minutes) chunk/frame and surface the **typed** [`CandleError::Canceled`] (never a
+    /// stringified `Msg` — the worker keys off the variant to map a user cancel). An absent or
+    /// untripped flag is a no-op. Mirrors `Sam3VideoModel`'s `check_canceled` (sc-8972).
+    #[test]
+    fn check_canceled_surfaces_typed_canceled_only_on_trip() {
+        assert!(check_canceled(None).is_ok(), "no flag → no-op");
+        let flag = CancelFlag::new();
+        assert!(check_canceled(Some(&flag)).is_ok(), "untripped → no-op");
+        flag.cancel();
+        assert!(
+            matches!(check_canceled(Some(&flag)), Err(CandleError::Canceled)),
+            "tripped → typed Canceled"
+        );
+    }
+
+    /// The per-unit progress contract (sc-11227): the loops report `(done, total)` with `done`
+    /// running 1..=total (monotonic, 1-based, ending exactly at `total`) — real per-chunk/per-frame
+    /// progress, NOT the old fixed `Step { current: 1, total: 1 }` placeholder that jumped to "done".
+    /// This asserts the callback-driving arithmetic the three loops share (`cb(i + 1, total)`).
+    #[test]
+    fn progress_callback_reports_monotonic_one_based_units() {
+        for total in [1usize, 4, 20] {
+            let mut seen: Vec<(usize, usize)> = Vec::new();
+            // Mirror the loops' `if let Some(cb) = progress.as_deref_mut() { cb(i + 1, total) }`.
+            let mut cb = |done: usize, tot: usize| seen.push((done, tot));
+            let mut progress: Option<&mut dyn FnMut(usize, usize)> = Some(&mut cb);
+            for i in 0..total {
+                if let Some(cb) = progress.as_deref_mut() {
+                    cb(i + 1, total);
+                }
+            }
+            assert_eq!(seen.len(), total, "one progress event per completed unit");
+            assert_eq!(seen.first().copied(), Some((1, total)), "1-based start");
+            assert_eq!(seen.last().copied(), Some((total, total)), "ends at total");
+            assert!(
+                seen.windows(2).all(|w| w[1].0 > w[0].0),
+                "strictly increasing (monotonic real progress, not a fixed placeholder): {seen:?}"
+            );
+        }
     }
 }

@@ -129,10 +129,37 @@ fn cuda_video_chunk_overlap_smoke() {
     let clip = synth_clip(src, n, 2); // ≤2 px/frame — realistic motion
 
     // chunk=16 forces TWO chunks ([0,16],[4,20]) so the 4-frame overlap cross-fade is exercised.
+    // Collect real per-chunk progress (sc-11227): must be monotonic, 1-based, and end at (total,total)
+    // — NOT the old fixed `Step { 1, 1 }` placeholder.
     let t0 = std::time::Instant::now();
-    let out = pipe
-        .generate_video(&clip, tgt, tgt, 42, 0.0, Some(16))
-        .expect("generate_video");
+    let mut steps: Vec<(usize, usize)> = Vec::new();
+    let out = {
+        let mut on_step = |done: usize, total: usize| steps.push((done, total));
+        pipe.generate_video(&clip, tgt, tgt, 42, 0.0, Some(16), None, Some(&mut on_step))
+            .expect("generate_video")
+    };
+    assert!(!steps.is_empty(), "progress must be reported per chunk");
+    let total = steps[0].1;
+    assert!(
+        total >= 2,
+        "chunk=16 over 20 frames → ≥2 chunks, got {total}"
+    );
+    assert_eq!(steps.first().copied(), Some((1, total)), "1-based start");
+    assert_eq!(steps.last().copied(), Some((total, total)), "ends at total");
+    assert!(
+        steps.windows(2).all(|w| w[1].0 > w[0].0),
+        "progress strictly increasing (real, not placeholder): {steps:?}"
+    );
+
+    // sc-11227: a cancel tripped mid-clip is honored promptly (per chunk), surfacing the typed
+    // `Canceled` rather than running the whole (minutes-to-hours) upscale to completion.
+    let cancel = candle_gen::gen_core::CancelFlag::new();
+    cancel.cancel();
+    let canceled = pipe.generate_video(&clip, tgt, tgt, 42, 0.0, Some(16), Some(&cancel), None);
+    assert!(
+        matches!(canceled, Err(candle_gen::CandleError::Canceled)),
+        "a tripped cancel flag must stop the upscale loop early with typed Canceled"
+    );
     eprintln!(
         "[seedvr2-video] {n}×{src}→{tgt} chunked in {:?} -> {} frames",
         t0.elapsed(),
@@ -195,7 +222,7 @@ fn cuda_video_chunk_overlap_smoke() {
     // frame fits but an 8-frame chunk doesn't (18 GiB > weights+1-frame for both bf16 & f32).
     std::env::set_var("SEEDVR2_BUDGET_GIB", "18");
     let per_frame = pipe
-        .generate_video(&clip, tgt, tgt, 42, 0.0, None)
+        .generate_video(&clip, tgt, tgt, 42, 0.0, None, None, None)
         .expect("generate_video per-frame fallback");
     std::env::remove_var("SEEDVR2_BUDGET_GIB");
     assert_eq!(per_frame.len(), n, "fallback frame count must be preserved");
@@ -279,7 +306,7 @@ fn cuda_video_identical_frames_smoke() {
         .expect("T=1 baseline");
     let clip: Vec<Image> = (0..8).map(|_| frame.clone()).collect();
     let vid = pipe
-        .generate_video(&clip, tgt, tgt, 11, 0.0, Some(8))
+        .generate_video(&clip, tgt, tgt, 11, 0.0, Some(8), None, None)
         .expect("identical-frames video");
     assert_eq!(vid.len(), 8);
     let base: Vec<f32> = img.pixels.iter().map(|&v| v as f32).collect();
