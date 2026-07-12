@@ -106,8 +106,9 @@ pub(crate) struct Pipeline {
     pub(crate) root: PathBuf,
     pub(crate) device: Device,
     pub(crate) dtype: DType,
-    /// When `Some`, the quantizable components (TE + DiT) are staged dense in CPU RAM and quantized
-    /// onto `device` (the dev 32B path; klein leaves this `None`).
+    /// When `Some`, the DiT (and, for dev, the TE) is staged dense in CPU RAM and quantized onto
+    /// `device`. dev folds both TE + DiT; klein folds ONLY the DiT and keeps its Qwen3 TE dense
+    /// (`te_quant`). `None` ⇒ everything dense (bf16 tier / fixtures).
     pub(crate) quant: Option<Quant>,
     /// The `LoadSpec::pid` component captured at load (epic 7840 / sc-7853), threaded into the lazy
     /// component build so the PiD engine loads once alongside the base model. `None` when not opted in.
@@ -216,6 +217,19 @@ impl Pipeline {
         Ok(candle_gen::quant::PackedConfig::from_config(&v).is_some())
     }
 
+    /// The quant applied to the **text encoder** (the DiT always uses `self.quant`). dev folds its ~24B
+    /// Mistral TE onto the GPU alongside the 32B DiT — the pair doesn't fit dense — so the TE quantizes
+    /// with the DiT. klein keeps its 8B Qwen3 TE DENSE bf16 in EVERY tier (epic 8506 DENSE_TE: only the
+    /// 9B DiT quantizes, for fidelity), so the TE is never quantized even at q4/q8 (sc-11031). Returns
+    /// `None` for klein regardless of `self.quant`; `self.quant` for dev.
+    fn te_quant(&self) -> Option<Quant> {
+        if self.variant.is_dev() {
+            self.quant
+        } else {
+            None
+        }
+    }
+
     /// Load the base **Mistral/Qwen3 TE + `Flux2Transformer` DiT** pair — the exact quantizable stack
     /// shared by every entry point (txt2img [`Self::load_components`], `Flux2Edit::load_variant`,
     /// `Flux2Control::load`). This is the single home for the "which builders + which tier/staging
@@ -242,6 +256,7 @@ impl Pipeline {
     pub(crate) fn load_te_seq(&self) -> CResult<Flux2PromptEncoder> {
         self.load_one_quantizable(
             "text_encoder",
+            self.te_quant(),
             |vb| Ok(Flux2PromptEncoder::new(&self.cfg, vb)?),
             |m, q, d| Ok(m.quantize(q, d)?),
         )
@@ -253,6 +268,7 @@ impl Pipeline {
     pub(crate) fn load_dit_seq(&self) -> CResult<Flux2Transformer> {
         self.load_one_quantizable(
             "transformer",
+            self.quant,
             |vb| Ok(Flux2Transformer::new(&self.cfg, vb)?),
             |m, q, d| Ok(m.quantize(q, d)?),
         )
@@ -272,32 +288,38 @@ impl Pipeline {
     ) -> CResult<(Flux2PromptEncoder, Flux2Transformer)> {
         let te = self.load_one_quantizable(
             "text_encoder",
+            self.te_quant(),
             |vb| mk_te(&self.cfg, vb),
             |m, q, d| Ok(m.quantize(q, d)?),
         )?;
         let dit = self.load_one_quantizable(
             "transformer",
+            self.quant,
             |vb| mk_dit(&self.cfg, vb),
             |m, q, d| Ok(m.quantize(q, d)?),
         )?;
         Ok((te, dit))
     }
 
-    /// Load one quantizable component (`sub`). Three regimes:
+    /// Load one quantizable component (`sub`) with its OWN `quant` (per-component: `self.quant` for the
+    /// DiT, `self.te_quant()` for the TE — klein passes `None` there to keep the Qwen3 TE dense while its
+    /// DiT quantizes). Three regimes:
     /// - **packed tier + quant**: build directly on the GPU from the packed parts (`.scales` detected
     ///   inside each `linear_detect`); no dense weight is ever materialized (sc-9087). The post-load
     ///   `quantize` pass is still called — it is a no-op on the already-packed projections and only
     ///   carries the dense leaves (RMSNorms, a dense token embedding) to the GPU.
     /// - **dense tier + quant**: stage dense in CPU RAM, then `quantize` folds each projection onto the
-    ///   GPU (the legacy ~105 GB path, retained for dense tiers / large fixtures).
-    /// - **no quant**: load dense on-device (klein, small dev fixtures).
+    ///   GPU (the legacy ~105 GB path, retained for dense tiers / large fixtures — and klein's on-the-fly
+    ///   DiT quant off a dense BFL snapshot, sc-11031).
+    /// - **no quant**: load dense on-device (klein's Qwen3 TE, small dev fixtures).
     fn load_one_quantizable<M>(
         &self,
         sub: &str,
+        quant: Option<Quant>,
         build: impl FnOnce(VarBuilder) -> CResult<M>,
         quantize: impl FnOnce(&mut M, Quant, &Device) -> CResult<()>,
     ) -> CResult<M> {
-        match self.quant {
+        match quant {
             Some(q) if self.component_is_packed(sub)? => {
                 // Build straight on the GPU from the packed tier — the packed footprint (≈ Q4: ¼ bf16)
                 // lands directly; no dense staging.
@@ -797,13 +819,10 @@ fn descriptor(variant: Flux2Variant) -> ModelDescriptor {
             max_size: 2048,
             max_count: 8,
             mac_only: false,
-            // dev quantizes (CPU-stage → quantize-onto-GPU) to fit the 32B under the memory ceiling;
-            // klein is small and runs dense.
-            supported_quants: if variant.is_dev() {
-                &[Quant::Q4, Quant::Q8]
-            } else {
-                &[] as &[Quant]
-            },
+            // Both quantize on-the-fly (CPU-stage → quantize-onto-GPU): dev folds the 32B DiT + Mistral
+            // TE to fit the memory ceiling; klein (sc-11031) folds only the 9B DiT and keeps the Qwen3
+            // TE dense bf16 (epic 8506 DENSE_TE, `Pipeline::te_quant`).
+            supported_quants: &[Quant::Q4, Quant::Q8],
             supports_kv_cache: false,
             // FLUX.2 uses the empirical-mu shifted flow-match schedule.
             requires_sigma_shift: true,
@@ -825,9 +844,11 @@ pub fn descriptor_dev() -> ModelDescriptor {
 /// [`WeightsSource::Dir`] pointing at a diffusers snapshot (`text_encoder/`, `transformer/`, `vae/`,
 /// `tokenizer/`) — klein at `black-forest-labs/FLUX.2-klein-9B`, dev at `black-forest-labs/FLUX.2-dev`
 /// (whose `text_encoder/` is the Mistral3 checkpoint). Adapters / control overlays are rejected (not
-/// wired). `spec.quantize` (Q4/Q8) is honored for **dev** — the 32B is staged dense in CPU RAM and
-/// quantized onto the GPU at load (it does not fit the GPU dense); for **klein** quantization is not
-/// wired and is rejected. dev without quant loads dense (fixture-only — the full 32B needs the quant).
+/// wired). `spec.quantize` (Q4/Q8) is honored by BOTH variants — each component staged dense in CPU RAM
+/// then folded onto the GPU: **dev** quantizes the 32B DiT + the ~24B Mistral TE (neither fits dense);
+/// **klein** (sc-11031) quantizes ONLY the 9B DiT and keeps its 8B Qwen3 TE dense bf16 (epic 8506
+/// DENSE_TE, `Pipeline::te_quant`). Without quant both load fully dense (klein's bf16 tier; dev is
+/// fixture-only there — the full 32B needs the quant).
 fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
     let id = variant.id();
     let root = match &spec.weights {
@@ -844,16 +865,10 @@ fn load_variant(variant: Flux2Variant, spec: &LoadSpec) -> gen_core::Result<Box<
             "candle {id} does not support LoRA/LoKr yet"
         )));
     }
-    // dev honors Q4/Q8 (CPU-stage → quantize-onto-GPU); klein has no candle quant path yet.
-    let quant = if variant.is_dev() {
-        spec.quantize
-    } else if spec.quantize.is_some() {
-        return Err(gen_core::Error::Unsupported(format!(
-            "candle {id} does not support on-the-fly Q4/Q8 quantization yet"
-        )));
-    } else {
-        None
-    };
+    // Both variants honor Q4/Q8 on-the-fly (CPU-stage dense → quantize-onto-GPU): dev folds the 32B DiT
+    // + the ~24B Mistral TE (neither fits the GPU dense), klein (sc-11031) folds ONLY the 9B DiT and
+    // keeps the 8B Qwen3 TE DENSE bf16 in every tier (epic 8506 DENSE_TE — see `Pipeline::te_quant`).
+    let quant = spec.quantize;
     if spec.control.is_some() || !spec.extra_controls.is_empty() || spec.ip_adapter.is_some() {
         return Err(gen_core::Error::Unsupported(format!(
             "candle {id} does not support control / IP-adapter / edit yet (txt2img only)"
@@ -957,7 +972,8 @@ mod tests {
         assert!(d.capabilities.conditioning.is_empty());
         assert!(!d.capabilities.supports_lora);
         assert!(!d.capabilities.supports_kv_cache);
-        assert!(d.capabilities.supported_quants.is_empty());
+        // klein now quantizes its DiT on-the-fly (sc-11031); the Qwen3 TE stays dense (`te_quant`).
+        assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
         assert!(!d.capabilities.accepts(ConditioningKind::Reference));
     }
 
@@ -977,9 +993,13 @@ mod tests {
         assert!(!d.capabilities.mac_only);
         assert!(d.capabilities.conditioning.is_empty());
         assert!(d.capabilities.requires_sigma_shift);
-        // dev advertises Q4/Q8 (CPU-stage → quantize-onto-GPU); klein advertises none.
+        // dev and klein both advertise Q4/Q8 now (CPU-stage → quantize-onto-GPU); klein keeps its Qwen3
+        // TE dense (`te_quant`), dev folds the Mistral TE with the DiT (sc-11031).
         assert_eq!(d.capabilities.supported_quants, &[Quant::Q4, Quant::Q8]);
-        assert!(descriptor_klein().capabilities.supported_quants.is_empty());
+        assert_eq!(
+            descriptor_klein().capabilities.supported_quants,
+            &[Quant::Q4, Quant::Q8]
+        );
     }
 
     #[test]
@@ -1018,19 +1038,13 @@ mod tests {
             load_klein(&lora).err().expect("err"),
             gen_core::Error::Unsupported(_)
         ));
-        let quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
-        assert!(matches!(
-            load_klein(&quant).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
-        // klein has no candle quant path — on-the-fly quant is rejected.
-        let klein_quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
-        assert!(matches!(
-            load_klein(&klein_quant).err().expect("err"),
-            gen_core::Error::Unsupported(_)
-        ));
-        // dev DOES accept Q4/Q8 (CPU-stage → quantize-onto-GPU); the generator builds lazily, so this
-        // succeeds without touching the (nonexistent) weights.
+        // klein (sc-11031) AND dev now accept Q4/Q8 on-the-fly (CPU-stage → quantize-onto-GPU): klein
+        // folds only the 9B DiT (Qwen3 TE stays dense bf16, `te_quant`), dev folds the DiT + Mistral TE.
+        // The generator builds lazily, so load succeeds without touching the (nonexistent) weights.
+        let klein_q4 = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
+        assert!(load_klein(&klein_q4).is_ok());
+        let klein_q8 = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q8);
+        assert!(load_klein(&klein_q8).is_ok());
         let dev_quant = LoadSpec::new(WeightsSource::Dir("/snap".into())).with_quant(Quant::Q4);
         assert!(load_dev(&dev_quant).is_ok());
     }
@@ -1144,7 +1158,7 @@ mod tests {
         write_shard("text_encoder", false);
         let pipe = Pipeline::load(Flux2Variant::Klein9b, None, &dir, &Device::Cpu, None);
         let p = pipe
-            .load_one_quantizable("text_encoder", build, quantize)
+            .load_one_quantizable("text_encoder", None, build, quantize)
             .unwrap();
         assert!(matches!(p.device, Device::Cpu));
         assert_eq!(p.dtype, DType::F32);
@@ -1153,7 +1167,7 @@ mod tests {
         // dense tier + quant → the builder sees the CPU (staging), then quantize runs onto the device.
         let dense = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu, None);
         let p = dense
-            .load_one_quantizable("text_encoder", build, quantize)
+            .load_one_quantizable("text_encoder", Some(Quant::Q4), build, quantize)
             .unwrap();
         assert!(
             matches!(p.device, Device::Cpu),
@@ -1168,7 +1182,7 @@ mod tests {
         write_shard("transformer", true);
         let packed = Pipeline::load(Flux2Variant::Dev, Some(Quant::Q4), &dir, &Device::Cpu, None);
         let p = packed
-            .load_one_quantizable("transformer", build, quantize)
+            .load_one_quantizable("transformer", Some(Quant::Q4), build, quantize)
             .unwrap();
         assert!(
             matches!(p.device, Device::Cpu),
@@ -1180,6 +1194,20 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// DENSE_TE invariant (epic 8506, sc-11031): klein quantizes ONLY its DiT and keeps the 8B Qwen3 TE
+    /// dense bf16 in every tier, so `te_quant` is `None` for klein at ANY DiT quant; dev folds its Mistral
+    /// TE with the DiT, so `te_quant` tracks `self.quant`.
+    #[test]
+    fn te_quant_keeps_klein_text_encoder_dense() {
+        let dir = std::env::temp_dir();
+        for q in [None, Some(Quant::Q4), Some(Quant::Q8)] {
+            let klein = Pipeline::load(Flux2Variant::Klein9b, q, &dir, &Device::Cpu, None);
+            assert_eq!(klein.te_quant(), None, "klein TE stays dense at {q:?}");
+            let dev = Pipeline::load(Flux2Variant::Dev, q, &dir, &Device::Cpu, None);
+            assert_eq!(dev.te_quant(), q, "dev folds its TE with the DiT at {q:?}");
+        }
     }
 
     /// `load_te_and_dit` is a thin delegation to `load_quantizable` with the default TE+DiT builders —
@@ -1270,9 +1298,10 @@ mod tests {
     /// files must be byte-identical (parity) and the sequential peak materially lower (the dense text
     /// encoder dropped before the DiT loads). Two processes are REQUIRED — candle's cudarc caching
     /// allocator never returns pages to the driver, so a second in-process run reuses the first run's
-    /// pool and reads the same peak. `honor_quant` reads `FLUX2_QUANT` (q4/q8) for the dev 32B (which
-    /// fits only quantized); klein has no candle quant path, so it always loads dense. Needs a real-file
-    /// (hardlink-staged, not raw-HF-symlink) snapshot in `dir_env` and a CUDA device.
+    /// pool and reads the same peak. `honor_quant` reads `FLUX2_QUANT` (q4/q8) — set for both dev (folds
+    /// the 32B DiT + Mistral TE) and klein (sc-11031: folds only the 9B DiT, Qwen3 TE stays dense);
+    /// unset `FLUX2_QUANT` loads the dense tier. Needs a real-file (hardlink-staged, not raw-HF-symlink)
+    /// snapshot in `dir_env` and a CUDA device.
     #[cfg(feature = "cuda")]
     fn run_probed_offload_ab(
         label: &str,
@@ -1286,8 +1315,8 @@ mod tests {
         });
         let out = std::env::var("FLUX2_OUT").expect("set FLUX2_OUT to the pixel-dump path");
         let mut spec = LoadSpec::new(WeightsSource::Dir(dir.into()));
-        // The 32B dev fits only quantized; honor FLUX2_QUANT (q4/q8), else load dense (fixture-only).
-        // klein has no candle quant path (only bf16 dense is candle-loadable) → honor_quant is false.
+        // honor FLUX2_QUANT (q4/q8) when set, else load dense. dev fits only quantized (bf16 is a
+        // fixture); klein (sc-11031) quantizes its DiT and keeps the Qwen3 TE dense, or loads bf16 dense.
         if honor_quant {
             spec = match std::env::var("FLUX2_QUANT")
                 .unwrap_or_default()
@@ -1349,18 +1378,18 @@ mod tests {
     }
 
     /// klein sibling of [`flux2_dev_probed_generate_for_offload_ab`] (epic 10765 Phase 1c follow-up,
-    /// sc-11008). Same A/B protocol, but loads FLUX.2-**klein**-9B (Qwen3 TE + 9B DiT) DENSE bf16 from
-    /// `FLUX2_KLEIN_DIR` at 4 steps CFG-free. klein has NO candle quant path — the `SceneWorks/
-    /// flux2-klein-9b-mlx` q4/q8 turnkey tiers are MLX-format, not candle-loadable — so only the bf16
-    /// tier is candle-measurable here (`honor_quant = false`). Directly captures the klein resident-vs-
-    /// sequential peak that sc-10920 could only arch-scale, validating that dropping the DENSE ~16 GB
-    /// Qwen3 TE before the 9B DiT loads is the sequential floor. Ignored by default; needs a hardlink-
-    /// staged klein bf16 diffusers snapshot (`text_encoder/` = Qwen3, `transformer/`, `vae/`,
-    /// `tokenizer/`) in `FLUX2_KLEIN_DIR` and a CUDA device.
+    /// sc-11008 bf16 / sc-11031 q4/q8). Same A/B protocol, but loads FLUX.2-**klein**-9B (Qwen3 TE + 9B
+    /// DiT) from `FLUX2_KLEIN_DIR` at 4 steps CFG-free. `honor_quant = true` reads `FLUX2_QUANT` (q4/q8)
+    /// now that klein quantizes its DiT on-the-fly off the dense BFL snapshot (sc-11031) — the Qwen3 TE
+    /// stays dense bf16 in every tier; omit `FLUX2_QUANT` for the bf16-dense tier. Directly captures the
+    /// klein resident-vs-sequential peak per tier that sc-10920 could only arch-scale, validating that
+    /// dropping the DENSE ~16 GB Qwen3 TE before the 9B DiT loads is the sequential floor. Ignored by
+    /// default; needs a hardlink-staged klein diffusers snapshot (`text_encoder/` = Qwen3,
+    /// `transformer/`, `vae/`, `tokenizer/`) in `FLUX2_KLEIN_DIR` and a CUDA device.
     #[cfg(feature = "cuda")]
     #[test]
     #[ignore]
     fn flux2_klein_probed_generate_for_offload_ab() {
-        run_probed_offload_ab("flux2_klein_9b", "FLUX2_KLEIN_DIR", load_klein, false, 4);
+        run_probed_offload_ab("flux2_klein_9b", "FLUX2_KLEIN_DIR", load_klein, true, 4);
     }
 }
