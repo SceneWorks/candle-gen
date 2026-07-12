@@ -45,6 +45,10 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use tokenizers::Tokenizer;
 
+use candle_gen::gen_core::runtime::CancelFlag;
+use candle_gen::gen_core::sampling::{
+    schedule_sigmas, DiscreteModelSampling, Scheduler as SamplingScheduler,
+};
 use candle_gen::gen_core::train::{
     NetworkType, Trainer, TrainerDescriptor, TrainingConfig, TrainingOutput, TrainingProgress,
     TrainingRequest,
@@ -69,7 +73,9 @@ use candle_transformers::models::stable_diffusion::vae::AutoEncoderKL;
 
 use crate::denoise::decode_image;
 use crate::loaders::load_sdxl_vae;
-use crate::pipeline::{hf_get, snapshot_file, Clip, VAE_FIX_FILE, VAE_FIX_REPO, VAE_SCALE};
+use crate::pipeline::{
+    hf_get, sdxl_alpha_schedule, snapshot_file, Clip, VAE_FIX_FILE, VAE_FIX_REPO, VAE_SCALE,
+};
 use crate::unet::{sdxl_unet_config, UNet2DConditionModel, VaeMomentsEncoder};
 use crate::MODEL_ID;
 
@@ -244,13 +250,24 @@ struct SamplePreview {
 }
 
 /// Render one preview image (sc-8650) on the **in-training** UNet — adapters live as eager `Var`s, so
-/// this denoise sees the partially-trained adapter exactly as a train step would. Mirrors the inference
-/// txt2img DDIM path ([`crate::pipeline::Pipeline::render`]'s default branch): seeded launch-portable
-/// noise (the sc-3673 CPU-`StdRng` discipline via [`sample_noise`]), DDIM (eta=0) over
-/// `cfg.sample_steps.max(1)` steps, classifier-free guidance with `cfg.sample_guidance_scale`, then a
-/// VAE decode to `gen_core::Image`. `cond` is the `[uncond, cond]` `[2, 77, 2048]` batch
-/// ([`SamplePreview::conds`]); `(lat_h, lat_w)` are the training latent dims (the cached `x0`'s /8 grid).
-/// Best-effort — any error propagates so the loop logs and skips this preview (never aborts the run).
+/// this denoise sees the partially-trained adapter exactly as a train step would.
+///
+/// **Curated sampler, not the native DDIM loop (sc-11173 / F-083).** This drives the SAME unified
+/// [`candle_gen::run_curated_sampler`] path SDXL *inference* uses — a curated `ddim` solver over
+/// [`DiscreteModelSampling::sdxl`] — mirroring [`crate::pipeline::Pipeline::denoise_curated`]. It
+/// replaces the earlier native candle-transformers `DDIMScheduler` inference loop, which sc-10826 found
+/// rendered a ghosted, translucent double-exposure (guidance-invariant) and deleted from the inference
+/// `pipeline.rs` — but the preview kept driving that identical loop, so a healthy adapter looked broken
+/// mid-run. The curated `ddim` is eta=0 / non-ancestral, so the sc-3673 launch-portable determinism the
+/// native default targeted is preserved.
+///
+/// Seeded launch-portable noise (the sc-3673 CPU-`StdRng` discipline via [`sample_noise`]) is scaled
+/// into VE σ-space by σ_max (`sigmas[0]`), the solver runs `cfg.sample_steps.max(1)` steps with
+/// classifier-free guidance `cfg.sample_guidance_scale`, then a VAE decode to `gen_core::Image`. `cond`
+/// is the `[uncond, cond]` `[2, 77, 2048]` batch ([`SamplePreview::conds`]); `(lat_h, lat_w)` are the
+/// training latent dims (the cached `x0`'s /8 grid). Previews have no cancel/progress surface, so a
+/// never-cancelled flag + a no-op progress sink are passed. Best-effort — any error propagates so the
+/// loop logs and skips this preview (never aborts the run).
 #[allow(clippy::too_many_arguments)]
 fn render_one_preview(
     unet: &UNet2DConditionModel,
@@ -263,42 +280,85 @@ fn render_one_preview(
     seed: u64,
     device: &Device,
 ) -> Result<gen_core::Image> {
+    let latents = preview_latents(unet, cond, cfg, lat_h, lat_w, compute_dtype, seed, device)?;
+    // The shared decode expects compute-dtype latents (like the inference curated loop); un-scale +
+    // `x/2 + 0.5` + clamp + ×255 → RGB8 `Image` lives in `crate::denoise::decode_image`.
+    decode_image(vae, &latents, None)
+}
+
+/// The curated denoise behind [`render_one_preview`] (sc-11173 / F-083), returning the final
+/// compute-dtype latent `[1, 4, lat_h, lat_w]` — factored out of the decode so the sampler wiring is
+/// unit-testable against a tiny synthetic UNet (no real VAE). Drives the SAME unified
+/// [`candle_gen::run_curated_sampler`] SDXL inference uses — the curated `ddim` solver over
+/// [`DiscreteModelSampling::sdxl`] — with the closure mirroring
+/// [`crate::pipeline::Pipeline::denoise_curated`]: σ-space prior, `1/√(σ²+1)` input scaling, CFG batch,
+/// raw ε in f32.
+#[allow(clippy::too_many_arguments)]
+fn preview_latents(
+    unet: &UNet2DConditionModel,
+    cond: &Tensor,
+    cfg: &TrainingConfig,
+    lat_h: usize,
+    lat_w: usize,
+    compute_dtype: DType,
+    seed: u64,
+    device: &Device,
+) -> Result<Tensor> {
     let steps = (cfg.sample_steps as usize).max(1);
     let guidance = cfg.sample_guidance_scale as f64;
     // CFG fires only above 1.0 (parity with the inference path's `use_guide`); the conditioning is
     // already the `[uncond, cond]` batch, so a no-CFG preview narrows to the cond row.
     let use_guide = guidance > 1.0;
 
+    // The SDXL ε-prediction ModelSampling + the native curated σ schedule (ComfyUI's `normal` default,
+    // the same schedule `Pipeline::denoise_curated` resolves from when the request omits a scheduler).
+    let sched = sdxl_alpha_schedule()?;
+    let ms = DiscreteModelSampling::sdxl(&sched);
+    let sigmas = schedule_sigmas(SamplingScheduler::Normal, &ms, steps);
+
     // sc-3673 launch-portable initial noise: N(0,1) from a seeded CPU `StdRng` moved to the device,
-    // then scaled by the scheduler's `init_noise_sigma` — exactly the inference txt2img init.
-    let mut scheduler = DDIMSchedulerConfig::default().build(steps)?;
-    let timesteps = scheduler.timesteps().to_vec();
+    // scaled into VE σ-space by σ_max (`sigmas[0]`). Kept f32 through the sampler (cast per eval).
     let init = sample_noise(&[1, 4, lat_h, lat_w], seed, device)?;
-    let mut latents = (init * scheduler.init_noise_sigma())?.to_dtype(compute_dtype)?;
+    let latents = (init * sigmas[0] as f64)?;
 
     let cond_c = cond.to_dtype(compute_dtype)?;
     let cond_only = cond_c.narrow(0, 1, 1)?;
-    for &timestep in timesteps.iter() {
-        let model_in = if use_guide {
-            Tensor::cat(&[&latents, &latents], 0)?
-        } else {
-            latents.clone()
-        };
-        let model_in = scheduler.scale_model_input(model_in, timestep)?;
-        let cond_in = if use_guide { &cond_c } else { &cond_only };
-        let noise_pred = unet.forward(&model_in, timestep as f64, cond_in)?;
-        let noise_pred = if use_guide {
-            let chunks = noise_pred.chunk(2, 0)?;
-            let (uncond, cond) = (&chunks[0], &chunks[1]);
-            (uncond + ((cond - uncond)? * guidance)?)?
-        } else {
-            noise_pred
-        };
-        latents = scheduler.step(&noise_pred, timestep, &latents)?;
-    }
-    // The shared decode expects compute-dtype latents (like the inference DDIM loop); un-scale +
-    // `x/2 + 0.5` + clamp + ×255 → RGB8 `Image` lives in `crate::denoise::decode_image`.
-    decode_image(vae, &latents.to_dtype(compute_dtype)?, None)
+
+    // A preview has no cancel/progress surface — a never-cancelled flag + a no-op progress sink.
+    let cancel = CancelFlag::new();
+    let mut on_progress = |_: gen_core::Progress| {};
+
+    let out = candle_gen::run_curated_sampler(
+        Some("ddim"),
+        &ms,
+        &sigmas,
+        latents,
+        seed,
+        &cancel,
+        &mut on_progress,
+        |x_in, timestep| -> Result<Tensor> {
+            // `x_in` is already `1/√(σ²+1)`-scaled by the solver; CFG-batch the single row to
+            // `[uncond, cond]` and cast to the UNet compute dtype (exactly the inference closure).
+            let model_in = if use_guide {
+                Tensor::cat(&[x_in, x_in], 0)?
+            } else {
+                x_in.clone()
+            };
+            let model_in = model_in.to_dtype(compute_dtype)?;
+            let cond_in = if use_guide { &cond_c } else { &cond_only };
+            let noise_pred = unet.forward(&model_in, timestep as f64, cond_in)?;
+            let eps = if use_guide {
+                let chunks = noise_pred.chunk(2, 0)?;
+                let (uncond, cond) = (&chunks[0], &chunks[1]);
+                (uncond + ((cond - uncond)? * guidance)?)?
+            } else {
+                noise_pred
+            };
+            // Raw ε in f32 so the `DiscreteModelSampling` x0 recombine + solver math stay f32.
+            Ok(eps.to_dtype(DType::F32)?)
+        },
+    )?;
+    Ok(out.to_dtype(compute_dtype)?)
 }
 
 /// One micro-step's forward+backward over the installed adapter `Var`s: build the noised latent at
@@ -885,6 +945,50 @@ mod tests {
             }
         }
         assert!(saw_nonzero, "expected nonzero adapter grads to compare");
+    }
+
+    /// F-083 / sc-11173: the trainer preview drives the SAME curated sampler SDXL inference uses, not
+    /// the native candle-transformers `DDIMScheduler` loop that sc-10826 diagnosed as rendering a
+    /// ghosted double-exposure. Two guards:
+    ///  1. The hardcoded preview solver name `"ddim"` is a real advertised curated solver (so it takes
+    ///     the curated `ddim` path, never the silent Euler fallback — mirrors the pipeline's
+    ///     `DEFAULT_SAMPLER` gate).
+    ///  2. `preview_latents` runs the curated sampler end-to-end over a tiny SDXL-shaped UNet (CFG on)
+    ///     and returns a finite latent of the exact `[1, 4, lat_h, lat_w]` shape the decode expects.
+    #[test]
+    fn preview_uses_curated_sampler() {
+        assert!(
+            candle_gen::curated_sampler_names().contains(&"ddim"),
+            "the preview's `ddim` solver must be an advertised curated sampler, not a Euler fallback"
+        );
+
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let vb = VarBuilder::from_varmap(&vm, DType::F32, &dev);
+        let mut unet = tiny_unet(vb);
+        let paths = unet.lora_target_paths().unwrap();
+        let set = build_lora_targets(&mut unet, &paths, 4, 8.0, 7, &dev).unwrap();
+        for v in &set.vars {
+            v.set(&Tensor::randn(0f32, 0.02f32, v.as_tensor().dims(), &dev).unwrap())
+                .unwrap();
+        }
+
+        // `[uncond, cond]` dual-CLIP-shaped conditioning at the tiny cross-attention dim (64).
+        let cond = Tensor::randn(0f32, 1f32, (2, 7, 64), &dev).unwrap();
+        let cfg = TrainingConfig {
+            sample_steps: 3,
+            sample_guidance_scale: 5.0,
+            ..TrainingConfig::default()
+        };
+        let (lat_h, lat_w) = (16, 16);
+        let latents =
+            preview_latents(&unet, &cond, &cfg, lat_h, lat_w, DType::F32, 42, &dev).unwrap();
+        assert_eq!(latents.dims4().unwrap(), (1, 4, lat_h, lat_w));
+        let flat = latents.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert!(
+            flat.iter().all(|v| v.is_finite()),
+            "curated preview latents must be finite"
+        );
     }
 
     /// `sample_timestep` is deterministic in its seed and lands in `[0, NUM_TRAIN_TIMESTEPS)`.
