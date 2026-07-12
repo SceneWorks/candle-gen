@@ -262,15 +262,21 @@ pub fn sample_vit_embed(
         if cancel.is_cancelled() {
             return Err(CandleError::Canceled);
         }
-        // Every step runs all 3 backbones over the current (partially-filled) embeds.
+        // `nonzero().sum() == 0` → nothing to predict this step (empty, or {token 0} only). This is a
+        // schedule-only decision (independent of the backbone outputs), so hoist it above the three
+        // backbone forwards (F-144): when `n_query < planning_step` the trailing schedule chunks are
+        // empty, and running cond/uncond/imgcond `stream_for_vit` there burns three discarded 7B
+        // forwards. The skipped step scatters nothing and consumes no `step_noise`, so hoisting the
+        // check is output-identical — it only avoids the wasted passes.
+        if revealed.iter().sum::<i32>() == 0 {
+            continue;
+        }
+
+        // Every non-empty step runs all 3 backbones over the current (partially-filled) embeds.
         let cond_vit = stream_for_vit(backbone, connector, cond, &target)?;
         let uncond_vit = stream_for_vit(backbone, connector, uncond, &target)?;
         let imgcond_vit = stream_for_vit(backbone, connector, imgcond, &target)?;
 
-        // `nonzero().sum() == 0` → nothing to predict this step (empty, or {token 0} only).
-        if revealed.iter().sum::<i32>() == 0 {
-            continue;
-        }
         let np = revealed.len();
         let hv = cond_vit.dim(2)?;
         let rev: Vec<u32> = revealed.iter().map(|&x| x as u32).collect();

@@ -17,7 +17,10 @@
 //! inside each block's cross-attention, so [`PackedForward::velocity`] carries the projected context
 //! tensor instead of a `(K, V)` list. The math is identical; only the cross-KV caching differs.
 
-use candle_gen::candle_core::Tensor;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+use candle_gen::candle_core::{Tensor, TensorId};
 use candle_gen::Result as CResult;
 
 use candle_gen_wan::config::TransformerConfig;
@@ -28,13 +31,36 @@ use crate::config::Mode;
 use crate::guidance::{normalized_guidance, normalized_guidance_chain, MomentumBuffer};
 use crate::vit_guidance::{rv2v_chain, vae_txt_vit};
 
+/// Cache key for the step-invariant RoPE `(cos, sin)` table: the token grid `(f, h, w)` plus the
+/// source-id phase (its raw f64 bits — the id is either an integer or a `linspace` sample, both exact).
+type RopeKey = (usize, usize, usize, u64);
+/// Cache key for a conditioning source's patch-embedded tokens: `(expert identity, latent identity)`.
+/// The patch-embed depends only on the DiT weights + the source latent (NOT the source-id), so the same
+/// latent re-embedded under different source-ids (the renderer combos) hits the same entry.
+type PatchKey = (usize, TensorId);
+/// Cached patch-embed value: the source tokens `[1, L, dim]` + their `(f, h, w)` token grid.
+type PatchEntry = (Tensor, (usize, usize, usize));
+
 /// The packed-forward engine: holds the transformer geometry (RoPE builder + patch grid) so it can
 /// patch-embed the target and each conditioning source with their source-id RoPE and run one packed
-/// forward. Cheap + immutable; build once per render.
+/// forward. Cheap to build; build once per render.
+///
+/// F-098: `velocity` is called 2–4× per denoise step (the guidance chain) over ~40 steps, and each call
+/// rebuilt the target's + every source's RoPE `(cos, sin)` host trig tables and re-patch-embedded every
+/// (step-invariant) conditioning source. Those are geometry-only, so they are memoized here behind
+/// interior-mutability caches keyed by geometry alone — the memoized tensors are bit-identical to a
+/// fresh build, so the guided velocity is unchanged. The `PackedForward` is built per render (never
+/// shared across renders), so the caches live exactly as long as one render.
 pub struct PackedForward {
     cfg: TransformerConfig,
     max_trained_src_id: f64,
     interpolate_src_id: bool,
+    /// Memoized `(cos, sin)` per `(grid, source_id)` — reused by the target (id 0) across all steps and
+    /// by every conditioning source across the guidance chain.
+    rope_cache: Mutex<HashMap<RopeKey, (Tensor, Tensor)>>,
+    /// Memoized patch-embedded source tokens per `(expert, latent)` — the conditioning sources are
+    /// step-invariant, so their patch-embed is computed once per expert instead of per `velocity` call.
+    patch_cache: Mutex<HashMap<PatchKey, PatchEntry>>,
 }
 
 /// The four conditioning combos (each a list of `(latent, source_id)`); the target is added per forward
@@ -56,12 +82,38 @@ impl PackedForward {
             cfg,
             max_trained_src_id,
             interpolate_src_id,
+            rope_cache: Mutex::new(HashMap::new()),
+            patch_cache: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Patch-embed one latent `[1, 16, T, H8, W8]` to `(tokens [1,L,dim], cos, sin, grid)` with the
-    /// source-id RoPE folded in. `cos`/`sin` are `[L, head_dim/2]` (f32); they are concatenated on the
-    /// token axis before the forward.
+    /// The step-invariant source-id RoPE `(cos, sin)` `[L, head_dim/2]` (f32) for a token grid, memoized
+    /// per `(grid, source_id)` (F-098). The build is deterministic host trig (`WanRope::cos_sin` +
+    /// `apply_source_id`), so a cache hit is bit-identical to a fresh build.
+    fn rope_for(
+        &self,
+        grid: (usize, usize, usize),
+        source_id: f64,
+        latent: &Tensor,
+    ) -> CResult<(Tensor, Tensor)> {
+        let key: RopeKey = (grid.0, grid.1, grid.2, source_id.to_bits());
+        if let Some((cos, sin)) = self.rope_cache.lock().unwrap().get(&key) {
+            return Ok((cos.clone(), sin.clone()));
+        }
+        let (cos, sin) =
+            WanRope::new(&self.cfg).cos_sin(grid.0, grid.1, grid.2, latent.device())?;
+        let (cos, sin) = apply_source_id(&cos, &sin, source_id, self.cfg.head_dim)?;
+        self.rope_cache
+            .lock()
+            .unwrap()
+            .insert(key, (cos.clone(), sin.clone()));
+        Ok((cos, sin))
+    }
+
+    /// Patch-embed a **conditioning source** latent `[1, 16, T, H8, W8]` to `(tokens [1,L,dim], cos,
+    /// sin, grid)` with the source-id RoPE folded in — the source's tokens (per expert) and its RoPE are
+    /// both step-invariant, so both are memoized (F-098). The noisy **target** is embedded separately in
+    /// [`Self::velocity`] (its tokens change every step; only its RoPE is cached).
     #[allow(clippy::type_complexity)]
     fn embed_segment(
         &self,
@@ -69,10 +121,27 @@ impl PackedForward {
         latent: &Tensor,
         source_id: f64,
     ) -> CResult<(Tensor, Tensor, Tensor, (usize, usize, usize))> {
-        let (tokens, grid) = dit.patch_embed_tokens(latent)?;
-        let (cos, sin) =
-            WanRope::new(&self.cfg).cos_sin(grid.0, grid.1, grid.2, latent.device())?;
-        let (cos, sin) = apply_source_id(&cos, &sin, source_id, self.cfg.head_dim)?;
+        let key: PatchKey = (dit as *const WanTransformer as usize, latent.id());
+        // Scope the read guard so it is dropped before `patch_embed_tokens` + the re-lock on a miss —
+        // `std::sync::Mutex` is not reentrant, so holding the guard across the insert would deadlock.
+        let hit = self
+            .patch_cache
+            .lock()
+            .unwrap()
+            .get(&key)
+            .map(|(tokens, grid)| (tokens.clone(), *grid));
+        let (tokens, grid) = match hit {
+            Some(entry) => entry,
+            None => {
+                let (tokens, grid) = dit.patch_embed_tokens(latent)?;
+                self.patch_cache
+                    .lock()
+                    .unwrap()
+                    .insert(key, (tokens.clone(), grid));
+                (tokens, grid)
+            }
+        };
+        let (cos, sin) = self.rope_for(grid, source_id, latent)?;
         Ok((tokens, cos, sin, grid))
     }
 
@@ -97,7 +166,10 @@ impl PackedForward {
             coss.push(c);
             sins.push(s);
         }
-        let (tk_t, c_t, s_t, grid_t) = self.embed_segment(dit, target, 0.0)?;
+        // The target is patch-embedded fresh every call (the noisy latent changes each step); only its
+        // step-invariant source-id-0 RoPE is memoized (F-098).
+        let (tk_t, grid_t) = dit.patch_embed_tokens(target)?;
+        let (c_t, s_t) = self.rope_for(grid_t, 0.0, target)?;
         let l_t = grid_t.0 * grid_t.1 * grid_t.2;
         toks.push(tk_t);
         coss.push(c_t);
@@ -646,6 +718,58 @@ mod tests {
         assert_eq!(one.v.len(), 1);
         assert_eq!(one.v[0].1, one.vi[0].1);
         assert!(pf.build_combos(&[], &[]).v.is_empty());
+    }
+
+    /// F-098: memoizing the step-invariant RoPE tables + source patch-embeds must not change the
+    /// velocity. A cached `PackedForward` (whose caches are warm after the first call, and which packs
+    /// the same source under two different source-ids across combos) must produce bit-identical
+    /// velocities to a fresh, cache-cold `PackedForward` on every call.
+    #[test]
+    fn cached_velocity_matches_uncached() {
+        let dev = Device::Cpu;
+        let cfg = tiny_cfg();
+        let dit = tiny_dit(&cfg, &dev);
+        let noisy = Tensor::randn(0f32, 1f32, (1, 16, 2, 4, 4), &dev).unwrap();
+        let ctx = Tensor::randn(0f32, 1f32, (1, 3, 16), &dev).unwrap();
+        let img = Tensor::randn(0f32, 1f32, (1, 16, 1, 4, 4), &dev).unwrap();
+
+        let pf = PackedForward::new(cfg, 5.0, true);
+        // Warm the caches (target RoPE for this grid, source tokens + RoPE at id 1.0).
+        let warm = pf
+            .velocity(&dit, &noisy, &[(img.clone(), 1.0)], 833.0, &ctx)
+            .unwrap();
+        // Second call on the warm caches must be bit-identical.
+        let hot = pf
+            .velocity(&dit, &noisy, &[(img.clone(), 1.0)], 833.0, &ctx)
+            .unwrap();
+        assert_eq!(
+            max_abs(&warm, &hot),
+            0.0,
+            "warm-cache velocity must be stable"
+        );
+        // A fresh, cache-cold engine must match the cached one.
+        let cold = PackedForward::new(cfg, 5.0, true);
+        let fresh = cold
+            .velocity(&dit, &noisy, &[(img.clone(), 1.0)], 833.0, &ctx)
+            .unwrap();
+        assert_eq!(
+            max_abs(&warm, &fresh),
+            0.0,
+            "cache must equal a fresh build"
+        );
+        // The SAME source latent re-embedded under a different source-id must give a different RoPE
+        // (so the patch-embed cache — keyed on latent, not source-id — never leaks a stale table).
+        let id2 = pf
+            .velocity(&dit, &noisy, &[(img.clone(), 2.0)], 833.0, &ctx)
+            .unwrap();
+        let id2_cold = cold
+            .velocity(&dit, &noisy, &[(img, 2.0)], 833.0, &ctx)
+            .unwrap();
+        assert_eq!(max_abs(&id2, &id2_cold), 0.0, "id-2 cached == fresh");
+        assert!(
+            max_abs(&warm, &id2) > 0.0,
+            "distinct source-ids must differ"
+        );
     }
 
     /// A conditioning image extends the packed sequence but the sliced target velocity keeps the target's

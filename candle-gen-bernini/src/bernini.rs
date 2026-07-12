@@ -31,6 +31,7 @@
 //! them.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use image::RgbImage;
 
@@ -581,12 +582,77 @@ pub fn descriptor() -> ModelDescriptor {
     }
 }
 
-/// The loaded full Bernini pipeline: the snapshot dir + the resolved renderer knobs.
+/// The heavy resident renderer components, loaded once on the first `generate` and cached across calls
+/// (F-097). Mirrors [`crate::pipeline::BerniniRenderer`]'s `Components`: unlike the planner (which is
+/// deliberately load-use-drop per request for peak VRAM), these — UMT5, both 14B experts, the z16 VAE,
+/// and the UMT5 tokenizer — are reloaded on every `generate` without a cache, so back-to-back or
+/// concurrent renders each re-mmap + re-upload ~50 GB of weights. Caching them behind
+/// [`candle_gen::cached`] loads them once and serializes racing first-callers on the load lock.
+struct Components {
+    /// UMT5-xxl text encoder (f32), reused across the pos/neg encodes.
+    te: Umt5Encoder,
+    /// `transformer/` — the **high-noise** expert (timestep ≥ boundary).
+    high: WanTransformer,
+    /// `transformer_2/` — the **low-noise** expert (timestep < boundary).
+    low: WanTransformer,
+    /// z16 VAE **with encoder** (encodes the source media up front, decodes the final latent).
+    vae: WanVae16,
+    /// UMT5 tokenizer, parsed once at component load and reused across the pos/neg encodes.
+    tok: TextTokenizer,
+}
+
+/// The loaded full Bernini pipeline: the snapshot dir + the resolved renderer knobs, with the heavy
+/// renderer components ([`Components`]) loaded lazily on the first `generate` and cached (F-097). The
+/// planner is intentionally **not** cached — it is loaded, used, and dropped per request (peak VRAM).
 pub struct Bernini {
     descriptor: ModelDescriptor,
     knobs: BerniniKnobs,
     root: PathBuf,
     device: Device,
+    components: Mutex<Option<Arc<Components>>>,
+}
+
+impl Bernini {
+    /// Load the cached renderer components (UMT5 + both experts + z16 VAE + tokenizer). Sequential
+    /// build: one component's staging VarBuilder at a time (mirrors the renderer sibling).
+    fn load_components(&self) -> CResult<Components> {
+        let dev = &self.device;
+        let te = Umt5Encoder::new(
+            &TextEncoderConfig::umt5_xxl(),
+            candle_gen::component_vb(&self.root, "text_encoder", ENC_DTYPE, dev, MODEL_ID)?,
+        )?;
+        let dit_cfg = TransformerConfig::t2v_14b();
+        // transformer/ = high-noise, transformer_2/ = low-noise (diffusers WanPipeline convention).
+        let high = WanTransformer::new(
+            &dit_cfg,
+            candle_gen::component_vb(&self.root, "transformer", DIT_DTYPE, dev, MODEL_ID)?,
+        )?;
+        let low = WanTransformer::new(
+            &dit_cfg,
+            candle_gen::component_vb(&self.root, "transformer_2", DIT_DTYPE, dev, MODEL_ID)?,
+        )?;
+        // The z16 VAE carries its encoder: the source media (Reference / MultiReference / VideoClip) is
+        // VAE-encoded into z16 source latents up front, and the final latent is decoded at the end.
+        let vae = WanVae16::new_with_encoder(
+            &Vae16Config::wan21(),
+            candle_gen::component_vb(&self.root, "vae", VAE_DTYPE, dev, MODEL_ID)?,
+        )?;
+        let tok = build_tokenizer(&self.root)?;
+        Ok(Components {
+            te,
+            high,
+            low,
+            vae,
+            tok,
+        })
+    }
+
+    /// The cached renderer components — loaded once, then cloned (`Arc`) on every subsequent generate.
+    /// The load lock serializes racing first-callers so two concurrent generates don't both mmap +
+    /// upload ~50 GB (F-097).
+    fn components(&self) -> CResult<Arc<Components>> {
+        candle_gen::cached(&self.components, || Ok(Arc::new(self.load_components()?)))
+    }
 }
 
 /// Load the full Bernini pipeline from a combined snapshot dir (the [`crate::convert`] renderer tier +
@@ -616,6 +682,7 @@ pub fn load(spec: &LoadSpec) -> gen_core::Result<Box<dyn Generator>> {
         knobs,
         root,
         device,
+        components: Mutex::new(None),
     }))
 }
 
@@ -684,6 +751,10 @@ impl Bernini {
     ) -> CResult<GenerationOutput> {
         let dev = &self.device;
 
+        // The heavy renderer components (UMT5 + both experts + z16 VAE + tokenizer) are loaded once and
+        // cached across generates (F-097); only the planner is reloaded per request (below).
+        let comps = self.components()?;
+
         // --- Geometry + knobs ---
         let frames = req.frames.unwrap_or(DEFAULT_FRAMES_14B).max(1) as usize;
         let out_video = frames > 1;
@@ -717,12 +788,10 @@ impl Bernini {
             total: steps as u32,
         });
 
-        // The z16 VAE (with encoder) is resident throughout: it VAE-encodes the source media into z16
-        // conditioning latents up front and decodes the final latent at the end.
-        let vae = {
-            let vb = candle_gen::component_vb(&self.root, "vae", VAE_DTYPE, dev, MODEL_ID)?;
-            WanVae16::new_with_encoder(&Vae16Config::wan21(), vb)?
-        };
+        // The z16 VAE (with encoder) is resident throughout (cached component, F-097): it VAE-encodes
+        // the source media into z16 conditioning latents up front and decodes the final latent at the
+        // end.
+        let vae = &comps.vae;
 
         // --- Stage 1: planner (loaded → 3 streams + MAR loop → freed) ---
         // Source latents (VAE) are computed here and carried past the planner drop; the ViT features are
@@ -747,7 +816,7 @@ impl Bernini {
                         let rgb: Vec<RgbImage> = clip.iter().map(to_rgb).collect::<CResult<_>>()?;
                         let vit_frames = sample_vit_frames(&rgb);
                         let (vit_feat, vit_grid) = vit_encode_video(&planner, &vit_frames, dev)?;
-                        let vae_latent = encode_videoclip(&vae, clip, width, height, dev)?;
+                        let vae_latent = encode_videoclip(vae, clip, width, height, dev)?;
                         let hw = (rgb[0].height() as i64, rgb[0].width() as i64);
                         videos.push(SourceVisual {
                             vit_feat,
@@ -759,7 +828,7 @@ impl Bernini {
                     Conditioning::Reference { image, .. } => {
                         let rgb = to_rgb(image)?;
                         let (vit_feat, vit_grid) = vit_encode_image(&planner, &rgb, dev)?;
-                        let vae_latent = encode_image(&vae, image, width, height, dev)?;
+                        let vae_latent = encode_image(vae, image, width, height, dev)?;
                         images.push(SourceVisual {
                             vit_feat,
                             vit_grid,
@@ -771,7 +840,7 @@ impl Bernini {
                         for image in imgs {
                             let rgb = to_rgb(image)?;
                             let (vit_feat, vit_grid) = vit_encode_image(&planner, &rgb, dev)?;
-                            let vae_latent = encode_image(&vae, image, width, height, dev)?;
+                            let vae_latent = encode_image(vae, image, width, height, dev)?;
                             images.push(SourceVisual {
                                 vit_feat,
                                 vit_grid,
@@ -891,13 +960,10 @@ impl Bernini {
         };
 
         // --- Stage 2: UMT5 text encode + concat_with_zero_init for the 4 renderer streams ---
+        // UMT5 encoder + tokenizer are cached components (F-097), not reloaded per generate.
         let (t5_pos, t5_neg) = {
-            let tok = build_tokenizer(&self.root)?;
-            let vb =
-                candle_gen::component_vb(&self.root, "text_encoder", ENC_DTYPE, dev, MODEL_ID)?;
-            let enc = Umt5Encoder::new(&TextEncoderConfig::umt5_xxl(), vb)?;
-            let pos = umt5_encode(&enc, &tok, &req.prompt, dev)?;
-            let neg = umt5_encode(&enc, &tok, &neg, dev)?;
+            let pos = umt5_encode(&comps.te, &comps.tok, &req.prompt, dev)?;
+            let neg = umt5_encode(&comps.te, &comps.tok, &neg, dev)?;
             (pos, neg)
         };
         let pe_wtxt_wvit = concat_with_zero_init(&t5_pos, &s_wtxt_wvit, max_seq)?;
@@ -939,21 +1005,16 @@ impl Bernini {
         };
 
         let dit_cfg = TransformerConfig::t2v_14b();
-        let load_expert = |sub: &str| -> CResult<WanTransformer> {
-            let vb = candle_gen::component_vb(&self.root, sub, DIT_DTYPE, dev, MODEL_ID)?;
-            Ok(WanTransformer::new(&dit_cfg, vb)?)
-        };
         let latents = {
-            let high_dit = load_expert("transformer")?;
-            let low_dit = load_expert("transformer_2")?;
+            // Both 14B experts are cached components (F-097), not reloaded per generate.
             let streams4 = [
                 &pe_wtxt_wvit,
                 &pe_wtxt_wovit,
                 &pe_wotxt_wvit,
                 &pe_wotxt_wovit,
             ];
-            let high = BVitExpert::build(&high_dit, streams4)?;
-            let low = BVitExpert::build(&low_dit, streams4)?;
+            let high = BVitExpert::build(&comps.high, streams4)?;
+            let low = BVitExpert::build(&comps.low, streams4)?;
             let pf = PackedForward::new(
                 dit_cfg,
                 self.knobs.max_trained_src_id,

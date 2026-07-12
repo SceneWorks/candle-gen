@@ -341,48 +341,95 @@ impl Qwen25VlText {
         position_ids: &Tensor,
         mask: &Tensor,
     ) -> CResult<Vec<Tensor>> {
-        // `embeds` is authoritative for the device (it came off the embedding weight). The
-        // host-assembled `position_ids` (mrope) and additive `mask` are built on CPU, so move them onto
-        // the embeds device before they meet GPU tensors in `mrope_cos_sin` / `broadcast_add` (a no-op
-        // on CPU → parity goldens unchanged). sc-11003 planner-on-GPU device fix.
+        let (cos, sin, mask) = self.prepare_rotary_and_mask(embeds, position_ids, mask)?;
+        let eps = self.cfg.rms_norm_eps;
+        let mut hidden = embeds.clone();
+        let mut all = Vec::with_capacity(self.layers.len() + 1);
+        for layer in &self.layers {
+            all.push(hidden.clone()); // HF appends the pre-layer hidden state
+            hidden = self.run_layer(&hidden, layer, &cos, &sin, &mask, eps)?;
+        }
+        all.push(rms_norm(&hidden, &self.norm, eps)?);
+        Ok(all)
+    }
+
+    /// Assemble the MRoPE `(cos, sin)` and normalize the additive attention `mask` to a 4D
+    /// `[B?,1,L,L]`-broadcastable shape — the per-forward setup shared by [`Self::forward`] and
+    /// [`Self::penultimate`].
+    ///
+    /// `embeds` is authoritative for the device (it came off the embedding weight). The host-assembled
+    /// `position_ids` (mrope) and additive `mask` are built on CPU, so move them onto the embeds device
+    /// before they meet GPU tensors in `mrope_cos_sin` / `broadcast_add` (a no-op on CPU → parity
+    /// goldens unchanged). sc-11003 planner-on-GPU device fix.
+    fn prepare_rotary_and_mask(
+        &self,
+        embeds: &Tensor,
+        position_ids: &Tensor,
+        mask: &Tensor,
+    ) -> CResult<(Tensor, Tensor, Tensor)> {
         let dev = embeds.device();
         let position_ids = position_ids.to_device(dev)?;
         let mask = mask.to_device(dev)?;
         let (cos, sin) = self.mrope_cos_sin(&position_ids, embeds.dtype())?;
-        // Normalize the mask to a 4D [B?,1,L,L]-broadcastable shape.
         let mask = match mask.rank() {
             3 => mask.unsqueeze(1)?, // [1,L,L] -> [1,1,L,L]
-            4 => mask.clone(),
+            4 => mask,
             r => {
                 return Err(CandleError::Msg(format!(
                     "qwen2_5_vl: attention mask must be 3D or 4D, got {r}D"
                 )))
             }
         };
-        let eps = self.cfg.rms_norm_eps;
-        let mut hidden = embeds.clone();
-        let mut all = Vec::with_capacity(self.layers.len() + 1);
-        for layer in &self.layers {
-            all.push(hidden.clone()); // HF appends the pre-layer hidden state
-            let normed = rms_norm(&hidden, &layer.input_ln, eps)?;
-            hidden = (&hidden + self.attention(&normed, &layer.attn, &cos, &sin, &mask)?)?;
-            let normed = rms_norm(&hidden, &layer.post_ln, eps)?;
-            hidden = (&hidden + layer.mlp.forward(&normed)?)?;
-        }
-        all.push(rms_norm(&hidden, &self.norm, eps)?);
-        Ok(all)
+        Ok((cos, sin, mask))
+    }
+
+    /// One decoder layer over the residual stream: pre-attn RMSNorm → self-attention residual →
+    /// post-attn RMSNorm → MLP residual. Factored so [`Self::forward`] and [`Self::penultimate`] run the
+    /// identical block math.
+    fn run_layer(
+        &self,
+        hidden: &Tensor,
+        layer: &Layer,
+        cos: &Tensor,
+        sin: &Tensor,
+        mask: &Tensor,
+        eps: f64,
+    ) -> CResult<Tensor> {
+        let normed = rms_norm(hidden, &layer.input_ln, eps)?;
+        let hidden = (hidden + self.attention(&normed, &layer.attn, cos, sin, mask)?)?;
+        let normed = rms_norm(&hidden, &layer.post_ln, eps)?;
+        Ok((&hidden + layer.mlp.forward(&normed)?)?)
     }
 
     /// The planner feature: the penultimate hidden state `hidden_states[-2]` (the residual stream
     /// feeding the final decoder layer, pre-final-norm) — `[B,L,hidden]`.
+    ///
+    /// F-143: only `[-2]` is ever consumed, so this walks the residual stack keeping a single hidden
+    /// state instead of retaining all `N+1` `[B,L,hidden]` states like [`Self::forward`] does (~1 GB
+    /// bf16 apiece for the 29-layer 7B backbone, allocated 75+× per generate). `hidden_states[-2]` is
+    /// the input to the *final* decoder layer, i.e. the residual stream after the first `N-1` layers —
+    /// the last layer's output and the final norm only affect `[-1]`, so they are skipped entirely. The
+    /// result is bit-identical to `forward(...)[len-2]` (see the `penultimate_matches_forward` golden);
+    /// [`Self::forward`] is retained as the full-Vec HF-parity API for tests.
     pub fn penultimate(
         &self,
         embeds: &Tensor,
         position_ids: &Tensor,
         mask: &Tensor,
     ) -> CResult<Tensor> {
-        let all = self.forward(embeds, position_ids, mask)?;
-        Ok(all[all.len() - 2].clone())
+        let (cos, sin, mask) = self.prepare_rotary_and_mask(embeds, position_ids, mask)?;
+        let eps = self.cfg.rms_norm_eps;
+        // `hidden_states[-2]` with an empty stack is `embeds` itself (all = [embeds, norm(embeds)]).
+        // The final layer + final norm only affect `[-1]`, so they are dropped from `leading` and never
+        // run.
+        let Some((_last, leading)) = self.layers.split_last() else {
+            return Ok(embeds.clone());
+        };
+        let mut hidden = embeds.clone();
+        for layer in leading {
+            hidden = self.run_layer(&hidden, layer, &cos, &sin, &mask, eps)?;
+        }
+        Ok(hidden)
     }
 }
 
@@ -390,6 +437,7 @@ impl Qwen25VlText {
 mod tests {
     use super::*;
     use candle_gen::candle_core::Device;
+    use std::collections::HashMap;
 
     /// The default config matches Qwen2.5-VL-7B (head_dim derived = 128, GQA groups = 7).
     #[test]
@@ -462,5 +510,114 @@ mod tests {
             diff < 1e-6,
             "text MRoPE must equal 1D rotary, max|Δ|={diff}"
         );
+    }
+
+    /// A tiny synthetic backbone (head_dim 8 = 2 heads × 4, 1 kv head, mrope [1,2,1]) with `n` real
+    /// decoder layers, runnable on CPU — the residual stack without the 7B weights.
+    fn tiny_backbone(n: usize, dev: &Device) -> (Qwen25VlText, QwenVlTextConfig) {
+        let cfg = QwenVlTextConfig {
+            hidden_size: 16,
+            num_layers: n,
+            num_heads: 2,
+            num_kv_heads: 1,
+            head_dim: 8,
+            intermediate_size: 32,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            mrope_section: [1, 2, 1],
+        };
+        let mut m: HashMap<String, Tensor> = HashMap::new();
+        let mut put = |k: &str, shape: &[usize]| {
+            m.insert(
+                k.to_string(),
+                Tensor::randn(0f32, 0.2f32, shape, dev).unwrap(),
+            );
+        };
+        let h = cfg.hidden_size;
+        let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
+        put("embed_tokens.weight", &[8, h]);
+        put("norm.weight", &[h]);
+        for i in 0..n {
+            let b = format!("layers.{i}");
+            put(&format!("{b}.input_layernorm.weight"), &[h]);
+            put(&format!("{b}.post_attention_layernorm.weight"), &[h]);
+            put(&format!("{b}.self_attn.q_proj.weight"), &[nh * hd, h]);
+            put(&format!("{b}.self_attn.q_proj.bias"), &[nh * hd]);
+            put(&format!("{b}.self_attn.k_proj.weight"), &[nkv * hd, h]);
+            put(&format!("{b}.self_attn.k_proj.bias"), &[nkv * hd]);
+            put(&format!("{b}.self_attn.v_proj.weight"), &[nkv * hd, h]);
+            put(&format!("{b}.self_attn.v_proj.bias"), &[nkv * hd]);
+            put(&format!("{b}.self_attn.o_proj.weight"), &[h, nh * hd]);
+            put(
+                &format!("{b}.mlp.gate_proj.weight"),
+                &[cfg.intermediate_size, h],
+            );
+            put(
+                &format!("{b}.mlp.up_proj.weight"),
+                &[cfg.intermediate_size, h],
+            );
+            put(
+                &format!("{b}.mlp.down_proj.weight"),
+                &[h, cfg.intermediate_size],
+            );
+        }
+        let vb = VarBuilder::from_tensors(m, DType::F32, dev);
+        (Qwen25VlText::new(cfg.clone(), vb).unwrap(), cfg)
+    }
+
+    fn max_abs(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .max(0)
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap()
+    }
+
+    /// F-143: the memory-lean [`Qwen25VlText::penultimate`] must return **bit-identical** results to the
+    /// full-Vec `forward(...)[len-2]` it replaces — the last decoder layer and the final norm only feed
+    /// `[-1]`, so skipping them cannot perturb `[-2]`. Checked across a multi-layer stack and the
+    /// empty-stack edge (where `[-2]` is `embeds` itself).
+    #[test]
+    fn penultimate_matches_forward() {
+        let dev = Device::Cpu;
+        let l = 6usize;
+        // MRoPE position ids [3, L] (all axes share the text row) + an all-attend additive mask.
+        let row: Vec<i64> = (0..l as i64).collect();
+        let mut pdata = Vec::new();
+        for _ in 0..3 {
+            pdata.extend_from_slice(&row);
+        }
+        let mk_inputs = |cfg: &QwenVlTextConfig| {
+            let embeds = Tensor::randn(0f32, 1f32, (1, l, cfg.hidden_size), &dev).unwrap();
+            let pos = Tensor::from_vec(pdata.clone(), (3, l), &dev).unwrap();
+            let mask = Tensor::zeros((1, 1, l, l), DType::F32, &dev).unwrap();
+            (embeds, pos, mask)
+        };
+        // `hidden_states[-2]` is only defined with ≥2 hidden states, i.e. ≥1 decoder layer.
+        for n in [1usize, 2, 3] {
+            let (bb, cfg) = tiny_backbone(n, &dev);
+            let (embeds, pos, mask) = mk_inputs(&cfg);
+            let all = bb.forward(&embeds, &pos, &mask).unwrap();
+            assert_eq!(all.len(), n + 1, "forward keeps N+1 hidden states");
+            let want = &all[all.len() - 2];
+            let got = bb.penultimate(&embeds, &pos, &mask).unwrap();
+            assert_eq!(got.dims(), want.dims());
+            assert_eq!(
+                max_abs(&got, want),
+                0.0,
+                "penultimate (n={n}) must equal forward()[-2] bit-for-bit"
+            );
+        }
+        // Degenerate empty stack: `forward` yields a single state, so `[-2]` is undefined; the lean
+        // path returns `embeds` (all = [embeds, norm(embeds)] → the pre-final-norm state is `embeds`).
+        let (bb0, cfg0) = tiny_backbone(0, &dev);
+        let (embeds, pos, mask) = mk_inputs(&cfg0);
+        let got0 = bb0.penultimate(&embeds, &pos, &mask).unwrap();
+        assert_eq!(max_abs(&got0, &embeds), 0.0, "empty stack → embeds");
     }
 }
