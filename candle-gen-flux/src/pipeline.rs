@@ -1004,8 +1004,8 @@ fn to_image(decoded: &Tensor) -> Result<Image> {
 }
 
 /// The diffusers `AutoEncoderKL` config for the FLUX packed VAE — identical to z-image's (16 latent
-/// channels, `[128, 256, 512, 512]`, layers 2, scaling 0.3611 / shift 0.1159, norm groups 32), so the
-/// shared `candle_transformers::models::z_image::vae` decoder loads the FLUX packed VAE directly.
+/// channels, `[128, 256, 512, 512]`, layers 2, scaling 0.3611 / shift 0.1159, norm groups 32). The
+/// live path now decodes the FLUX packed VAE through the vendored `crate::vae::diffusers::AutoEncoderKL`.
 fn flux_vae_config() -> VaeConfig {
     VaeConfig::z_image()
 }

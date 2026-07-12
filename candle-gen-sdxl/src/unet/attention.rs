@@ -79,7 +79,8 @@ impl Module for FeedForward {
 // `CustomOp3` with no `bwd`, so it cannot back-propagate and is unusable in a training forward. The
 // trainer constructs every attention with `use_flash_attn = false`, so this stub is never reached;
 // it stays only to keep `CrossAttention::attention` structurally identical to the stock module this
-// is vendored from. Inference still uses the stock candle-transformers UNet (with real flash-attn).
+// is vendored from. The live inference path is the dense math path, which now runs the vendored
+// budgeted UNet; only the (currently-unreachable) flash-attn branch would use the stock UNet.
 fn flash_attn(_: &Tensor, _: &Tensor, _: &Tensor, _: f32, _: bool) -> Result<Tensor> {
     unimplemented!("flash-attn has no backward in candle; the trainable UNet uses the math path")
 }
