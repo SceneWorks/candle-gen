@@ -68,7 +68,14 @@ pub const MAX_EDIT_REFERENCES: usize = 2;
 /// template prefix are short). Enforced up front by [`crate::tokenizer::KreaTokenizer::encode_prompt`]
 /// so an over-length prompt returns a clear length error instead of an opaque tensor-shape error deep
 /// in the condition encoder (sc-9047).
-pub(crate) const MAX_TEXT_TOKENS: usize = 1024;
+///
+/// The **single** canonical cap for the whole crate (sc-11205 / F-120): the inference pipeline, the LoRA
+/// trainer ([`crate::training`]), the ControlNet provider/trainer, and the `krea-control-*` example
+/// binaries all import THIS constant. Keeping one definition means raising the cap can never leave the
+/// inference and training/control lanes sized differently — a mismatch that surfaced only as the opaque
+/// `narrow` error sc-9047 eliminated. `pub` (not `pub(crate)`) so the example crates — compiled as
+/// separate crates against this library — can import it too.
+pub const MAX_TEXT_TOKENS: usize = 1024;
 
 /// Max tokens for the **image-grounded edit** conditioning (epic 10871 / sc-10880). Far larger than
 /// [`MAX_TEXT_TOKENS`] because the edit template embeds one `<|image_pad|>` per merged vision token —

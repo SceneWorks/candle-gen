@@ -22,12 +22,12 @@ use candle_gen::candle_core::{DType, Tensor};
 use candle_gen::train::flow_match::{component_vb, sample_noise};
 use candle_gen_krea::control::{forward_with_control, probe_forward, ControlBranch};
 use candle_gen_krea::loader::Weights;
+// The crate's single canonical prompt-token cap (sc-11205 / F-120) — no longer a per-example const.
+use candle_gen_krea::pipeline::MAX_TEXT_TOKENS;
 use candle_gen_krea::{
     turbo_sigmas, Krea2Config, KreaTeConfig, KreaTextEncoder, KreaTokenizer, KreaTrainDit,
 };
 use candle_gen_qwen_image::vae::QwenVaeEncoder;
-
-const MAX_TEXT_TOKENS: usize = 1024;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let argv: Vec<String> = std::env::args().skip(1).collect();

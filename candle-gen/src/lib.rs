@@ -70,6 +70,14 @@ pub use loader::{
 pub mod attention;
 pub use attention::{sdpa_budgeted_bhsd, sdpa_budgeted_flat, ATTN_SCORES_BUDGET};
 
+// Shared Qwen3-VL text-encoder grounding helpers (sc-11205 / F-118): the MRoPE / vision-splice
+// machinery (`Rotary` 1-D RoPE table, GQA `repeat_kv`, `<|image_pad|>` `image_blocks`, the vision-embed
+// `replace_seq`/`slice_seq`, the 3-D interleaved `mrope_positions` + `mrope_cos_sin`, and the additive
+// `causal_mask`) that the Boogu (Qwen3-VL-8B) and Krea (Qwen3-VL-4B) condition encoders both need on
+// their image-grounded edit paths. Was byte-identical between `candle-gen-boogu` and `candle-gen-krea`
+// (~250 lines of parity-critical grounding, fixed twice); hoisted here so both draw from one copy.
+pub mod grounding;
+
 // The latent→pixel decode seam (epic 7840, sc-7853): the `LatentDecoder` trait a provider routes its
 // final `vae.decode(latent)` through so a per-generation `req.use_pid` toggle can swap in NVIDIA PiD
 // (`candle-gen-pid`) without N bespoke per-engine ports. The candle twin of `mlx_gen::decoder`.

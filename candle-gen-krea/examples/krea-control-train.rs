@@ -37,10 +37,10 @@ use candle_gen_krea::control_train::{
     ControlSample, ControlTrainConfig, ControlTrainer, TrainEvent,
 };
 use candle_gen_krea::loader::Weights;
+// The crate's single canonical prompt-token cap (sc-11205 / F-120) — no longer a per-example const.
+use candle_gen_krea::pipeline::MAX_TEXT_TOKENS;
 use candle_gen_krea::{Krea2Config, KreaTeConfig, KreaTextEncoder, KreaTokenizer, KreaTrainDit};
 use candle_gen_qwen_image::vae::QwenVaeEncoder;
-
-const MAX_TEXT_TOKENS: usize = 1024;
 
 struct Args {
     snapshot: PathBuf,

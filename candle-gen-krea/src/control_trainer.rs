@@ -33,10 +33,11 @@ use crate::config::Krea2Config;
 use crate::control::{ControlBranch, DEFAULT_INJECT_OFFSET};
 use crate::control_train::{ControlSample, ControlTrainConfig, ControlTrainer};
 use crate::loader::Weights;
+use crate::pipeline::MAX_TEXT_TOKENS;
 use crate::text_encoder::{KreaTeConfig, KreaTextEncoder};
 use crate::tokenizer::KreaTokenizer;
 use crate::train_dit::KreaTrainDit;
-use crate::training::{encode_caption, MAX_TEXT_TOKENS};
+use crate::training::encode_caption;
 
 /// Registry id for the candle Krea pose-ControlNet trainer. Distinct from the LoRA trainer's
 /// `krea_2_raw` — this trains a control branch, not a LoRA. The output overlay applies at

@@ -27,13 +27,14 @@ use candle_gen::gen_core::Progress;
 use candle_gen::train::flow_match::component_vb;
 use candle_gen_krea::control::{forward_with_control, ControlBranch};
 use candle_gen_krea::loader::Weights;
+// The crate's single canonical prompt-token cap (sc-11205 / F-120) — no longer a per-example const.
+use candle_gen_krea::pipeline::MAX_TEXT_TOKENS;
 use candle_gen_krea::{
     load_vae, turbo_sigmas, Krea2Config, KreaTeConfig, KreaTextEncoder, KreaTokenizer, KreaTrainDit,
 };
 use candle_gen_qwen_image::vae::QwenVaeEncoder;
 use rand::{rngs::StdRng, SeedableRng};
 
-const MAX_TEXT_TOKENS: usize = 1024;
 const LATENT_CHANNELS: usize = 16;
 const SPATIAL_SCALE: u32 = 8;
 

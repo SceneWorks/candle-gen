@@ -34,10 +34,10 @@ use crate::config::Krea2Config;
 use crate::control::{forward_with_control, ControlBranch, DEFAULT_RESIDUAL_CLAMP};
 use crate::loader::Weights;
 use crate::pipeline::to_image;
+use crate::pipeline::MAX_TEXT_TOKENS;
 use crate::text_encoder::{KreaTeConfig, KreaTextEncoder};
 use crate::tokenizer::KreaTokenizer;
 use crate::train_dit::KreaTrainDit;
-use crate::training::MAX_TEXT_TOKENS;
 use crate::{load_vae, turbo_sigmas, TURBO_STEPS};
 
 /// Qwen-Image VAE 8× spatial compression (latent side = pixels / 8).

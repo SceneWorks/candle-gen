@@ -61,7 +61,7 @@ const LATENT_CHANNELS: usize = 16;
 /// length error instead of an opaque tensor-shape error deep in the condition encoder (sc-9047).
 ///
 /// This bounds ONLY the text-to-image / CFG-negative / text-only-edit paths, which run through the
-/// pre-built [`crate::text_encoder::Rotary`] table (`narrow` into a table sized to this cap). The
+/// pre-built [`candle_gen::grounding::Rotary`] table (`narrow` into a table sized to this cap). The
 /// image-grounded edit path is bounded by [`MAX_EDIT_TOKENS`] instead — see below.
 pub(crate) const MAX_TEXT_TOKENS: usize = 1280;
 

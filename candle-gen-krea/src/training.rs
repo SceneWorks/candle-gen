@@ -95,8 +95,10 @@ pub const KREA_2_RAW_ID: &str = "krea_2_raw";
 /// items` guard.
 const LABEL: &str = "krea trainer";
 
-/// Max prompt tokens the Qwen3-VL RoPE table is sized for during caption caching (matches the pipeline).
-pub(crate) const MAX_TEXT_TOKENS: usize = 1024;
+// The prompt-token cap for caption caching is the crate's single canonical
+// [`crate::pipeline::MAX_TEXT_TOKENS`] (sc-11205 / F-120) — no longer a second definition here, so the
+// training/control lanes can never drift from the inference cap.
+use crate::pipeline::MAX_TEXT_TOKENS;
 
 /// `(x_t, target, timestep)` for one sample at flow-match `σ`: delegates the latent mix
 /// (`x_t = (1−σ)·x0 + σ·noise`, `target = noise − x0`) to the shared

@@ -20,6 +20,13 @@ use std::path::Path;
 use candle_gen::candle_core::{DType, Device, IndexOp, Result, Tensor};
 use candle_gen::candle_nn::ops::softmax_last_dim;
 use candle_gen::candle_nn::rotary_emb::rope;
+// Shared Qwen3-VL grounding helpers (sc-11205 / F-118) — the MRoPE / vision-splice machinery this
+// encoder previously defined inline ("ported verbatim from candle_gen_boogu"), byte-identical to
+// Boogu's copy. Now one shared home in `candle_gen::grounding`.
+use candle_gen::grounding::{
+    causal_mask, image_blocks, mrope_cos_sin, mrope_positions, repeat_kv, replace_seq, slice_seq,
+    Rotary,
+};
 
 use crate::loader::{embedding_detect, linear_detect, rmsnorm, Weights};
 use crate::quant::{QEmbedding, QLinear};
@@ -182,35 +189,6 @@ fn read_mrope_section(a: &[serde_json::Value]) -> Option<[usize; 3]> {
     Some(out)
 }
 
-/// HF half-split RoPE table (θ over `head_dim`), built once for the max sequence length (f32).
-struct Rotary {
-    cos: Tensor,
-    sin: Tensor,
-}
-
-impl Rotary {
-    fn new(head_dim: usize, theta: f32, max_seq: usize, device: &Device) -> Result<Self> {
-        let inv_freq: Vec<f32> = (0..head_dim)
-            .step_by(2)
-            .map(|i| 1f32 / theta.powf(i as f32 / head_dim as f32))
-            .collect();
-        let n = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, n), device)?;
-        let t = Tensor::arange(0u32, max_seq as u32, device)?
-            .to_dtype(DType::F32)?
-            .reshape((max_seq, 1))?;
-        let freqs = t.matmul(&inv_freq)?; // (max_seq, head_dim/2)
-        Ok(Self {
-            cos: freqs.cos()?,
-            sin: freqs.sin()?,
-        })
-    }
-
-    fn text(&self, seq: usize) -> Result<(Tensor, Tensor)> {
-        Ok((self.cos.narrow(0, 0, seq)?, self.sin.narrow(0, 0, seq)?))
-    }
-}
-
 struct Attention {
     q_proj: QLinear,
     k_proj: QLinear,
@@ -280,18 +258,6 @@ impl Attention {
         let o = o.transpose(1, 2)?.contiguous()?.reshape((b, s, nh * hd))?;
         self.o_proj.forward(&o)
     }
-}
-
-/// Repeat each kv head `groups` times along the head axis ([B,nkv,S,D] → [B,nkv·groups,S,D]).
-fn repeat_kv(x: &Tensor, groups: usize) -> Result<Tensor> {
-    if groups == 1 {
-        return Ok(x.clone());
-    }
-    let (b, nkv, s, d) = x.dims4()?;
-    x.unsqueeze(2)?
-        .expand((b, nkv, groups, s, d))?
-        .contiguous()?
-        .reshape((b, nkv * groups, s, d))
 }
 
 struct Mlp {
@@ -474,9 +440,17 @@ impl KreaTextEncoder {
             hidden = replace_seq(&hidden, &img, start, start + len, s)?;
         }
 
-        // 3-D interleaved MRoPE (per-image grids) + causal mask.
+        // 3-D interleaved MRoPE (per-image grids) + causal mask (shared grounding helpers, sc-11205).
         let (pt, ph, pw) = mrope_positions(&ids, self.image_token_id, grids);
-        let (cos, sin) = self.mrope_cos_sin(&pt, &ph, &pw)?;
+        let (cos, sin) = mrope_cos_sin(
+            self.head_dim,
+            self.mrope_section,
+            self.rope_theta,
+            &pt,
+            &ph,
+            &pw,
+            &self.device,
+        )?;
         let mask = causal_mask(b, s, &self.device)?;
 
         let mut saved: Vec<(usize, Tensor)> = Vec::with_capacity(self.out_layers.len());
@@ -531,127 +505,10 @@ impl KreaTextEncoder {
         stacked.narrow(1, self.prefix_tokens, n - self.prefix_tokens)
     }
 
-    /// Build the interleaved-MRoPE `cos`/`sin` `[s, head_dim/2]` (f32). Each of the `head_dim/2`
-    /// frequencies takes its position from the T/H/W axis per the Qwen3-VL interleave: within the first
-    /// `mrope_section[1]·3` indices, `j%3==1 → H`, `j%3==2 → W`, else `T` (the tail stays `T`). Ported
-    /// verbatim from `candle_gen_boogu`'s text encoder (Krea shares the section `[24,20,20]`, head_dim
-    /// 128, and θ = 5e6).
-    fn mrope_cos_sin(&self, pt: &[i64], ph: &[i64], pw: &[i64]) -> Result<(Tensor, Tensor)> {
-        let s = pt.len();
-        let hd = self.head_dim;
-        let half = hd / 2;
-        let sec_h = self.mrope_section[1] * 3;
-        let sec_w = self.mrope_section[2] * 3;
-        let inv: Vec<f32> = (0..half)
-            .map(|j| (self.rope_theta as f64).powf(-(2.0 * j as f64) / hd as f64) as f32)
-            .collect();
-
-        let mut freqs = vec![0f32; s * half];
-        for (i, ((&t, &h), &w)) in pt.iter().zip(ph).zip(pw).enumerate() {
-            for j in 0..half {
-                let pos = if j < sec_h && j % 3 == 1 {
-                    h
-                } else if j < sec_w && j % 3 == 2 {
-                    w
-                } else {
-                    t
-                };
-                freqs[i * half + j] = pos as f32 * inv[j];
-            }
-        }
-        let freqs = Tensor::from_vec(freqs, (s, half), &self.device)?;
-        Ok((freqs.cos()?, freqs.sin()?))
-    }
-
     /// The RMS-norm eps (exposed for the parity harness); the config value threaded at load.
     pub fn rms_norm_eps(&self) -> f64 {
         self.rms_norm_eps
     }
-}
-
-/// Slice `[1, s, d]` along the sequence axis (axis 1) to `[start, end)`.
-fn slice_seq(x: &Tensor, start: usize, end: usize) -> Result<Tensor> {
-    x.narrow(1, start, end - start)
-}
-
-/// Replace `x[:, start:end, :]` with `repl` (`[1, end-start, d]`) via concat of the surrounding slices.
-fn replace_seq(x: &Tensor, repl: &Tensor, start: usize, end: usize, s: usize) -> Result<Tensor> {
-    let before = x.narrow(1, 0, start)?;
-    let after = x.narrow(1, end, s - end)?;
-    Tensor::cat(&[&before, repl, &after], 1)
-}
-
-/// Contiguous runs of `image_token_id` in `ids`, returned as `(start, len)` in input-id order. Each run
-/// is one reference image's `<|image_pad|>` block.
-fn image_blocks(ids: &[u32], image_token_id: u32) -> Vec<(usize, usize)> {
-    let mut blocks = Vec::new();
-    let mut i = 0usize;
-    while i < ids.len() {
-        if ids[i] == image_token_id {
-            let start = i;
-            while i < ids.len() && ids[i] == image_token_id {
-                i += 1;
-            }
-            blocks.push((start, i - start));
-        } else {
-            i += 1;
-        }
-    }
-    blocks
-}
-
-/// Vision spatial merge — the LM sees one token per `merge²` patches (Qwen3-VL `spatial_merge_size`).
-const SPATIAL_MERGE: i64 = 2;
-
-/// 3-D MRoPE positions per token (mirrors `get_rope_index`): text tokens advance `(i, i, i)`; the k-th
-/// image block (at running offset `cur`) takes `grids[k] = [t, h, w]`, gets `t = cur`, `h = cur + row`,
-/// `w = cur + col` over its `(h/merge)×(w/merge)` merged grid, then advances `cur += max(h, w) / merge`.
-/// Multiple image blocks consume `grids` in order. Ported from `candle_gen_boogu`'s text encoder.
-fn mrope_positions(
-    ids: &[u32],
-    image_token_id: u32,
-    grids: &[[i32; 3]],
-) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
-    let (mut pt, mut ph, mut pw) = (Vec::new(), Vec::new(), Vec::new());
-    let mut cur = 0i64;
-    let mut i = 0usize;
-    let mut img_k = 0usize;
-    while i < ids.len() {
-        if ids[i] == image_token_id {
-            let g = grids[img_k];
-            let (llm_h, llm_w) = (g[1] as i64 / SPATIAL_MERGE, g[2] as i64 / SPATIAL_MERGE);
-            let step = (g[1].max(g[2]) as i64) / SPATIAL_MERGE;
-            for idx in 0..(llm_h * llm_w) {
-                pt.push(cur);
-                ph.push(cur + idx / llm_w);
-                pw.push(cur + idx % llm_w);
-            }
-            cur += step;
-            i += (llm_h * llm_w) as usize;
-            img_k += 1;
-        } else {
-            pt.push(cur);
-            ph.push(cur);
-            pw.push(cur);
-            cur += 1;
-            i += 1;
-        }
-    }
-    (pt, ph, pw)
-}
-
-/// Additive causal mask `[B, 1, S, S]` (f32): `0` where query `i` may attend key `j` (`j ≤ i`),
-/// `-inf` otherwise. No padding term (the candle tokenizer emits no padding).
-fn causal_mask(b: usize, s: usize, device: &Device) -> Result<Tensor> {
-    let mut data = vec![0f32; b * s * s];
-    for bi in 0..b {
-        for i in 0..s {
-            for j in (i + 1)..s {
-                data[(bi * s + i) * s + j] = f32::NEG_INFINITY;
-            }
-        }
-    }
-    Tensor::from_vec(data, (b, 1, s, s), device)
 }
 
 #[cfg(test)]
