@@ -68,24 +68,55 @@ fn instantid_unet_file(root: &Path) -> Result<PathBuf> {
 /// As [`load_instantid_unet`], but fold user LoRA/LoKr `adapters` into the UNet weights at load
 /// (sc-6038). InstantID runs on a stock SDXL (RealVisXL) UNet, so SDXL-family LoRAs apply on top of
 /// the IdentityNet + face IP-Adapter. Mirrors the SDXL generator's adapter path
-/// ([`crate::pipeline`]'s `build_unet_with_adapters`): load the `unet/` tensors onto CPU at their
-/// native dtype, fold the deltas in ([`crate::adapters::merge_adapters`], f32 math), then build the
-/// stock UNet + `add_embedding` head from the merged map — each tensor moved to `device` and cast to
-/// `dtype` as the VarBuilder serves it, so peak GPU is unchanged vs the mmap path. An empty
-/// `adapters` slice merges nothing; a non-empty slice that matches no target errors (it never renders
-/// an unadapted image silently). The caller installs the IP-Adapter K/V pairs on the returned UNet.
+/// ([`crate::pipeline`]'s `build_unet_with_adapters` / `load_packed_unet_with_adapters`).
+///
+/// sc-11176 (F-084): fork on the packed tier the SAME way the non-adapter [`load_instantid_unet`]
+/// (sc-10813) and the registered txt2img adapter lane (sc-9528) do — the pre-fix loader hard-coded the
+/// dense `.fp16` file, so an InstantID/edit/IP-Adapter LoRA job against a packed MLX q4/q8 tier
+/// hard-failed with a misleading "snapshot is missing …fp16.safetensors" even though the packed tier
+/// was present and the same LoRA works on the registered lane.
+///
+/// - **Packed tier** ([`crate::pipeline::detect_packed_unet`] ⇒ `Some`): a trained LoRA/LoKr delta
+///   cannot be added to the u32-packed weights and SDXL merges rather than adds a forward-time residual
+///   (chaos-sensitivity, see [`crate::adapters`]), so the packed Linears are **dequantized** to dense
+///   f32, the deltas **folded** through [`crate::adapters::merge_adapters`] (shared, verbatim), and only
+///   the adapted layers **kept dense** while every unadapted layer stays packed
+///   ([`crate::packed_adapters::fold_adapters_into_packed_map`], group 64 asserted). The mixed map feeds
+///   both the UNet body and the `add_embedding` head via one `VarBuilder::from_tensors`, whose per-Linear
+///   `linear_detect_gs` routes an adapted layer through the dense arm and an unadapted one through the
+///   packed arm — exactly the txt2img packed+adapter lane's behavior, plus the `add_embedding` head.
+/// - **Dense snapshot** (`None`): load the `unet/` `.fp16` tensors onto CPU at their native dtype, fold
+///   the deltas in (f32 math), then build the UNet + `add_embedding` head from the merged map — each
+///   tensor moved to `device` and cast to `dtype` as the VarBuilder serves it, so peak GPU is unchanged
+///   vs the mmap path (byte-unchanged pre-sc-11176 behavior).
+///
+/// An empty `adapters` slice merges nothing; a non-empty slice that matches no target errors (it never
+/// renders an unadapted image silently). The caller installs the IP-Adapter K/V pairs on the returned
+/// UNet. `VarBuilder::from_tensors` is Arc-backed, so the body/head clone is cheap.
 pub fn load_instantid_unet_with_adapters(
     root: &Path,
     device: &Device,
     dtype: DType,
     adapters: &[AdapterSpec],
 ) -> Result<UNet2DConditionModel> {
-    let unet_file = snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
-    let mut tensors = candle_core::safetensors::load(&unet_file, &Device::Cpu)?;
-    crate::adapters::merge_adapters(&mut tensors, adapters)?;
-    // `VarBuilder::from_tensors` owns the merged map and is Arc-backed (clone is cheap), feeding both
-    // the UNet body and the `add_embedding` head — exactly as the mmap path clones its VarBuilder.
-    let vs = VarBuilder::from_tensors(tensors, dtype, device);
+    let vs = match crate::pipeline::detect_packed_unet(root)? {
+        Some((packed_file, group_size)) => {
+            // The vendored UNet threads only the default MLX group 64 through its blocks; a non-64 tier
+            // would dequantize/repartition at `group_size` while the UNet reads at 64. Refuse it loudly
+            // (mirrors `detect_packed_unet` / the txt2img packed+adapter lane) rather than mis-fold.
+            crate::packed_adapters::assert_group_size_supported(group_size)?;
+            let raw = candle_core::safetensors::load(&packed_file, &Device::Cpu)?;
+            let merged =
+                crate::packed_adapters::fold_adapters_into_packed_map(raw, adapters, group_size)?;
+            VarBuilder::from_tensors(merged, dtype, device)
+        }
+        None => {
+            let unet_file = snapshot_file(root, "unet/diffusion_pytorch_model.fp16.safetensors")?;
+            let mut tensors = candle_core::safetensors::load(&unet_file, &Device::Cpu)?;
+            crate::adapters::merge_adapters(&mut tensors, adapters)?;
+            VarBuilder::from_tensors(tensors, dtype, device)
+        }
+    };
     let unet = UNet2DConditionModel::new(vs.clone(), 4, 4, false, sdxl_unet_config())?
         .with_add_embedding(vs, ADDITION_TIME_EMBED_DIM, PROJECTION_INPUT_DIM)?;
     Ok(unet)
@@ -190,6 +221,62 @@ mod tests {
             instantid_unet_file(&tmp).unwrap(),
             unet_dir.join("diffusion_pytorch_model.fp16.safetensors"),
             "a dense snapshot ⇒ the .fp16 weight file (unchanged pre-sc-10813 behavior)"
+        );
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// sc-11176 (F-084): the InstantID/edit/IP-Adapter **adapter** loader forks on the packed tier the
+    /// same way the non-adapter load does — a packed q4/q8 tier routes through the packed weight file
+    /// (`packed_adapters::fold_adapters_into_packed_map`), NOT the dense `.fp16` snapshot. Pre-fix it
+    /// hard-coded `.fp16`, so a packed-tier LoRA job hard-failed with a misleading
+    /// "snapshot is missing …fp16.safetensors" even though the packed tier was present. GPU-free: drives
+    /// the branch on stub weights and asserts the packed arm never surfaces the dense `.fp16` diagnosis
+    /// (and the dense arm still does), proving the fork is taken.
+    #[test]
+    fn instantid_adapter_load_forks_packed_vs_dense() {
+        let tmp =
+            std::env::temp_dir().join(format!("sc11176_instantid_adapter_{}", std::process::id()));
+        let unet_dir = tmp.join("unet");
+        std::fs::create_dir_all(&unet_dir).unwrap();
+        let dev = Device::Cpu;
+
+        // Packed tier: a group-64 `quantization` block + the packed weight file at the non-`.fp16`
+        // name. The adapter load must take the packed fork — it fails parsing the stub safetensors, NOT
+        // with a missing-`.fp16` diagnosis (the pre-fix bug). Empty adapters is fine: the fork is chosen
+        // before any delta math, and the packed arm loads the packed file (which the stub bytes fail).
+        std::fs::write(
+            unet_dir.join("config.json"),
+            br#"{"quantization": {"bits": 4, "group_size": 64}, "cross_attention_dim": 2048}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            unet_dir.join("diffusion_pytorch_model.safetensors"),
+            b"not-a-real-safetensor",
+        )
+        .unwrap();
+        let err = load_instantid_unet_with_adapters(&tmp, &dev, DType::F32, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("fp16"),
+            "a packed tier must take the packed fork, not resolve the dense .fp16 file (got: {err})"
+        );
+
+        // Dense snapshot: no `quantization` block AND no weight file present ⇒ the dense fork resolves
+        // the `.fp16` name and surfaces the missing-snapshot diagnosis naming it — proving the other arm.
+        std::fs::write(
+            unet_dir.join("config.json"),
+            br#"{"cross_attention_dim": 2048, "sample_size": 128}"#,
+        )
+        .unwrap();
+        std::fs::remove_file(unet_dir.join("diffusion_pytorch_model.safetensors")).ok();
+        let err = load_instantid_unet_with_adapters(&tmp, &dev, DType::F32, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("fp16"),
+            "a dense snapshot with no weights ⇒ the missing-.fp16 diagnosis (got: {err})"
         );
 
         std::fs::remove_dir_all(&tmp).ok();
