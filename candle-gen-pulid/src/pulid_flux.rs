@@ -31,7 +31,7 @@ use candle_gen::gen_core::sampling::TimestepConvention;
 use candle_gen::gen_core::{Image, PidWeights, Progress};
 use candle_gen::weights::Weights;
 use candle_gen::{CandleError, Result};
-use candle_gen_flux::{DitImageInjector, FluxRefBackbone, Variant};
+use candle_gen_flux::{flow_mu, DitImageInjector, FluxRefBackbone, Variant, BASE_SHIFT, MAX_SHIFT};
 use candle_gen_pid::{PidDecoder, PidEngine};
 
 use crate::ca::PulidCa;
@@ -46,9 +46,9 @@ const DTYPE: DType = DType::BF16;
 const COND_DTYPE: DType = DType::F32;
 /// FLUX latent channel count (the raw VAE latent / initial noise; the DiT packs it 2×2 to 64).
 const LATENT_CHANNELS: usize = 16;
-/// FLUX dev's resolution-dependent flow-match time-shift endpoints (the txt2img / IP-Adapter pipeline).
-const BASE_SHIFT: f64 = 0.5;
-const MAX_SHIFT: f64 = 1.15;
+// FLUX dev's flow-match time-shift endpoints (`BASE_SHIFT`/`MAX_SHIFT`) and the `flow_mu` linear map
+// are shared from `candle-gen-flux` (sc-11249 / F-140) — PuLID (always dev) reuses the exact
+// parity-critical schedule constants rather than maintaining a third copy.
 
 /// FLUX packs the /8 VAE latent 2×2, so both render dims must be multiples of 16 (the flux1 txt2img /
 /// IP-Adapter / control size floor).
@@ -143,18 +143,6 @@ impl Default for PulidFluxRequest {
             cancel: CancelFlag::default(),
         }
     }
-}
-
-/// The FLUX.1-dev flow-match time-shift `mu` for the curated scheduler axis (epic 7114, sc-7297) — the
-/// same linear map candle's `get_schedule(.., Some((seq_len, BASE_SHIFT, MAX_SHIFT)))` applies, so
-/// gen-core's exponential time-shift lands on the native schedule's shift (the candle-gen-flux
-/// `flow_mu` twin; PuLID is always dev so there is no schnell `mu = 0` branch). Used ONLY to feed the
-/// curated [`candle_gen::resolve_flow_schedule`]; the default path returns the verbatim native schedule
-/// (N1 byte-exact).
-fn flow_mu(seq_len: usize) -> f32 {
-    let m = (MAX_SHIFT - BASE_SHIFT) / (4096.0 - 256.0);
-    let b = BASE_SHIFT - m * 256.0;
-    (m * seq_len as f64 + b) as f32
 }
 
 /// L2-normalize each row of `[B, D]` over the feature axis (the PuLID `id_cond_vit` normalization),
@@ -274,15 +262,22 @@ impl PulidFlux {
     pub fn compute_id_embedding(&self, reference: &Image) -> Result<Tensor> {
         let inner = self.face.inner();
         let (h, w) = (reference.height as usize, reference.width as usize);
-        let faces = inner.analyze(&reference.pixels, h, w)?;
-        let face = faces.first().ok_or_else(|| {
+        // Detect-then-embed-the-largest (sc-11249 / F-138), matching the `candle-gen-face` /
+        // InstantID pattern: `detect` returns detections largest-first (no ArcFace forward), and
+        // `embed` runs the single `[1,3,112,112]` iresnet100 forward on the largest one only. This
+        // avoids `analyze`'s N−1 wasted host norm-crops + N-row batched forward for a group-photo
+        // reference; iresnet100 has no cross-batch ops, so the kept embedding is bit-identical to the
+        // old `analyze(..).first()`.
+        let dets = inner.detect(&reference.pixels, h, w)?;
+        let det = dets.first().ok_or_else(|| {
             CandleError::Msg("pulid_flux: no face detected in the reference image".into())
         })?;
+        let face = inner.embed(&reference.pixels, h, w, det)?;
         // ArcFace 512-d (raw, un-normalized) → [1, 512] f32.
         let dim = face.embedding.len();
         let arcface = Tensor::from_vec(face.embedding.clone(), (1, dim), &self.device)?;
         // face_features_image (512² NCHW) → EVA 336² transform → tower.
-        let ffi = inner.face_features_image(&reference.pixels, h, w, face)?;
+        let ffi = inner.face_features_image(&reference.pixels, h, w, &face)?;
         let eva_in = transform::eva_transform(&ffi, self.eva.config().image_size)?;
         let eva_out = self.eva.forward(&eva_in)?;
         let id_cond_vit = l2_normalize_rows(&eva_out.id_cond_vit)?; // [1,768]
@@ -386,7 +381,9 @@ impl PulidFlux {
         // default (scheduler unset / native alias) returns it byte-exact, so the legacy flow-match Euler
         // path is the N1 no-op for `img += pred·(σ_{i+1} − σ_i)`.
         let native: Vec<f32> = timesteps.iter().map(|&t| t as f32).collect();
-        let mu = flow_mu(state.img.dim(1)?);
+        // PuLID is always dev, so the shared `flow_mu` is fed `Variant::Dev` (the schnell `mu = 0`
+        // branch is inert here) — the candle-gen-flux twin, deduped in sc-11249 / F-140.
+        let mu = flow_mu(Variant::Dev, state.img.dim(1)?);
         let steps = native.len().saturating_sub(1);
         let sigmas = candle_gen::resolve_flow_schedule(scheduler, mu, steps, &native);
         candle_gen::run_flow_sampler(
@@ -467,5 +464,29 @@ mod tests {
         // Second row is all-zero → stays zero (epsilon-clamped, no NaN).
         assert!(rows[1].iter().all(|&v| v == 0.0));
         assert_eq!((NUM_DOUBLE_BLOCKS, NUM_SINGLE_BLOCKS), (19, 38));
+    }
+
+    /// The shared `candle-gen-flux` `flow_mu`/shift constants (sc-11249 / F-140) reproduce the deleted
+    /// PuLID-local copy bit-for-bit: `BASE_SHIFT`/`MAX_SHIFT` are the dev endpoints and
+    /// `flow_mu(Variant::Dev, ..)` equals the old inlined linear map at every seq_len.
+    #[test]
+    fn shared_flow_mu_matches_deleted_pulid_copy() {
+        assert_eq!((BASE_SHIFT, MAX_SHIFT), (0.5, 1.15));
+        // The exact formula the PuLID copy used before the dedup.
+        let old = |seq_len: usize| -> f32 {
+            let m = (MAX_SHIFT - BASE_SHIFT) / (4096.0 - 256.0);
+            let b = BASE_SHIFT - m * 256.0;
+            (m * seq_len as f64 + b) as f32
+        };
+        for &seq_len in &[256usize, 512, 1024, 4096, 4224] {
+            assert_eq!(
+                flow_mu(Variant::Dev, seq_len),
+                old(seq_len),
+                "seq_len={seq_len}"
+            );
+        }
+        // Endpoints land on the shift constants (m·256+b = BASE_SHIFT, m·4096+b = MAX_SHIFT).
+        assert!((flow_mu(Variant::Dev, 256) as f64 - BASE_SHIFT).abs() < 1e-6);
+        assert!((flow_mu(Variant::Dev, 4096) as f64 - MAX_SHIFT).abs() < 1e-6);
     }
 }

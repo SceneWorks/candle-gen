@@ -34,7 +34,7 @@ use crate::flux1_load;
 use crate::ip_adapter::{FluxIpAdapter, FluxIpInjector};
 use crate::ip_dit::IpFlux;
 use crate::ip_image_encoder::FluxIpImageEncoder;
-use crate::pipeline::{decode_latents, encode_text, flow_mu, flux_config};
+use crate::pipeline::{decode_latents, encode_text, flow_mu, flux_config, BASE_SHIFT, MAX_SHIFT};
 use crate::Variant;
 
 /// The provider-specific error label for the shared [`crate::flux1_load`] diagnostics.
@@ -43,9 +43,8 @@ const LABEL: &str = "flux ip-adapter";
 const DTYPE: DType = DType::BF16;
 /// FLUX latent channel count (the raw VAE latent / initial noise; the DiT packs it 2×2 to 64).
 const LATENT_CHANNELS: usize = 16;
-/// FLUX dev's resolution-dependent flow-match time-shift endpoints (matching the txt2img pipeline).
-const BASE_SHIFT: f64 = 0.5;
-const MAX_SHIFT: f64 = 1.15;
+// FLUX dev's flow-match time-shift endpoints (`BASE_SHIFT`/`MAX_SHIFT`) are shared from
+// `crate::pipeline` (sc-11249 / F-140) rather than re-declared here.
 
 /// Default `ip_adapter_scale` for the XLabs FLUX IP-Adapter (mlx-gen-flux `DEFAULT_IP_SCALE`).
 pub const DEFAULT_IP_SCALE: f32 = 0.7;

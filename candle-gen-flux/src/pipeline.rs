@@ -95,9 +95,11 @@ const LATENT_CHANNELS: usize = 16;
 
 /// FLUX dev's resolution-dependent flow-match time-shift endpoints (`base_shift`, `max_shift`),
 /// matching the candle `flux` example's `get_schedule(.., Some((seq_len, 0.5, 1.15)))` and the
-/// diffusers FluxPipeline. schnell uses no shift (`None`).
-const BASE_SHIFT: f64 = 0.5;
-const MAX_SHIFT: f64 = 1.15;
+/// diffusers FluxPipeline. schnell uses no shift (`None`). One home for all FLUX lanes (sc-11249 /
+/// F-140): the IP-Adapter (`ip_provider`) and PuLID (`candle-gen-pulid`) reference streams share these
+/// exact parity-critical endpoints rather than re-declaring them.
+pub const BASE_SHIFT: f64 = 0.5;
+pub const MAX_SHIFT: f64 = 1.15;
 
 /// T5 pad token id (`<pad>`) — FLUX pads the T5 sequence to the variant max length with this id, and
 /// attends every padded position (no attention mask), so it is parity-relevant.
@@ -110,7 +112,11 @@ const T5_PAD_TOKEN_ID: u32 = 0;
 /// shift the native schedule uses. schnell applies no shift (`get_schedule(.., None)`), so `mu = 0`.
 /// Used ONLY to feed the curated `resolve_flow_schedule`; the native (default) schedule stays the
 /// verbatim `get_schedule(..)` so the N1 default path is byte-exact.
-pub(crate) fn flow_mu(variant: Variant, seq_len: usize) -> f32 {
+///
+/// Shared across every FLUX lane (sc-11249 / F-140): the IP-Adapter (`ip_provider`) reaches it as
+/// `pub(crate)`; the separate PuLID crate (`candle-gen-pulid`) reaches it re-exported as `pub`. PuLID
+/// is always dev, so it calls `flow_mu(Variant::Dev, seq_len)` — the schnell `mu = 0` branch is inert.
+pub fn flow_mu(variant: Variant, seq_len: usize) -> f32 {
     if !variant.is_dev() {
         return 0.0;
     }

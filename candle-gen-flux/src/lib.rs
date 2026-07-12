@@ -85,6 +85,10 @@ pub use ip_dit::{Config as FluxConfig, DitImageInjector, IpFlux};
 pub use pipeline::{
     ae_config, clip_config, decode_latents, encode_text, flux_config, FluxTokenizers,
 };
+// The FLUX dev flow-match time-shift constants + `flow_mu` linear map — one home (sc-11249 / F-140).
+// The PuLID reference stream (`candle-gen-pulid`) shares these exact parity-critical schedule pieces
+// rather than maintaining a third copy; the IP-Adapter provider reaches them in-crate.
+pub use pipeline::{flow_mu, BASE_SHIFT, MAX_SHIFT};
 
 // The tier-detecting reference backbone (sc-10103, epic 9083) — the candle twin of
 // `mlx_gen_flux::load_flux1`. Reuses the txt2img `Pipeline`'s tier detect-and-load so the reference
