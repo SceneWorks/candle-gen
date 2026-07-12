@@ -25,7 +25,7 @@ use candle_gen::gen_core::{
     WeightsSource,
 };
 use candle_gen::{CandleError, Result as CResult};
-use candle_gen_wan::config::{TextEncoderConfig, Vae16Config};
+use candle_gen_wan::config::{TextEncoderConfig, Vae16Config, MAX_AREA_14B};
 use candle_gen_wan::scheduler::Sampler;
 use candle_gen_wan::text_encoder::Umt5Encoder;
 use candle_gen_wan::vae16::WanVae16;
@@ -235,6 +235,7 @@ impl Generator for Scail2 {
         // (which also rejects it now that `MultiReference` is unadvertised, sc-8985).
         reject_multi_reference(self.descriptor.id, req)?;
         reject_zero_steps(self.descriptor.id, req)?;
+        reject_over_area(self.descriptor.id, req)?;
         self.descriptor
             .capabilities
             .validate_request(self.descriptor.id, req)
@@ -279,6 +280,24 @@ fn reject_zero_steps(id: &str, req: &GenerationRequest) -> gen_core::Result<()> 
     if req.steps == Some(0) {
         return Err(gen_core::Error::Msg(format!(
             "{id}: steps must be >= 1 (an explicit 0 renders undenoised noise)"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject an over-area request loudly instead of letting the 14B DiT run for minutes and OOM. SCAIL-2's
+/// DiT runs **f32** (≈ 56 GiB resident) with a packed conditioning sequence >2× the plain token count,
+/// so a far-over-envelope request (e.g. 1280×1280×81) validates and dies with an opaque CUDA OOM at the
+/// VAE-decode peak. Reject past the shared A14B cap with an actionable message, mirroring the A14B MoE
+/// lane (`wan14b.rs`, sc-9028 / F-044); the incident class F-090 (sc-11215) left this lane open. `max_size`
+/// alone only bounds each edge, so 1280×1280 (both ≤ 1280) slips through without the area check.
+fn reject_over_area(id: &str, req: &GenerationRequest) -> gen_core::Result<()> {
+    let area = req.width as usize * req.height as usize;
+    if area > MAX_AREA_14B {
+        return Err(gen_core::Error::Msg(format!(
+            "{id}: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_14B} px \
+             (704×1280); reduce the resolution",
+            req.width, req.height
         )));
     }
     Ok(())
@@ -475,6 +494,36 @@ mod tests {
             ..zero
         };
         assert!(reject_zero_steps(MODEL_ID, &unset).is_ok());
+    }
+
+    #[test]
+    fn over_area_is_rejected_loudly() {
+        // A far-over-envelope request (1280×1280, both edges ≤ `max_size` so `max_size` alone lets it
+        // through) must be a fast, actionable rejection — NOT minutes of the f32 14B DiT running to an
+        // opaque CUDA OOM (F-090 / sc-11215, mirroring the A14B MoE lane's sc-9028 guard).
+        assert_eq!(704 * 1280, MAX_AREA_14B);
+        let over = GenerationRequest {
+            prompt: "a character".into(),
+            width: 1280,
+            height: 1280,
+            ..Default::default()
+        };
+        let err = reject_over_area(MODEL_ID, &over).expect_err("over-area must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("max area"), "message names the cap: {msg}");
+        // Exactly at the cap (1280×704 = 901 120 px) and a small in-bounds request both pass the guard.
+        let at_cap = GenerationRequest {
+            width: 1280,
+            height: 704,
+            ..over.clone()
+        };
+        assert!(reject_over_area(MODEL_ID, &at_cap).is_ok());
+        let small = GenerationRequest {
+            width: 512,
+            height: 512,
+            ..over
+        };
+        assert!(reject_over_area(MODEL_ID, &small).is_ok());
     }
 
     #[test]

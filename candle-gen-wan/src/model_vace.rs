@@ -31,8 +31,8 @@ use candle_gen::{CandleError, Result as CResult};
 
 use crate::config::{
     TextEncoderConfig, Vae16Config, WanVaceConfig, DEFAULT_FPS_VACE, DEFAULT_GUIDANCE_VACE,
-    DEFAULT_STEPS_VACE, MODEL_ID_VACE, NEGATIVE_FALLBACK, SIZE_MULTIPLE_14B, VACE_FLOW_SHIFT,
-    VAE16_STRIDE_TEMPORAL,
+    DEFAULT_STEPS_VACE, MAX_AREA_14B, MODEL_ID_VACE, NEGATIVE_FALLBACK, SIZE_MULTIPLE_14B,
+    VACE_FLOW_SHIFT, VAE16_STRIDE_TEMPORAL,
 };
 use crate::pipeline::{create_noise, frames_to_images};
 use crate::rope::WanRope;
@@ -291,6 +291,17 @@ impl Generator for WanVaceGenerator {
                 req.width, req.height
             )));
         }
+        // The 14B VACE DiT (14B params + a 96-ch control stream) fails opaquely (OOM) far over the
+        // envelope. Reject past the shared A14B cap with an actionable message, mirroring the A14B
+        // MoE lane (`wan14b.rs`, sc-9028 / F-044); the incident class F-090 (sc-11215) left open here.
+        let area = req.width as usize * req.height as usize;
+        if area > MAX_AREA_14B {
+            return Err(gen_core::Error::Msg(format!(
+                "wan-vace: width×height ({}×{} = {area} px) exceeds the max area {MAX_AREA_14B} px \
+                 (704×1280); reduce the resolution",
+                req.width, req.height
+            )));
+        }
         let clip = req.control_clip().ok_or_else(|| {
             gen_core::Error::Msg(
                 "wan-vace: needs a ControlClip (the masked control video — the worker builds it per \
@@ -491,6 +502,32 @@ mod tests {
         let mut bad_size = control_req();
         bad_size.width = 70;
         assert!(g.validate(&bad_size).is_err());
+    }
+
+    /// The shared A14B area cap is enforced on the VACE lane too (F-090 / sc-11215): an at-cap request
+    /// passes and a grid-aligned over-cap request is rejected by the area check with an actionable
+    /// message that names the cap — mirroring `wan14b.rs`'s `validate_enforces_max_area` (sc-9028).
+    #[test]
+    fn validate_enforces_max_area() {
+        let spec = LoadSpec::new(WeightsSource::Dir("/nonexistent".into()));
+        let g = registry::load(MODEL_ID_VACE, &spec).unwrap();
+
+        // Exactly at the cap (1280×704 = 901 120 px, both multiples of 16) is accepted.
+        assert_eq!(704 * 1280, MAX_AREA_14B);
+        let mut at_cap = control_req();
+        at_cap.width = 1280;
+        at_cap.height = 704;
+        assert!(g.validate(&at_cap).is_ok());
+
+        // Over the cap while both edges stay within `max_size` (1280×1280 = 1 638 400 px, both
+        // grid-aligned and ≤ 1280) is rejected specifically by the area check, with an actionable
+        // message naming the cap.
+        let mut over = control_req();
+        over.width = 1280;
+        over.height = 1280;
+        let err = g.validate(&over).expect_err("over-area must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("max area"), "message names the cap: {msg}");
     }
 
     #[test]
