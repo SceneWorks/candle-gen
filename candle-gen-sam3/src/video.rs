@@ -81,11 +81,13 @@ pub struct VideoFrameOutput {
     pub masks: Vec<Vec<f32>>, // each [288·288] logits, parallel to obj_ids
 }
 
-/// `Sam3VideoModel`: the detector + the tracker, driving the multi-object PCS pipeline.
-pub struct Sam3VideoModel {
-    segmenter: Sam3ImageSegmenter,
-    tracker: Sam3Tracker,
-    // --- per-session state ---
+/// All per-video (per-`propagate`-call) mutable bookkeeping, factored out of [`Sam3VideoModel`] so a
+/// clip's tracking state is a single value that can be reset wholesale between clips. F-093: because
+/// `propagate` accumulates into these fields and only construction ever initialized them, a cached
+/// model's second clip would otherwise inherit the first's banks/hotstart maps/removed-id bans and
+/// silently corrupt tracking. Keeping them in one struct means resetting is `= SessionState::default()`
+/// — a new field added here is cleared automatically, so the leak cannot silently reappear.
+struct SessionState {
     obj_ids: Vec<i32>,      // ordered; index = obj_idx
     banks: Vec<ObjectBank>, // parallel to obj_ids
     obj_prompt: Vec<i32>,   // prompt id per obj_idx
@@ -98,6 +100,32 @@ pub struct Sam3VideoModel {
     overlap_pairs: BTreeMap<(i32, i32), Vec<i32>>,
     removed: std::collections::BTreeSet<i32>,
     last_occluded: BTreeMap<i32, i32>,
+}
+
+impl Default for SessionState {
+    fn default() -> Self {
+        Self {
+            obj_ids: Vec::new(),
+            banks: Vec::new(),
+            obj_prompt: Vec::new(),
+            max_obj_id: -1, // no objects yet; first assigned id is max_obj_id + 1 = 0
+            num_frames: 0,
+            first_frame: BTreeMap::new(),
+            unmatched_frames: BTreeMap::new(),
+            keep_alive: BTreeMap::new(),
+            overlap_pairs: BTreeMap::new(),
+            removed: std::collections::BTreeSet::new(),
+            last_occluded: BTreeMap::new(),
+        }
+    }
+}
+
+/// `Sam3VideoModel`: the detector + the tracker, driving the multi-object PCS pipeline.
+pub struct Sam3VideoModel {
+    segmenter: Sam3ImageSegmenter,
+    tracker: Sam3Tracker,
+    /// Per-video state (reset at the top of every [`Sam3VideoModel::propagate`] — F-093).
+    session: SessionState,
 }
 
 impl Sam3VideoModel {
@@ -114,17 +142,7 @@ impl Sam3VideoModel {
         Ok(Self {
             segmenter: Sam3ImageSegmenter::from_weights_with_backbone(w, backbone.clone())?,
             tracker: Sam3Tracker::from_weights_with_backbone(w, backbone)?,
-            obj_ids: Vec::new(),
-            banks: Vec::new(),
-            obj_prompt: Vec::new(),
-            max_obj_id: -1,
-            num_frames: 0,
-            first_frame: BTreeMap::new(),
-            unmatched_frames: BTreeMap::new(),
-            keep_alive: BTreeMap::new(),
-            overlap_pairs: BTreeMap::new(),
-            removed: std::collections::BTreeSet::new(),
-            last_occluded: BTreeMap::new(),
+            session: SessionState::default(),
         })
     }
 
@@ -152,6 +170,16 @@ impl Sam3VideoModel {
         &self.tracker
     }
 
+    /// F-093: clear all per-video session bookkeeping to its just-constructed state, keeping the
+    /// loaded weights. `propagate` accumulates per-clip state (`obj_ids`/`banks`/`obj_prompt`, the
+    /// hotstart maps, `removed`, `last_occluded`, the id/frame counters) but only `from_weights`
+    /// initialized it, so a second `propagate` on a cached instance would inherit the previous clip's
+    /// banks and bans and silently corrupt tracking. `propagate` calls this at entry so every clip
+    /// starts clean; it is also `pub` so a caller can reset explicitly between clips if desired.
+    pub fn reset_session(&mut self) {
+        self.session = SessionState::default();
+    }
+
     /// Process a whole video (forward, non-streaming): `frames[f]` = NCHW `[1,3,1008,1008]`; one text
     /// prompt (`input_ids[1,32]` + `text_mask`). Returns per-frame `obj_id → 288² mask logits`.
     ///
@@ -167,7 +195,10 @@ impl Sam3VideoModel {
         cancel: Option<&CancelFlag>,
         mut progress: Option<&mut dyn FnMut(usize, usize)>,
     ) -> Result<Vec<VideoFrameOutput>> {
-        self.num_frames = frames.len() as i32;
+        // F-093: start every clip from clean session state so a cached instance's second `propagate`
+        // never inherits the previous clip's banks/hotstart bookkeeping/removed-id bans.
+        self.reset_session();
+        self.session.num_frames = frames.len() as i32;
         // The concept prompt is fixed for the whole video; encode it through the 24-layer CLIP text
         // tower once here and reuse the features on every frame (F-016).
         let text = self.segmenter.encode_text(input_ids, text_mask)?; // [1, N, 256]
@@ -200,7 +231,7 @@ impl Sam3VideoModel {
         let det = self.run_detection(&features, text, text_mask)?;
 
         // --- Step 2: propagate existing identities (run_mem_encoder = false) ---
-        let num_existing = self.obj_ids.len();
+        let num_existing = self.session.obj_ids.len();
         let mut trk_masks: Vec<Vec<f32>> = Vec::with_capacity(num_existing); // [288²] logits per obj
         let mut trk_scores: Vec<f32> = Vec::with_capacity(num_existing);
         for obj_idx in 0..num_existing {
@@ -210,7 +241,7 @@ impl Sam3VideoModel {
                 .prepare_memory_conditioned_features(&cvf, &cvp, &spatial, &pointers, max_optr)?;
             let out = self.tracker.decode_tracked_frame(&conditioned, &high_res)?;
             let low = to_vec(&out.low_res)?;
-            self.banks[obj_idx].non_cond.insert(
+            self.session.banks[obj_idx].non_cond.insert(
                 frame_idx,
                 FrameMem {
                     maskmem_features: None,
@@ -226,7 +257,7 @@ impl Sam3VideoModel {
         // --- Step 3: associate + new-object ids + hotstart ---
         let assoc = self.associate(&det, &trk_masks);
         let new_obj_ids: Vec<i32> = (0..assoc.new_det_inds.len() as i32)
-            .map(|i| self.max_obj_id + 1 + i)
+            .map(|i| self.session.max_obj_id + 1 + i)
             .collect();
         let removed_now = self.process_hotstart(frame_idx, &assoc, &new_obj_ids);
 
@@ -237,7 +268,7 @@ impl Sam3VideoModel {
             && !assoc.trk_id_to_max_iou_high_conf_det.is_empty()
         {
             for &trk_oid in assoc.trk_id_to_max_iou_high_conf_det.keys() {
-                if let Some(obj_idx) = self.obj_ids.iter().position(|&o| o == trk_oid) {
+                if let Some(obj_idx) = self.session.obj_ids.iter().position(|&o| o == trk_oid) {
                     if trk_scores.get(obj_idx).copied().unwrap_or(f32::MIN) > HIGH_CONF_THRESH {
                         reconditioned_obj_ids.push(trk_oid);
                     }
@@ -251,9 +282,9 @@ impl Sam3VideoModel {
             self.tracker_update_memories(frame_idx, &img_emb, &trk_masks)?;
             // move reconditioned frames from non_cond → cond so they seed future memory selection.
             for &oid in &reconditioned_obj_ids {
-                if let Some(obj_idx) = self.obj_ids.iter().position(|&o| o == oid) {
-                    if let Some(fm) = self.banks[obj_idx].non_cond.remove(&frame_idx) {
-                        self.banks[obj_idx].cond.insert(frame_idx, fm);
+                if let Some(obj_idx) = self.session.obj_ids.iter().position(|&o| o == oid) {
+                    if let Some(fm) = self.session.banks[obj_idx].non_cond.remove(&frame_idx) {
+                        self.session.banks[obj_idx].cond.insert(frame_idx, fm);
                     }
                 }
             }
@@ -262,7 +293,7 @@ impl Sam3VideoModel {
         // --- Step 5 (execution): add new objects from unmatched detections ---
         for (&oid, &di) in new_obj_ids.iter().zip(&assoc.new_det_inds) {
             self.add_object(oid, det.dets[di].prompt_id);
-            let obj_idx = self.obj_ids.len() - 1;
+            let obj_idx = self.session.obj_ids.len() - 1;
             // binarize the detection logits at 0.5 (reference: det_mask >= 0.5) → mask prompt.
             let mask_bin: Vec<f32> = det.dets[di]
                 .mask
@@ -276,7 +307,7 @@ impl Sam3VideoModel {
             let mem =
                 self.tracker
                     .encode_new_memory(&img_emb, &out.high_res, out.object_score, true)?;
-            self.banks[obj_idx].cond.insert(
+            self.session.banks[obj_idx].cond.insert(
                 frame_idx,
                 FrameMem {
                     maskmem_features: Some(seq_first(&mem.features, true)?),
@@ -338,7 +369,7 @@ impl Sam3VideoModel {
 
     // ----- memory bank gather (F2.4 selection logic) -----
     fn gather_memory(&self, obj_idx: usize, frame_idx: i32) -> (SpatialMem, ObjPointers, i32) {
-        let bank = &self.banks[obj_idx];
+        let bank = &self.session.banks[obj_idx];
         // spatial memory: closest cond frames (offset 0) + non-cond at offsets [num_maskmem-1..1].
         let (selected_cond, unselected_cond) =
             select_closest_cond_frames(frame_idx, &bank.cond, MAX_COND_FRAME_NUM);
@@ -366,7 +397,7 @@ impl Sam3VideoModel {
             }
         }
         // object pointers: eligible cond frames (t <= frame_idx) + non-cond up to max_optr-1.
-        let max_optr = self.num_frames.min(MAX_OBJ_PTRS);
+        let max_optr = self.session.num_frames.min(MAX_OBJ_PTRS);
         let mut pointers: Vec<(i32, Tensor)> = Vec::new();
         for (&t, m) in &bank.cond {
             if t <= frame_idx {
@@ -375,7 +406,7 @@ impl Sam3VideoModel {
         }
         for t_diff in 1..max_optr {
             let r = frame_idx - t_diff;
-            if r < 0 || r >= self.num_frames {
+            if r < 0 || r >= self.session.num_frames {
                 break;
             }
             if let Some(m) = bank.non_cond.get(&r) {
@@ -399,7 +430,7 @@ impl Sam3VideoModel {
     fn evict_stale_memory(&mut self, frame_idx: i32) {
         let heavy_keep = frame_idx + 1 - (NUM_MASKMEM - 1);
         let ptr_keep = frame_idx + 1 - (MAX_OBJ_PTRS - 1);
-        for bank in &mut self.banks {
+        for bank in &mut self.session.banks {
             evict_stale_bank(bank, heavy_keep, ptr_keep);
             evict_stale_cond_heavy(bank, heavy_keep);
         }
@@ -422,7 +453,7 @@ impl Sam3VideoModel {
         let mut iou = vec![vec![0f32; m]; n];
         for (i, db) in det_bin.iter().enumerate() {
             for (j, tb) in trk_bin.iter().enumerate() {
-                if det.dets[i].prompt_id == self.obj_prompt[j] {
+                if det.dets[i].prompt_id == self.session.obj_prompt[j] {
                     iou[i][j] = mask_iou(db, tb);
                 }
             }
@@ -432,7 +463,7 @@ impl Sam3VideoModel {
         for j in 0..m {
             let matched = (0..n).any(|i| iou[i][j] >= TRK_ASSOC_IOU_THRESH);
             if trk_nonempty[j] && !matched {
-                a.unmatched_trk.push(self.obj_ids[j]);
+                a.unmatched_trk.push(self.session.obj_ids[j]);
             }
         }
         // detections: new if score >= new_det_thresh and no track IoU >= assoc_iou.
@@ -446,7 +477,7 @@ impl Sam3VideoModel {
             }
             let matched: Vec<i32> = (0..m)
                 .filter(|&j| iou[i][j] >= ASSOC_IOU_THRESH)
-                .map(|j| self.obj_ids[j])
+                .map(|j| self.session.obj_ids[j])
                 .collect();
             let (best_j, best_iou) = (0..m).fold((0usize, -1f32), |(bj, bi), j| {
                 if iou[i][j] > bi {
@@ -461,7 +492,7 @@ impl Sam3VideoModel {
                 && m > 0
             {
                 a.trk_id_to_max_iou_high_conf_det
-                    .insert(self.obj_ids[best_j], i);
+                    .insert(self.session.obj_ids[best_j], i);
             }
             a.det_to_matched_trk.push(matched);
         }
@@ -473,8 +504,8 @@ impl Sam3VideoModel {
         let mut newly_removed = Vec::new();
         let hotstart_diff = frame_idx - HOTSTART_DELAY;
         for &oid in new_obj_ids {
-            self.first_frame.entry(oid).or_insert(frame_idx);
-            self.keep_alive.insert(oid, INIT_KEEP_ALIVE);
+            self.session.first_frame.entry(oid).or_insert(frame_idx);
+            self.session.keep_alive.insert(oid, INIT_KEEP_ALIVE);
         }
         let mut matched: std::collections::BTreeSet<i32> = std::collections::BTreeSet::new();
         for trks in &a.det_to_matched_trk {
@@ -482,31 +513,45 @@ impl Sam3VideoModel {
         }
         for &oid in &matched {
             let k = self
+                .session
                 .keep_alive
                 .get(&oid)
                 .copied()
                 .unwrap_or(INIT_KEEP_ALIVE);
-            self.keep_alive.insert(oid, MAX_KEEP_ALIVE.min(k + 1));
+            self.session
+                .keep_alive
+                .insert(oid, MAX_KEEP_ALIVE.min(k + 1));
         }
         for &oid in &a.unmatched_trk {
-            self.unmatched_frames
+            self.session
+                .unmatched_frames
                 .entry(oid)
                 .or_default()
                 .push(frame_idx);
             let k = self
+                .session
                 .keep_alive
                 .get(&oid)
                 .copied()
                 .unwrap_or(INIT_KEEP_ALIVE);
-            self.keep_alive.insert(oid, MIN_KEEP_ALIVE.max(k - 1));
+            self.session
+                .keep_alive
+                .insert(oid, MIN_KEEP_ALIVE.max(k - 1));
         }
         let unmatched_snapshot: Vec<(i32, usize, i32)> = self
+            .session
             .unmatched_frames
             .iter()
-            .map(|(&oid, fs)| (oid, fs.len(), *self.first_frame.get(&oid).unwrap_or(&0)))
+            .map(|(&oid, fs)| {
+                (
+                    oid,
+                    fs.len(),
+                    *self.session.first_frame.get(&oid).unwrap_or(&0),
+                )
+            })
             .collect();
         for (oid, count, first) in unmatched_snapshot {
-            if self.removed.contains(&oid) || newly_removed.contains(&oid) {
+            if self.session.removed.contains(&oid) || newly_removed.contains(&oid) {
                 continue;
             }
             if count >= HOTSTART_UNMATCH && first > hotstart_diff {
@@ -519,11 +564,12 @@ impl Sam3VideoModel {
             }
             let first_appear = *trks
                 .iter()
-                .min_by_key(|&&o| *self.first_frame.get(&o).unwrap_or(&0))
+                .min_by_key(|&&o| *self.session.first_frame.get(&o).unwrap_or(&0))
                 .unwrap();
             for &oid in trks {
                 if oid != first_appear {
-                    self.overlap_pairs
+                    self.session
+                        .overlap_pairs
                         .entry((first_appear, oid))
                         .or_default()
                         .push(frame_idx);
@@ -531,12 +577,19 @@ impl Sam3VideoModel {
             }
         }
         let overlap_snapshot: Vec<(i32, usize, i32)> = self
+            .session
             .overlap_pairs
             .iter()
-            .map(|(&(_f, oid), fs)| (oid, fs.len(), *self.first_frame.get(&oid).unwrap_or(&0)))
+            .map(|(&(_f, oid), fs)| {
+                (
+                    oid,
+                    fs.len(),
+                    *self.session.first_frame.get(&oid).unwrap_or(&0),
+                )
+            })
             .collect();
         for (oid, count, first) in overlap_snapshot {
-            if self.removed.contains(&oid) || newly_removed.contains(&oid) {
+            if self.session.removed.contains(&oid) || newly_removed.contains(&oid) {
                 continue;
             }
             if first > hotstart_diff && count >= HOTSTART_DUP {
@@ -544,7 +597,7 @@ impl Sam3VideoModel {
             }
         }
         for &oid in &newly_removed {
-            self.removed.insert(oid);
+            self.session.removed.insert(oid);
         }
         newly_removed
     }
@@ -564,20 +617,21 @@ impl Sam3VideoModel {
         let bin: Vec<Vec<bool>> = trk_masks.iter().map(|t| binarize(t)).collect();
         let last_occ: Vec<i32> = (0..n)
             .map(|j| {
-                let oid = self.obj_ids[j];
-                self.last_occluded
-                    .get(&oid)
-                    .copied()
-                    .unwrap_or(if removed_now.contains(&oid) {
+                let oid = self.session.obj_ids[j];
+                self.session.last_occluded.get(&oid).copied().unwrap_or(
+                    if removed_now.contains(&oid) {
                         ALWAYS_OCCLUDED
                     } else {
                         NEVER_OCCLUDED
-                    })
+                    },
+                )
             })
             .collect();
         let mut to_suppress = vec![false; n];
-        for pg in unique(&self.obj_prompt[0..n]) {
-            let idxs: Vec<usize> = (0..n).filter(|&j| self.obj_prompt[j] == pg).collect();
+        for pg in unique(&self.session.obj_prompt[0..n]) {
+            let idxs: Vec<usize> = (0..n)
+                .filter(|&j| self.session.obj_prompt[j] == pg)
+                .collect();
             if idxs.len() <= 1 {
                 continue;
             }
@@ -598,13 +652,13 @@ impl Sam3VideoModel {
         }
         for j in 0..n {
             let occluded = !bin[j].iter().any(|&x| x);
-            let oid = self.obj_ids[j];
+            let oid = self.session.obj_ids[j];
             let new_lo = if occluded || to_suppress[j] {
                 frame_idx
             } else {
                 last_occ[j]
             };
-            self.last_occluded.insert(oid, new_lo);
+            self.session.last_occluded.insert(oid, new_lo);
             if to_suppress[j] {
                 for v in trk_masks[j].iter_mut() {
                     *v = NO_OBJ_LOGIT;
@@ -625,7 +679,7 @@ impl Sam3VideoModel {
         if n == 0 {
             return Ok(());
         }
-        let constrained = suppress_pw_area_shrinkage(trk_masks, &self.obj_prompt[0..n]);
+        let constrained = suppress_pw_area_shrinkage(trk_masks, &self.session.obj_prompt[0..n]);
         for obj_idx in 0..n {
             let mask = &constrained[obj_idx];
             let appearing = mask.iter().any(|&v| v > 0.0);
@@ -637,11 +691,11 @@ impl Sam3VideoModel {
                 .encode_new_memory(img_emb, &mask_arr, object_score, false)?;
             let feat = seq_first(&mem.features, true)?;
             let pos = seq_first(&mem.pos, false)?;
-            if let Some(fm) = self.banks[obj_idx].cond.get_mut(&frame_idx) {
+            if let Some(fm) = self.session.banks[obj_idx].cond.get_mut(&frame_idx) {
                 fm.maskmem_features = Some(feat);
                 fm.maskmem_pos_enc = Some(pos);
                 fm.object_score = object_score;
-            } else if let Some(fm) = self.banks[obj_idx].non_cond.get_mut(&frame_idx) {
+            } else if let Some(fm) = self.session.banks[obj_idx].non_cond.get_mut(&frame_idx) {
                 fm.maskmem_features = Some(feat);
                 fm.maskmem_pos_enc = Some(pos);
                 fm.object_score = object_score;
@@ -664,7 +718,7 @@ impl Sam3VideoModel {
         let mut masks = Vec::new();
         let num_existing = trk_masks.len();
         for j in 0..num_existing {
-            let oid = self.obj_ids[j];
+            let oid = self.session.obj_ids[j];
             obj_ids.push(oid);
             if reconditioned_obj_ids.contains(&oid) {
                 if let Some(&di) = a.trk_id_to_max_iou_high_conf_det.get(&oid) {
@@ -682,17 +736,17 @@ impl Sam3VideoModel {
     }
 
     fn add_object(&mut self, obj_id: i32, prompt_id: i32) {
-        self.obj_ids.push(obj_id);
-        self.banks.push(ObjectBank::default());
-        self.obj_prompt.push(prompt_id);
-        self.max_obj_id = self.max_obj_id.max(obj_id);
+        self.session.obj_ids.push(obj_id);
+        self.session.banks.push(ObjectBank::default());
+        self.session.obj_prompt.push(prompt_id);
+        self.session.max_obj_id = self.session.max_obj_id.max(obj_id);
     }
 
     fn remove_object(&mut self, obj_id: i32) {
-        if let Some(idx) = self.obj_ids.iter().position(|&o| o == obj_id) {
-            self.obj_ids.remove(idx);
-            self.banks.remove(idx);
-            self.obj_prompt.remove(idx);
+        if let Some(idx) = self.session.obj_ids.iter().position(|&o| o == obj_id) {
+            self.session.obj_ids.remove(idx);
+            self.session.banks.remove(idx);
+            self.session.obj_prompt.remove(idx);
         }
     }
 }
@@ -1262,5 +1316,136 @@ mod tests {
             ),
             "segmenter and tracker must point at one shared PE backbone",
         );
+    }
+
+    /// F-093: a freshly-constructed session is empty and, crucially, `max_obj_id == -1` (so the first
+    /// assigned object id is `max_obj_id + 1 == 0`, matching `from_weights`). Guards the hand-written
+    /// `Default` against a silent `#[derive(Default)]` regression that would default `max_obj_id` to 0.
+    #[test]
+    fn session_default_is_empty_and_max_obj_id_is_minus_one() {
+        let s = SessionState::default();
+        assert_eq!(s.max_obj_id, -1, "first id must be max_obj_id+1 == 0");
+        assert_eq!(s.num_frames, 0);
+        assert!(s.obj_ids.is_empty());
+        assert!(s.banks.is_empty());
+        assert!(s.obj_prompt.is_empty());
+        assert!(s.first_frame.is_empty());
+        assert!(s.unmatched_frames.is_empty());
+        assert!(s.keep_alive.is_empty());
+        assert!(s.overlap_pairs.is_empty());
+        assert!(s.removed.is_empty());
+        assert!(s.last_occluded.is_empty());
+    }
+
+    /// F-093 (unit): `reset_session` restores **every** per-video field, so no clip inherits the
+    /// previous clip's banks, hotstart bookkeeping, removed-id bans, or id/frame counters. Populating a
+    /// `SessionState` with dirty values from a hypothetical prior clip and then applying the exact reset
+    /// (`= SessionState::default()`) must reproduce a pristine session — the whole leak fix in one
+    /// value assignment, verified without a loaded model. (The full two-`propagate`-calls end-to-end
+    /// proof is `propagate_twice_matches_fresh_model`, weights-gated below.)
+    #[test]
+    fn reset_session_clears_all_prior_clip_state() {
+        // A session dirtied as if by a prior clip: live objects, banks, hotstart maps, bans, counters.
+        let mut s = SessionState::default();
+        s.obj_ids.push(7);
+        s.banks.push(ObjectBank::default());
+        s.obj_prompt.push(3);
+        s.max_obj_id = 42;
+        s.num_frames = 99;
+        s.first_frame.insert(7, 2);
+        s.unmatched_frames.insert(7, vec![1, 2]);
+        s.keep_alive.insert(7, 5);
+        s.overlap_pairs.insert((1, 7), vec![3]);
+        s.removed.insert(9);
+        s.last_occluded.insert(7, 4);
+        // Sanity: it really is dirty before the reset.
+        assert!(!s.obj_ids.is_empty() && s.max_obj_id != -1 && !s.removed.is_empty());
+
+        // This is exactly what `reset_session` does.
+        s = SessionState::default();
+
+        assert_eq!(
+            s.max_obj_id, -1,
+            "max_obj_id must reset (stale id would ban 0..=42)"
+        );
+        assert_eq!(s.num_frames, 0);
+        assert!(s.obj_ids.is_empty(), "objects must not carry over");
+        assert!(
+            s.banks.is_empty(),
+            "banks (stale cond entries) must not carry over"
+        );
+        assert!(s.obj_prompt.is_empty());
+        assert!(s.first_frame.is_empty());
+        assert!(s.unmatched_frames.is_empty());
+        assert!(s.keep_alive.is_empty());
+        assert!(s.overlap_pairs.is_empty());
+        assert!(s.removed.is_empty(), "removed-id bans must not carry over");
+        assert!(s.last_occluded.is_empty());
+    }
+
+    /// F-093 (end-to-end): running clip A then clip B on ONE cached model must yield the identical B
+    /// result to a freshly-constructed model that only ran B — i.e. `propagate` is independent of any
+    /// prior call. Before the fix the reused instance carried clip A's banks/hotstart/removed-id state
+    /// into B and silently corrupted tracking. Weights-gated (needs `facebook/sam3`); `#[ignore]` until
+    /// staged (sc-6248). Frame content is arbitrary — the invariant is *first-clip independence*.
+    #[test]
+    #[ignore = "needs staged facebook/sam3 weights (SAM3_WEIGHTS) — sc-6248"]
+    fn propagate_twice_matches_fresh_model() {
+        use candle_gen::candle_core::DType;
+        use candle_gen::default_device;
+
+        let weights_path =
+            std::env::var("SAM3_WEIGHTS").expect("set SAM3_WEIGHTS to the facebook/sam3 snapshot");
+        let device = default_device().expect("default device");
+        let wp = Path::new(&weights_path);
+        let w = if wp.is_dir() {
+            crate::Weights::from_dir(wp, &device)
+        } else {
+            crate::Weights::from_file(wp, &device)
+        }
+        .expect("load sam3 weights");
+
+        // Two distinct short clips (different length + content) so A meaningfully dirties the session.
+        let frame = |seed: f32, n: usize| -> Vec<Tensor> {
+            (0..n)
+                .map(|f| {
+                    Tensor::full(seed + f as f32, (1, 3, 1008, 1008), &device)
+                        .unwrap()
+                        .to_dtype(DType::F32)
+                        .unwrap()
+                })
+                .collect()
+        };
+        let clip_a = frame(0.10, 5);
+        let clip_b = frame(0.70, 3);
+        let input_ids = Tensor::zeros((1, 32), DType::U32, &device).unwrap();
+        let text_mask = vec![1i32; 32];
+
+        // Reused model: A first (dirties the session), then B.
+        let mut reused = Sam3VideoModel::from_weights(&w).expect("build reused model");
+        let _ = reused
+            .propagate(&clip_a, &input_ids, &text_mask, None, None)
+            .expect("clip A");
+        let b_after_a = reused
+            .propagate(&clip_b, &input_ids, &text_mask, None, None)
+            .expect("clip B on reused model");
+
+        // Fresh model that only ever saw B.
+        let mut fresh = Sam3VideoModel::from_weights(&w).expect("build fresh model");
+        let b_fresh = fresh
+            .propagate(&clip_b, &input_ids, &text_mask, None, None)
+            .expect("clip B on fresh model");
+
+        assert_eq!(b_after_a.len(), b_fresh.len(), "frame count must match");
+        for (i, (r, f)) in b_after_a.iter().zip(&b_fresh).enumerate() {
+            assert_eq!(
+                r.obj_ids, f.obj_ids,
+                "frame {i}: obj ids differ — clip A leaked into clip B",
+            );
+            assert_eq!(
+                r.masks, f.masks,
+                "frame {i}: masks differ — clip A leaked into clip B",
+            );
+        }
     }
 }
