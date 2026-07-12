@@ -15,10 +15,11 @@
 //! penultimate hidden state through the residual stack (~5e-3 f32 matmul floor).
 
 use candle_gen::candle_core::{DType, Device, Tensor, D};
-use candle_gen::candle_nn::{ops::softmax_last_dim, Linear, Module, VarBuilder};
+use candle_gen::candle_nn::{ops::softmax_last_dim, VarBuilder};
+use candle_gen::quant::AdaptLinear as QLinear;
 use candle_gen::{CandleError, Result as CResult};
 
-use crate::nn::{lin, lin_bias, rms_norm};
+use crate::nn::rms_norm;
 
 /// Text-decoder config for the Qwen2.5-VL-7B planner backbone (the LLM half of `mllm/config.json`).
 #[derive(Clone, Debug)]
@@ -94,37 +95,49 @@ impl QwenVlTextConfig {
 }
 
 /// Per-layer attention: `q/k/v_proj` carry bias, `o_proj` does not (Qwen2.5-VL; no q/k-norm).
+///
+/// sc-11062: each projection is a **packed-detecting** [`QLinear`] ([`AdaptLinear`]): when the tier ships
+/// the MLX-packed triple (`{proj}.scales`/`.biases` present — the q4/q8 planner the converter emits), the
+/// packed base loads with no dense weight materialized; a dense bf16 tier (no `.scales`) takes the dense
+/// arm byte-identically to the old `candle_nn::Linear` read (the CPU parity goldens are unaffected). Only
+/// the LLM text linears quantize — the vision tower / connector / clip_diff head stay dense (mirrors the
+/// MLX lane's conservative planner quant policy, sc-5146).
 struct Attn {
-    q: Linear,
-    k: Linear,
-    v: Linear,
-    o: Linear,
+    q: QLinear,
+    k: QLinear,
+    v: QLinear,
+    o: QLinear,
 }
 
 impl Attn {
-    fn new(vb: &VarBuilder) -> CResult<Self> {
+    fn new(vb: &VarBuilder, cfg: &QwenVlTextConfig) -> CResult<Self> {
+        let h = cfg.hidden_size;
+        let qd = cfg.num_heads * cfg.head_dim;
+        let kvd = cfg.num_kv_heads * cfg.head_dim;
         Ok(Self {
-            q: lin_bias(vb, "q_proj")?,
-            k: lin_bias(vb, "k_proj")?,
-            v: lin_bias(vb, "v_proj")?,
-            o: lin(vb, "o_proj")?,
+            q: QLinear::linear_detect(h, qd, vb, "q_proj", true)?,
+            k: QLinear::linear_detect(h, kvd, vb, "k_proj", true)?,
+            v: QLinear::linear_detect(h, kvd, vb, "v_proj", true)?,
+            o: QLinear::linear_detect(qd, h, vb, "o_proj", false)?,
         })
     }
 }
 
-/// SwiGLU MLP (bias-free), the stock Qwen2 MLP.
+/// SwiGLU MLP (bias-free), the stock Qwen2 MLP. Packed-detecting like [`Attn`] (sc-11062).
 struct Mlp {
-    gate: Linear,
-    up: Linear,
-    down: Linear,
+    gate: QLinear,
+    up: QLinear,
+    down: QLinear,
 }
 
 impl Mlp {
-    fn new(vb: &VarBuilder) -> CResult<Self> {
+    fn new(vb: &VarBuilder, cfg: &QwenVlTextConfig) -> CResult<Self> {
+        let h = cfg.hidden_size;
+        let inter = cfg.intermediate_size;
         Ok(Self {
-            gate: lin(vb, "gate_proj")?,
-            up: lin(vb, "up_proj")?,
-            down: lin(vb, "down_proj")?,
+            gate: QLinear::linear_detect(h, inter, vb, "gate_proj", false)?,
+            up: QLinear::linear_detect(h, inter, vb, "up_proj", false)?,
+            down: QLinear::linear_detect(inter, h, vb, "down_proj", false)?,
         })
     }
 
@@ -142,12 +155,12 @@ struct Layer {
 }
 
 impl Layer {
-    fn new(vb: &VarBuilder) -> CResult<Self> {
+    fn new(vb: &VarBuilder, cfg: &QwenVlTextConfig) -> CResult<Self> {
         Ok(Self {
             input_ln: vb.get_unchecked("input_layernorm.weight")?,
             post_ln: vb.get_unchecked("post_attention_layernorm.weight")?,
-            attn: Attn::new(&vb.pp("self_attn"))?,
-            mlp: Mlp::new(&vb.pp("mlp"))?,
+            attn: Attn::new(&vb.pp("self_attn"), cfg)?,
+            mlp: Mlp::new(&vb.pp("mlp"), cfg)?,
         })
     }
 }
@@ -176,7 +189,7 @@ impl Qwen25VlText {
     pub fn new(cfg: QwenVlTextConfig, vb: VarBuilder) -> CResult<Self> {
         let lvb = vb.pp("layers");
         let layers = (0..cfg.num_layers)
-            .map(|i| Layer::new(&lvb.pp(i)))
+            .map(|i| Layer::new(&lvb.pp(i), &cfg))
             .collect::<CResult<Vec<_>>>()?;
         Ok(Self {
             embed_tokens: vb.get_unchecked("embed_tokens.weight")?,
@@ -619,5 +632,193 @@ mod tests {
         let (embeds, pos, mask) = mk_inputs(&cfg0);
         let got0 = bb0.penultimate(&embeds, &pos, &mask).unwrap();
         assert_eq!(max_abs(&got0, &embeds), 0.0, "empty stack → embeds");
+    }
+
+    // --- sc-11062: packed-detect planner LLM linears --------------------------------------------
+
+    /// Build the MLX-packed triple (`{name}.weight` u32 codes + `.scales` + `.biases`) for a random
+    /// dense `[out, in]` weight at group 64, alongside the affine grid it dequantizes to (the exact
+    /// reference the packed forward reproduces). `in` must be a multiple of 64.
+    fn pack_into(
+        map: &mut HashMap<String, Tensor>,
+        name: &str,
+        out_dim: usize,
+        in_dim: usize,
+        dev: &Device,
+    ) -> Tensor {
+        let w = Tensor::randn(0f32, 0.1f32, (out_dim, in_dim), dev).unwrap();
+        let (wq, scales, biases) =
+            candle_gen::quant::pack_mlx_affine(&w, 4, 64).expect("pack q4 group-64");
+        // The affine grid the packed codes dequantize to (scale·q + bias) — the packed forward target.
+        let grid = candle_gen::quant::dequant_mlx_q4_reference_gs(&wq, &scales, &biases, 64)
+            .expect("dequant grid")
+            .to_device(dev)
+            .unwrap();
+        map.insert(format!("{name}.weight"), wq);
+        map.insert(format!("{name}.scales"), scales);
+        map.insert(format!("{name}.biases"), biases);
+        grid
+    }
+
+    fn cosine(a: &Tensor, b: &Tensor) -> f32 {
+        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+        for (x, y) in a.iter().zip(&b) {
+            dot += (*x as f64) * (*y as f64);
+            na += (*x as f64) * (*x as f64);
+            nb += (*y as f64) * (*y as f64);
+        }
+        (dot / (na.sqrt() * nb.sqrt() + 1e-12)) as f32
+    }
+
+    /// sc-11062: when the tier ships the MLX-packed triple for the Qwen2.5-VL LLM linears, [`Attn`] and
+    /// [`Mlp`] load **packed** (no dense weight materialized) and their forward reproduces the affine
+    /// grid the pack represents; a dense tier (no `.scales`) loads dense. Group-64-aligned dims (hidden
+    /// 64, intermediate 128) mirror the real 7B backbone (hidden 3584 = 56·64, intermediate 18944 =
+    /// 296·64, kv 512 = 8·64 all group-64-aligned).
+    #[test]
+    fn attn_and_mlp_load_packed_when_scales_present() {
+        use candle_gen::candle_core::safetensors::MmapedSafetensors;
+        let dev = Device::Cpu;
+        let cfg = QwenVlTextConfig {
+            hidden_size: 64,
+            num_layers: 1,
+            num_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 64,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000.0,
+            mrope_section: [16, 8, 8],
+        };
+        let (h, qd, kvd, inter) = (
+            cfg.hidden_size,
+            cfg.num_heads * cfg.head_dim,
+            cfg.num_kv_heads * cfg.head_dim,
+            cfg.intermediate_size,
+        );
+
+        let mut map: HashMap<String, Tensor> = HashMap::new();
+        let attn = "self_attn";
+        let grids = [
+            (
+                "q",
+                pack_into(&mut map, &format!("{attn}.q_proj"), qd, h, &dev),
+            ),
+            (
+                "k",
+                pack_into(&mut map, &format!("{attn}.k_proj"), kvd, h, &dev),
+            ),
+            (
+                "v",
+                pack_into(&mut map, &format!("{attn}.v_proj"), kvd, h, &dev),
+            ),
+            (
+                "o",
+                pack_into(&mut map, &format!("{attn}.o_proj"), h, qd, &dev),
+            ),
+            ("gate", pack_into(&mut map, "mlp.gate_proj", inter, h, &dev)),
+            ("up", pack_into(&mut map, "mlp.up_proj", inter, h, &dev)),
+            ("down", pack_into(&mut map, "mlp.down_proj", h, inter, &dev)),
+        ];
+        // q/k/v carry a dense bias (the tier ships it alongside the packed triple).
+        for (proj, out) in [("q_proj", qd), ("k_proj", kvd), ("v_proj", kvd)] {
+            map.insert(
+                format!("{attn}.{proj}.bias"),
+                Tensor::randn(0f32, 0.1f32, (out,), &dev).unwrap(),
+            );
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "sc11062_planner_packed_{}.safetensors",
+            std::process::id()
+        ));
+        candle_gen::candle_core::safetensors::save(&map, &tmp).unwrap();
+        // SAFETY: freshly written, single-reader for the test.
+        let st = unsafe { MmapedSafetensors::new(&tmp).unwrap() };
+        let vb = VarBuilder::from_backend(Box::new(st), DType::F32, dev.clone());
+
+        let a = Attn::new(&vb.pp(attn), &cfg).expect("packed attn");
+        let m = Mlp::new(&vb.pp("mlp"), &cfg).expect("packed mlp");
+        for (name, packed) in [
+            ("q", a.q.is_packed()),
+            ("k", a.k.is_packed()),
+            ("v", a.v.is_packed()),
+            ("o", a.o.is_packed()),
+            ("gate", m.gate.is_packed()),
+            ("up", m.up.is_packed()),
+            ("down", m.down.is_packed()),
+        ] {
+            assert!(packed, "{name} must load packed when `.scales` present");
+        }
+
+        // The bias-free packed projections' forward reproduces their affine grid (dequant-on-forward).
+        // q/k/v carry a bias the packed base folds in, so they are compared only for packed detection.
+        use candle_gen::candle_nn::Module;
+        let bias_free: [(&str, &QLinear); 4] = [
+            ("o", &a.o),
+            ("gate", &m.gate),
+            ("up", &m.up),
+            ("down", &m.down),
+        ];
+        for (name, lin) in bias_free {
+            let grid = &grids.iter().find(|(n, _)| *n == name).unwrap().1;
+            let in_dim = grid.dim(1).unwrap();
+            let x = Tensor::randn(0f32, 1f32, (3, in_dim), &dev).unwrap();
+            let dense = candle_gen::candle_nn::Linear::new(grid.clone(), None);
+            let got = lin.forward(&x).unwrap();
+            let want = dense.forward(&x).unwrap();
+            let cos = cosine(&got, &want);
+            assert!(
+                cos > 0.9999,
+                "{name} packed forward vs grid cosine {cos:.6}"
+            );
+        }
+
+        // A dense tier (no `.scales`) still loads dense — the byte-identical legacy path.
+        let mut dmap: HashMap<String, Tensor> = HashMap::new();
+        dmap.insert(
+            format!("{attn}.q_proj.weight"),
+            Tensor::randn(0f32, 0.1f32, (qd, h), &dev).unwrap(),
+        );
+        dmap.insert(
+            format!("{attn}.q_proj.bias"),
+            Tensor::randn(0f32, 0.1f32, (qd,), &dev).unwrap(),
+        );
+        dmap.insert(
+            format!("{attn}.k_proj.weight"),
+            Tensor::randn(0f32, 0.1f32, (kvd, h), &dev).unwrap(),
+        );
+        dmap.insert(
+            format!("{attn}.k_proj.bias"),
+            Tensor::randn(0f32, 0.1f32, (kvd,), &dev).unwrap(),
+        );
+        dmap.insert(
+            format!("{attn}.v_proj.weight"),
+            Tensor::randn(0f32, 0.1f32, (kvd, h), &dev).unwrap(),
+        );
+        dmap.insert(
+            format!("{attn}.v_proj.bias"),
+            Tensor::randn(0f32, 0.1f32, (kvd,), &dev).unwrap(),
+        );
+        dmap.insert(
+            format!("{attn}.o_proj.weight"),
+            Tensor::randn(0f32, 0.1f32, (h, qd), &dev).unwrap(),
+        );
+        let dtmp = std::env::temp_dir().join(format!(
+            "sc11062_planner_dense_{}.safetensors",
+            std::process::id()
+        ));
+        candle_gen::candle_core::safetensors::save(&dmap, &dtmp).unwrap();
+        // SAFETY: freshly written, single-reader.
+        let dst = unsafe { MmapedSafetensors::new(&dtmp).unwrap() };
+        let dvb = VarBuilder::from_backend(Box::new(dst), DType::F32, dev.clone());
+        let da = Attn::new(&dvb.pp(attn), &cfg).expect("dense attn");
+        assert!(!da.q.is_packed(), "no `.scales` ⇒ dense q");
+        assert!(!da.o.is_packed(), "no `.scales` ⇒ dense o");
+
+        std::fs::remove_file(&tmp).ok();
+        std::fs::remove_file(&dtmp).ok();
     }
 }

@@ -36,8 +36,16 @@
 //!
 //! plus the copied Qwen2.5-VL `tokenizer.json` (into `mllm/`), a `qwen2_5_vl_config.json` (copy of the
 //! package's `mllm/config.json`, read by the backbone/vision/MRoPE configs), and a `bernini_planner.json`
-//! sidecar (`num_mask_token`, `max_sequence_length`, `clip_diff_cfg` z_channels + shift). The planner is
-//! written **dense bf16** — packed planner quant is the separate sc-11062, deliberately not done here.
+//! sidecar (`num_mask_token`, `max_sequence_length`, `clip_diff_cfg` z_channels + shift).
+//!
+//! **Planner quant (sc-11062).** When `bits ∈ {4, 8}`, the `mllm/` component's Qwen2.5-VL **LLM text
+//! linears** (attention `q/k/v/o_proj` + MLP `gate/up/down_proj`, per decoder layer) are MLX-affine-packed
+//! at group [`TIER_GROUP_SIZE`] into the `{base}.weight` (u32) + `.scales` + `.biases` triple the loader's
+//! packed-detect [`crate::qwen2_5_vl`] `Attn`/`Mlp` seam reads, with a `mllm/quantize_config.json` emitted
+//! alongside. The token embedding, RMS norms, biases, and the **entire vision tower** (`visual.*`,
+//! group-64-misaligned) stay dense bf16, as do the `connector/` and `vit_decoder/` components — mirroring
+//! the MLX lane's conservative planner quant policy (sc-5146: only the ~7B LLM text linears quantize).
+//! `bits == 0` writes the whole planner dense bf16 (unchanged).
 //!
 //! The [`build_bernini_candle_tier`] entry point is an `#[ignore]`d test (it needs the multi-GB package
 //! on disk); the pure [`route_bernini_expert_key`] / [`route_bernini_planner_key`] routing cores are
@@ -47,6 +55,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use candle_gen::candle_core::{safetensors as cst, DType, Device, Result, Tensor};
+use candle_gen::quant::pack_mlx_affine;
 use candle_gen_wan::candle_tier_build::{pack_transformer_component, TIER_GROUP_SIZE};
 
 /// The two renderer-expert prefixes in the combined `bernini/` index → the diffusers component dir the
@@ -379,13 +388,14 @@ fn write_expert_streamed(
     Ok(packed)
 }
 
-/// Write one **dense bf16** planner component to `dst` as a single `model.safetensors`, **streaming** the
-/// source tensors one at a time from the mmap'd shards (`keys` = the `(source key, stripped key)` pairs
-/// routed to this component). Unlike the renderer experts, the planner is never packed here — packed
-/// planner quant is the separate sc-11062; the loader reads these dense (bf16, the Qwen2.5-VL native
-/// dtype). Byte-identical to the pre-streaming path (same per-tensor bf16 cast; canonical safetensors
-/// ordering), but peak RSS is one source tensor plus the bf16 output map instead of the whole component in
-/// F32.
+/// Write one **dense bf16** planner component (`connector/` / `vit_decoder/`) to `dst` as a single
+/// `model.safetensors`, **streaming** the source tensors one at a time from the mmap'd shards (`keys` =
+/// the `(source key, stripped key)` pairs routed to this component). These two components are never packed
+/// (small, and the clip_diff head runs ~75× through the MAR loop with triple-CFG where 4-bit error would
+/// compound — sc-5146); the `mllm/` LLM linears DO pack (see [`write_planner_mllm_streamed`], sc-11062).
+/// The loader reads these dense (bf16, the Qwen2.5-VL native dtype). Byte-identical to the pre-streaming
+/// path (same per-tensor bf16 cast; canonical safetensors ordering), but peak RSS is one source tensor
+/// plus the bf16 output map instead of the whole component in F32.
 fn write_planner_component_streamed(
     st: &cst::MmapedSafetensors,
     keys: &[(String, String)],
@@ -399,6 +409,83 @@ fn write_planner_component_streamed(
     }
     cst::save(&out, dst.join("model.safetensors"))?;
     Ok(())
+}
+
+/// Whether a **stripped** `mllm/` key (`model.*` / `visual.*`) is one of the Qwen2.5-VL **LLM text
+/// linears** the tier packs at q4/q8: attention `q/k/v/o_proj` + MLP `gate/up/down_proj`, per decoder
+/// layer. Everything else in the `mllm/` component stays dense — the token embedding
+/// (`model.embed_tokens.weight`), the RMS norms (`*.layernorm.weight`, `model.norm.weight`), all biases,
+/// and the ENTIRE vision tower (`visual.*`, whose linears are group-64-misaligned). This is EXACTLY the
+/// Linear set the loader's packed-detect seam routes through `linear_detect` ([`crate::qwen2_5_vl`]'s
+/// `Attn`/`Mlp`), and the same set the MLX lane quantizes (sc-5146) — the two must stay aligned (packing a
+/// weight the loader reads densely would feed u32 codes into a bf16 read as garbage).
+fn is_planner_llm_linear(key: &str) -> bool {
+    let Some(rest) = key.strip_prefix("model.layers.") else {
+        return false;
+    };
+    let Some((idx, tail)) = rest.split_once('.') else {
+        return false;
+    };
+    if idx.is_empty() || !idx.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    matches!(
+        tail,
+        "self_attn.q_proj.weight"
+            | "self_attn.k_proj.weight"
+            | "self_attn.v_proj.weight"
+            | "self_attn.o_proj.weight"
+            | "mlp.gate_proj.weight"
+            | "mlp.up_proj.weight"
+            | "mlp.down_proj.weight"
+    )
+}
+
+/// Write the `mllm/` planner component to `dst`, MLX-affine-packing **only the Qwen2.5-VL LLM text
+/// linears** ([`is_planner_llm_linear`]) at `bits ∈ {4, 8}` / group [`TIER_GROUP_SIZE`] into the
+/// `{base}.weight` (u32) + `.scales` + `.biases` triple the loader's packed-detect [`crate::qwen2_5_vl`]
+/// seam consumes (sc-11062), and emitting a `quantize_config.json`. The token embedding, RMS norms,
+/// biases, and the entire vision tower (`visual.*`) stay dense bf16. `bits == 0` writes the whole
+/// component dense (identical to [`write_planner_component_streamed`]). Streams one source tensor at a
+/// time from the mmap'd shards (peak RSS = one source tensor plus the output map). Each rank-2 weight is
+/// cast to bf16 **first** (mirroring [`write_expert_streamed`] — the MLX numerics quantize from bf16),
+/// then packed (the packer re-casts bf16→f32 internally). Returns the number of LLM Linears packed.
+fn write_planner_mllm_streamed(
+    st: &cst::MmapedSafetensors,
+    keys: &[(String, String)],
+    dst: &Path,
+    bits: usize,
+) -> Result<usize> {
+    std::fs::create_dir_all(dst)?;
+    let mut out: HashMap<String, Tensor> = HashMap::with_capacity(keys.len());
+    let mut packed = 0usize;
+    for (src, stripped) in keys {
+        let value = st.load(src, &Device::Cpu)?.to_dtype(DType::BF16)?;
+        if bits != 0 && is_planner_llm_linear(stripped) {
+            let base = stripped
+                .strip_suffix(".weight")
+                .expect("an LLM linear key ends with .weight");
+            let (wq, scales, biases) =
+                pack_mlx_affine(&value.to_dtype(DType::F32)?, bits, TIER_GROUP_SIZE)?;
+            out.insert(format!("{base}.weight"), wq);
+            out.insert(format!("{base}.scales"), scales);
+            out.insert(format!("{base}.biases"), biases);
+            packed += 1;
+        } else {
+            // Dense passthrough: token embedding, RMS norms, biases, the whole vision tower.
+            out.insert(stripped.clone(), value);
+        }
+    }
+    cst::save(&out, dst.join("model.safetensors"))?;
+    if bits != 0 {
+        std::fs::write(
+            dst.join("quantize_config.json"),
+            format!(
+                "{{\n  \"bits\": {bits},\n  \"quantization\": {{ \"group_size\": {TIER_GROUP_SIZE} }}\n}}\n"
+            ),
+        )?;
+    }
+    Ok(packed)
 }
 
 /// Write the single MAR `mask_tokens` parameter (dense bf16) to the root-level
@@ -515,13 +602,23 @@ pub fn build_bernini_candle_tier(
         eprintln!("[[BERNINI-CANDLE-TIER]] {name}: packed {n} Linears (bits={bits})");
     }
 
-    // 1b. Planner components: dense bf16 (packed planner quant is sc-11062, deliberately not here),
-    // likewise streamed one source tensor at a time.
-    for dir in [
-        PLANNER_MLLM_DIR,
-        PLANNER_CONNECTOR_DIR,
-        PLANNER_VIT_DECODER_DIR,
-    ] {
+    // 1b. Planner `mllm/` component: the Qwen2.5-VL LLM text linears pack at q4/q8 (group 64), while the
+    // token embedding / norms / biases / vision tower stay dense (sc-11062). `bits == 0` writes it fully
+    // dense. Streamed one source tensor at a time.
+    let mllm_keys = plan
+        .planner
+        .get(PLANNER_MLLM_DIR)
+        .expect("planner group present");
+    let mllm_n = mllm_keys.len();
+    let packed =
+        write_planner_mllm_streamed(&plan.st, mllm_keys, &out_dir.join(PLANNER_MLLM_DIR), bits)?;
+    eprintln!(
+        "[[BERNINI-CANDLE-TIER]] {PLANNER_MLLM_DIR}: {mllm_n} tensors, {packed} LLM Linears packed (bits={bits})"
+    );
+
+    // 1c. `connector/` + `vit_decoder/`: always dense bf16 (small; clip_diff runs ~75× through the MAR
+    // loop with triple-CFG where 4-bit error would compound — sc-5146). Streamed likewise.
+    for dir in [PLANNER_CONNECTOR_DIR, PLANNER_VIT_DECODER_DIR] {
         let keys = plan.planner.get(dir).expect("planner group present");
         let n = keys.len();
         write_planner_component_streamed(&plan.st, keys, &out_dir.join(dir))?;
@@ -1086,6 +1183,150 @@ mod tests {
             a, b,
             "streamed planner output must be byte-identical to whole-map"
         );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // --- sc-11062: packed planner (mllm LLM linears) --------------------------------------------
+
+    /// The pack predicate selects EXACTLY the Qwen2.5-VL LLM text linears (attention q/k/v/o + MLP
+    /// gate/up/down, any decoder-layer index) and rejects the token embedding, norms, biases, and the
+    /// whole vision tower — the same set the loader's packed-detect seam reads.
+    #[test]
+    fn planner_llm_linear_predicate() {
+        for k in [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "model.layers.27.mlp.gate_proj.weight",
+            "model.layers.5.mlp.up_proj.weight",
+            "model.layers.13.mlp.down_proj.weight",
+        ] {
+            assert!(is_planner_llm_linear(k), "{k} must pack");
+        }
+        for k in [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+            "model.layers.0.self_attn.q_proj.bias", // bias stays dense
+            "visual.blocks.0.attn.qkv.weight",      // vision tower stays dense
+            "visual.patch_embed.proj.weight",
+            "visual.merger.mlp.0.weight",
+            "model.layers.x.self_attn.q_proj.weight", // non-numeric layer index
+            "model.layers.0.self_attn.q_proj",        // no .weight suffix
+        ] {
+            assert!(!is_planner_llm_linear(k), "{k} must stay dense");
+        }
+    }
+
+    /// The `mllm/` writer packs ONLY the LLM text linears at q4 (u32 codes + `.scales`/`.biases`, group
+    /// 64), keeps the dense `.bias` alongside, and leaves the token embedding / norms / vision tower dense
+    /// bf16 — emitting a `quantize_config.json`. `bits == 0` packs nothing and writes no config.
+    #[test]
+    fn planner_mllm_packs_only_llm_linears() {
+        // in-dims are group-64 multiples (64 / 128) so the packer accepts the LLM linears.
+        let tensors: Vec<(&str, Tensor)> = vec![
+            ("model.embed_tokens.weight", f32_tensor(&[64, 64], 1.0)),
+            ("model.norm.weight", f32_tensor(&[64], 2.0)),
+            (
+                "model.layers.0.input_layernorm.weight",
+                f32_tensor(&[64], 3.0),
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                f32_tensor(&[64, 64], 4.0),
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.bias",
+                f32_tensor(&[64], 5.0),
+            ),
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                f32_tensor(&[128, 64], 6.0),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                f32_tensor(&[64, 128], 7.0),
+            ),
+            (
+                "visual.blocks.0.attn.qkv.weight",
+                f32_tensor(&[192, 64], 8.0),
+            ),
+        ];
+        let tmp = stream_tmp("mllm_pack");
+        let p0 = tmp.join("shard0.safetensors");
+        let mut s0: HashMap<String, Tensor> = HashMap::new();
+        for (k, v) in &tensors {
+            s0.insert(k.to_string(), v.clone());
+        }
+        cst::save(&s0, &p0).unwrap();
+        let st = unsafe { cst::MmapedSafetensors::multi(&[&p0]).unwrap() };
+        let keys: Vec<(String, String)> = tensors
+            .iter()
+            .map(|(k, _)| (k.to_string(), k.to_string()))
+            .collect();
+
+        // bits = 4: LLM linears pack, the rest stays dense.
+        let dst = tmp.join("out");
+        let packed = write_planner_mllm_streamed(&st, &keys, &dst, 4).unwrap();
+        assert_eq!(packed, 3, "q_proj + gate_proj + down_proj pack");
+        let loaded = cst::load(dst.join("model.safetensors"), &Device::Cpu).unwrap();
+        for base in [
+            "model.layers.0.self_attn.q_proj",
+            "model.layers.0.mlp.gate_proj",
+            "model.layers.0.mlp.down_proj",
+        ] {
+            assert!(
+                loaded.contains_key(&format!("{base}.scales")),
+                "{base}.scales present"
+            );
+            assert!(
+                loaded.contains_key(&format!("{base}.biases")),
+                "{base}.biases present"
+            );
+            assert_eq!(
+                loaded[&format!("{base}.weight")].dtype(),
+                DType::U32,
+                "{base}.weight is u32 codes"
+            );
+        }
+        assert_eq!(
+            loaded["model.layers.0.self_attn.q_proj.bias"].dtype(),
+            DType::BF16,
+            "packed linear's bias stays dense bf16"
+        );
+        for k in [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "model.layers.0.input_layernorm.weight",
+            "visual.blocks.0.attn.qkv.weight",
+        ] {
+            assert!(
+                !loaded.contains_key(&k.replace(".weight", ".scales")),
+                "{k} must stay dense (no .scales)"
+            );
+            assert_eq!(loaded[k].dtype(), DType::BF16, "{k} dense bf16");
+        }
+        assert!(
+            dst.join("quantize_config.json").exists(),
+            "quantize_config.json emitted for the packed mllm component"
+        );
+
+        // bits = 0: fully dense, no config, no packed triple anywhere.
+        let dst0 = tmp.join("out0");
+        let packed0 = write_planner_mllm_streamed(&st, &keys, &dst0, 0).unwrap();
+        assert_eq!(packed0, 0);
+        let loaded0 = cst::load(dst0.join("model.safetensors"), &Device::Cpu).unwrap();
+        assert!(
+            !loaded0.keys().any(|k| k.ends_with(".scales")),
+            "bits=0 packs nothing"
+        );
+        assert!(
+            !dst0.join("quantize_config.json").exists(),
+            "bits=0 writes no quantize_config"
+        );
+
         std::fs::remove_dir_all(&tmp).ok();
     }
 

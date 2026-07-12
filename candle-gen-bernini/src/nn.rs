@@ -7,15 +7,6 @@ use candle_gen::candle_core::{Tensor, D};
 use candle_gen::candle_nn::{Linear, VarBuilder};
 use candle_gen::Result;
 
-/// Bias-less dense `Linear` loaded from `{name}.weight` (shape read from disk via `get_unchecked`, so a
-/// packed/dense weight of any `[out, in]` loads unchanged) — the candle twin of the MLX `lin` helper.
-pub fn lin(vb: &VarBuilder, name: &str) -> Result<Linear> {
-    Ok(Linear::new(
-        vb.get_unchecked(&format!("{name}.weight"))?,
-        None,
-    ))
-}
-
 /// `Linear` **with** bias loaded from `{name}.weight` + `{name}.bias`.
 pub fn lin_bias(vb: &VarBuilder, name: &str) -> Result<Linear> {
     Ok(Linear::new(
