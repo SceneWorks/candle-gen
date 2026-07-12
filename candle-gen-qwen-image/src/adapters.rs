@@ -254,6 +254,16 @@ fn merge_loha_thirdparty(
     Ok(())
 }
 
+/// An **untagged third-party LyCORIS LoKr**: `lokr_*` keys with no `networkType=lokr` stamp and no
+/// declaration in the file's metadata, so its per-module LyCORIS scaling can't be labeled by the
+/// caller's declared `kind`. Detected purely from the file's own keys + metadata — `spec.kind` is
+/// deliberately NOT an input, so both the dense fold ([`merge_adapters`]) and the packed additive
+/// install ([`install_additive`]) treat file metadata as authoritative and can't diverge on the
+/// same `(file, spec)` (sc-11188 / F-086).
+fn is_untagged_lycoris_lokr(af: &AdapterFile) -> bool {
+    !af.declares_lokr() && wmeta::keys_contain_lokr(af.tensors.keys().map(String::as_str))
+}
+
 /// Fold every adapter spec in `specs` into the base MMDiT tensor `map` (CPU, native dtype) at each
 /// spec's `scale` — LoRA and LoKr, merged into the dense weights (`W += δ`). Returns the
 /// [`MergeReport`]; errors if a non-empty spec list matches **no** target (a format / prefix
@@ -270,7 +280,7 @@ pub fn merge_adapters(
         let af = read_adapter(&spec.path)?;
         // Untagged LyCORIS: `lokr_*` / `hada_*` keys without a `networkType=lokr` stamp, so the
         // caller's declared `kind` can't label them — detect + route by keys before the kind match.
-        if !af.declares_lokr() && wmeta::keys_contain_lokr(af.tensors.keys().map(String::as_str)) {
+        if is_untagged_lycoris_lokr(&af) {
             merge_lokr_thirdparty(map, &af, spec.scale, &mut report)?;
             continue;
         }
@@ -462,11 +472,12 @@ pub fn install_additive(
         }
         // Untagged LyCORIS LoKr (`lokr_*` keys, no `networkType=lokr` stamp, not declared) carries its
         // scale per-module in a way this additive resolver doesn't thread; reject on packed rather than
-        // silently mis-scale (the dense tier folds it via `merge_lokr_thirdparty`).
-        let untagged_lokr = !af.declares_lokr()
-            && spec.kind != AdapterKind::Lokr
-            && wmeta::keys_contain_lokr(af.tensors.keys().map(String::as_str));
-        if untagged_lokr {
+        // silently mis-scale (the dense tier folds it via `merge_lokr_thirdparty`). The file's own
+        // metadata is authoritative — the caller's `spec.kind` is deliberately NOT consulted, so a
+        // `kind == Lokr` hint can't let an undeclared file slip past into `resolve_lokr_file` (where
+        // `parse_rank_alpha(None, None)` = `(1, 1)` and per-module `.alpha` tensors are dropped),
+        // matching the dense route's stance (sc-11188 / F-086).
+        if is_untagged_lycoris_lokr(&af) {
             return Err(CandleError::Msg(format!(
                 "qwen edit: an untagged third-party LyCORIS LoKr cannot apply additively on a packed \
                  (q4/q8) Edit tier — use the dense (bf16) tier (where `merge_adapters` folds it), a \
@@ -651,6 +662,48 @@ mod tests {
         assert!(wmeta::keys_contain_lokr(
             ["transformer_blocks.0.attn.to_q.lokr_w1"].into_iter()
         ));
+    }
+
+    /// sc-11188 / F-086: an untagged LyCORIS LoKr (`lokr_*` keys, no `networkType` stamp) is classified
+    /// as untagged from the FILE alone — the caller's `spec.kind` is not consulted. Before the fix the
+    /// packed guard AND'd in `spec.kind != Lokr`, so the identical `(file, spec)` that the dense route
+    /// folds via `merge_lokr_thirdparty` slipped past on the packed tier into `resolve_lokr_file` and
+    /// silently mis-scaled at `(rank, alpha) = (1, 1)`. Both tiers must reach the same verdict.
+    #[test]
+    fn untagged_lycoris_lokr_classified_regardless_of_declared_kind() {
+        let path = "transformer_blocks.0.attn.to_q";
+        // Untagged: `lokr_*` keys, empty metadata (no `networkType=lokr`).
+        let untagged = AdapterFile {
+            tensors: HashMap::from([
+                (format!("{path}.lokr_w1"), t2(&[1.0, 0.0, 0.0, 1.0], 2, 2)),
+                (format!("{path}.lokr_w2"), t2(&[0.5, 0.0, 0.0, 0.5], 2, 2)),
+            ]),
+            meta: HashMap::new(),
+        };
+        // Authoritative on the file: untagged whether the caller declared Lora or Lokr.
+        assert!(is_untagged_lycoris_lokr(&untagged));
+
+        // A PEFT-stamped LoKr is NOT untagged (it threads rank/alpha) and must keep resolving.
+        let tagged = AdapterFile {
+            tensors: untagged.tensors.clone(),
+            meta: HashMap::from([
+                ("networkType".to_string(), "lokr".to_string()),
+                ("rank".to_string(), "2".to_string()),
+                ("alpha".to_string(), "2".to_string()),
+            ]),
+        };
+        assert!(tagged.declares_lokr());
+        assert!(!is_untagged_lycoris_lokr(&tagged));
+
+        // A plain LoRA file (no `lokr_*` keys) is never flagged.
+        let lora = AdapterFile {
+            tensors: HashMap::from([
+                (format!("{path}.lora_down.weight"), t2(&[1.0, 0.0], 1, 2)),
+                (format!("{path}.lora_up.weight"), t2(&[1.0, 0.0], 2, 1)),
+            ]),
+            meta: HashMap::new(),
+        };
+        assert!(!is_untagged_lycoris_lokr(&lora));
     }
 
     /// The lightx2v Lightning shape: bare dotted path + `lora_down`/`lora_up` + per-module `.alpha`.
