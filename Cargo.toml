@@ -495,11 +495,16 @@ opt-level = 3
 # (no candle provider wires a footprint here — mlx-gen owns the image-residency seam). This is a
 # MANDATORY lockstep re-pin even without candle code changes: the worker pins gen-core via mlx-gen and
 # candle-gen pins it independently, so `check-gen-core-skew.sh --features backend-candle` (a PR gate)
-# fails if the two resolve different gen-core revs. NOTE: 202193c is the mlx-gen BRANCH head
-# (claude/sc-10894-gen-core-footprint-seam); the coordinator flips both lines to the squash-merge rev
-# after mlx-gen #727 lands. Both lines below move as one.
-sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "202193c920db7c9b51e8f28f5e8668733722a1d7" }
-sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "202193c920db7c9b51e8f28f5e8668733722a1d7" }
+# fails if the two resolve different gen-core revs.
+# Bumped `202193c` -> `c9faefc` (sc-10894 follow-up): candle-gen #503 merged pinning the mlx-gen
+# BRANCH head `202193c` (claude/sc-10894-gen-core-footprint-seam) before the flip to the merged rev
+# could be applied. mlx-gen #727 has since landed on mlx-gen main as squash-merge `c9faefc`, so this
+# corrective re-pin moves both lines to `c9faefc` — the rev the SceneWorks worker resolves via mlx-gen —
+# restoring the single-rev `check-gen-core-skew.sh --features backend-candle` invariant. `202193c` was
+# the pre-merge head of the SAME footprint-seam work, so this is a behavior-neutral SHA alignment, not a
+# feature change. Both lines below move as one.
+sceneworks-gen-core = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "c9faefc5d2e0650dd5679745089f2c03be51ba7a" }
+sceneworks-gen-core-testkit = { git = "https://github.com/michaeltrefry/mlx-gen", rev = "c9faefc5d2e0650dd5679745089f2c03be51ba7a" }
 # candle tensor backend (CPU on Mac by default; Metal under the `metal` feature; CUDA on Windows
 # under the `cuda` feature). Pinned to candle git main (post-0.10.2) — REQUIRED for Blackwell
 # sm_120: the crates.io 0.10.2 release fails `CUDA_ERROR_INVALID_PTX` at the first candle-kernels
