@@ -311,7 +311,15 @@ impl SanaPipeline {
 fn load_text_encoder(root: &Path, device: &Device) -> Result<SanaTextEncoder> {
     let te_files = resolve_component_files(&root.join("text_encoder"))?;
     let gw = Weights::from_files(&te_files, device, DType::F32)?;
-    let gemma = Gemma2::from_weights(&gw, "model.", &Gemma2Config::gemma_2_2b())?;
+    // The diffusers SANA `text_encoder/` saves the Gemma2Model UN-prefixed (`embed_tokens.weight`,
+    // `layers.0.…`); PiD's `SceneWorks/gemma-2-2b-it` mirror wraps it under `model.`. Pick whichever
+    // this snapshot uses so both layouts load.
+    let prefix = if gw.contains("embed_tokens.weight") {
+        ""
+    } else {
+        "model."
+    };
+    let gemma = Gemma2::from_weights(&gw, prefix, &Gemma2Config::gemma_2_2b())?;
     // Prefer the sibling `tokenizer/` dir (the diffusers layout); fall back to a co-located file.
     let tok = {
         let t1 = root.join("tokenizer").join("tokenizer.json");
