@@ -105,8 +105,9 @@ pub mod train;
 pub mod sampler;
 pub use sampler::{
     curated_sampler_names, curated_scheduler_names, menu_with_aliases, resolve_flow_schedule,
-    resolve_schedule, run_av_curated_sampler, run_curated_sampler, run_flow_sampler, AvLatents,
-    CandleAvLatentOps, CandleLatentOps,
+    resolve_schedule, run_av_curated_sampler, run_curated_sampler, run_flow_sampler,
+    run_scm_sampler, AvLatents, CandleAvLatentOps, CandleLatentOps, ScmScheduler,
+    SCM_DEFAULT_INTERMEDIATE_TIMESTEP, SCM_DEFAULT_MAX_TIMESTEP, SCM_SIGMA_DATA,
 };
 
 // Shared seed-derivation + launch-portable seeded-noise helpers (sc-7792 consolidation / F-059,

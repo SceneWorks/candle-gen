@@ -33,8 +33,15 @@
 //!
 //! **sc-11780** assembles the end-to-end base txt2img [`pipeline`] (TE → trunk → DC-AE, driven by
 //! candle's unified flow scheduler, static shift 3.0, true CFG) and the gen-core [`model`] adapter
-//! (registered under `sana_1600m`), mirroring mlx-gen-sana's sc-8489. The CFG-free SCM/Sprint distill
-//! (mlx sc-8490) is not ported on the candle side.
+//! (registered under `sana_1600m`), mirroring mlx-gen-sana's sc-8489.
+//!
+//! **sc-11781** adds the **SANA-Sprint** CFG-free few-step variant (epic 11776; the candle sibling of
+//! mlx sc-8490): the SCM / TrigFlow continuous-time-consistency sampler
+//! ([`candle_gen::run_scm_sampler`] + [`candle_gen::ScmScheduler`]), a SEPARATE
+//! [`pipeline::SanaSprintPipeline`] (embedded-guidance trunk forward via
+//! [`transformer::SanaTransformer::forward_with_guidance`], 1–4 steps, no CFG uncond pass), and the
+//! gen-core [`model`] adapter registered under `sana_sprint_1600m`. The base `sana_1600m` pipeline /
+//! trunk `forward` / example are byte-unchanged — Sprint is purely additive.
 
 pub mod config;
 pub mod dc_ae;
@@ -45,8 +52,11 @@ pub mod transformer;
 
 pub use config::{BlockType, DcAeConfig, SanaTransformerConfig};
 pub use dc_ae::{DcAeDecoder, DcAeEncoder};
-pub use model::{descriptor, load, MODEL_ID};
-pub use pipeline::{SanaGenerateRequest, SanaPipeline};
+pub use model::{descriptor, load, load_sprint, sprint_descriptor, MODEL_ID, SPRINT_MODEL_ID};
+pub use pipeline::{
+    denoise_sprint, SanaGenerateRequest, SanaPipeline, SanaSprintPipeline, SPRINT_DEFAULT_GUIDANCE,
+    SPRINT_DEFAULT_STEPS,
+};
 pub use text_encoder::{SanaTextEncoder, MAX_SEQUENCE_LENGTH, SANA_CHI_PROMPT};
 pub use transformer::SanaTransformer;
 

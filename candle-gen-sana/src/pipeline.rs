@@ -45,7 +45,10 @@ use std::path::{Path, PathBuf};
 use candle_gen::candle_core::{DType, Device, IndexOp, Tensor};
 use candle_gen::gen_core::sampling::{build_flow_sigmas, TimestepConvention};
 use candle_gen::gen_core::{CancelFlag, Image, Progress};
-use candle_gen::{resolve_flow_schedule, run_flow_sampler, CandleError, Result, Weights};
+use candle_gen::{
+    resolve_flow_schedule, run_flow_sampler, run_scm_sampler, CandleError, Result, ScmScheduler,
+    Weights,
+};
 use candle_gen_pid::{Gemma2, Gemma2Config};
 
 use crate::config::{DcAeConfig, SanaTransformerConfig};
@@ -165,7 +168,8 @@ pub fn decode_to_image(decoder: &DcAeDecoder, cfg: &DcAeConfig, latents: &Tensor
 /// The composed SANA text-to-image pipeline: text encoder + trunk + DC-AE decoder, with the DC-AE
 /// config (for the latent `scaling_factor`). A clean `generate` entrypoint mirroring the sibling candle
 /// flow-match pipelines. Base SANA-1.6B only (true-CFG flow-match Euler); the CFG-free SCM/Sprint
-/// distill is not ported on the candle side.
+/// distilled variant is [`SanaSprintPipeline`], a SEPARATE entrypoint (sc-11781) — the base flow here
+/// is byte-unchanged.
 pub struct SanaPipeline {
     text_encoder: SanaTextEncoder,
     transformer: SanaTransformer,
@@ -390,6 +394,148 @@ pub fn resolve_component_files(dir: &Path) -> Result<Vec<PathBuf>> {
     }
     chosen.sort();
     Ok(chosen)
+}
+
+// =================================================================================================
+// SANA-Sprint — continuous-time-consistency (SCM/TrigFlow), CFG-free, 1–4 step (sc-11781, epic 11776;
+// the candle sibling of `mlx-gen-sana`'s sc-8490). A SEPARATE pipeline + entrypoint: the base
+// [`SanaPipeline`] flow above is byte-unchanged; only the trunk-call (embedded guidance, no CFG uncond
+// pass) and the sampler (the SCM loop in `candle_gen::run_scm_sampler`) differ. TE + DC-AE are reused.
+// =================================================================================================
+
+/// diffusers `SanaSprintPipeline` default `num_inference_steps` (the Sprint operating band is 1–4).
+pub const SPRINT_DEFAULT_STEPS: usize = 2;
+/// diffusers `SanaSprintPipeline` default `guidance_scale` (embedded, NOT classifier-free).
+pub const SPRINT_DEFAULT_GUIDANCE: f32 = 4.5;
+
+/// One SCM (TrigFlow continuous-time-consistency) denoise — the **CFG-free, few-step** SANA-Sprint
+/// loop. Builds the embedded guidance scalar (`guidance_scale · guidance_embeds_scale`, a `[1]` tensor
+/// fed to the trunk's guidance embedder — NOT classifier-free guidance) and runs
+/// [`candle_gen::run_scm_sampler`] with a single-trunk-forward-per-step `predict` closure. The SCM
+/// scheduler math (angle schedule, trigflow recombination, renoise) lives in the shared sampler; this
+/// only wires the trunk call.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_sprint(
+    transformer: &SanaTransformer,
+    scheduler: &ScmScheduler,
+    seed: u64,
+    latents: Tensor,
+    cond: &Tensor,
+    guidance_scale: f32,
+    guidance_embeds_scale: f32,
+    device: &Device,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+) -> Result<Tensor> {
+    // The embedded guidance scalar (CFG-free): guidance_scale · guidance_embeds_scale, a [1] tensor
+    // fed to the trunk's guidance embedder. Constant across steps.
+    let guidance = Tensor::from_vec(vec![guidance_scale * guidance_embeds_scale], (1,), device)?;
+    let predict = |lat_in: &Tensor, scm_t: f32| -> Result<Tensor> {
+        // The trunk embeds `scm_t` as its timestep (NOT the raw angle) + the embedded guidance scalar;
+        // ONE forward per step (Sprint is CFG-free — no uncond branch).
+        let t = Tensor::from_vec(vec![scm_t], (1,), device)?;
+        transformer
+            .forward_with_guidance(lat_in, cond, &t, Some(&guidance))
+            .map_err(CandleError::from)
+    };
+    run_scm_sampler(scheduler, latents, seed, cancel, on_progress, predict)
+}
+
+/// The composed **SANA-Sprint** text-to-image pipeline (CFG-free SCM/TrigFlow few-step, sc-11781) — a
+/// SEPARATE type from the base [`SanaPipeline`] so the base flow stays byte-unchanged. Same three
+/// components (gemma-2-2b-it TE + Linear-DiT trunk + DC-AE decoder), but the trunk is loaded with
+/// [`SanaTransformerConfig::sana_sprint_1600m`] (its guidance embedder + rms-norm-across-heads are
+/// config-gated) and driven by the CFG-free SCM few-step loop.
+pub struct SanaSprintPipeline {
+    text_encoder: SanaTextEncoder,
+    transformer: SanaTransformer,
+    decoder: DcAeDecoder,
+    dc_ae_cfg: DcAeConfig,
+    /// The trunk config's `guidance_embeds_scale` (`0.1`), pre-multiplied into the guidance scalar.
+    guidance_embeds_scale: f32,
+}
+
+impl SanaSprintPipeline {
+    /// Compose the Sprint pipeline from its already-constructed components + the DC-AE config and the
+    /// trunk's `guidance_embeds_scale`.
+    pub fn new(
+        text_encoder: SanaTextEncoder,
+        transformer: SanaTransformer,
+        decoder: DcAeDecoder,
+        dc_ae_cfg: DcAeConfig,
+        guidance_embeds_scale: f32,
+    ) -> Self {
+        Self {
+            text_encoder,
+            transformer,
+            decoder,
+            dc_ae_cfg,
+            guidance_embeds_scale,
+        }
+    }
+
+    /// Assemble the Sprint pipeline from an `Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers`-
+    /// shaped snapshot directory. Identical layout to the base
+    /// ([`SanaPipeline::from_diffusers_snapshot`]) — `transformer/ vae/ text_encoder/ tokenizer/` — but
+    /// the transformer loads the Sprint config (so the guidance embedder + qk-norm weights are
+    /// required). Everything runs f32.
+    pub fn from_diffusers_snapshot(root: &Path, device: &Device) -> Result<Self> {
+        let trunk_cfg = SanaTransformerConfig::sana_sprint_1600m();
+        let guidance_embeds_scale = trunk_cfg.guidance_embeds_scale;
+        let trunk_files = resolve_component_files(&root.join("transformer"))?;
+        let trunk_w = Weights::from_files(&trunk_files, device, DType::F32)?;
+        let trunk = SanaTransformer::from_weights(&trunk_w, trunk_cfg)?;
+
+        let dcfg = DcAeConfig::sana_f32c32();
+        let vae_files = resolve_component_files(&root.join("vae"))?;
+        let vae_w = Weights::from_files(&vae_files, device, DType::F32)?;
+        let decoder = DcAeDecoder::from_weights(&vae_w, dcfg.clone())?;
+
+        let te = load_text_encoder(root, device)?;
+
+        Ok(Self::new(te, trunk, decoder, dcfg, guidance_embeds_scale))
+    }
+
+    /// Run the full Sprint prompt→image path. Encodes the prompt ONCE (no uncond — Sprint is
+    /// CFG-free), seeds the DC-AE latent, runs [`denoise_sprint`] over an [`ScmScheduler`] (default 2
+    /// steps, embedded guidance 4.5), then DC-AE-decodes. The negative prompt / curated sampler +
+    /// scheduler knobs are inapplicable to the SCM loop and ignored.
+    pub fn generate_with(
+        &self,
+        req: &SanaGenerateRequest<'_>,
+        device: &Device,
+        cancel: &CancelFlag,
+        on_progress: &mut dyn FnMut(Progress),
+    ) -> Result<Image> {
+        let steps = req.steps.unwrap_or(SPRINT_DEFAULT_STEPS);
+        let guidance = req.guidance_scale.unwrap_or(SPRINT_DEFAULT_GUIDANCE);
+        let seed = req.seed.unwrap_or(0);
+
+        let cond = self.text_encoder.encode(req.prompt)?;
+        let scheduler = ScmScheduler::new(steps);
+        let latents = create_noise(device, seed, req.width, req.height)?;
+        let latents = denoise_sprint(
+            &self.transformer,
+            &scheduler,
+            seed,
+            latents,
+            &cond,
+            guidance,
+            self.guidance_embeds_scale,
+            device,
+            cancel,
+            on_progress,
+        )?;
+        on_progress(Progress::Decoding);
+        decode_to_image(&self.decoder, &self.dc_ae_cfg, &latents)
+    }
+
+    /// Convenience [`SanaSprintPipeline::generate_with`] with a no-op cancel + progress.
+    pub fn generate(&self, req: &SanaGenerateRequest<'_>, device: &Device) -> Result<Image> {
+        let cancel = CancelFlag::default();
+        let mut noop = |_: Progress| {};
+        self.generate_with(req, device, &cancel, &mut noop)
+    }
 }
 
 #[cfg(test)]

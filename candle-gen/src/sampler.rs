@@ -432,6 +432,207 @@ pub fn run_av_curated_sampler(
         .map_err(CandleError::from)
 }
 
+// =================================================================================================
+// SCM / TrigFlow continuous-time-consistency sampler — the CFG-free, 1–4 step SANA-Sprint loop
+// (epic 11776, story sc-11781; the candle twin of `mlx-gen-sana::scm` + `denoise_sprint`).
+//
+// ## Why this is NOT the unified flow-match sampler
+//
+// The epic-7114 unified framework ([`run_flow_sampler`] / the `Solver` menu) integrates in **sigma
+// space** with an `x0 = k_x·x + k_out·output` recombination. SCM is a different parameterization: it
+// works in **angle / atan space** (`t ∈ [0, π/2]`, the TrigFlow continuous-time-consistency map),
+// predicts `x0 = cos(s)·x − sin(s)·output`, and **renoises** to the next angle
+// `x_t = cos(t)·x0 + sin(t)·noise·σ_data`. The model output itself is recombined trigonometrically
+// *before* the scheduler step. None of that maps onto the flow-match `ModelSampling` / `Solver`
+// contract, so SCM is a dedicated scheduler + driver here (the consistency analog of the curated
+// solver menu). What it DOES reuse is the run-loop contract — per-step cancel + monotone progress —
+// and [`CandleLatentOps::randn_like`]'s per-step subkey derivation for the between-step renoise, so
+// the stochastic noise matches the rest of candle-gen's D6 determinism convention.
+//
+// ## Guidance axis (epic 7434)
+//
+// SANA-Sprint is **CFG-free**: a single trunk forward per step with the guidance scale fed as an
+// *embedded scalar* (the trunk's guidance embedder). There is no cond/uncond pair to combine, so the
+// epic-7434 guidance library (`cfg` / `cfg_rescale` / `apg` / `cfg_pp` — all *combine* operators) does
+// not apply; Sprint slots onto the guidance axis as the embedded / CFG-free case. The embedded
+// guidance forward lives INSIDE the caller's `predict` closure, so this driver stays trunk-agnostic.
+// =================================================================================================
+
+/// diffusers `SCMScheduler` default `max_timesteps` — the Sprint default `π/2`.
+pub const SCM_DEFAULT_MAX_TIMESTEP: f32 = std::f32::consts::FRAC_PI_2;
+/// diffusers Sprint default `intermediate_timesteps` (only consulted when `num_steps == 2`).
+pub const SCM_DEFAULT_INTERMEDIATE_TIMESTEP: f32 = 1.3;
+/// diffusers `SCMScheduler` `sigma_data` — the std-dev of the multi-step renoise (`0.5` for Sprint).
+pub const SCM_SIGMA_DATA: f32 = 0.5;
+
+/// A SANA-Sprint SCM (TrigFlow consistency) denoising schedule: the descending angle timesteps
+/// `t ∈ [max_timesteps … 0]`, length `num_steps + 1` (the trailing `0` is the clean endpoint).
+///
+/// Mirrors diffusers `SCMScheduler.set_timesteps`:
+/// * `num_steps == 2` → `[max_timesteps, intermediate_timesteps, 0]`;
+/// * otherwise → `linspace(max_timesteps, 0, num_steps + 1)`.
+#[derive(Clone, Debug)]
+pub struct ScmScheduler {
+    /// Descending angle timesteps, length `num_steps + 1`.
+    pub timesteps: Vec<f32>,
+    /// `sigma_data` (the renoise std-dev; `0.5` for Sprint).
+    pub sigma_data: f32,
+}
+
+impl ScmScheduler {
+    /// Build the Sprint schedule for `num_steps` (the diffusers `set_timesteps` default path:
+    /// `max_timesteps = π/2`, `intermediate_timesteps = 1.3`). 1–4 steps is the Sprint operating band.
+    pub fn new(num_steps: usize) -> Self {
+        Self::with_timesteps(
+            num_steps,
+            SCM_DEFAULT_MAX_TIMESTEP,
+            SCM_DEFAULT_INTERMEDIATE_TIMESTEP,
+        )
+    }
+
+    /// Build the schedule for `num_steps` with explicit `max_timesteps` / `intermediate_timesteps`
+    /// (the latter only used for the `num_steps == 2` two-point schedule, matching diffusers).
+    pub fn with_timesteps(
+        num_steps: usize,
+        max_timesteps: f32,
+        intermediate_timesteps: f32,
+    ) -> Self {
+        let timesteps = if num_steps == 2 {
+            vec![max_timesteps, intermediate_timesteps, 0.0]
+        } else {
+            let n = num_steps.max(1);
+            (0..=n)
+                .map(|i| max_timesteps * (1.0 - i as f32 / n as f32))
+                .collect()
+        };
+        Self {
+            timesteps,
+            sigma_data: SCM_SIGMA_DATA,
+        }
+    }
+
+    /// Wrap an explicit descending angle schedule (length `num_steps + 1`).
+    pub fn from_timesteps(timesteps: Vec<f32>) -> Self {
+        Self {
+            timesteps,
+            sigma_data: SCM_SIGMA_DATA,
+        }
+    }
+
+    /// Number of denoise iterations (loop count) = `timesteps.len() - 1`.
+    pub fn num_steps(&self) -> usize {
+        self.timesteps.len().saturating_sub(1)
+    }
+
+    /// Whether this is a true single-step schedule (one renoise-free step). diffusers skips the
+    /// between-step noise when `num_steps == 1`.
+    pub fn is_single_step(&self) -> bool {
+        self.num_steps() <= 1
+    }
+
+    /// The **SCM conditioning timestep** the trunk embeds at step `i` (diffusers
+    /// `scm_timestep = sin(t)/(cos(t)+sin(t))` where `t` is the angle timestep). The trunk consumes
+    /// this, NOT the raw angle.
+    pub fn scm_timestep(&self, i: usize) -> f32 {
+        let t = self.timesteps[i];
+        let (s, c) = (t.sin(), t.cos());
+        s / (c + s)
+    }
+
+    /// The model-input scale at step `i` (diffusers `sqrt(scm_t² + (1 - scm_t)²)`, applied to
+    /// `latents / sigma_data`).
+    pub fn input_scale(&self, i: usize) -> f32 {
+        let st = self.scm_timestep(i);
+        (st * st + (1.0 - st) * (1.0 - st)).sqrt()
+    }
+}
+
+/// Drive the SCM / TrigFlow **CFG-free few-step** consistency loop — the SANA-Sprint denoise. One
+/// trunk forward per step (no CFG uncond pass), a faithful port of diffusers `SanaSprintPipeline`'s
+/// denoise + `SCMScheduler.step`:
+///
+/// 1. pre-scale the seed latent by `sigma_data` (diffusers `latents = latents * sigma_data`);
+/// 2. per step `i` over the angle schedule `s = timesteps[i]`:
+///    * `scm_t = sin(s)/(cos(s)+sin(s))`; model input = `(latents / σ_data) · sqrt(scm_t²+(1−scm_t)²)`;
+///    * ONE `predict(lat_in, scm_t)` (the caller's embedded-guidance trunk forward — CFG-free);
+///    * recombine the raw output trigonometrically, `· σ_data`;
+///    * `x0 = cos(s)·latents − sin(s)·model_output`; renoise to the next angle
+///      `latents = cos(t')·x0 + sin(t')·noise·σ_data` (skipped on the final / single-step transition);
+/// 3. return `denoised / σ_data` (the diffusers decode input).
+///
+/// `predict(lat_in, scm_t)` returns the RAW trunk output; the trigflow recombination + renoise live
+/// here, so the driver is trunk-agnostic (the embedded guidance scalar is captured by the closure).
+/// Cancel + monotone progress mirror the [`run_curated_sampler`] run-loop contract.
+pub fn run_scm_sampler(
+    scheduler: &ScmScheduler,
+    latents: Tensor,
+    seed: u64,
+    cancel: &CancelFlag,
+    on_progress: &mut dyn FnMut(Progress),
+    mut predict: impl FnMut(&Tensor, f32) -> Result<Tensor>,
+) -> Result<Tensor> {
+    let ops = CandleLatentOps;
+    let sd = scheduler.sigma_data as f64;
+    let n = scheduler.num_steps();
+    let total = n.max(1) as u32;
+    let single_step = scheduler.is_single_step();
+
+    // diffusers: latents = latents * sigma_data (the SCM prior std-dev).
+    let mut latents = latents.affine(sd, 0.0)?;
+    let mut denoised = latents.clone();
+
+    for i in 0..n {
+        if cancel.is_cancelled() {
+            return Err(CandleError::Canceled);
+        }
+        on_progress(Progress::Step {
+            current: (i as u32 + 1).min(total),
+            total,
+        });
+
+        let s = scheduler.timesteps[i];
+        let t_next = scheduler.timesteps[i + 1];
+        let scm_t = scheduler.scm_timestep(i);
+        let in_scale = scheduler.input_scale(i) as f64;
+
+        // model input = (latents / σ_data) · sqrt(scm_t² + (1-scm_t)²).
+        let lat_in = latents.affine(in_scale / sd, 0.0)?;
+        let raw = predict(&lat_in, scm_t)?;
+
+        // diffusers trigflow recombination (uses the SCALED lat_in, not the raw latent):
+        //   noise_pred = ((1-2·scm_t)·lat_in + (1-2·scm_t+2·scm_t²)·raw) / in_scale · σ_data.
+        let a = 1.0 - 2.0 * scm_t;
+        let b = 1.0 - 2.0 * scm_t + 2.0 * scm_t * scm_t;
+        let combined = lat_in
+            .affine(a as f64, 0.0)?
+            .add(&raw.affine(b as f64, 0.0)?)?;
+        let model_output = combined.affine(sd / in_scale, 0.0)?;
+
+        // SCMScheduler.step: pred_x0 = cos(s)·latents − sin(s)·model_output.
+        let pred_x0 = latents
+            .affine(s.cos() as f64, 0.0)?
+            .sub(&model_output.affine(s.sin() as f64, 0.0)?)?;
+        denoised = pred_x0.clone();
+
+        // Renoise to the next angle (skipped on the final / single-step transition, matching diffusers
+        // `if len(self.timesteps) > 1`). The per-step subkey reuses the shared D6 derivation.
+        latents = if single_step {
+            pred_x0
+        } else {
+            let noise = ops
+                .randn_like(&latents, seed, i)
+                .map_err(CandleError::from)?
+                .affine(sd, 0.0)?;
+            pred_x0
+                .affine(t_next.cos() as f64, 0.0)?
+                .add(&noise.affine(t_next.sin() as f64, 0.0)?)?
+        };
+    }
+
+    // diffusers: latents = denoised / sigma_data (the decode input).
+    Ok(denoised.affine(1.0 / sd, 0.0)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,6 +1086,141 @@ mod tests {
                 "{name} (AV two-stream) produced non-finite output"
             );
         }
+    }
+
+    // =============================================================================================
+    // SCM / TrigFlow consistency sampler (sc-11781) — the CFG-free few-step SANA-Sprint loop.
+    // =============================================================================================
+
+    fn approx(a: f32, b: f32, tol: f32, what: &str) {
+        assert!((a - b).abs() < tol, "{what}: got {a} want {b}");
+    }
+
+    #[test]
+    fn scm_two_step_schedule_is_diffusers_intermediate() {
+        // diffusers set_timesteps(2) → [π/2, 1.3, 0].
+        let s = ScmScheduler::new(2);
+        assert_eq!(s.timesteps.len(), 3);
+        approx(s.timesteps[0], SCM_DEFAULT_MAX_TIMESTEP, 1e-4, "max");
+        approx(s.timesteps[1], 1.3, 1e-6, "intermediate");
+        approx(s.timesteps[2], 0.0, 1e-6, "end");
+        assert_eq!(s.num_steps(), 2);
+        approx(s.sigma_data, 0.5, 1e-6, "sigma_data");
+    }
+
+    #[test]
+    fn scm_four_step_schedule_is_linspace() {
+        // diffusers set_timesteps(4) → linspace(π/2, 0, 5) = [π/2, 3π/8, π/4, π/8, 0].
+        let s = ScmScheduler::new(4);
+        assert_eq!(s.timesteps.len(), 5);
+        for (i, &tt) in s.timesteps.iter().enumerate() {
+            approx(
+                tt,
+                SCM_DEFAULT_MAX_TIMESTEP * (1.0 - i as f32 / 4.0),
+                1e-5,
+                "ts",
+            );
+        }
+        assert!(s.timesteps.windows(2).all(|w| w[0] > w[1]));
+    }
+
+    #[test]
+    fn scm_timestep_and_input_scale_match_diffusers_formula() {
+        let s = ScmScheduler::new(2);
+        // Endpoints: t = π/2 → sin=1, cos=0 → scm = 1; input scale = sqrt(1+0) = 1.
+        approx(s.scm_timestep(0), 1.0, 1e-5, "scm at pi/2");
+        approx(s.input_scale(0), 1.0, 1e-5, "scale at pi/2");
+        // INDEPENDENT hard-coded reference for the mid-angle t=1.3 (Python: sin(1.3)=0.963558,
+        // cos(1.3)=0.267499 → scm = 0.782708; input_scale = sqrt(0.782708²+0.217292²) = 0.812310).
+        // Non-circular: proves the formula matches reality, not just that the impl matches the formula.
+        approx(s.scm_timestep(1), 0.782708, 1e-5, "scm at t=1.3");
+        approx(s.input_scale(1), 0.812310, 1e-5, "input_scale at t=1.3");
+    }
+
+    #[test]
+    fn scm_single_step_flag() {
+        assert!(ScmScheduler::new(1).is_single_step());
+        assert!(!ScmScheduler::new(2).is_single_step());
+        assert!(!ScmScheduler::new(4).is_single_step());
+    }
+
+    /// The driver runs EXACTLY one `predict` per step (CFG-free: no uncond pass), reports `num_steps`
+    /// progress events, and produces a finite, non-degenerate latent.
+    #[test]
+    fn run_scm_sampler_one_forward_per_step_finite() {
+        let latents = t(&[0.3, -1.1, 2.0, 0.05, -0.4, 1.7]);
+        let scheduler = ScmScheduler::new(2);
+        let cancel = CancelFlag::new();
+        let mut forwards = 0usize;
+        let mut steps_seen = 0usize;
+        let mut progress = |p: Progress| {
+            if matches!(p, Progress::Step { .. }) {
+                steps_seen += 1;
+            }
+        };
+        // A trunk stub: a small affine of the (scaled) input, scm_t-dependent so the two steps differ.
+        let out = run_scm_sampler(
+            &scheduler,
+            latents,
+            7,
+            &cancel,
+            &mut progress,
+            |xin, scm_t| {
+                forwards += 1;
+                Ok(xin.affine(0.2 * scm_t as f64 + 0.1, 0.05)?)
+            },
+        )
+        .unwrap();
+        assert_eq!(forwards, 2, "CFG-free: exactly one trunk forward per step");
+        assert_eq!(steps_seen, 2, "reports exactly num_steps progress events");
+        let v = vec1(&out);
+        assert!(v.iter().all(|x| x.is_finite()), "SCM latent non-finite");
+        let (lo, hi) = (
+            v.iter().cloned().fold(f32::INFINITY, f32::min),
+            v.iter().cloned().fold(f32::NEG_INFINITY, f32::max),
+        );
+        assert!(hi - lo > 1e-6, "SCM latent is constant — graph degenerate");
+    }
+
+    /// Single-step (num_steps = 1) takes exactly one forward and skips the renoise draw.
+    #[test]
+    fn run_scm_sampler_single_step_one_forward() {
+        let latents = t(&[0.5, -0.2, 0.9, 1.3]);
+        let scheduler = ScmScheduler::new(1);
+        assert!(scheduler.is_single_step());
+        let cancel = CancelFlag::new();
+        let mut forwards = 0usize;
+        let mut progress = |_p: Progress| {};
+        let out = run_scm_sampler(&scheduler, latents, 1, &cancel, &mut progress, |xin, _t| {
+            forwards += 1;
+            Ok(xin.affine(0.3, 0.0)?)
+        })
+        .unwrap();
+        assert_eq!(forwards, 1, "single-step SCM runs exactly one forward");
+        assert!(vec1(&out).iter().all(|x| x.is_finite()));
+    }
+
+    /// Determinism: the same seed + schedule + stub reproduces the latent bit-for-bit (the per-step
+    /// renoise is seed-derived), and a different seed diverges (the multi-step noise actually mixes in).
+    #[test]
+    fn run_scm_sampler_is_seed_deterministic() {
+        let run = |seed: u64| -> Vec<f32> {
+            let scheduler = ScmScheduler::new(4);
+            let cancel = CancelFlag::new();
+            let mut progress = |_p: Progress| {};
+            let out = run_scm_sampler(
+                &scheduler,
+                t(&[0.3, -1.1, 2.0, 0.05]),
+                seed,
+                &cancel,
+                &mut progress,
+                |xin, scm_t| Ok(xin.affine(0.15 * scm_t as f64 + 0.2, 0.0)?),
+            )
+            .unwrap();
+            vec1(&out)
+        };
+        assert_eq!(run(7), run(7), "same seed reproduces");
+        assert_ne!(run(7), run(8), "different seed diverges (renoise mixes in)");
     }
 }
 

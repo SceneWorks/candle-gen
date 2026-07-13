@@ -25,6 +25,14 @@ respective providers:
       https://huggingface.co/Efficient-Large-Model/Sana_1600M_1024px_diffusers/blob/main/LICENSE.txt
       SANA is a work of NVIDIA / NVlabs (https://github.com/NVlabs/Sana).
 
+  * SANA-Sprint 1.6B transformer + DC-AE autoencoder (the CFG-free, SCM/TrigFlow
+    continuous-time-consistency-distilled, 1-4 step variant — sc-11781)
+      Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers
+      Licensed under the NVIDIA License (the NVIDIA Open Model License family).
+      See the repository's LICENSE.txt:
+      https://huggingface.co/Efficient-Large-Model/Sana_Sprint_1.6B_1024px_diffusers/blob/main/LICENSE.txt
+      SANA-Sprint is a work of NVIDIA / NVlabs (https://github.com/NVlabs/Sana).
+
   * gemma-2-2b-it text encoder (the SANA caption encoder)
       Gemma is provided by Google under the Gemma Terms of Use:
       https://ai.google.dev/gemma/terms
