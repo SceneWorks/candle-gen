@@ -49,7 +49,10 @@ use crate::config::{BlockType, DcAeConfig};
 /// A conv whose on-disk weight is the diffusers-native `[O, I/groups, kH, kW]`, consumed by candle's
 /// NCHW `Conv2d` as-is (no transpose — the MLX port transposes to `[O, kH, kW, I/groups]`). Stored
 /// f32.
-fn conv(
+///
+/// `pub(crate)` so the SANA Linear-DiT trunk ([`crate::transformer`]) loads its `patch_embed` and
+/// Mix-FFN convs through the identical NCHW-native loader (sc-11778 primitive reuse).
+pub(crate) fn conv(
     w: &Weights,
     prefix: &str,
     stride: usize,
@@ -335,6 +338,33 @@ impl LinearAttn {
 // GLUMBConv
 // ---------------------------------------------------------------------------------------------------
 
+/// The **gated inverted-bottleneck core** of a `GLUMBConv`, shared by the DC-AE EfficientViT block
+/// here and the SANA Linear-DiT trunk's Mix-FFN ([`crate::transformer`], sc-11778): `conv_inverted
+/// (1×1) → SiLU → conv_depth(3×3 depthwise) → gated SiLU → conv_point(1×1)`. NCHW; `hidden` is the
+/// per-branch width (`conv_depth` outputs `2·hidden`, chunk on the channel axis → `a · SiLU(g)`).
+///
+/// The two callers differ only in what they append: the DC-AE [`GluMbConv`] adds `trms2d + residual`
+/// (`norm_type=rms_norm, residual_connection=True`); the trunk Mix-FFN uses the **bare** core
+/// (diffusers `SanaTransformerBlock.ff`: `norm_type=None, residual_connection=False`, the block owns
+/// its own modulation-gate + residual). The 3×3 depthwise `conv_depth` is the Mix-FFN token-mixer —
+/// the trunk's only spatial mixing (NoPE + single-scale linear attn otherwise).
+pub(crate) fn glu_mbconv_core(
+    conv_inverted: &Conv2d,
+    conv_depth: &Conv2d,
+    conv_point: &Conv2d,
+    hidden: usize,
+    x: &Tensor,
+) -> Result<Tensor> {
+    let h = conv_inverted.forward(x)?;
+    let h = silu(&h)?;
+    let h = conv_depth.forward(&h)?;
+    // chunk(2) over the channel axis → gate.
+    let a = h.narrow(1, 0, hidden)?;
+    let g = h.narrow(1, hidden, hidden)?;
+    let h = (a * silu(&g)?)?;
+    conv_point.forward(&h)
+}
+
 /// `GLUMBConv` (`rms_norm`, residual, expand_ratio 4).
 struct GluMbConv {
     conv_inverted: Conv2d, // 1×1, in → 2·hidden
@@ -357,14 +387,13 @@ impl GluMbConv {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let h = self.conv_inverted.forward(x)?;
-        let h = silu(&h)?;
-        let h = self.conv_depth.forward(&h)?;
-        // chunk(2) over the channel axis → gate.
-        let a = h.narrow(1, 0, self.hidden)?;
-        let g = h.narrow(1, self.hidden, self.hidden)?;
-        let h = (a * silu(&g)?)?;
-        let h = self.conv_point.forward(&h)?;
+        let h = glu_mbconv_core(
+            &self.conv_inverted,
+            &self.conv_depth,
+            &self.conv_point,
+            self.hidden,
+            x,
+        )?;
         let h = self.norm.forward(&h)?;
         h + x
     }
