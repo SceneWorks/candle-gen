@@ -19,8 +19,14 @@ candle-gen = { path = "../candle-gen" }
 # once in candle-gen-pid and are wired here via `CaptionEncoder::with_chi_prompt`. No encoder body is
 # copied.
 candle-gen-pid = { path = "../candle-gen-pid" }
+# Launch-portable seeded latent noise draw (the same CPU `StdRng` the shared `candle_gen::seed`
+# helpers use) — the pipeline seeds the DC-AE latent here.
+rand = { workspace = true }
 
 [dev-dependencies]
+# The txt2img example fetches the WHOLE SANA HF repo snapshot (model-download convention — every
+# sibling, not a pinned allow-list) into the HF cache before loading.
+hf-hub = { workspace = true }
 # Shared test-support helpers (PPM IO / cosine / HF-cache resolution / GPU peak-VRAM probe) behind
 # candle-gen's `testkit` feature (mirrors candle-gen-pid / candle-gen-krea test IO).
 candle-gen = { path = "../candle-gen", features = ["testkit"] }

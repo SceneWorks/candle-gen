@@ -1,0 +1,43 @@
+candle-gen-sana
+Copyright 2026 Michael Trefry and the candle-gen contributors
+
+This crate (source code) is licensed under the Apache License, Version 2.0, the
+same as the candle-gen workspace it belongs to.
+
+candle-gen-sana is an independent, from-scratch Rust/candle reimplementation of
+the SANA (NVlabs) text-to-image architecture — the DC-AE f32 deep-compression
+autoencoder, the Linear-DiT trunk, and the gemma-2-2b-it CHI caption encoder
+seam. It does not include or redistribute any model weights.
+
+------------------------------------------------------------------------------
+Model weights (NOT distributed with this crate)
+------------------------------------------------------------------------------
+
+The candle-gen-sana-txt2img example downloads model weights at runtime, on the
+user's machine, from the official public Hugging Face repository. Those weights
+are NOT part of this crate and remain subject to the licenses of their
+respective providers:
+
+  * SANA-1.6B transformer + DC-AE autoencoder
+      Efficient-Large-Model/Sana_1600M_1024px_diffusers
+      Licensed under the NVIDIA License (the NVIDIA Open Model License family).
+      See the repository's LICENSE.txt:
+      https://huggingface.co/Efficient-Large-Model/Sana_1600M_1024px_diffusers/blob/main/LICENSE.txt
+      SANA is a work of NVIDIA / NVlabs (https://github.com/NVlabs/Sana).
+
+  * gemma-2-2b-it text encoder (the SANA caption encoder)
+      Gemma is provided by Google under the Gemma Terms of Use:
+      https://ai.google.dev/gemma/terms
+      This crate reuses candle-gen-pid's gemma-2-2b-it loader; the example loads
+      the gemma weights bundled in the SANA diffusers repository above.
+
+Use of the downloaded weights is governed by the above licenses. By downloading
+and using them you agree to the applicable terms. This crate's Apache-2.0
+license covers the source code only, not the model weights.
+
+This crate gratefully acknowledges the following as architectural lineage,
+references, and parity baselines (no source code is copied from them):
+
+  * NVIDIA / NVlabs SANA      https://github.com/NVlabs/Sana
+  * Hugging Face Diffusers    https://github.com/huggingface/diffusers   (Apache-2.0)
+  * mlx-gen-sana              the MLX sibling this port mirrors

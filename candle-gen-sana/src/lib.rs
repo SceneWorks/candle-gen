@@ -31,15 +31,27 @@
 //! last-hidden caption embedding feeding the trunk's `attn2` cross-attention. Mirrors mlx-gen-sana's
 //! sc-8488 (mlx-gen #614).
 //!
-//! The remaining native-SANA pipeline (flow / SCM schedulers, e2e wiring, gen-core registration)
-//! lands in the sibling stories of epic 11776, mirroring mlx-gen-sana's sc-8489..8490.
+//! **sc-11780** assembles the end-to-end base txt2img [`pipeline`] (TE → trunk → DC-AE, driven by
+//! candle's unified flow scheduler, static shift 3.0, true CFG) and the gen-core [`model`] adapter
+//! (registered under `sana_1600m`), mirroring mlx-gen-sana's sc-8489. The CFG-free SCM/Sprint distill
+//! (mlx sc-8490) is not ported on the candle side.
 
 pub mod config;
 pub mod dc_ae;
+pub mod model;
+pub mod pipeline;
 pub mod text_encoder;
 pub mod transformer;
 
 pub use config::{BlockType, DcAeConfig, SanaTransformerConfig};
 pub use dc_ae::{DcAeDecoder, DcAeEncoder};
+pub use model::{descriptor, load, MODEL_ID};
+pub use pipeline::{SanaGenerateRequest, SanaPipeline};
 pub use text_encoder::{SanaTextEncoder, MAX_SEQUENCE_LENGTH, SANA_CHI_PROMPT};
 pub use transformer::SanaTransformer;
+
+/// Force the linker to keep this crate's `register_generators!` submission (epic 3720): a binary that
+/// only resolves the model by id through the gen-core registry never names a symbol here, so without a
+/// referenced item the whole object — and its `inventory::submit!` — can be dead-stripped. Call this
+/// once from `main` (as the sibling candle providers do) before `gen_core::registry::load`.
+pub fn force_link() {}

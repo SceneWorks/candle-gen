@@ -492,7 +492,9 @@ version = "0.0.0"
 dependencies = [
  "candle-gen",
  "candle-gen-pid",
+ "hf-hub",
  "image",
+ "rand",
 ]
 
 [[package]]
