@@ -13,6 +13,12 @@ categories = ["science"]
 # bridge). Re-exports `candle_core` / `candle_nn` / `gen_core`, so the SANA modules resolve the SAME
 # candle build + gen-core rev the provider crates they wire into resolve.
 candle-gen = { path = "../candle-gen" }
+# SANA text conditioning REUSES PiD's native gemma-2-2b-it CHI caption encoder (`CaptionEncoder`,
+# `Gemma2`) — SANA and PiD share the exact same text-conditioning lineage (sc-11779, mirrors
+# mlx-gen #614). Only the CHI prompt text differs; the Gemma-2 forward + token-selection policy live
+# once in candle-gen-pid and are wired here via `CaptionEncoder::with_chi_prompt`. No encoder body is
+# copied.
+candle-gen-pid = { path = "../candle-gen-pid" }
 
 [dev-dependencies]
 # Shared test-support helpers (PPM IO / cosine / HF-cache resolution / GPU peak-VRAM probe) behind

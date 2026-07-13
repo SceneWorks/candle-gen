@@ -24,14 +24,22 @@
 //! caption conditioning (base SANA-1.6B + the SANA-Sprint guidance-embed / qk-norm superset). Its
 //! `[B, 32, H, W]` noise prediction feeds [`dc_ae::DcAeDecoder::decode`] directly.
 //!
-//! The remaining native-SANA pipeline (flow / SCM schedulers, Gemma text encoder, e2e wiring,
-//! gen-core registration) lands in the sibling stories of epic 11776, mirroring mlx-gen-sana's
-//! sc-8488..8490.
+//! **sc-11779** adds the **text conditioning** ([`text_encoder::SanaTextEncoder`]) — a thin wrapper
+//! that REUSES PiD's native gemma-2-2b-it CHI caption encoder ([`candle_gen_pid::CaptionEncoder`])
+//! via the shared [`candle_gen_pid::CaptionEncoder::with_chi_prompt`] seam, differing from PiD only
+//! in the CHI template's quoting around `Enhanced prompt`. Prompt → `[1, 300, 2304]` gemma
+//! last-hidden caption embedding feeding the trunk's `attn2` cross-attention. Mirrors mlx-gen-sana's
+//! sc-8488 (mlx-gen #614).
+//!
+//! The remaining native-SANA pipeline (flow / SCM schedulers, e2e wiring, gen-core registration)
+//! lands in the sibling stories of epic 11776, mirroring mlx-gen-sana's sc-8489..8490.
 
 pub mod config;
 pub mod dc_ae;
+pub mod text_encoder;
 pub mod transformer;
 
 pub use config::{BlockType, DcAeConfig, SanaTransformerConfig};
 pub use dc_ae::{DcAeDecoder, DcAeEncoder};
+pub use text_encoder::{SanaTextEncoder, MAX_SEQUENCE_LENGTH, SANA_CHI_PROMPT};
 pub use transformer::SanaTransformer;

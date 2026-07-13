@@ -491,6 +491,7 @@ name = "candle-gen-sana"
 version = "0.0.0"
 dependencies = [
  "candle-gen",
+ "candle-gen-pid",
  "image",
 ]
 

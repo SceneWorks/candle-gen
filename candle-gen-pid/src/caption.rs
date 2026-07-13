@@ -27,6 +27,24 @@ pub const CHI_PROMPT: &str = "Given a user prompt, generate an \"Enhanced prompt
 const MODEL_MAX_LENGTH: i32 = 300;
 const PAD_ID: i32 = 0;
 
+/// The released token-selection policy shared by PiD and SANA: gather `select_index = [0] +
+/// range(max_len − (MODEL_MAX_LENGTH − 1), max_len)` — the `<bos>` at position 0 plus the trailing
+/// `MODEL_MAX_LENGTH − 1` tokens — from the `max_len`-long Gemma **last-hidden** sequence, yielding
+/// exactly `MODEL_MAX_LENGTH` (300) caption tokens.
+///
+/// Exposed (and unit-tested) so the index math can be confirmed against the SANA reference
+/// (`select_index = [0] + range(-(max_sequence_length − 1), 0)` in diffusers
+/// `SanaPipeline._get_gemma_prompt_embeds`) without the Gemma weights. `max_len` must be
+/// `≥ MODEL_MAX_LENGTH` (the caption tokenizer always right-pads to `num_chi_tokens + 300 − 2`, which
+/// is well above 300).
+pub fn select_index(max_len: usize) -> Vec<u32> {
+    debug_assert!(max_len >= MODEL_MAX_LENGTH as usize);
+    let mut sel = Vec::with_capacity(MODEL_MAX_LENGTH as usize);
+    sel.push(0u32);
+    sel.extend(((max_len as i32 - (MODEL_MAX_LENGTH - 1))..max_len as i32).map(|i| i as u32));
+    sel
+}
+
 /// Gemma-2 caption encoder: tokenizer + CHI-prompt + the released token-selection policy.
 pub struct CaptionEncoder {
     gemma: Gemma2,
@@ -109,13 +127,43 @@ impl CaptionEncoder {
         let ids_arr = Tensor::from_vec(ids_u32, (1, max_len), device)?;
         let mask_f32: Vec<f32> = mask.iter().map(|&m| m as f32).collect();
         let mask_arr = Tensor::from_vec(mask_f32, (1, max_len), device)?;
+        // Gemma-2 run in encoder / feature-extraction mode: `forward` returns the decoder's
+        // LAST-HIDDEN states `[1, max_len, 2304]` (post final `model.norm`), NOT generation logits —
+        // the diffusers reference does `prompt_embeds[0]` (== `last_hidden_state`), never the LM head.
         let hidden = self.gemma.forward(&ids_arr, Some(&mask_arr))?; // [1, max_len, 2304]
 
         // select_index = [0] + range(max_len-(300-1), max_len)
-        let mut sel = Vec::with_capacity(MODEL_MAX_LENGTH as usize);
-        sel.push(0u32);
-        sel.extend(((max_len as i32 - (MODEL_MAX_LENGTH - 1))..max_len as i32).map(|i| i as u32));
+        let sel = select_index(max_len);
         let sel_arr = Tensor::from_vec(sel, (MODEL_MAX_LENGTH as usize,), device)?;
         Ok(hidden.index_select(&sel_arr, 1)?) // [1, 300, 2304]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{select_index, MODEL_MAX_LENGTH};
+
+    #[test]
+    fn select_index_is_bos_plus_trailing_299() {
+        // `[0] + range(max_len - 299, max_len)` for a representative padded length.
+        let max_len = 555usize; // e.g. num_chi_tokens(257) + 300 - 2
+        let sel = select_index(max_len);
+
+        // Exactly MODEL_MAX_LENGTH (300) indices.
+        assert_eq!(sel.len(), MODEL_MAX_LENGTH as usize);
+        // The <bos> token at position 0 is preserved as the first selected index.
+        assert_eq!(sel[0], 0);
+        // Then the trailing MODEL_MAX_LENGTH - 1 positions, contiguous, ending at the last token.
+        assert_eq!(sel[1], (max_len as u32) - (MODEL_MAX_LENGTH as u32 - 1));
+        assert_eq!(*sel.last().unwrap(), max_len as u32 - 1);
+        // The tail is a contiguous ascending run (no gaps).
+        for w in sel[1..].windows(2) {
+            assert_eq!(w[1], w[0] + 1);
+        }
+
+        // Byte-identical to the explicit reference construction `[0] + list(range(...))`.
+        let mut expect = vec![0u32];
+        expect.extend((max_len as u32 - (MODEL_MAX_LENGTH as u32 - 1))..max_len as u32);
+        assert_eq!(sel, expect);
     }
 }
