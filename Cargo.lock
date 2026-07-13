@@ -487,6 +487,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-gen-sana"
+version = "0.0.0"
+dependencies = [
+ "candle-gen",
+ "image",
+]
+
+[[package]]
 name = "candle-gen-scail2"
 version = "0.0.0"
 dependencies = [

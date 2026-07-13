@@ -1,5 +1,5 @@
 [workspace]
-members = ["candle-gen", "candle-gen-sdxl", "candle-gen-z-image", "candle-gen-flux", "candle-gen-flux2", "candle-gen-qwen-image", "candle-gen-anima", "candle-gen-wan", "candle-gen-scail2", "candle-gen-bernini", "candle-gen-ltx", "candle-gen-svd", "candle-gen-joycaption", "candle-gen-lens", "candle-gen-chroma", "candle-gen-kolors", "candle-gen-sensenova", "candle-gen-face", "candle-gen-instantid", "candle-gen-seedvr2", "candle-gen-pulid", "candle-gen-sam3", "candle-gen-ideogram", "candle-gen-boogu", "candle-gen-clip", "candle-gen-krea", "candle-gen-sd3", "candle-gen-depth", "candle-gen-pid"]
+members = ["candle-gen", "candle-gen-sdxl", "candle-gen-z-image", "candle-gen-flux", "candle-gen-flux2", "candle-gen-qwen-image", "candle-gen-anima", "candle-gen-wan", "candle-gen-scail2", "candle-gen-bernini", "candle-gen-ltx", "candle-gen-svd", "candle-gen-joycaption", "candle-gen-lens", "candle-gen-chroma", "candle-gen-kolors", "candle-gen-sensenova", "candle-gen-face", "candle-gen-instantid", "candle-gen-seedvr2", "candle-gen-pulid", "candle-gen-sam3", "candle-gen-ideogram", "candle-gen-boogu", "candle-gen-clip", "candle-gen-krea", "candle-gen-sd3", "candle-gen-depth", "candle-gen-pid", "candle-gen-sana"]
 resolver = "2"
 
 # Optimize DEPENDENCIES (not our own crates) even in debug/test builds. `cargo test --workspace` in

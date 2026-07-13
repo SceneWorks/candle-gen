@@ -1,0 +1,28 @@
+[package]
+name = "candle-gen-sana"
+version = "0.0.0"
+edition = "2021"
+description = "SANA (NVlabs) provider crate for candle-gen — gating spike sc-11777: the DC-AE f32 deep-compression image decoder + the EfficientViT GLU ReLU-linear-attention block (the shared hard primitive the SANA Linear-DiT trunk reuses). Windows/CUDA + Linux sibling of mlx-gen-sana (mlx-gen #612)."
+license = "Apache-2.0"
+repository = "https://github.com/michaeltrefry/candle-gen"
+keywords = ["candle", "cuda", "diffusion", "sana", "autoencoder"]
+categories = ["science"]
+
+[dependencies]
+# The shared candle backend + commons (device/dtype seam, `Weights`, `CandleError → gen_core::Error`
+# bridge). Re-exports `candle_core` / `candle_nn` / `gen_core`, so the SANA modules resolve the SAME
+# candle build + gen-core rev the provider crates they wire into resolve.
+candle-gen = { path = "../candle-gen" }
+
+[dev-dependencies]
+# Shared test-support helpers (PPM IO / cosine / HF-cache resolution / GPU peak-VRAM probe) behind
+# candle-gen's `testkit` feature (mirrors candle-gen-pid / candle-gen-krea test IO).
+candle-gen = { path = "../candle-gen", features = ["testkit"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[features]
+default = []
+# Apple Metal GPU backend (Mac) — forwarded to the candle backend. Not in `default`.
+metal = ["candle-gen/metal"]
+# NVIDIA CUDA backend (Windows/Linux target) — forwarded to the candle backend. Not in `default`.
+cuda = ["candle-gen/cuda"]
