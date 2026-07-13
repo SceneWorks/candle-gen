@@ -2764,7 +2764,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core"
 version = "0.1.0"
-source = "git+https://github.com/michaeltrefry/mlx-gen?rev=202193c920db7c9b51e8f28f5e8668733722a1d7#202193c920db7c9b51e8f28f5e8668733722a1d7"
+source = "git+https://github.com/michaeltrefry/mlx-gen?rev=c9faefc5d2e0650dd5679745089f2c03be51ba7a#c9faefc5d2e0650dd5679745089f2c03be51ba7a"
 dependencies = [
  "core-llm",
  "inventory",
@@ -2777,7 +2777,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core-testkit"
 version = "0.1.0"
-source = "git+https://github.com/michaeltrefry/mlx-gen?rev=202193c920db7c9b51e8f28f5e8668733722a1d7#202193c920db7c9b51e8f28f5e8668733722a1d7"
+source = "git+https://github.com/michaeltrefry/mlx-gen?rev=c9faefc5d2e0650dd5679745089f2c03be51ba7a#c9faefc5d2e0650dd5679745089f2c03be51ba7a"
 dependencies = [
  "sceneworks-gen-core",
 ]
